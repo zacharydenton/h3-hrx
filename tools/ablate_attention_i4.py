@@ -32,6 +32,20 @@ def variants(src: str):
     s = re.sub(r"      %ve(\d+) = vector.extract %v_chunk\[\d+\] : vector<16xf16> -> f16\n      %vr\d+ = index.add %st_chunk_v, %cj\d+ : index\n      view.store %ve\d+, %v_tile\[%vr\d+, %st_key_v\] : f16, view<128x24xf16>\n", "", src)
     s = s.replace("    } else {\n    }\n", "    } else {\n      vector.store %v_chunk, %v_tile[%st_chunk_v, %c0] : vector<16xf16>, view<128x24xf16>\n    }\n")
     out["V staged untransposed"] = s
+    # no P round trip through LDS: a V fragment's data stands in for the probability lhs (wrong values)
+    s = src.replace("    %probability = vector.fragment.load<lhs> %scratch_view[%c0, %c0] shape [%m, %k_frag] : view<16x16xf16> -> vector<16xf16>\n", "    %probability = vector.fragment<lhs> %v_data0 shape [%m, %k_frag] : vector<16xf16>\n")
+    s = re.sub(r"    vector.fragment.store<result> %weight, %scratch_view\[%c0, %c0\] shape \[%m, %n\] : vector<8xf32>, view<16x16xf16>\n    kernel.barrier<workgroup> scope\(subgroup\) ordering\(acq_rel\)\n", "", s)
+    out["no P LDS round trip"] = s
+    # no trailing barrier (a race; timing only)
+    idx = src.rindex("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)\n    scf.yield %next_max")
+    out["no trailing barrier"] = src[:idx] + src[idx + len("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)\n"):]
+    # no K/V staging: the tiles are never loaded or stored (stale LDS; timing only)
+    s = re.sub(r"      %k_chunk = vector.load %ki_view\[%st_row, %st_col\] : view<\[%padded_tokens\]x\[%ki_words\]xi32> -> vector<2xi32>\n      vector.store %k_chunk, %k_tile\[%st_key, %st_chunk\] : vector<2xi32>, view<16x20xi32>\n", "", src)
+    s = re.sub(r"      %v_chunk = vector.load %v_view\[%st_chan, %key_origin0\] : view<\[%kv_stride0\]x\[%padded_tokens\]xf16> -> vector<16xf16>\n      vector.store %v_chunk, %v_tile\[%st_lane, %c0\] : vector<16xf16>, view<128x24xf16>\n", "", s)
+    out["no K/V staging"] = s
+    # no epilogue publish loop
+    i0 = src.index("  scf.for %fragment = [%c0 to %c_nf step %c1] {"); i1 = src.index("  kernel.return")
+    out["no epilogue"] = src[:i0] + src[i1:]
     # LDS padded to 40 KB: at most one workgroup per CU (occupancy sensitivity)
     s = re.sub(r"  %lds_bytes = index.constant \d+ : offset\n", "  %lds_bytes = index.constant 40960 : offset\n", src)
     out["LDS padded (1 WG/CU)"] = s

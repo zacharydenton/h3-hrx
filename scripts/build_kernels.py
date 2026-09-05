@@ -39,7 +39,8 @@ def build(tokens: int) -> Path:
     m_group = gemm_m_group(tokens)
     waves = int(os.environ.get("H3_ATTN_WAVES", "8" if tokens >= 4096 else "4"))   # query tiles per attention workgroup
     capacity = max((tokens + 16 + 31) // 32 * 32, (tokens + 16 * waves - 1) // (16 * waves) * (16 * waves))   # tokens+16 headroom, whole query blocks
-    attn_stem = ("attention_mha8_lds_f16_wmma" if waves == 8 else "attention_mha_lds_f16_wmma") if ATTN_QK == "f16" else ("attention_i4qk_mha8_lds_f16_wmma" if waves == 8 else "attention_i4qk_mha_lds_f16_wmma")
+    LONG_FROM = 20000            # past ~20k rows the int4 kernel capped at one workgroup per CU (LDS-padded) is 11% faster; below, 3% slower
+    attn_stem = ("attention_mha8_lds_f16_wmma" if waves == 8 else "attention_mha_lds_f16_wmma") if ATTN_QK == "f16" else ("attention_i4qkl_mha8_lds_f16_wmma" if tokens >= LONG_FROM else ("attention_i4qk_mha8_lds_f16_wmma" if waves == 8 else "attention_i4qk_mha_lds_f16_wmma"))
     attn = "h3." + attn_stem
     sfx = "_256" if GEMM_TILE == 256 else ""
     g4 = lambda stem: stem + sfx
@@ -64,7 +65,7 @@ def build(tokens: int) -> Path:
         hs = out / f"{name}.hsaco"
         if not hs.exists():
             compile_kernel(ROOT / "kernels" / f"{stem}.loom", sym, cfg, hs)
-    (out / "attention_qk.txt").write_text(f"{ATTN_QK}\n")
+    (out / "attention_qk.txt").write_text(("i4l" if attn_stem.startswith("attention_i4qkl") else ATTN_QK) + "\n")
     (out / "capacity.txt").write_text(f"{capacity}\n")
     (out / "gemm_tile.txt").write_text(f"{GEMM_TILE}\n")
     (out / "attention_waves.txt").write_text(f"{waves}\n")

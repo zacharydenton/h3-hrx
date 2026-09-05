@@ -577,3 +577,34 @@ coarser than ours.
 H3's late layers are the limit of int4 QK^T under any smoothing (layer 49 at 23% per block,
 |k| to 378, |q| to 187); keeping the last layers in f16 attention did not move the velocity
 (0.9972 vs 0.9975 with layers 45+ exact), because the velocity error is set by the middle.
+
+## The 2x: what the ablations found in the int4 kernel (2026-09-06, night)
+
+`tools/ablate_attention_i4.py` removes one component at a time from the shipped kernel and
+times the variants interleaved. First round at 15427 rows: P.V MMAs and V fragment reads 32%,
+**the V transpose staging 20%** (16 scalar f16 LDS stores per lane per tile), QK^T and K reads
+13%, exp / max butterflies / accumulator rescale 3% each, and capping the LDS to one workgroup
+per CU made it 3.5% faster. The softmax was never the cost.
+
+Landed from that:
+- `kernels/transpose_f16.loom`: V^T once per block (32x32 LDS tiles, headroom columns zeroed
+  -- stale tile rows gave NaN x 0 = NaN in the masked keys the first time). The attention
+  stages V by channel rows with one 32-byte load and one store. 768 attention 2.94 -> 1.69 s
+  per block (interleaved). The register-prefetch variant, which spilled, is retired.
+- double-buffered K/V tiles (ATTN_DBUF, now the shipped form): the trailing barrier goes;
+  1.02-1.05x.
+- `attention_i4qkl_mha8` for 20k+ rows: the same kernel with its LDS request padded so one
+  workgroup runs per CU (fewer concurrent K/V streams); 1.09x at 37743 rows, 0.97x at 15427.
+- 16 waves per workgroup, retried with the int4 kernel: 0.76-0.82x again.
+
+Interleaved at 37743 rows (best of 6): f16 kernel ~3.2 s per block; int4 QK^T 2.94; +V^T
+1.65; +double buffering 1.61; +one workgroup per CU 1.51 (27.1 TFLOP/s-equivalent). That is
+2.1x on attention against the f16 kernel at 768; the session's 50-block mean under the day's
+load is 1.7 s per block, the 768 step about 110 s (attention 75%), 30 steps about 55 minutes.
+Velocity unchanged at 0.9899 (V^T is exact).
+
+Second ablation round (noisier, the box shared): K/V staging 31%, the trailing barrier 15%,
+the epilogue's publish loop 12%, P.V 37%, QK^T 26%. Left on the table, in order: the
+epilogue (write the accumulator layout straight to global instead of 8 LDS round trips with
+16 subgroup barriers), a lazy accumulator rescale, the P round trip through LDS (an
+in-register layout change), and two query tiles per wave if the registers can be found.
