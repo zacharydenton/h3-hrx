@@ -796,3 +796,30 @@ rest in overlapping latency that no single removal exposes. A further 2x on the 
 on this list; the remaining step-level levers cut attention work instead: a lower skip tau
 (quality trade), and a two-pass final-max skip for the late layers where 60-80% of tiles are
 skippable under the final max but only 40-60% under the running max.
+
+### The key scale's four placements, and a barrier the dbuf pass had missed (2026-09-07, later)
+
+The per-tile global load of the key scale (5% in the ablation) was tried four ways on the
+plain 8-wave kernel, interleaved A/Bs (the GPU was shared with another process for the later
+rows, so only the ratios hold):
+
+| key scale | 15427 rows | 37743 rows | notes |
+| --- | ---: | ---: | --- |
+| loaded after the QK^T chain (original) | 1.000x | 1.000x | |
+| carried: next tile's loaded at the end, kept in a register | 1.036x | 1.068x | shipped |
+| staged into LDS with the K tile (16 lanes store, loop reads LDS) | | 0.79x | no spills; lost anyway |
+| loaded before the QK^T chain (nothing carried) | | 0.87x of carried | |
+
+The skip twins spill 60 bytes with the carried form and run at 0.39x, and 0.77x with the
+early form, so the twins take the scale the original way (`uncarry` in the generator) and are
+byte-identical to the pre-prefetch twins. The carried form also exposed a generator bug: the
+dbuf pass removes the loop's trailing barrier by matching the barrier followed by the yield,
+and the carried scale's lines sat between them, so the shipped carried kernels ran two
+barriers per tile and were still 1.07x. Measured directly at 15427 rows (shared GPU): the
+trailing barrier costs 5% on the original kernel; the carry without it is 1.023x over the
+original on that run. The pass now asserts one barrier per tile.
+
+The reference stack's final velocity cosine with the skip (`tools/quant_study.py
+attn:w4a4:a4rs<tau>`): tau 6 0.97508, tau 5 0.97506, tau 4 0.97529, against 0.9751 without
+the skip: no measurable cost down to tau 4 on this metric, so the long form's default tau is
+chosen by step time alone (below).

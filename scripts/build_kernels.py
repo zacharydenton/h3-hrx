@@ -4,7 +4,7 @@
 Shapes are MiniMax H3's: hidden 5376, 56 heads of 128 (q, k, v each 7168, fused 21504),
 SwiGLU 14336 (fused gate|up 28672), AdaLN classes = (timestep, modality) rows.
 """
-import os
+import hashlib, os
 import subprocess
 import sys
 from pathlib import Path
@@ -77,8 +77,10 @@ def build(tokens: int) -> Path:
                   ("transpose_f16", "h3_transpose_f16", "transpose_v", {"h3.transpose_f16.width": INNER, "h3.transpose_f16.row_capacity": capacity})]   # V^T once per block: the int4 kernel stages V by channel rows
     for stem, sym, name, cfg in specs:
         hs = out / f"{name}.hsaco"
-        if not hs.exists():
-            compile_kernel(ROOT / "kernels" / f"{stem}.loom", sym, cfg, hs)
+        src = ROOT / "kernels" / f"{stem}.loom"
+        src_stamp = hashlib.sha1(src.read_bytes()).hexdigest()[:12] + " " + " ".join(f"{k}={v}" for k, v in cfg.items()); stamp_file = hs.with_suffix(".src.txt")
+        if not hs.exists() or not stamp_file.exists() or stamp_file.read_text().strip() != src_stamp:   # the source or its configs changed
+            compile_kernel(src, sym, cfg, hs); stamp_file.write_text(src_stamp + "\n")
     (out / "attention_qk.txt").write_text(("i4l" if "i4qkl" in attn_stem or "i4qksl" in attn_stem else ATTN_QK) + "\n")
     (out / "attention_stem.txt").write_text(stamp + "\n")    # the host loads this symbol
     (out / "capacity.txt").write_text(f"{capacity}\n")

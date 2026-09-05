@@ -156,9 +156,16 @@ using Cfg = std::vector<std::pair<std::string, std::string>>;
 struct Compiler {
     std::string exe, sources, cache;
     std::map<std::string, std::shared_ptr<Kernel>> loaded;
-    // one kernel per (stem, config); the cache file name carries the config
+    // one kernel per (stem, source, config); the cache file name carries a hash of the .loom text and the config,
+    // so an edited kernel source never reuses a stale binary
+    static std::string source_hash(const std::string &path) {
+        std::ifstream f(path, std::ios::binary); if (!f) throw std::runtime_error("missing kernel source " + path);
+        std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        uint64_t h = 1469598103934665603ull; for (unsigned char c : text) { h ^= c; h *= 1099511628211ull; }
+        char buf[17]; snprintf(buf, sizeof buf, "%016llx", (unsigned long long)h); return std::string(buf, 10);
+    }
     std::shared_ptr<Kernel> get(const std::string &stem, const std::string &symbol, const Cfg &cfg) {
-        std::string tag = stem;
+        std::string tag = stem + "__s" + source_hash(sources + "/" + stem + ".loom");
         for (auto &c : cfg) { tag += "__" + c.first.substr(c.first.rfind('.') + 1) + "_" + c.second; }
         for (char &ch : tag) if (!isalnum((unsigned char)ch) && ch != '_' && ch != '-' && ch != '.') ch = '_';
         auto it = loaded.find(tag);

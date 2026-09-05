@@ -48,8 +48,7 @@ class H3Blocks:
         weights = Path(weights or ROOT / "build/weights")
         library = Path(library or ROOT / "build/libh3.so")
         kernels = ROOT / ("build/kernels" if os.environ.get("H3_ATTN_QK", "f16") == "f16" else "build/kernels_i4qk") / f"T{tokens}"
-        if not (kernels / "attention_waves.txt").exists():
-            subprocess.run([sys.executable, str(ROOT / "scripts/build_kernels.py"), str(tokens)], check=True, capture_output=True)
+        subprocess.run([sys.executable, str(ROOT / "scripts/build_kernels.py"), str(tokens)], check=True, capture_output=True)   # rebuilds only what changed (source and config stamps)
         native = ctypes.CDLL(str(library))
         native.h3_abi_version.restype = ctypes.c_uint32
         if native.h3_abi_version() != _ABI:
