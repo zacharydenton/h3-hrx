@@ -533,6 +533,10 @@ kernel.def target(@h3_gemm_i4_swiglu_256b_gs_gfx11) export("h3_gemm_i4_swiglu_25
   %zero_f32 = scalar.constant 0.0 : f32
   %one4 = vector.splat %one_f32 : vector<4xf32>
   %zero4 = vector.splat %zero_f32 : vector<4xf32>
+  %f16_max = scalar.constant 65472.0 : f32
+  %f16_min = scalar.constant -65472.0 : f32
+  %f16_max4 = vector.splat %f16_max : vector<4xf32>
+  %f16_min4 = vector.splat %f16_min : vector<4xf32>
   %up_stage_offset = index.constant 1024 : offset
   %wave_up_offset = index.add %wave_result_offset, %up_stage_offset : offset
   %up_view = buffer.view %lds[%wave_up_offset] : buffer -> view<16x16xi32>
@@ -613,7 +617,10 @@ kernel.def target(@h3_gemm_i4_swiglu_256b_gs_gfx11) export("h3_gemm_i4_swiglu_25
         %sig = vector.divf %one4, %den : vector<4xf32>
         %silu = vector.mulf %g, %sig : vector<4xf32>
         %prod = vector.mulf %silu, %u : vector<4xf32>
-        %narrow = vector.fptrunc %prod : vector<4xf32> to vector<4xf16>
+        // saturate: H3's products reach 5e4, and an f16 inf here becomes a NaN token scale downstream
+        %sat0 = vector.minnumf %prod, %f16_max4 : vector<4xf32>
+        %sat = vector.maxnumf %sat0, %f16_min4 : vector<4xf32>
+        %narrow = vector.fptrunc %sat : vector<4xf32> to vector<4xf16>
         vector.store %narrow, %c_view[%bounded, %out_col] : vector<4xf16>, view<[%m_bounded]x[%n_half]xf16>
       }
     }

@@ -118,9 +118,9 @@ public:
         load(k_gemm_down_, "gemm_down", ("h3_gemm_i4_resid" + sfx).c_str());
         load(k_rope_, "rope_qknorm", "h3_rope_qknorm_f16");
         { std::ifstream wf(kernels_dir + "/attention_waves.txt"); if (wf) wf >> attn_waves_; if (attn_waves_ != 4 && attn_waves_ != 8) throw std::runtime_error("attention_waves.txt must say 4 or 8"); }
-        { std::ifstream qf(kernels_dir + "/attention_qk.txt"); std::string mode; if (qf) qf >> mode; attn_i4_ = mode == "i4"; }
-        if (attn_i4_) {                                              // QK^T in int4: K column means, per-head int4 operands, the int4 attention kernel
-            load(k_attention_, "attention", attn_waves_ == 8 ? "h3_attention_i4qk_mha8_lds_f16_wmma" : "h3_attention_i4qk_mha_lds_f16_wmma");
+        std::string qk_mode; { std::ifstream qf(kernels_dir + "/attention_qk.txt"); if (qf) qf >> qk_mode; attn_i4_ = qk_mode == "i4" || qk_mode == "i4p"; }
+        if (attn_i4_) {                                              // QK^T in int4: K column means, per-head int4 operands, the int4 attention kernel (i4p: double-buffered tiles)
+            load(k_attention_, "attention", qk_mode == "i4p" ? "h3_attention_i4qkp_mha8_lds_f16_wmma" : (attn_waves_ == 8 ? "h3_attention_i4qk_mha8_lds_f16_wmma" : "h3_attention_i4qk_mha_lds_f16_wmma"));
             load(k_colmean_, "colmean", "h3_colmean_f32"); load(k_prep_q_, "prepare_q_i4", "h3_prepare_qk_i4"); load(k_prep_k_, "prepare_k_i4", "h3_prepare_qk_i4");
         } else load(k_attention_, "attention", attn_waves_ == 8 ? "h3_attention_mha8_lds_f16_wmma" : "h3_attention_mha_lds_f16_wmma");
         const size_t T = capacity_;
@@ -218,6 +218,15 @@ private:
         launch(k, stage, unsigned(n / 128), gemm_grid_y(tokens_), THREADS, a);
     }
 
+    void scan_stream(int i, const char *what, unsigned T) {
+        if (!std::getenv("H3_DEBUG_NAN")) return;
+        HIP_CHECK(hipDeviceSynchronize());
+        std::vector<float> h(size_t(T) * HIDDEN); HIP_CHECK(hipMemcpyDtoH(h.data(), (hipDeviceptr_t)x_, h.size() * 4));
+        std::vector<float> s(T); HIP_CHECK(hipMemcpyDtoH(s.data(), (hipDeviceptr_t)a_s_, T * 4));
+        for (size_t r = 0; r < size_t(T); ++r) for (int c = 0; c < HIDDEN; ++c) if (!std::isfinite(h[r * HIDDEN + c])) { fprintf(stderr, "H3_DEBUG_NAN: layer %d: stream non-finite at row %zu col %d after %s (token scale %g)\n", i, r, c, what, s[r]); return; }
+        for (size_t r = 0; r < size_t(T); ++r) if (!std::isfinite(s[r]) || s[r] == 0.0f) { fprintf(stderr, "H3_DEBUG_NAN: layer %d: token scale row %zu = %g before %s\n", i, r, s[r], what); return; }
+    }
+
     void block(int i) {
         const Block &b = blocks_[i];
         const float *mod = (const float *)mods_ + size_t(i) * MODS_PER_LAYER;
@@ -231,9 +240,10 @@ private:
           launch(k_rope_, "qk norm + rope", T, 1, THREADS, a); }
         const unsigned qblock = 16 * unsigned(attn_waves_);
         if (attn_i4_) {
-            { KernArgs a; a.scalar_i32(T); a.pointer(k_); a.pointer(kmean_); launch(k_colmean_, "attention operands", INNER / 256, 1, THREADS, a); }
+            // K mean smoothing (H3_KSMOOTH=1) measured worse on the fixture's velocity (0.9881 vs 0.9899 without) and costs a pass over K: off by default
+            static const bool smooth = std::getenv("H3_KSMOOTH") && std::string(std::getenv("H3_KSMOOTH")) == "1";
+            if (smooth) { KernArgs a; a.scalar_i32(T); a.pointer(k_); a.pointer(kmean_); launch(k_colmean_, "attention operands", INNER / 256, 1, THREADS, a); }
             { KernArgs a; a.scalar_i32(T); a.pointer(q_); a.pointer(zmean_); a.pointer(qi_); a.pointer(qs_); launch(k_prep_q_, "attention operands", T, 1, THREADS, a); }
-            static const bool smooth = !(std::getenv("H3_KSMOOTH") && std::string(std::getenv("H3_KSMOOTH")) == "0");
             { KernArgs a; a.scalar_i32(T); a.pointer(k_); a.pointer(smooth ? kmean_ : zmean_); a.pointer(ki_); a.pointer(ks_); launch(k_prep_k_, "attention operands", T, 1, THREADS, a); }
             { KernArgs a; a.scalar_i32(T); a.scalar_i32(HEADS); a.pointer(qi_); a.pointer(qs_); a.pointer(ki_); a.pointer(ks_); a.pointer(v_); a.pointer(attn_);
               launch(k_attention_, "attention", (T + qblock - 1) / qblock, HEADS, 32 * unsigned(attn_waves_), a); }
@@ -241,19 +251,42 @@ private:
             KernArgs a; a.scalar_i32(T); a.scalar_i32(HEADS); a.pointer(q_); a.pointer(k_); a.pointer(v_); a.pointer(attn_);
             launch(k_attention_, "attention", (T + qblock - 1) / qblock, HEADS, 32 * unsigned(attn_waves_), a);
         }
+        if (const char *dbg = std::getenv("H3_DEBUG_NAN")) {                     // find the first layer whose attention output goes non-finite; dump its operands
+            HIP_CHECK(hipDeviceSynchronize());
+            auto scan = [&](const char *what, const void *buf, size_t width) {
+                std::vector<uint16_t> h(size_t(T) * width); HIP_CHECK(hipMemcpyDtoH(h.data(), (hipDeviceptr_t)buf, h.size() * 2));
+                long bad = -1; uint16_t worst = 0;
+                for (size_t r = 0; r < size_t(T) && bad < 0; ++r) for (size_t c = 0; c < width; ++c) { const uint16_t e = (h[r * width + c] >> 10) & 31; if (e == 31) { bad = long(r); break; } if (e > worst) worst = e; }
+                if (bad >= 0) fprintf(stderr, "H3_DEBUG_NAN: layer %d: %s row %ld non-finite\n", i, what, bad);
+                else if (worst >= 30) fprintf(stderr, "H3_DEBUG_NAN: layer %d: %s max exponent %u (>= 2^15: within 2x of the f16 ceiling)\n", i, what, worst - 15);
+                return bad; };
+            scan("qkv (fused)", fused_, size_t(QKV)); scan("gu (silu(g)*u)", gu_, size_t(FFN));
+            std::vector<uint16_t> h(size_t(T) * INNER); HIP_CHECK(hipMemcpyDtoH(h.data(), (hipDeviceptr_t)attn_, h.size() * 2));
+            long bad = -1;
+            for (size_t r = 0; r < size_t(T) && bad < 0; ++r) for (int c = 0; c < INNER; ++c) { const uint16_t e = (h[r * INNER + c] >> 10) & 31; if (e == 31) { bad = long(r); break; } }
+            if (bad >= 0 && !dumped_) {
+                dumped_ = true; fprintf(stderr, "H3_DEBUG_NAN: layer %d row %ld attention output non-finite; dumping operands to %s\n", i, bad, dbg);
+                auto dump = [&](const char *name, const void *ptr, size_t bytes) { std::vector<char> b(bytes); HIP_CHECK(hipMemcpyDtoH(b.data(), (hipDeviceptr_t)ptr, bytes)); FILE *f = fopen((std::string(dbg) + "/" + name).c_str(), "wb"); if (f) { fwrite(b.data(), 1, bytes, f); fclose(f); } };
+                dump("q.f16", q_, size_t(T) * INNER * 2); dump("k.f16", k_, size_t(T) * INNER * 2); dump("v.f16", v_, size_t(T) * INNER * 2); dump("attn.f16", attn_, size_t(T) * INNER * 2);
+                if (attn_i4_) { dump("qi.i32", qi_, size_t(T) * HEADS * 64); dump("ki.i32", ki_, size_t(T) * HEADS * 64); dump("qs.f32", qs_, size_t(T) * HEADS * 4); dump("ks.f32", ks_, size_t(T) * HEADS * 4); dump("kmean.f32", kmean_, INNER * 4); }
+                FILE *f = fopen((std::string(dbg) + "/meta.txt").c_str(), "w"); if (f) { fprintf(f, "layer %d row %ld tokens %u\n", i, bad, T); fclose(f); }
+            }
+        }
         { KernArgs a; a.scalar_i32(T); a.pointer(attn_); a.pointer(a_q_); a.pointer(a_s_);
           launch(k_prep_attn_, "prepare out input", T, 1, ATTN_LANES, a); }
         gemm(k_gemm_out_, "gemm out + residual", b.out_q, b.out_s, HIDDEN, x_, gate_msa);
+        scan_stream(i, "gemm out + residual", T);
         { KernArgs a; a.scalar_i32(T); a.pointer(x_); a.pointer(b.norm2); a.pointer(table_mlp); a.pointer(cls_); a.pointer(a_q_); a.pointer(a_s_);
           launch(k_prep_norm_, "prepare norm", T, 1, NORM_LANES, a); }
         gemm(k_gemm_gu_, "gemm gate|up + swiglu", b.gu_q, b.gu_s, 2 * FFN, gu_, nullptr);
         { KernArgs a; a.scalar_i32(T); a.pointer(gu_); a.pointer(a_q_); a.pointer(a_s_);
           launch(k_prep_down_, "prepare down input", T, 1, DOWN_LANES, a); }
         gemm(k_gemm_down_, "gemm down + residual", b.down_q, b.down_s, HIDDEN, x_, gate_mlp);
+        scan_stream(i, "gemm down + residual", T);
     }
 
     int tokens_, layers_;
-    size_t capacity_ = 0, gemm_tile_ = 128, attn_waves_ = 4; bool attn_i4_ = false;
+    size_t capacity_ = 0, gemm_tile_ = 128, attn_waves_ = 4; bool attn_i4_ = false, dumped_ = false;
     void *qi_ = nullptr, *ki_ = nullptr, *qs_ = nullptr, *ks_ = nullptr, *kmean_ = nullptr, *zmean_ = nullptr;
     std::mutex mutex_;
     std::vector<Block> blocks_;

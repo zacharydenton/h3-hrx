@@ -404,6 +404,10 @@ kernel.def target(@h3_gemm_i8_256b_gfx11) export("h3_gemm_i8_256b") @h3_gemm_i8_
   %zero_f32 = scalar.constant 0.0 : f32
   %one4 = vector.splat %one_f32 : vector<4xf32>
   %zero4 = vector.splat %zero_f32 : vector<4xf32>
+  %f16_max = scalar.constant 65472.0 : f32
+  %f16_min = scalar.constant -65472.0 : f32
+  %f16_max4 = vector.splat %f16_max : vector<4xf32>
+  %f16_min4 = vector.splat %f16_min : vector<4xf32>
   %up_stage_offset = index.constant 1024 : offset
   %wave_up_offset = index.add %wave_result_offset, %up_stage_offset : offset
   %up_view = buffer.view %lds[%wave_up_offset] : buffer -> view<16x16xi32>
@@ -465,7 +469,9 @@ kernel.def target(@h3_gemm_i8_256b_gfx11) export("h3_gemm_i8_256b") @h3_gemm_i8_
         %scaled1 = vector.mulf %scaled0, %a_scale_vector : vector<4xf32>
         %bias_values = vector.load %bias_view[%out_col] : view<[%n_size]xf32> -> vector<4xf32>
         %scaled = vector.addf %scaled1, %bias_values : vector<4xf32>
-        %narrow = vector.fptrunc %scaled : vector<4xf32> to vector<4xf16>
+        %sat0 = vector.minnumf %scaled, %f16_max4 : vector<4xf32>
+        %sat = vector.maxnumf %sat0, %f16_min4 : vector<4xf32>
+        %narrow = vector.fptrunc %sat : vector<4xf32> to vector<4xf16>
         vector.store %narrow, %c_view[%bounded, %out_col] : vector<4xf16>, view<[%m_bounded]x[%n_size]xf16>
       }
     }

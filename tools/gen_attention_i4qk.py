@@ -203,5 +203,5 @@ if os.environ.get("ATTN_PREFETCH", "0") == "1" and WAVES == 8:
     sub2("  %zero_acc = vector.constant 0.0 : vector<8xf32>\n", "  %zero_acc = vector.constant 0.0 : vector<8xf32>\n  %zero_k = vector.constant 0 : vector<2xi32>\n  %zero_v = vector.constant 0.0 : vector<16xf16>\n")
     STEM2 = STEM.replace("i4qk", "i4qkp")
     K = K.replace(SYM, "h3_" + STEM2).replace(NS, "h3." + STEM2)
-    OUT2 = ROOT / "experiments" / f"{STEM2}.loom"
+    OUT2 = ROOT / ("kernels" if STEM2 == "attention_i4qkp_mha8_lds_f16_wmma" else "experiments") / f"{STEM2}.loom"
     OUT2.write_text(K); print("wrote", OUT2)
