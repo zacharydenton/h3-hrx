@@ -13,23 +13,27 @@ import h3_ref as R
 
 import os
 D = int(os.environ.get("ROPE_D", "128"))
-STEM = "rope_qknorm_f16" if D == 128 else "rope64_qknorm_f16"
+R_DIM = int(os.environ.get("ROPE_R", "96" if D == 128 else "48"))
+STEM = {(128, 96): "rope_qknorm_f16", (64, 48): "rope64_qknorm_f16", (128, 128): "rope128_qknorm_f16"}[(D, R_DIM)]
 NS, SYM = "h3." + STEM, "h3_" + STEM
 
 
 def main() -> int:
     torch.manual_seed(0)
     tokens, heads, d = 200, (56 if D == 128 else 32), D
-    rope_dim = 96 if D == 128 else 48
+    rope_dim = R_DIM
     stride, k_off = 3 * heads * d, heads * d
     fused = (torch.randn(tokens, stride) * 0.7).half()
     qw = (1.0 + torch.randn(d) * 0.1).float(); kw = (1.0 + torch.randn(d) * 0.1).float()
     layout = R.Layout(8, 3, 8, 8, 4)                     # 8 text + 8 audio + 48 video rows = 64; the rest repeats
     pos = layout.position_ids.repeat((tokens + layout.seq_len - 1) // layout.seq_len, 1)[:tokens]
     inv_freq = 10000.0 ** (-torch.arange(0, 32, 2, dtype=torch.float32) / 32)
-    cos, sin = R.rope_tables(pos, inv_freq, "cpu")
-    if D == 64:                                   # the decoder rotates 48 channels: 8 frequencies per axis
+    cos, sin = R.rope_tables(pos, inv_freq, "cpu")                 # [T, 48]
+    if rope_dim == 48:                            # the decoder rotates 48 channels: 8 frequencies per axis
         cos, sin = cos[:, :24].contiguous(), sin[:, :24].contiguous()
+    elif rope_dim == 128:                         # the text encoder rotates all 128: 64 angles
+        ang = torch.arange(tokens, dtype=torch.float32)[:, None] * (10000.0 ** (-torch.arange(0, 128, 2, dtype=torch.float32) / 128))[None]
+        cos, sin = torch.cos(ang).contiguous(), torch.sin(ang).contiguous()
     q = fused[:, :heads * d].view(tokens, heads, d)
     k = fused[:, k_off:k_off + heads * d].view(tokens, heads, d)
     want_q = R.apply_rope(R.rms_norm(q, qw), cos, sin, rope_dim).reshape(tokens, -1)
