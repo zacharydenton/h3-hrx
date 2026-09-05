@@ -11,7 +11,8 @@ from h3pipe_loom import H3Pipe
 
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("--prompt-file", default=None); a = ap.parse_args()
+    ap = argparse.ArgumentParser(); ap.add_argument("--prompt-file", default=None); ap.add_argument("--step", action="store_true", help="one denoising step vs the Python pipeline"); ap.add_argument("--attrib", action="store_true", help="also the Python step with the C path's int8 numerics per stage")
+    ap.add_argument("--height", type=int, default=480); ap.add_argument("--width", type=int, default=864); ap.add_argument("--frames", type=int, default=22); a = ap.parse_args()
     pf = Path(a.prompt_file) if a.prompt_file else min((Path(p) for p in glob.glob(str(ROOT / "build/prompts/*.pt"))), key=lambda p: p.stat().st_size)
     prompt = torch.load(pf); ids = prompt["ids"].numpy().astype(np.int32); print(f"prompt {prompt['prompt'][:60]!r}: {ids.size} tokens")
     ok = True
@@ -23,8 +24,93 @@ def main():
     c = float(np.dot(got.ravel(), want.ravel()) / (np.linalg.norm(got) * np.linalg.norm(want) + 1e-30)); err = float(np.linalg.norm(got - want) / (np.linalg.norm(want) + 1e-30))
     print(f"  {'PASS' if c > 0.999 else 'FAIL'} text_in: cosine {c:.5f}, rel err {err:.4f}  (the C path re-encodes the prompt in Loom; the reference uses the cached Loom embeddings)")
     ok &= c > 0.999
+    if a.step or a.attrib:
+        ok &= denoise_step(pipe, prompt, ids, a)
     pipe.close()
     return 0 if ok else 1
+
+
+def glue_linear(name, k_true):
+    """The C path's int8 weights (rotated along K, per-row scales) from build/weights_glue, dequantised: [N][K] f32 in rotated space."""
+    spans = {l.split()[0]: l.split() for l in (ROOT / "build/weights_glue/manifest.txt").read_text().splitlines()}
+    raw = np.memmap(ROOT / "build/weights_glue/weights.bin", dtype=np.uint8, mode="r")
+    q = np.frombuffer(raw[int(spans[name + ".q"][1]):int(spans[name + ".q"][1]) + int(spans[name + ".q"][2])], dtype=np.int8).reshape([int(v) for v in spans[name + ".q"][4].split("x")])
+    s = np.frombuffer(raw[int(spans[name + ".s"][1]):int(spans[name + ".s"][1]) + int(spans[name + ".s"][2])], dtype=np.float32)
+    b = np.frombuffer(raw[int(spans[name + ".b"][1]):int(spans[name + ".b"][1]) + int(spans[name + ".b"][2])], dtype=np.float32)
+    return torch.from_numpy(q.astype(np.float32) * s[:, None]).cuda(), torch.from_numpy(b.copy()).cuda()
+
+
+def w8a8(x, w_rot, b, kpad=None):
+    """x [S][K] float -> pad K, rotate (group 256), per-token int8, times the dequantised rotated weights."""
+    h = R.hadamard(256).to(x.device)
+    xf = x.float()
+    if kpad and xf.shape[1] < kpad: xf = torch.cat([xf, xf.new_zeros(xf.shape[0], kpad - xf.shape[1])], 1)
+    xr = R.rotate_groups(xf, h)
+    s = xr.abs().amax(dim=1, keepdim=True).clamp_min(1e-30) / 127.0
+    xq = (xr / s).round().clamp(-127, 127) * s
+    return xq @ w_rot.T + b
+
+
+def denoise_step(pipe, prompt, ids, a):
+    """One Euler step from shared noise: the C pipeline vs tools/pipeline.py's loop (the Loom blocks
+    through the Python session, the reference's embedders / final layer, diffusers' scheduler)."""
+    from diffusers import MiniMaxH3Scheduler
+    from h3_loom import H3Blocks, mods_table
+    from pipeline import align_frames
+    dev = "cuda"; p = H3Pipe.params(height=a.height, width=a.width, frames=a.frames, steps=2, seed=1)
+    s = pipe.shape(p); frames = align_frames(a.frames); assert frames == s.frames
+    rng = np.random.default_rng(1)
+    nv = rng.standard_normal((24, s.latent_t, s.lat_h, s.lat_w)).astype(np.float32); na = rng.standard_normal((2, 32, s.audio_t)).astype(np.float32)
+    # --- Python ---
+    layout = R.Layout(ids.size, s.latent_t, s.lat_h, s.lat_w, s.audio_t)
+    ckpt = R.Checkpoint(device=dev, dtype=torch.bfloat16); ref = R.H3Ref(ckpt, quant="none")
+    with torch.no_grad(): text_x = ref.text_in(prompt["embeds"].to(dev))
+    cos, sin = R.rope_tables(layout.position_ids, ref.inv_freq, dev); rows = layout.adaln_rows.to(dev); tclass = layout.tclass.to(dev)
+    vs, as_ = MiniMaxH3Scheduler(shift=12.0), MiniMaxH3Scheduler(shift=3.0); vs.set_timesteps(2, device=dev); as_.set_timesteps(2, device=dev)
+    latents = torch.from_numpy(nv).to(dev)[None]
+    video_rows = latents.reshape(1, 24, s.latent_t, s.lat_h // 2, 2, s.lat_w // 2, 2).permute(0, 2, 3, 5, 1, 4, 6).reshape(-1, 96)
+    audio_rows = torch.from_numpy(na).to(dev).permute(0, 2, 1).reshape(-1, 32).contiguous()
+    blocks = H3Blocks(layout.seq_len, layers=50, weights=str(ROOT / "build/weights_gptq"))
+    variants = [("float", False, False, False)]
+    if a.attrib: variants += [("int8 embedders", True, False, False), ("perturbed 0.4%", False, False, False), ("perturbed 0.1%", False, False, False)]
+    wants = {}
+    with torch.no_grad():
+        temb = ref.t_emb(torch.tensor([vs.timesteps[0].item(), as_.timesteps[0].item()]))
+        mods = mods_table(ref, temb, 50)
+        text_c = torch.from_numpy(pipe.text_in(ids)).to(dev) if a.attrib else None
+        for name, q_embed, q_final, q_text in variants:
+            if q_embed:
+                wv, bv = glue_linear("h3.video_in", 96); wa, ba = glue_linear("h3.audio_in", 32)
+                x = torch.cat([text_c.to(text_x.dtype) if q_text else text_x, w8a8(audio_rows, wa, ba, 256).to(text_x.dtype), w8a8(video_rows, wv, bv, 256).to(text_x.dtype)], dim=0)
+            else:
+                x = torch.cat([text_c.to(text_x.dtype) if q_text else text_x, ref.audio_in(audio_rows), ref.video_in(video_rows)], dim=0)
+            if name.startswith("perturbed"):
+                g = torch.Generator(dev).manual_seed(7); x = x.float(); x = x + torch.randn(x.shape, generator=g, device=dev) * x.abs() * (0.004 if "0.4" in name else 0.001)
+            y = blocks.forward(x, rows, mods, cos, sin).to(dev)
+            if q_final:
+                fm = ref.final_mods(temb)[tclass]
+                h = R.rms_norm(y, ref.t("final_layer.norm.weight"), ref.eps) * (1.0 + fm[:, 1].to(y.dtype)) + fm[:, 0].to(y.dtype)
+                wf, bf = glue_linear("h3.final.out", 5376); o = w8a8(h, wf, bf)
+                a0, a1 = layout.text_len, layout.text_len + layout.audio_rows
+                v_rows, a_rows = o[a1:, :96], o[a0:a1, 96:]
+            else:
+                v_rows, a_rows = ref.final(y, temb, tclass, layout)
+            vr = vs.step(v_rows.float(), vs.timesteps[0], video_rows, return_dict=False)[0]; ar = as_.step(a_rows.float(), as_.timesteps[0], audio_rows, return_dict=False)[0]
+            vs.set_timesteps(2, device=dev); as_.set_timesteps(2, device=dev)
+            wants[name] = (vr.reshape(1, s.latent_t, s.lat_h // 2, s.lat_w // 2, 24, 2, 2).permute(0, 4, 1, 2, 5, 3, 6).reshape(24, s.latent_t, s.lat_h, s.lat_w).cpu().numpy(),
+                           ar.reshape(2, s.audio_t, 32).permute(0, 2, 1).cpu().numpy())
+    want_v, want_a = wants["float"]
+    blocks.close(); del blocks, ref, ckpt; torch.cuda.empty_cache()
+    # --- C ---
+    t0 = time.time(); got_v, got_a = pipe.denoise(ids, p, noise_video=nv, noise_audio=na, progress=lambda st, n, sec: print(f"    step {st}/{n} {sec:.1f} s") or 0); print(f"  C denoise (1 step, {layout.seq_len} rows) in {time.time() - t0:.1f} s")
+    ok = True
+    for vname, (want_v, want_a) in wants.items():
+        for name, got, want, noise in (("video", got_v, want_v, nv), ("audio", got_a, want_a, na)):
+            c = float(np.dot(got.ravel(), want.ravel()) / (np.linalg.norm(got) * np.linalg.norm(want) + 1e-30)); err = float(np.linalg.norm(got - want) / (np.linalg.norm(want) + 1e-30))
+            upd_c = float(np.dot((got - noise).ravel(), (want - noise).ravel()) / (np.linalg.norm(got - noise) * np.linalg.norm(want - noise) + 1e-30))
+            print(f"  {'PASS' if upd_c > 0.98 else 'FAIL'} one step vs Python [{vname}], {name}: cosine {c:.5f}, rel err {err:.4f}, update cosine {upd_c:.5f}")
+            if vname == "float": ok &= upd_c > 0.98         # the int4 blocks' own sensitivity to a 0.1% input change is ~0.994 (--attrib)
+    return ok
 
 
 if __name__ == "__main__":

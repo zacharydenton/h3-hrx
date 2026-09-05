@@ -405,18 +405,19 @@ public:
         HIP_CHECK(hipMalloc(&mods_, size_t(50) * MODS_ROWS * HID * 4));
         HIP_CHECK(hipMalloc(&final_table_, size_t(4) * HID * 4));
     }
-    ~Pipe() { for (void *p : {ones_, zeros_, mods_, final_table_, x_, cls_, tcls_, cos_, sin_, in16_, a_q_, a_s_, out16_, te_x_, te_cos_, te_sin_, te_cls_}) if (p) (void)hipFree(p); }
+    ~Pipe() { for (void *p : {ones_, zeros_, mods_, final_table_, x_, cls_, cls0_, tcls_, cos_, sin_, in16_, a_q_, a_s_, out16_, text_copy_, ref_cos_, ref_sin_, te_x_, te_cos_, te_sin_, te_cls_}) if (p) (void)hipFree(p); }
 
     Profile prof;
 
     // --- the prompt: embedding lookup on the host, the encoder, condition_proj, the refiner ---
     void ensure_seq(size_t seq) {
         if (seq <= seq_cap_) return;
-        for (void *p : {x_, cls_, tcls_, cos_, sin_, in16_, a_q_, a_s_, out16_}) if (p) (void)hipFree(p);
+        for (void *p : {x_, cls_, cls0_, tcls_, cos_, sin_, in16_, a_q_, a_s_, out16_}) if (p) (void)hipFree(p);
         seq_cap_ = (seq + 255) / 256 * 256 + 32;
         const size_t T = seq_cap_;
         HIP_CHECK(hipMalloc(&x_, T * HID * 4)); HIP_CHECK(hipMemset(x_, 0, T * HID * 4));
         HIP_CHECK(hipMalloc(&cls_, T * 4)); HIP_CHECK(hipMemset(cls_, 0, T * 4));
+        HIP_CHECK(hipMalloc(&cls0_, T * 4)); HIP_CHECK(hipMemset(cls0_, 0, T * 4));       // the single-class GEMMs (embedders, condition proj) index their gate table with this
         HIP_CHECK(hipMalloc(&tcls_, T * 4)); HIP_CHECK(hipMemset(tcls_, 0, T * 4));
         HIP_CHECK(hipMalloc(&cos_, T * ROPE_HALF * 4)); HIP_CHECK(hipMalloc(&sin_, T * ROPE_HALF * 4));
         HIP_CHECK(hipMalloc(&in16_, T * TEXT_DIM * 2)); HIP_CHECK(hipMemset(in16_, 0, T * TEXT_DIM * 2));
@@ -431,7 +432,7 @@ public:
         prep.run(&prof, stage, unsigned(rows), in16_, nullptr, nullptr, nullptr, a_q_, a_s_);
         float *xr = (float *)x_ + row0 * HID;
         HIP_CHECK(hipMemset(xr, 0, rows * HID * 4));
-        g.run(&prof, stage, unsigned(rows), a_q_, glue_.at(wname + ".q", size_t(HID) * k), glue_.at(wname + ".s", size_t(HID) * 4), a_s_, xr, ones_, cls_, glue_.at(wname + ".b", size_t(HID) * 4));
+        g.run(&prof, stage, unsigned(rows), a_q_, glue_.at(wname + ".q", size_t(HID) * k), glue_.at(wname + ".s", size_t(HID) * 4), a_s_, xr, ones_, cls0_, glue_.at(wname + ".b", size_t(HID) * 4));
     }
 
     void text_in(const int32_t *ids, int n) {
@@ -465,13 +466,14 @@ public:
         if (!refiner_ || refiner_->tokens() != size_t(n)) {
             refiner_.reset(); refiner_ = std::make_unique<Stack>(comp_, StackDims{HID, HEADS, HEADS, HEAD_DIM, FFN, ROPE_DIM, 1, 8, 1e-5f, false, true, false}, size_t(n), 2, glue_, "h3.refiner.%d.", true, nullptr);
             std::vector<float> c(size_t(n) * ROPE_HALF, 1.0f), s(size_t(n) * ROPE_HALF, 0.0f);
-            HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)cos_, c.data(), c.size() * 4)); HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)sin_, s.data(), s.size() * 4));
+            for (void *q : {ref_cos_, ref_sin_}) if (q) (void)hipFree(q);
+            HIP_CHECK(hipMalloc(&ref_cos_, c.size() * 4)); HIP_CHECK(hipMalloc(&ref_sin_, s.size() * 4));
+            HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)ref_cos_, c.data(), c.size() * 4)); HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)ref_sin_, s.data(), s.size() * 4));
             const std::string ns = "h3.norm_mod_f32.";
             norm_f32_ = comp_.get("norm_mod_f32", "h3_norm_mod_f32", {{ns + "width", std::to_string(HID)}, {ns + "lanes", std::to_string(lanes_for(HID))}, {ns + "eps", num(1e-5)}, {ns + "classes", "1"}});
         }
-        HIP_CHECK(hipMemset(cls_, 0, size_t(n) * 4));
-        refiner_->forward(&prof, x_, cls_, cos_, sin_, [&](int) { return LayerCond{(const float *)zeros_, (const float *)ones_, (const float *)zeros_, (const float *)ones_}; });
-        { KernArgs a; a.i32(n).ptr(x_).ptr(glue_.at("h3.refiner.final_norm", size_t(HID) * 4)).ptr(zeros_).ptr(cls_); launch(*norm_f32_, &prof, "refiner final norm", unsigned(n), 1, unsigned(lanes_for(HID)), a); }
+        refiner_->forward(&prof, x_, cls0_, ref_cos_, ref_sin_, [&](int) { return LayerCond{(const float *)zeros_, (const float *)ones_, (const float *)zeros_, (const float *)ones_}; });
+        { KernArgs a; a.i32(n).ptr(x_).ptr(glue_.at("h3.refiner.final_norm", size_t(HID) * 4)).ptr(zeros_).ptr(cls0_); launch(*norm_f32_, &prof, "refiner final norm", unsigned(n), 1, unsigned(lanes_for(HID)), a); }
     }
 
     void get_text_in(const int32_t *ids, int n, float *out) {
@@ -592,8 +594,8 @@ private:
     std::map<std::string, Prepare> prepares_; std::map<std::string, Gemm> gemms_; Prepare final_prep_;
     std::shared_ptr<Kernel> norm_f32_;
     size_t seq_cap_ = 0;
-    void *ones_ = nullptr, *zeros_ = nullptr, *mods_ = nullptr, *final_table_ = nullptr, *x_ = nullptr, *cls_ = nullptr, *tcls_ = nullptr, *cos_ = nullptr, *sin_ = nullptr,
-         *in16_ = nullptr, *a_q_ = nullptr, *a_s_ = nullptr, *out16_ = nullptr, *text_copy_ = nullptr, *te_x_ = nullptr, *te_cos_ = nullptr, *te_sin_ = nullptr, *te_cls_ = nullptr;
+    void *ones_ = nullptr, *zeros_ = nullptr, *mods_ = nullptr, *final_table_ = nullptr, *x_ = nullptr, *cls_ = nullptr, *cls0_ = nullptr, *tcls_ = nullptr, *cos_ = nullptr, *sin_ = nullptr,
+         *in16_ = nullptr, *a_q_ = nullptr, *a_s_ = nullptr, *out16_ = nullptr, *text_copy_ = nullptr, *ref_cos_ = nullptr, *ref_sin_ = nullptr, *te_x_ = nullptr, *te_cos_ = nullptr, *te_sin_ = nullptr, *te_cls_ = nullptr;
 };
 
 void write_error(char *error, size_t cap, const char *m) noexcept { if (error && cap) std::snprintf(error, cap, "%s", m ? m : "unknown error"); }
