@@ -53,7 +53,7 @@ def main():
         for blk in vae.decoder.transformer_blocks: ref = blk(ref, rot)
         frames_ref = decoder_head(vae, ref, num_patches, fhw)
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True); blobs = []
-    def add(name, t): blobs.append((name, t.contiguous().cpu()))
+    def add(name, t): blobs.append((name, t.detach().contiguous().cpu()))
     x = hs.clone(); t0 = time.time()
     names = (("attn.to_q", "attn.to_k", "attn.to_v"), ("attn.to_out.0",), ("ff.net.0.proj",), ("ff.net.2",))
     tags = ("qkv", "out", "gu", "down")

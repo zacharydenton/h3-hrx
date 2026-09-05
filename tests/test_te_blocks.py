@@ -15,17 +15,17 @@ PROMPT = ("A red fox trotting through a snowy forest at dawn, low golden light t
 
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("--curve", default="1,4,12,50"); ap.add_argument("--prompt", default=PROMPT); ap.add_argument("--profile", action="store_true"); ap.add_argument("--weights", default=None)
+    ap = argparse.ArgumentParser(); ap.add_argument("--curve", default="1,4,12,50"); ap.add_argument("--prompt", default=PROMPT); ap.add_argument("--profile", action="store_true"); ap.add_argument("--weights", default=None); ap.add_argument("--fake-a8", action="store_true", help="the torch reference with per-token int8 activations (isolates the kernels from the quantisation)"); ap.add_argument("--per-token", action="store_true")
     a = ap.parse_args(); dev = "cuda"
     from transformers import AutoTokenizer
     ids = AutoTokenizer.from_pretrained(str(TOK))(a.prompt, add_special_tokens=False, return_tensors="pt")["input_ids"]
     n = ids.shape[1]; print(f"prompt tokens {n}")
     depths = [int(v) for v in a.curve.split(",")]
-    cache = ROOT / "build/te_ref" / (hashlib.sha1(a.prompt.encode()).hexdigest()[:12] + ".pt")
+    cache = ROOT / "build/te_ref" / (hashlib.sha1(a.prompt.encode()).hexdigest()[:12] + ("_a8" if a.fake_a8 else "") + ".pt")
     if cache.exists() and all(str(d) in torch.load(cache) for d in depths):
         hs = torch.load(cache)
     else:                                       # the bf16 reference (~30 GB) runs alone, then is freed before the Loom session
-        model = load_encoder(dev); rotate_inputs(model, dev)
+        model = load_encoder(dev); rotate_inputs(model, dev, a8=a.fake_a8)
         with torch.no_grad():
             full = model.model.language_model(input_ids=ids.to(dev), output_hidden_states=True).hidden_states
         hs = {str(d): full[d][0].float().cpu() for d in [0] + depths}
@@ -42,7 +42,11 @@ def main():
         c = torch.nn.functional.cosine_similarity(got.flatten(), ref.flatten(), dim=0).item()
         cu = torch.nn.functional.cosine_similarity((got - x0).flatten(), (ref - x0).flatten(), dim=0).item()
         err = ((got - ref).norm() / ref.norm()).item()
-        print(f"  {depth:2d} layers {dt * 1e3:8.0f} ms: hidden cosine vs bf16 {c:.5f}, update cosine {cu:.5f}, rel err {err:.4f}")
+        print(f"  {depth:2d} layers {dt * 1e3:8.0f} ms: hidden cosine vs {'W8A8-torch' if a.fake_a8 else 'bf16'} {c:.5f}, update cosine {cu:.5f}, rel err {err:.4f}, |ref| max {ref.abs().max():.0f}")
+        if a.per_token:
+            pt = ((got - ref).norm(dim=1) / ref.norm(dim=1)); pc = torch.nn.functional.cosine_similarity(got, ref, dim=1)
+            worst = pt.argsort(descending=True)[:5].tolist()
+            print("     per-token rel err (worst 5): " + ", ".join(f"t{i}: {pt[i]:.3f} (cos {pc[i]:.4f}, |ref| max {ref[i].abs().max():.0f})" for i in worst) + f"; median {pt.median():.4f}")
         ok &= c > 0.99
     return 0 if ok else 1
 

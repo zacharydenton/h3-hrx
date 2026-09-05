@@ -19,7 +19,7 @@ def unpack(q: np.ndarray) -> np.ndarray:
 
 
 def lanes_for(width):
-    return next(l for l in (256, 128, 96, 64, 32) if width % (8 * l) == 0 and (width // 4) % l == 0)
+    return next(l for l in (320, 256, 128, 96, 64, 32) if width % (8 * l) == 0 and (width // 4) % l == 0)
 
 
 def check(name, tmp, tokens, width, x_expected, args, cfg, bits=4):
@@ -35,7 +35,7 @@ def check(name, tmp, tokens, width, x_expected, args, cfg, bits=4):
     got = (unpack(q) if bits == 4 else q.view(np.int8)).astype(np.float32); wq = want_q.numpy()
     differ = np.mean(got != wq); by_one = np.mean(np.abs(got - wq) <= 1)
     scale_err = np.max(np.abs(s - want_s.numpy()[:, 0]) / want_s.numpy()[:, 0])
-    tol_codes, tol_scale = (5e-3, 2e-3) if name == "plain" else (2e-3, 1e-5)
+    tol_codes, tol_scale = (5e-3, 2e-3) if name in ("plain", "plain16") else (2e-3, 1e-5)   # plain16: the scale carries f16 staging precision (~5e-4)
     ok = differ < tol_codes and by_one == 1.0 and scale_err < tol_scale
     print(f"  {'PASS' if ok else 'FAIL'} prepare_{name}_i{bits}: tokens={tokens} width={width} lanes={lanes}  {t['per_launch_us'] / 1e3:.3f} ms  "
           f"codes differ {differ * 100:.3f}% ({'all by 1, ties' if by_one == 1.0 else 'NOT all by 1'}) scale rel err {scale_err:.1e}")
@@ -64,6 +64,8 @@ def main() -> int:
         # int8 (the VAE decoder's W8A8 path and the text encoder)
         x = (rng.standard_normal((tokens, 8192)) * 0.5).astype(np.float16)
         ok &= check("plain", tmp, tokens, 8192, x.astype(np.float32), [("in_f16", x)], {}, bits=8)
+        x = (rng.standard_normal((tokens, 25600)) * 0.5).astype(np.float16); x[:, 7] = 6e4    # the f16-LDS variant: pre-scaled by 1/16, must not overflow
+        ok &= check("plain16", tmp, tokens, 25600, x.astype(np.float32), [("in_f16", x)], {}, bits=8)
         h2 = (rng.standard_normal((tokens, 2048)) * 1.5e3).astype(np.float32); w2 = (1.0 + rng.standard_normal(2048) * 0.1).astype(np.float32)
         table2 = np.zeros((2, 2048), np.float32); cls2 = np.zeros(tokens, np.int32)
         h2f = h2 / np.sqrt((h2 * h2).mean(axis=1, keepdims=True) + 1e-5) * w2

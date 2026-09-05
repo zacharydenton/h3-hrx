@@ -70,15 +70,18 @@ def load_encoder(device="cuda"):
 class RotatedLinear(torch.nn.Module):
     """ConvRot: the file's rows are W H (group-256 regular Hadamard along K); the input must be
     rotated by the same H before the matmul."""
-    def __init__(self, weight, h):
-        super().__init__(); self.weight = torch.nn.Parameter(weight, requires_grad=False); self.h = h
+    def __init__(self, weight, h, a8: bool = False):
+        super().__init__(); self.weight = torch.nn.Parameter(weight, requires_grad=False); self.h = h; self.a8 = a8
     def forward(self, x):
         g = self.h.shape[0]
-        xr = (x.float().reshape(*x.shape[:-1], x.shape[-1] // g, g) @ self.h).reshape(x.shape).to(x.dtype)
-        return torch.nn.functional.linear(xr, self.weight)
+        xr = (x.float().reshape(*x.shape[:-1], x.shape[-1] // g, g) @ self.h).reshape(x.shape)
+        if self.a8:                                        # the runtime's per-token int8 activations, fake-quantised
+            s = xr.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / 127.0
+            xr = (xr / s).round().clamp(-127, 127) * s
+        return torch.nn.functional.linear(xr.to(x.dtype), self.weight)
 
 
-def rotate_inputs(model, device):
+def rotate_inputs(model, device, a8: bool = False):
     sys.path.insert(0, str(ROOT / "reference"))
     import h3_ref as R
     h = R.hadamard(R.HADAMARD_GROUP).to(device)
@@ -87,14 +90,33 @@ def rotate_inputs(model, device):
         for parent, names in ((layer.self_attn, ("q_proj", "k_proj", "v_proj", "o_proj")), (layer.mlp, ("gate_proj", "up_proj", "down_proj"))):
             for nm in names:
                 lin = getattr(parent, nm)
-                setattr(parent, nm, RotatedLinear(lin.weight.data, h)); n += 1
+                setattr(parent, nm, RotatedLinear(lin.weight.data, h, a8)); n += 1
     print(f"  {n} linears take rotated inputs", file=sys.stderr)
+
+
+def embed_tokens(ids: torch.Tensor) -> torch.Tensor:
+    """The token embeddings straight from the file's bf16 table: [L, 5120] f32."""
+    from safetensors import safe_open
+    table = safe_open(str(TE), "pt", device="cpu").get_tensor("model.embed_tokens.weight")
+    return table[ids].float()
+
+
+def encode_loom(ids: torch.Tensor) -> torch.Tensor:
+    """The 50 layers in Loom (W8A8, the same int8 file): [L, 5120] f32 after layer 50, no norm."""
+    sys.path.insert(0, str(ROOT))
+    from h3te_loom import H3TeBlocks
+    session = H3TeBlocks(int(ids.shape[0]))
+    try:
+        return session.forward(embed_tokens(ids))
+    finally:
+        session.close()
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("prompt")
     ap.add_argument("--out", default=str(ROOT / "build/prompts"))
+    ap.add_argument("--torch", action="store_true", help="the transformers bf16 path instead of the Loom session")
     a = ap.parse_args()
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     path = prompt_path(a.prompt, out)
@@ -103,12 +125,15 @@ def main() -> None:
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(TOK))
     ids = tok(a.prompt, add_special_tokens=False, return_tensors="pt")["input_ids"]
-    device = "cuda"
-    model = load_encoder(device)
-    rotate_inputs(model, device)
-    with torch.no_grad():
-        outputs = model.model.language_model(input_ids=ids.to(device), output_hidden_states=True)
-        embeds = outputs.hidden_states[LAYERS][0].float().cpu()            # [L, 5120], after layer 50, no norm
+    if a.torch:
+        device = "cuda"
+        model = load_encoder(device)
+        rotate_inputs(model, device)
+        with torch.no_grad():
+            outputs = model.model.language_model(input_ids=ids.to(device), output_hidden_states=True)
+            embeds = outputs.hidden_states[LAYERS][0].float().cpu()            # [L, 5120], after layer 50, no norm
+    else:
+        embeds = encode_loom(ids[0])
     torch.save(dict(prompt=a.prompt, ids=ids[0], embeds=embeds, tags=torch.ones(embeds.shape[0], dtype=torch.long)), path)
     print(f"{path}: {embeds.shape[0]} tokens, rms {embeds.pow(2).mean().sqrt():.3f}")
 

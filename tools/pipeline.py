@@ -22,7 +22,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "reference")); sys.path.insert(0, str(ROOT / "tools"))
 import h3_ref as R
 from h3_loom import H3Blocks, mods_table
-from encode_prompt import prompt_path
+from encode_prompt import prompt_path, encode_loom, TOK
+from decode_loom import LoomClipDecoder
 
 MODELS = Path.home() / "h3-models"
 FPS, AUDIO_RATE, AUDIO_LATENTS_PER_S = 24, 32000, 40
@@ -45,14 +46,21 @@ def main() -> None:
     ap.add_argument("--out", default=str(ROOT / "build/clip.mp4"))
     ap.add_argument("--latents-out", default=None)
     ap.add_argument("--profile", action="store_true")
+    ap.add_argument("--vae-bits", type=int, default=8, help="the Loom video decoder's weights/activations: 8 (lossless class) or 4 (GPTQ)")
+    ap.add_argument("--vae-weights", default=None, help="tools/export_vae.py output; default build/weights_vae_i8 or build/weights_vae_gptq")
+    ap.add_argument("--torch-decode", action="store_true", help="diffusers' fp16 video decoder instead of the Loom session")
     a = ap.parse_args()
     dev = "cuda"
     from diffusers import MiniMaxH3Scheduler, AutoencoderKLMiniMaxH3, AutoencoderKLMiniMaxH3Audio
 
     # --- conditioning and layout ---
     pp = prompt_path(a.prompt, ROOT / "build/prompts")
-    if not pp.exists():
-        raise SystemExit(f"encode the prompt first: python3 tools/encode_prompt.py {a.prompt!r}")
+    if not pp.exists():                                                      # the text encoder in Loom (tools/encode_prompt.py caches the same file)
+        from transformers import AutoTokenizer
+        ids = AutoTokenizer.from_pretrained(str(TOK))(a.prompt, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
+        t0 = time.time(); embeds = encode_loom(ids); print(f"prompt encoded in Loom: {ids.shape[0]} tokens, {time.time() - t0:.1f} s", flush=True)
+        pp.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(dict(prompt=a.prompt, ids=ids, embeds=embeds, tags=torch.ones(embeds.shape[0], dtype=torch.long)), pp)
     prompt = torch.load(pp)
     frames = align_frames(a.frames)
     latent_t = (frames - 5) // 17 * 5 + 2
@@ -105,10 +113,20 @@ def main() -> None:
 
     # --- decode ---
     del blocks, ref, ckpt; torch.cuda.empty_cache()
-    vae = AutoencoderKLMiniMaxH3.from_pretrained(str(MODELS / "vae"), torch_dtype=torch.float16).to(dev).eval()
-    mean = torch.tensor(vae.config.latents_mean, device=dev).view(1, -1, 1, 1, 1); std = torch.tensor(vae.config.latents_std, device=dev).view(1, -1, 1, 1, 1)
-    with torch.no_grad():
-        video = vae.decode((latents * std + mean).to(torch.float16), return_dict=False)[0]     # [1, 3, F, H, W]
+    t0 = time.time()
+    if a.torch_decode:
+        vae = AutoencoderKLMiniMaxH3.from_pretrained(str(MODELS / "vae"), torch_dtype=torch.float16).to(dev).eval()
+        mean = torch.tensor(vae.config.latents_mean, device=dev).view(1, -1, 1, 1, 1); std = torch.tensor(vae.config.latents_std, device=dev).view(1, -1, 1, 1, 1)
+        with torch.no_grad():
+            video = vae.decode((latents * std + mean).to(torch.float16), return_dict=False)[0]     # [1, 3, F, H, W]
+    else:                                                                    # the 36 decoder blocks in Loom, diffusers' chunking and head around them
+        vae = AutoencoderKLMiniMaxH3.from_pretrained(str(MODELS / "vae"), torch_dtype=torch.float32).to(dev).eval(); vae.disable_tiling()
+        mean = torch.tensor(vae.config.latents_mean, device=dev).view(1, -1, 1, 1, 1); std = torch.tensor(vae.config.latents_std, device=dev).view(1, -1, 1, 1, 1)
+        vae_weights = a.vae_weights or str(ROOT / ("build/weights_vae_i8" if a.vae_bits == 8 else "build/weights_vae_gptq"))
+        vae._decode_clip = LoomClipDecoder(vae, profile=a.profile, weights=vae_weights, bits=a.vae_bits)
+        with torch.no_grad():
+            video = vae._decode((latents * std + mean).float())
+    torch.cuda.synchronize(); print(f"video decoded in {time.time() - t0:.1f} s ({'torch fp16' if a.torch_decode else f'Loom W{a.vae_bits}A{a.vae_bits}'})", flush=True)
     del vae; torch.cuda.empty_cache()
     avae = AutoencoderKLMiniMaxH3Audio.from_pretrained(str(MODELS / "audio_vae"), torch_dtype=torch.float32).to(dev).eval()
     amean = torch.tensor(avae.config.latents_mean, device=dev).view(1, -1, 1); astd = torch.tensor(avae.config.latents_std, device=dev).view(1, -1, 1)

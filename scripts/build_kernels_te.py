@@ -28,7 +28,7 @@ def build(tokens: int) -> Path:
     specs = [
         ("prepare_norm_i8", "h3_prepare_norm_i8", "prepare_norm", {"h3.prepare_norm_i8.width": HIDDEN, "h3.prepare_norm_i8.lanes": 160, "h3.prepare_norm_i8.eps": EPS, "h3.prepare_norm_i8.classes": 1}),
         ("prepare_plain_i8", "h3_prepare_plain_i8", "prepare_attn", {"h3.prepare_plain_i8.width": INNER, "h3.prepare_plain_i8.lanes": 256}),
-        ("prepare_plain_i8", "h3_prepare_plain_i8", "prepare_down", {"h3.prepare_plain_i8.width": FFN, "h3.prepare_plain_i8.lanes": 320}),
+        ("prepare_plain16_i8", "h3_prepare_plain16_i8", "prepare_down", {"h3.prepare_plain16_i8.width": FFN, "h3.prepare_plain16_i8.lanes": 320}),   # f16 LDS: 25600 f32 would not fit
         ("gemm_i8_256", "h3_gemm_i8_256", "gemm_qkv", {"h3.gemm_i8_256.k_size": HIDDEN, "h3.gemm_i8_256.n_size": QKV, "h3.gemm_i8_256.m_group": m_group}),
         ("gemm_i8_swiglu_256", "h3_gemm_i8_swiglu_256", "gemm_gu", {"h3.gemm_i8_swiglu_256.k_size": HIDDEN, "h3.gemm_i8_swiglu_256.n_size": 2 * FFN, "h3.gemm_i8_swiglu_256.m_group": m_group}),
         ("gemm_i8_resid_256", "h3_gemm_i8_resid_256", "gemm_out", {"h3.gemm_i8_resid_256.k_size": INNER, "h3.gemm_i8_resid_256.n_size": HIDDEN, "h3.gemm_i8_resid_256.m_group": m_group, "h3.gemm_i8_resid_256.classes": 1}),

@@ -51,7 +51,7 @@ class H3VaeBlocks:
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """x [tokens][2048] -> f32 stream after `layers` blocks; cos/sin [tokens][24] f32."""
-        xa = np.ascontiguousarray(x.detach().to(torch.float32).cpu().numpy())
+        xa = np.array(x.detach().to(torch.float32).cpu().numpy(), dtype=np.float32, order="C", copy=True)   # a copy: the session writes the result back into it, and a CPU input would otherwise be overwritten
         ca = np.ascontiguousarray(cos.detach().float().cpu().numpy()); sa = np.ascontiguousarray(sin.detach().float().cpu().numpy())
         assert xa.shape == (self.tokens, HIDDEN) and ca.shape == sa.shape == (self.tokens, ROPE_HALF)
         err = ctypes.create_string_buffer(_ERR)

@@ -114,7 +114,8 @@ FORM = {
         form="""  // the row as produced (the gate|up GEMM's fused silu(g)*u output)
   scf.for %m_j = [%c0 to %chunks_per_lane step %c1] {
 """ + chunk("m") + """    %m_v16 = vector.load %h_view[%row, %m_i] : view<[%tokens_b]x[%width]xf16> -> vector<8xf16>
-    %m_out = vector.extf %m_v16 : vector<8xf16> to vector<8xf32>
+    %m_out0 = vector.extf %m_v16 : vector<8xf16> to vector<8xf32>
+    %m_out = vector.mulf %m_out0, %prescale8 : vector<8xf32>
     vector.store %m_out, %x_view[%m_i] : vector<8xf32>, view<[%width]xf32>
   }
 """),
@@ -139,11 +140,17 @@ def pack_tail(bits: int) -> str:
     return out
 
 
-def kernel(name: str, bits: int = 4) -> str:
+def kernel(name: str, bits: int = 4, lds: str = "f32") -> str:
+    """lds: "f32" stages the row in f32 (H3's gate|up products reach 5e4 and the unnormalised
+    Hadamard stages grow 4x each, so f16 would overflow); "f16" (the plain form only, for rows
+    too wide for 64 KB of f32: the text encoder's 25600) pre-scales the f16 input by 1/16 at
+    staging, so the four unnormalised stages land exactly on the normalised rotation and the
+    1/16 no longer folds into the scale."""
     f = FORM[name]
-    lds = "f32"      # f16 LDS overflows: H3's gate|up products reach 5e4 and the unnormalised stages grow 4x each
+    assert lds == "f32" or name == "plain"
     lds_bytes = 2 if lds == "f16" else 4
-    ns, sym = f"h3.prepare_{name}_i{bits}", f"h3_prepare_{name}_i{bits}"
+    tag = f"{name}16" if lds == "f16" else name
+    ns, sym = f"h3.prepare_{tag}_i{bits}", f"h3_prepare_{tag}_i{bits}"
     extra_cfg = "" if name in ("norm", "plain") else f"\nconfig.decl @{ns}.gate_stride : %value: index where [range(%value, 256, 65536), mul(%value, 256)]\n"
     extra_get = "" if name in ("norm", "plain") else f"  %gate_stride = config.get @{ns}.gate_stride : index\n"
     gate_last = "" if name in ("norm", "plain") else "  %gate_last = index.sub %gate_stride, %c8 : index\n"
@@ -183,6 +190,8 @@ kernel.def target(@{sym}_gfx11) export("{sym}") @{sym}(%tokens: index) {{
   %seven = scalar.constant 7.0 : f32
   %neg_seven = scalar.constant -7.0 : f32
   %sixteenth = scalar.constant 0.0625 : f32
+  %prescale = scalar.constant {0.0625 if lds == "f16" else 1.0} : f32
+  %prescale8 = vector.splat %prescale : vector<8xf32>
   %tiny = scalar.constant 1e-30 : f32
   %fifteen = scalar.constant 15 : i32
   %sh4 = scalar.constant 4 : i32
@@ -238,10 +247,10 @@ kernel.def target(@{sym}_gfx11) export("{sym}") @{sym}(%tokens: index) {{
   }}
   %amax = vector.reduce<maxnumf> %amax_v, %zero : vector<8xf32>, f32
   %row_max0 = kernel.workgroup.reduce<maxnumf> %amax : f32
-  %row_max = scalar.mulf %row_max0, %sixteenth : f32
+  %row_max = scalar.mulf %row_max0, %{"one" if lds == "f16" else "sixteenth"} : f32
   %row_max_safe = scalar.maxnumf %row_max, %tiny : f32
   %s = scalar.divf %row_max_safe, %{"seven" if bits == 4 else "qmax"} : f32
-  %inv_s = scalar.divf %sixteenth, %s : f32
+  %inv_s = scalar.divf %{"one" if lds == "f16" else "sixteenth"}, %s : f32
   %inv_s8 = vector.splat %inv_s : vector<8xf32>
   scf.for %q_j = [%c0 to %chunks_per_lane step %c1] {{
     %q_lane_step = index.mul %q_j, %lanes : index
@@ -323,3 +332,5 @@ for name in FORM:
     for bits in (4, 8):
         (OUT / f"prepare_{name}_i{bits}.loom").write_text(uniform_loops(lds_type(kernel(name, bits), "f32")))
         print("wrote", f"prepare_{name}_i{bits}.loom")
+(OUT / "prepare_plain16_i8.loom").write_text(uniform_loops(lds_type(kernel("plain", 8, "f16"), "f16")))   # the text encoder's 25600-wide row
+print("wrote prepare_plain16_i8.loom")

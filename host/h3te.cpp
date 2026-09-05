@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -117,7 +118,7 @@ public:
         auto load = [&](Kernel &k, const char *stem, const char *symbol) { k.load(kernels_dir + "/" + stem + ".hsaco", symbol); };
         load(k_prep_norm_, "prepare_norm", "h3_prepare_norm_i8");
         load(k_prep_attn_, "prepare_attn", "h3_prepare_plain_i8");
-        load(k_prep_down_, "prepare_down", "h3_prepare_plain_i8");
+        load(k_prep_down_, "prepare_down", "h3_prepare_plain16_i8");   // f16 LDS: the 25600-wide row
         load(k_gemm_qkv_, "gemm_qkv", "h3_gemm_i8_256");
         load(k_gemm_gu_, "gemm_gu", "h3_gemm_i8_swiglu_256");
         load(k_gemm_out_, "gemm_out", "h3_gemm_i8_resid_256");
@@ -207,28 +208,55 @@ private:
         launch(k, stage, unsigned(n / 128), gemm_grid_y(tokens_), THREADS, a);
     }
 
+    // H3TE_DEBUG=1: a few values of each stage's output for the first layer
+    void dump(const char *what, const void *p, size_t bytes_per, size_t count, bool f16) {
+        if (!debug_) return;
+        HIP_CHECK(hipDeviceSynchronize());
+        std::vector<unsigned char> h(bytes_per * count);
+        HIP_CHECK(hipMemcpyDtoH(h.data(), (hipDeviceptr_t)p, h.size()));
+        fprintf(stderr, "  %-20s", what);
+        for (size_t i = 0; i < count; ++i) {
+            if (bytes_per == 4 && !f16) { float v; memcpy(&v, h.data() + 4 * i, 4); fprintf(stderr, " %10.4g", v); }
+            else if (f16) { uint16_t u; memcpy(&u, h.data() + 2 * i, 2); const int e = (u >> 10) & 31, m = u & 1023; const float v = (e == 0 ? std::ldexp(float(m), -24) : std::ldexp(1.0f + m / 1024.0f, e - 15)) * ((u & 0x8000) ? -1 : 1); fprintf(stderr, " %10.4g", v); }
+            else fprintf(stderr, " %4d", int((signed char)h[i]));
+        }
+        fprintf(stderr, "\n");
+    }
+
     void block(int i) {
         const Block &b = blocks_[i];
         const unsigned T = unsigned(tokens_);
+        debug_ = i == 0 && std::getenv("H3TE_DEBUG");
+        dump("x in", x_, 4, 6, false);
         { KernArgs a; a.scalar_i32(T); a.pointer(x_); a.pointer(b.norm1); a.pointer(mods_); a.pointer(cls_); a.pointer(a_q_); a.pointer(a_s_);
           launch(k_prep_norm_, "prepare norm", T, 1, NORM_LANES, a); }
+        dump("norm1 a_q", a_q_, 1, 8, false); dump("norm1 a_s", a_s_, 4, 4, false);
         gemm(k_gemm_qkv_, "gemm qkv", b.qkv_q, b.qkv_s, QKV, fused_, nullptr);
+        dump("qkv", fused_, 2, 6, true);
         { KernArgs a; a.scalar_i32(T); a.pointer(fused_); a.pointer(b.qnorm); a.pointer(b.knorm); a.pointer(cos_); a.pointer(sin_); a.pointer(q_); a.pointer(k_); a.pointer(v_);
           launch(k_rope_, "qk norm + rope", T, 1, THREADS, a); }
+        dump("q", q_, 2, 6, true); dump("k", k_, 2, 6, true); dump("v", v_, 2, 6, true);
         { KernArgs a; a.scalar_i32(T); a.scalar_i32(KV_HEADS); a.pointer(q_); a.pointer(k_); a.pointer(v_); a.pointer(attn_);
           launch(k_attention_, "attention", (T + 15) / 16, KV_HEADS, THREADS, a); }
+        dump("attn", attn_, 2, 6, true);
         { KernArgs a; a.scalar_i32(T); a.pointer(attn_); a.pointer(a_q_); a.pointer(a_s_);
           launch(k_prep_attn_, "prepare out input", T, 1, ATTN_LANES, a); }
+        dump("attn a_q", a_q_, 1, 8, false); dump("attn a_s", a_s_, 4, 4, false);
         gemm(k_gemm_out_, "gemm out + residual", b.out_q, b.out_s, HIDDEN, x_, (const float *)ones_);
+        dump("x after out", x_, 4, 6, false);
         { KernArgs a; a.scalar_i32(T); a.pointer(x_); a.pointer(b.norm2); a.pointer(mods_); a.pointer(cls_); a.pointer(a_q_); a.pointer(a_s_);
           launch(k_prep_norm_, "prepare norm", T, 1, NORM_LANES, a); }
         gemm(k_gemm_gu_, "gemm ff + swiglu", b.gu_q, b.gu_s, 2 * FFN, gu_, nullptr);
+        dump("gu", gu_, 2, 6, true);
         { KernArgs a; a.scalar_i32(T); a.pointer(gu_); a.pointer(a_q_); a.pointer(a_s_);
           launch(k_prep_down_, "prepare down input", T, 1, DOWN_LANES, a); }
+        dump("down a_q", a_q_, 1, 8, false); dump("down a_s", a_s_, 4, 4, false);
         gemm(k_gemm_down_, "gemm down + residual", b.down_q, b.down_s, HIDDEN, x_, (const float *)ones_);
+        dump("x after down", x_, 4, 6, false);
     }
 
     static constexpr size_t GEMM_TILE = 256;
+    bool debug_ = false;
     int tokens_, layers_;
     size_t capacity_ = 0;
     std::mutex mutex_;

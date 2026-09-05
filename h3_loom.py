@@ -77,7 +77,7 @@ class H3Blocks:
         cls [tokens] int (AdaLN row class), mods [layers][72][5376] f32 (mods_table), cos/sin [tokens][48] f32."""
         timing = os.environ.get("H3_TIMING") == "1"
         t0 = time.time()
-        xa = np.ascontiguousarray(x.detach().to(torch.float32).cpu().numpy())
+        xa = np.array(x.detach().to(torch.float32).cpu().numpy(), dtype=np.float32, order="C", copy=True)   # a copy: the session writes the result back into it, and a CPU input would otherwise be overwritten
         ca_ = np.ascontiguousarray(cls.detach().to(torch.int32).cpu().numpy())
         ma = np.ascontiguousarray(mods.detach().float().cpu().numpy()[: self.layers])
         ca = np.ascontiguousarray(cos.detach().float().cpu().numpy()); sa = np.ascontiguousarray(sin.detach().float().cpu().numpy())

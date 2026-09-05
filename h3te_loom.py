@@ -59,7 +59,7 @@ class H3TeBlocks:
     def forward(self, x: torch.Tensor, cos: torch.Tensor | None = None, sin: torch.Tensor | None = None) -> torch.Tensor:
         """x [tokens][5120] embeddings -> f32 hidden state after `layers` layers (no final norm)."""
         if cos is None: cos, sin = rope_tables(self.tokens)
-        xa = np.ascontiguousarray(x.detach().to(torch.float32).cpu().numpy())
+        xa = np.array(x.detach().to(torch.float32).cpu().numpy(), dtype=np.float32, order="C", copy=True)   # a copy: the session writes the result back into it, and a CPU input would otherwise be overwritten
         ca = np.ascontiguousarray(cos.detach().float().cpu().numpy()); sa = np.ascontiguousarray(sin.detach().float().cpu().numpy())
         assert xa.shape == (self.tokens, HIDDEN) and ca.shape == sa.shape == (self.tokens, ROPE_HALF)
         err = ctypes.create_string_buffer(_ERR)
