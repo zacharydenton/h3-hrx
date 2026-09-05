@@ -30,7 +30,9 @@ kernel.def target(@h3_attention_mha8_lds_f16_wmma_gfx11) export("h3_attention_mh
   %c64 = index.constant 64 : index
   %c127 = index.constant 127 : index
   %c128 = index.constant 128 : index
+  %c255 = index.constant 255 : index
   %c256 = index.constant 256 : index
+  %c512 = index.constant 512 : index
   %tokens0 = config.get @h3.attention_mha8_lds_f16_wmma.tokens : index
   %rounded = index.add %tokens0, %c127 : index
   %tiles = index.div %rounded, %c128 : index
@@ -60,6 +62,7 @@ kernel.def target(@h3_attention_mha8_lds_f16_wmma_gfx11) export("h3_attention_mh
   %c96 = index.constant 96 : index
   %c112 = index.constant 112 : index
   %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
   %c136 = index.constant 136 : index
   %c0_offset = index.constant 0 : offset
   %k_tile_offset = index.constant 0 : offset
@@ -161,6 +164,7 @@ kernel.def target(@h3_attention_mha8_lds_f16_wmma_gfx11) export("h3_attention_mh
   %st_key_v = index.rem %st_lane, %c16 : index
   %st_chunk_v0 = index.div %st_lane, %c16 : index
   %st_is_k = index.cmp ult, %workitem, %c128 : index
+  %st_is_v = index.cmp ult, %workitem, %c256 : index
   %st_chunk_v = index.mul %st_chunk_v0, %c16 : index
   %st_col_v0 = index.add %kv_base0, %st_chunk_v : index
   %st_col_v = index.assume %st_col_v0 [le(%st_col_v0, %kv_col_limit), mul(%st_col_v0, 16)] : index

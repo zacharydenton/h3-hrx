@@ -17,7 +17,7 @@ assert GQA == 4 and WAVES == 4 or GQA == 1 and WAVES in (4, 8, 16)
 QBLOCK = 16 * WAVES                                     # query rows per workgroup
 STEM = os.environ.get("ATTN_STEM", ({4: "attention_mha_lds_f16_wmma", 8: "attention_mha8_lds_f16_wmma", 16: "attention_mha16_lds_f16_wmma"}[WAVES]) if GQA == 1 else "attention_gqa_lds_f16_wmma")
 assert TILE in (16, 32)
-OUT = ROOT / ("kernels" if STEM in ("attention_gqa_lds_f16_wmma", "attention_mha_lds_f16_wmma", "attention_mha8_lds_f16_wmma", "attention_mha16_lds_f16_wmma") else "experiments") / f"{STEM}.loom"
+OUT = ROOT / ("kernels" if STEM in ("attention_gqa_lds_f16_wmma", "attention_mha_lds_f16_wmma", "attention_mha8_lds_f16_wmma") else "experiments") / f"{STEM}.loom"   # 16 waves lost (0.92x): experiments/
 NS, SYM = "h3." + STEM, "h3_" + STEM
 ROW = 136   # LDS row length in halves for a 128-channel tile (272-byte rows)
 import os
@@ -61,7 +61,9 @@ kernel.def target(@{SYM}_gfx11) export("{SYM}") @{SYM}(%token_count: index, %kv_
   %c64 = index.constant 64 : index
   %c127 = index.constant 127 : index
   %c128 = index.constant 128 : index
+  %c255 = index.constant 255 : index
   %c256 = index.constant 256 : index
+  %c512 = index.constant 512 : index
   %tokens0 = config.get @{NS}.tokens : index
   %rounded = index.add %tokens0, %c{15 if GQA == 4 else QBLOCK - 1} : index
   %tiles = index.div %rounded, %c{16 if GQA == 4 else QBLOCK} : index
@@ -91,6 +93,7 @@ kernel.def target(@{SYM}_gfx11) export("{SYM}") @{SYM}(%token_count: index, %kv_
   %c96 = index.constant 96 : index
   %c112 = index.constant 112 : index
   %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
   %c{ROW} = index.constant {ROW} : index
 {"  %c31 = index.constant 31 : index" + chr(10) if TILE == 32 else ""}  %c0_offset = index.constant 0 : offset
   %k_tile_offset = index.constant 0 : offset

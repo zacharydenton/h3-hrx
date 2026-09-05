@@ -13,12 +13,13 @@ step "reference vs ComfyUI's MiniMaxH3Model (toy)" bash -c 'podman run --rm -v "
 step "generated kernels match their generators" bash -c '
   tmpdir=$(mktemp -d); trap "rm -rf $tmpdir" EXIT
   cp -r kernels "$tmpdir/kernels" && cp -r tools "$tmpdir/tools" && cd "$tmpdir" &&
-  python3 tools/gen_prepare.py >/dev/null && python3 tools/gen_attention_lds.py >/dev/null &&
-  for f in prepare_norm_i4 prepare_plain_i4 attention_mha_lds_f16_wmma; do "$LOOM_FORMAT" --in-place "kernels/$f.loom" >/dev/null && cmp -s "kernels/$f.loom" "$OLDPWD/kernels/$f.loom" || { echo "  $f differs"; exit 1; }; done'
+  python3 tools/gen_prepare.py >/dev/null && python3 tools/gen_attention_lds.py >/dev/null && ATTN_WAVES=8 python3 tools/gen_attention_lds.py >/dev/null && python3 tools/gen_gemm.py >/dev/null &&
+  for f in prepare_norm_i4 prepare_plain_i4 attention_mha_lds_f16_wmma attention_mha8_lds_f16_wmma gemm_i4_256 gemm_i4_resid_256 gemm_i4_swiglu_256; do "$LOOM_FORMAT" --in-place "kernels/$f.loom" >/dev/null && cmp -s "kernels/$f.loom" "$OLDPWD/kernels/$f.loom" || { echo "  $f differs"; exit 1; }; done'
 step "build host"        ./scripts/build_host.sh
 step "prepare kernels"   bash -c 'env -u LD_LIBRARY_PATH python3 tests/test_prepare.py'
 step "qk norm + rope"    bash -c 'env -u LD_LIBRARY_PATH python3 tests/test_rope_qknorm.py'
 step "attention"         bash -c 'env -u LD_LIBRARY_PATH python3 tests/test_attention.py'
+step "gemm family (M=512)" bash -c 'env -u LD_LIBRARY_PATH python3 tests/test_gemm.py 512'
 if [ "${1:-}" != "--quick" ]; then
   step "native blocks vs reference (fixture)" bash -c 'source ~/code/krea2-loom/.venv/bin/activate && env -u LD_LIBRARY_PATH python3 tests/test_blocks.py --curve 1,50'
 fi

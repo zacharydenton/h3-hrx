@@ -224,3 +224,10 @@ builder picks 8 waves from 4096 rows and writes `attention_waves.txt`; the host 
 for the grid and block. The remaining gap to the 21 TFLOP/s the kernel reaches when K/V
 fit L2 is the same streaming traffic at half the volume; the next step in that direction
 is 256-query workgroups or K/V shared across the two heads a WGP runs.
+
+## Sixteen-wave workgroups -- lost (0.919x at 10317 rows)
+
+`ATTN_WAVES=16` (256 queries per K/V pass, lanes 256..511 idle in staging, 55.5 KB LDS, 256
+VGPRs): 188.6 against 173.3 ms for eight waves. One workgroup per WGP is too little
+occupancy for the halved traffic to pay. Eight waves is the point of the curve; the kernel
+sits at 17.6 TFLOP/s at 10k rows against 21 when K/V fit L2.
