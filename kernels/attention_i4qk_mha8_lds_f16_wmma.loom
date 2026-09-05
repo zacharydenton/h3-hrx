@@ -388,7 +388,6 @@ kernel.def target(@h3_attention_i4qk_mha8_lds_f16_wmma_gfx11) export("h3_attenti
     %next5 = vector.mma %probability, %v5, %rescaled5 : vector<16xf16>, vector<16xf16>, vector<8xf32>
     %next6 = vector.mma %probability, %v6, %rescaled6 : vector<16xf16>, vector<16xf16>, vector<8xf32>
     %next7 = vector.mma %probability, %v7, %rescaled7 : vector<16xf16>, vector<16xf16>, vector<8xf32>
-    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
     %ks_key_n0 = index.add %local_key, %c16 : index
     %ks_key_n1 = index.min %ks_key_n0, %ks_last : index
     %ks_key_n = index.assume %ks_key_n1 [lt(%ks_key_n1, %padded_tokens)] : index
