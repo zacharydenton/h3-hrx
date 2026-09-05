@@ -203,3 +203,13 @@ kernel directory. Calm-box numbers to follow.
 
 At 2097 rows the 256-row tile pads to 9 tiles (9% ghost rows), so the GEMMs run at about
 79 TOPS on real rows. The 100 TOPS target is 86% of the iu4 peak; the GEMM sits at 62-68%.
+
+## 10317 rows (480p, 4 s): attention is bandwidth-bound
+
+Fixture 32 text + 25 x 405 video + 160 audio rows, GPTQ weights, 256-row tile, 50 blocks in
+23.8 s: attention 18.0 s (75.7%, 8.5 TFLOP/s against 21 at 2097 rows), gate/up 1.95 s
+(82 TOPS), qkv 1.50 (80), down 1.12 (71), out 0.51 (78), the rest 0.7 s. Attention's rate
+falls with length because each workgroup of 64 queries streams its head's whole K and V
+(10317 x 128 x 2 x 2 B = 5.3 MB, past L2) -- 162 workgroups x 56 heads x 5.3 MB = 48 GB per
+block, 2.4 TB per step, 133 GB/s over the 18 s: the memory system's streaming rate. The
+lever is queries per K/V pass: eight-wave workgroups (128 queries) halve the traffic.
