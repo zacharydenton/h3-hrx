@@ -483,3 +483,41 @@ becomes 16 VGPRs instead of 64, K tiles 1 KB instead of 4 KB.
 on triple-buffered K/V tiles so one group's softmax overlaps the other's MMAs instead of the
 whole workgroup running in lockstep behind each barrier. Warp specialisation with async
 copies has no RDNA3 equivalent. Estimated 1.2-1.3x; after the int4 kernel.
+
+## Int4 QK^T attention: built, measured, and what it took (2026-09-06)
+
+`kernels/prepare_qk_i4.loom` (per token, the eight waves over the heads: subtract the K
+column mean, Sylvester H_128 by butterflies through the wave's LDS row, per-(token, head)
+int4 with absmax/7, the attention scale and the Hadamard's 1/128 folded into Q's scale),
+`kernels/colmean_f32.loom`, and `tools/gen_attention_i4qk.py`, which derives the int4-QK
+kernel from the f16 generator's text: Q as eight int4 fragments in registers (16 VGPRs, no
+Q LDS), K tiles of 16 x 16 words, i32 accumulation, scores = sitofp(acc) * q_scale[row] *
+k_scale[key]; softmax and the f16 PV unchanged. 240 VGPRs, 11.5 KB LDS (from 33).
+
+| int4 QK^T vs f16 (8 waves) | 5504 | 10317 | 15427 | 37743 rows |
+| --- | ---: | ---: | ---: | ---: |
+| f16 kernel, TFLOP/s-equivalent | 18.6 | 17.6 | 17.6 | ~16 |
+| int4 QK^T kernel | 28.5 | 26.9 | 25.3 | 18.6 |
+
+Pipeline at 10317 rows: attention 8.9 -> 5.9 s per step, the step 14.6 -> 11.9 s. At the
+768 layout (37743 rows) the int4 kernel slides back to 18.6: the K/V stream's latency with
+two waves per SIMD, not its bandwidth, which is what the prefetch variant
+(`ATTN_PREFETCH=1`: double-buffered tiles, the next tile's loads issued before this tile's
+compute, one barrier per tile; 256 VGPRs, 19 KB LDS, no spills) is for -- untested at the
+time of writing because the GPU was busy with a game.
+
+Quality through the native stack (fixture, GPTQ int4 GEMMs): final velocity cosine 0.9881
+with int4 attention against 0.9912 with f16 (0.9786 for RTN int4 GEMMs alone). The C and
+Python paths agree at 0.981 / 0.988 (video / audio) on one step, the int4 floor.
+
+The prepare kernel cost a day: its first form, one wave per (token, head) with the pairs
+spread over a flat grid and cross-lane traffic through `kernel.subgroup.shuffle<xor>` and
+`kernel.subgroup.reduce`, was bit-exact against its replica on a single launch yet
+non-deterministic across launches; without the wave-uniform `scf.if` guard it also faulted
+(memory aperture violations) on one launch in seven, more with overflowed inputs; through
+LDS instead of shuffles it still skipped one (token, head) in a few thousand at random.
+Restructured to the rope kernel's shape -- one workgroup per token, the waves looping over
+the heads, exchanges through LDS -- it is deterministic, fault-free over dozens of launches,
+and bit-exact. The mechanism is unexplained (the wave id is workitem >> 5, the argument
+slots are 32-bit and zeroed); the lesson is the pattern: give each workgroup a token, not a
+flat pair index, and keep subgroup ops out of per-wave branches.
