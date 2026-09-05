@@ -106,6 +106,64 @@ FORM = {
     vector.store %m_out, %x_view[%m_i] : vector<8xf32>, view<[%width]xf32>
   }
 """),
+    "lnorm": dict(
+        args="%h: buffer, %norm_weight: buffer, %table: buffer, %cls: buffer",
+        views="""  %h_global = buffer.assume.memory_space<global> %h : buffer
+  %nw_global = buffer.assume.memory_space<global> %norm_weight : buffer
+  %tab_global = buffer.assume.memory_space<global> %table : buffer
+  %cls_global = buffer.assume.memory_space<global> %cls : buffer
+  // the residual stream is f32: H3's grows past f16's range by block 23
+  %h_view = buffer.view %h_global[%c0_offset] : buffer -> view<[%tokens_b]x[%width]xf32>
+  %nw_view = buffer.view %nw_global[%c0_offset] : buffer -> view<[%width]xf32>
+  // the AdaLN table: rows 2*class (scale) and 2*class + 1 (shift), classes = (timestep, modality) pairs
+  %table_rows = index.mul %classes, %c2 : index
+  %tab_view = buffer.view %tab_global[%c0_offset] : buffer -> view<[%table_rows]x[%width]xf32>
+  %cls_view = buffer.view %cls_global[%c0_offset] : buffer -> view<[%tokens_b]xi32>
+  %cls_i32 = view.load %cls_view[%row] : view<[%tokens_b]xi32> -> i32
+  %cls_idx0 = index.cast %cls_i32 : i32 to index
+  %cls_idx = index.assume %cls_idx0 [range(%cls_idx0, 0, 63), lt(%cls_idx0, %classes)] : index
+  %scale_row0 = index.mul %cls_idx, %c2 : index
+  %scale_row = index.assume %scale_row0 [range(%scale_row0, 0, 126), lt(%scale_row0, %table_rows)] : index
+  %shift_row0 = index.add %scale_row, %c1 : index
+  %shift_row = index.assume %shift_row0 [range(%shift_row0, 1, 127), lt(%shift_row0, %table_rows)] : index
+""",
+        form="""  // LayerNorm: sum and sum of squares, then centre, normalise, scale and modulate into LDS
+  %ss_v, %s1_v = scf.for %ss_j = [%c0 to %chunks_per_lane step %c1](%ss_acc = %zero8 : vector<8xf32>, %s1_acc = %zero8 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>) {
+""" + chunk("ss") + """    %ss_x = vector.load %h_view[%row, %ss_i] : view<[%tokens_b]x[%width]xf32> -> vector<8xf32>
+    %ss_sq = vector.mulf %ss_x, %ss_x : vector<8xf32>
+    %ss_next = vector.addf %ss_acc, %ss_sq : vector<8xf32>
+    %s1_next = vector.addf %s1_acc, %ss_x : vector<8xf32>
+    scf.yield %ss_next, %s1_next : vector<8xf32>, vector<8xf32>
+  }
+  %ss = vector.reduce<addf> %ss_v, %zero : vector<8xf32>, f32
+  %s1 = vector.reduce<addf> %s1_v, %zero : vector<8xf32>, f32
+  %total = kernel.workgroup.reduce<addf> %ss : f32
+  %total1 = kernel.workgroup.reduce<addf> %s1 : f32
+  %width_i = index.cast %width : index to i32
+  %width_f = scalar.sitofp %width_i : i32 to f32
+  %ex2 = scalar.divf %total, %width_f : f32
+  %mu = scalar.divf %total1, %width_f : f32
+  %mu2 = scalar.mulf %mu, %mu : f32
+  %var0 = scalar.subf %ex2, %mu2 : f32
+  %var = scalar.maxnumf %var0, %zero : f32
+  %var_eps = scalar.addf %var, %eps : f32
+  %rms_inv = scalar.rsqrtf %var_eps : f32
+  %rms_inv8 = vector.splat %rms_inv : vector<8xf32>
+  %mu8 = vector.splat %mu : vector<8xf32>
+  scf.for %m_j = [%c0 to %chunks_per_lane step %c1] {
+""" + chunk("m") + """    %m_x0 = vector.load %h_view[%row, %m_i] : view<[%tokens_b]x[%width]xf32> -> vector<8xf32>
+    %m_x = vector.subf %m_x0, %mu8 : vector<8xf32>
+    %m_n = vector.mulf %m_x, %rms_inv8 : vector<8xf32>
+    %m_nw = vector.load %nw_view[%m_i] : view<[%width]xf32> -> vector<8xf32>
+    %m_normed = vector.mulf %m_n, %m_nw : vector<8xf32>
+    %m_ms = vector.load %tab_view[%scale_row, %m_i] : view<[%table_rows]x[%width]xf32> -> vector<8xf32>
+    %m_ms1 = vector.addf %m_ms, %one8 : vector<8xf32>
+    %m_sh = vector.load %tab_view[%shift_row, %m_i] : view<[%table_rows]x[%width]xf32> -> vector<8xf32>
+    %m_scaled = vector.mulf %m_normed, %m_ms1 : vector<8xf32>
+    %m_out = vector.addf %m_scaled, %m_sh : vector<8xf32>
+    vector.store %m_out, %x_view[%m_i] : vector<8xf32>, view<[%width]xf32>
+  }
+"""),
     "plain": dict(
         args="%h: buffer",
         views="""  %h_global = buffer.assume.memory_space<global> %h : buffer
@@ -151,11 +209,11 @@ def kernel(name: str, bits: int = 4, lds: str = "f32") -> str:
     lds_bytes = 2 if lds == "f16" else 4
     tag = f"{name}16" if lds == "f16" else name
     ns, sym = f"h3.prepare_{tag}_i{bits}", f"h3_prepare_{tag}_i{bits}"
-    extra_cfg = "" if name in ("norm", "plain") else f"\nconfig.decl @{ns}.gate_stride : %value: index where [range(%value, 256, 65536), mul(%value, 256)]\n"
-    extra_get = "" if name in ("norm", "plain") else f"  %gate_stride = config.get @{ns}.gate_stride : index\n"
-    gate_last = "" if name in ("norm", "plain") else "  %gate_last = index.sub %gate_stride, %c8 : index\n"
-    eps_cfg = f"\nconfig.decl @{ns}.eps : f32\n\nconfig.decl @{ns}.classes : %value: index where [range(%value, 1, 64)]\n" if name == "norm" else ""
-    eps_get = f"  %eps = config.get @{ns}.eps : f32\n  %classes = config.get @{ns}.classes : index\n" if name == "norm" else ""
+    extra_cfg = "" if name in ("norm", "lnorm", "plain") else f"\nconfig.decl @{ns}.gate_stride : %value: index where [range(%value, 256, 65536), mul(%value, 256)]\n"
+    extra_get = "" if name in ("norm", "lnorm", "plain") else f"  %gate_stride = config.get @{ns}.gate_stride : index\n"
+    gate_last = "" if name in ("norm", "lnorm", "plain") else "  %gate_last = index.sub %gate_stride, %c8 : index\n"
+    eps_cfg = f"\nconfig.decl @{ns}.eps : f32\n\nconfig.decl @{ns}.classes : %value: index where [range(%value, 1, 64)]\n" if name in ("norm", "lnorm") else ""
+    eps_get = f"  %eps = config.get @{ns}.eps : f32\n  %classes = config.get @{ns}.classes : index\n" if name in ("norm", "lnorm") else ""
     return f"""// GEMM input preparation ({name}), one workgroup of `lanes` lanes per token: form the
 // row in f32 in LDS, rotate it by the group-256 Hadamard (H4 (x) H4 (x) H4 (x) H4 as four
 // radix-4 stages of strides 1, 4, 16, 64; the 1/16 folds into the scale), take the
@@ -329,7 +387,7 @@ def uniform_loops(text: str) -> str:
                         "  %quads_per_lane = index.div %quads, %lanes : index\n  %chunk_count = index.div %width, %c8 : index\n  %chunks_per_lane = index.div %chunk_count, %lanes : index\n")
 
 for name in FORM:
-    for bits in (4, 8):
+    for bits in ((8,) if name == "lnorm" else (4, 8)):
         (OUT / f"prepare_{name}_i{bits}.loom").write_text(uniform_loops(lds_type(kernel(name, bits), "f32")))
         print("wrote", f"prepare_{name}_i{bits}.loom")
 (OUT / "prepare_plain16_i8.loom").write_text(uniform_loops(lds_type(kernel("plain", 8, "f16"), "f16")))   # the text encoder's 25600-wide row

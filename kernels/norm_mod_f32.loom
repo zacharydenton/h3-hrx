@@ -1,0 +1,91 @@
+// In-place RMSNorm with a class-indexed modulation on an f32 row stream:
+//   x[row] = rmsnorm(x[row]) * weight * (1 + scale[cls[row]]) + shift[cls[row]]
+// One workgroup of `lanes` lanes per row, 8 elements per lane per chunk. The token refiner's
+// final norm (zero table) and any f32 norm that feeds the host rather than a GEMM.
+amdgpu.target<gfx11-generic> @h3_norm_mod_f32_gfx11 {subgroup_size = 32}
+
+config.decl @h3.norm_mod_f32.width : %value: index where [range(%value, 256, 32768), mul(%value, 256)]
+
+config.decl @h3.norm_mod_f32.lanes : %value: index where [range(%value, 32, 1024), mul(%value, 32)]
+
+config.decl @h3.norm_mod_f32.eps : f32
+
+config.decl @h3.norm_mod_f32.classes : %value: index where [range(%value, 1, 64)]
+
+kernel.def target(@h3_norm_mod_f32_gfx11) export("h3_norm_mod_f32") @h3_norm_mod_f32(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %lanes = config.get @h3.norm_mod_f32.lanes : index
+  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%lanes, %c1, %c1) : index
+} launch(%tokens: index, %h: buffer, %norm_weight: buffer, %table: buffer, %cls: buffer) {
+  %width = config.get @h3.norm_mod_f32.width : index
+  %lanes = config.get @h3.norm_mod_f32.lanes : index
+  %eps = config.get @h3.norm_mod_f32.eps : f32
+  %classes = config.get @h3.norm_mod_f32.classes : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c8 = index.constant 8 : index
+  %c0_offset = index.constant 0 : offset
+  %one = scalar.constant 1.0 : f32
+  %zero = scalar.constant 0.0 : f32
+  %zero8 = vector.splat %zero : vector<8xf32>
+  %one8 = vector.splat %one : vector<8xf32>
+  %tokens_b = index.assume %tokens [range(%tokens, 1, 1048576)] : index
+  %token = kernel.workgroup.id<x> : index
+  %row = index.assume %token [lt(%token, %tokens_b)] : index
+  %lane = kernel.workitem.id<x> : index
+  %width_last = index.sub %width, %c8 : index
+  %chunk_count = index.div %width, %c8 : index
+  %chunks_per_lane = index.div %chunk_count, %lanes : index
+  %h_global = buffer.assume.memory_space<global> %h : buffer
+  %nw_global = buffer.assume.memory_space<global> %norm_weight : buffer
+  %tab_global = buffer.assume.memory_space<global> %table : buffer
+  %cls_global = buffer.assume.memory_space<global> %cls : buffer
+  %h_view = buffer.view %h_global[%c0_offset] : buffer -> view<[%tokens_b]x[%width]xf32>
+  %nw_view = buffer.view %nw_global[%c0_offset] : buffer -> view<[%width]xf32>
+  %table_rows = index.mul %classes, %c2 : index
+  %tab_view = buffer.view %tab_global[%c0_offset] : buffer -> view<[%table_rows]x[%width]xf32>
+  %cls_view = buffer.view %cls_global[%c0_offset] : buffer -> view<[%tokens_b]xi32>
+  %cls_i32 = view.load %cls_view[%row] : view<[%tokens_b]xi32> -> i32
+  %cls_idx0 = index.cast %cls_i32 : i32 to index
+  %cls_idx = index.assume %cls_idx0 [range(%cls_idx0, 0, 63), lt(%cls_idx0, %classes)] : index
+  %scale_row0 = index.mul %cls_idx, %c2 : index
+  %scale_row = index.assume %scale_row0 [range(%scale_row0, 0, 126), lt(%scale_row0, %table_rows)] : index
+  %shift_row0 = index.add %scale_row, %c1 : index
+  %shift_row = index.assume %shift_row0 [range(%shift_row0, 1, 127), lt(%shift_row0, %table_rows)] : index
+  %ss_v = scf.for %ss_j = [%c0 to %chunks_per_lane step %c1](%ss_acc = %zero8 : vector<8xf32>) -> (vector<8xf32>) {
+    %ss_lane_step = index.mul %ss_j, %lanes : index
+    %ss_chunk = index.add %ss_lane_step, %lane : index
+    %ss_i0 = index.mul %ss_chunk, %c8 : index
+    %ss_i = index.assume %ss_i0 [le(%ss_i0, %width_last), mul(%ss_i0, 8)] : index
+    %ss_x = vector.load %h_view[%row, %ss_i] : view<[%tokens_b]x[%width]xf32> -> vector<8xf32>
+    %ss_sq = vector.mulf %ss_x, %ss_x : vector<8xf32>
+    %ss_next = vector.addf %ss_acc, %ss_sq : vector<8xf32>
+    scf.yield %ss_next : vector<8xf32>
+  }
+  %ss = vector.reduce<addf> %ss_v, %zero : vector<8xf32>, f32
+  %total = kernel.workgroup.reduce<addf> %ss : f32
+  %width_i = index.cast %width : index to i32
+  %width_f = scalar.sitofp %width_i : i32 to f32
+  %mean = scalar.divf %total, %width_f : f32
+  %mean_eps = scalar.addf %mean, %eps : f32
+  %rms_inv = scalar.rsqrtf %mean_eps : f32
+  %rms_inv8 = vector.splat %rms_inv : vector<8xf32>
+  scf.for %m_j = [%c0 to %chunks_per_lane step %c1] {
+    %m_lane_step = index.mul %m_j, %lanes : index
+    %m_chunk = index.add %m_lane_step, %lane : index
+    %m_i0 = index.mul %m_chunk, %c8 : index
+    %m_i = index.assume %m_i0 [le(%m_i0, %width_last), mul(%m_i0, 8)] : index
+    %m_x = vector.load %h_view[%row, %m_i] : view<[%tokens_b]x[%width]xf32> -> vector<8xf32>
+    %m_n = vector.mulf %m_x, %rms_inv8 : vector<8xf32>
+    %m_nw = vector.load %nw_view[%m_i] : view<[%width]xf32> -> vector<8xf32>
+    %m_normed = vector.mulf %m_n, %m_nw : vector<8xf32>
+    %m_ms = vector.load %tab_view[%scale_row, %m_i] : view<[%table_rows]x[%width]xf32> -> vector<8xf32>
+    %m_ms1 = vector.addf %m_ms, %one8 : vector<8xf32>
+    %m_sh = vector.load %tab_view[%shift_row, %m_i] : view<[%table_rows]x[%width]xf32> -> vector<8xf32>
+    %m_scaled = vector.mulf %m_normed, %m_ms1 : vector<8xf32>
+    %m_out = vector.addf %m_scaled, %m_sh : vector<8xf32>
+    vector.store %m_out, %h_view[%row, %m_i] : vector<8xf32>, view<[%tokens_b]x[%width]xf32>
+  }
+  kernel.return
+}

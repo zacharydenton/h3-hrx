@@ -8,3 +8,5 @@ printf 'built build/libh3.so\n'
 printf 'built build/libh3vae.so\n'
 /opt/rocm/bin/hipcc -O2 -Wall -Werror -fPIC -shared -o build/libh3te.so host/h3te.cpp
 printf 'built build/libh3te.so\n'
+/opt/rocm/bin/hipcc -O2 -Wall -Werror -fPIC -shared -o build/libh3pipe.so host/h3pipe.cpp
+printf 'built build/libh3pipe.so\n'
