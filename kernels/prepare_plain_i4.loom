@@ -34,7 +34,7 @@ kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_
   %sixteenth = scalar.constant 0.0625 : f32
   %prescale = scalar.constant 1.0 : f32
   %prescale8 = vector.splat %prescale : vector<8xf32>
-  %tiny = scalar.constant 1e-30 : f32
+  %tiny = scalar.constant 1.0000000000000001e-30 : f32
   %fifteen = scalar.constant 15 : i32
   %sh4 = scalar.constant 4 : i32
   %sh8 = scalar.constant 8 : i32
