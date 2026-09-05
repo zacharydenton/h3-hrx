@@ -46,10 +46,14 @@ the final layer's RMSNorm removes them, which is why the velocity is the metric.
 The end-to-end clip runs: `tools/encode_prompt.py` (Qwen3-VL-32B from the int8 file, layer
 50's raw state) then `tools/pipeline.py` (layout, the two schedules through diffusers'
 `MiniMaxH3Scheduler`, the blocks in Loom, the reference's embeddings and final layer,
-diffusers' two VAEs, ffmpeg). A frame of the first smoke clip, 22 frames at 864x480 in 8
-steps with the GPTQ int4 blocks:
+diffusers' two VAEs, ffmpeg). The first full clip: 124 frames (5.2 s) at 864x480 with
+stereo audio, 49 denoising steps with the GPTQ int4 blocks, frames 5, 60 and 118:
 
-![fox](docs/media/smoke_fox_22f_8steps.jpg)
+![fox](docs/media/fox_480p_5s_strip.jpg)
+
+That render packs 15427 rows and takes 29.4 s per step (attention 70%, the four GEMMs
+26%): 24 minutes of denoising, plus the encoder once per prompt and the VAE decode in
+torch. `docs/media/smoke_fox_22f_8steps.jpg` is the 22-frame smoke clip.
 
 **Quantisation.** Round-to-nearest int4 per row cost 21% relative error on the final
 velocity over 50 blocks; GPTQ at export time (`tools/gptq_export.py`, block by block on the

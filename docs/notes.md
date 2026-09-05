@@ -244,3 +244,12 @@ twice (shift 12 and 3), noise drawn in diffusers' order, the head's raw data-war
 to the scheduler (ComfyUI negates it, diffusers does not), diffusers' VAEs from the
 official repo (their weight names differ from the ComfyUI files), ffmpeg mux. The 22-frame
 8-step smoke clip is a coherent backlit fox on snow (`docs/media/smoke_fox_22f_8steps.jpg`).
+
+The full clip: `tools/pipeline.py "A red fox trots through fresh snow at dawn, ..." --frames
+124 --steps 50` (49 after the shift collapses a duplicate sigma): 37 x 30 x 54 latents, 207
+audio latents, 28 text rows, 15427 packed rows; 29.4 s per step, attention 20.1 s of it
+(17 TFLOP/s), gate/up 2.9 s, qkv 2.2 s, down 1.7 s, out 0.8 s; 1440 s of denoising, then
+the two VAE decodes in torch (the video decoder is the slow one, several minutes at this
+size). The frames are temporally coherent and on prompt (`docs/media/fox_480p_5s_strip.jpg`).
+Attention at video length is the next lever; the budget that resists a 256-query pass is
+LDS (Q tiles for 16 waves) and registers (two query tiles per wave).
