@@ -608,3 +608,8 @@ the epilogue's publish loop 12%, P.V 37%, QK^T 26%. Left on the table, in order:
 epilogue (write the accumulator layout straight to global instead of 8 LDS round trips with
 16 subgroup barriers), a lazy accumulator rescale, the P round trip through LDS (an
 in-register layout change), and two query tiles per wave if the registers can be found.
+
+Epilogue follow-up: a direct-store epilogue (`ATTN_DIRECT_OUT`, 64 scalar f16 stores per lane
+from the accumulator layout, no LDS round trips or subgroup barriers) is correct and a wash
+(1.03x at 15427 rows, 0.97x at 37743): the ablation's 12% was the output writes themselves,
+which any epilogue pays. Kept in experiments/.

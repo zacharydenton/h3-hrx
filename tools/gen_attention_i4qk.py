@@ -191,6 +191,27 @@ if os.environ.get("ATTN_DBUF", "1") == "1":
     OUT3 = (ROOT / "kernels" / f"{STEM3}.loom") if STEM3 == STEM or STEM3 == "attention_i4qkl_mha8_lds_f16_wmma" else (ROOT / "experiments" / f"{STEM3}.loom")
     OUT3.write_text(K); print("wrote", OUT3, "(double-buffered)")
 
+# --- ATTN_DIRECT_OUT=1: the epilogue stores the accumulator layout straight to global memory (lane holds column
+# lane%16 of rows 2e + lane/16): 64 scalar f16 stores per lane, no LDS round trips or subgroup barriers
+if os.environ.get("ATTN_DIRECT_OUT", "0") == "1":
+    src_path = ROOT / "kernels" / f"{STEM}.loom"
+    K = src_path.read_text()
+    i0 = K.index("  // Publish one 16x16 fragment at a time"); i1 = K.index("  kernel.return")
+    ep = "  // direct epilogue: each lane writes its 8 rows of column lane_column for each of the 8 channel fragments\n"
+    ep += "  %ocol_limit = index.sub %out_stride0, %c1 : index\n"
+    for e in range(8):
+        ep += f"  %orow{e}a = index.add %query_origin0, %c{2 * e} : index\n  %orow{e}b = index.add %orow{e}a, %lane_group : index\n"
+        ep += f"  %ovalid{e}a = index.cmp ult, %orow{e}b, %tokens0 : index\n  %ovalid{e}b = index.cmp ult, %orow{e}b, %token_count : index\n  %ovalid{e} = scalar.andi %ovalid{e}a, %ovalid{e}b : i1\n"
+    for c in range(8):
+        ep += f"  %ocol{c}a = index.add %head_base0, %c{16 * c} : index\n  %ocol{c}b = index.add %ocol{c}a, %lane_column : index\n  %ocol{c} = index.assume %ocol{c}b [le(%ocol{c}b, %ocol_limit)] : index\n"
+        for e in range(8):
+            ep += f"  %ov{c}_{e} = vector.extract %out{c}[{e}] : vector<8xf32> -> f32\n  %oh{c}_{e} = scalar.fptrunc %ov{c}_{e} : f32 to f16\n"
+            ep += f"  scf.if %ovalid{e} {{\n    %orow{c}_{e} = index.assume %orow{e}b [lt(%orow{e}b, %token_count)] : index\n    view.store %oh{c}_{e}, %out_view[%orow{c}_{e}, %ocol{c}] : f16, view<[%token_count]x[%out_stride0]xf16>\n  }}\n"
+    K = K[:i0] + ep + K[i1:]
+    STEM4 = os.environ.get("ATTN_DIRECT_STEM", STEM.replace("i4qk", "i4qko"))
+    K = K.replace("h3_" + STEM, "h3_" + STEM4).replace("h3." + STEM, "h3." + STEM4)
+    OUT4 = ROOT / "experiments" / f"{STEM4}.loom"; OUT4.write_text(K); print("wrote", OUT4, "(direct epilogue)")
+
 # --- ATTN_PREFETCH=1: double-buffered K/V tiles, the next tile's global loads issued before this tile's
 # compute (their latency overlaps the MMAs and softmax), one workgroup barrier per tile instead of two.
 if os.environ.get("ATTN_PREFETCH", "0") == "1" and WAVES == 8:
