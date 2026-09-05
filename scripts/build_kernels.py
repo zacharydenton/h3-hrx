@@ -34,10 +34,10 @@ ATTN_QK = os.environ.get("H3_ATTN_QK", "f16")        # "i4": QK^T in int4 WMMA o
 
 
 def skip_tau(tokens: int):
-    """The tile skip's tau for a row count: H3_ATTN_SKIP_TAU=<tau> forces it, 'off' (or 0 / 1e30) disables it; unset ->
-    tau 6 on the long form (measured 1.13x on the 768 step, no velocity cost) and off below (measured nothing at 480p)."""
+    """The tile skip's tau for a row count: H3_ATTN_SKIP_TAU=<tau> selects the skip twin at that tau (tau 4 measured no
+    velocity cost and about 3% on the 768 step against the carried-scale plain kernel); unset or 'off' -> the plain kernel."""
     v = os.environ.get("H3_ATTN_SKIP_TAU")
-    if v is None: return 6.0 if tokens >= 20000 else None
+    if v is None: return None
     if v.lower() in ("off", "0", "1e30", "none", ""): return None
     return float(v)
 

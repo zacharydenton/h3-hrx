@@ -823,3 +823,25 @@ The reference stack's final velocity cosine with the skip (`tools/quant_study.py
 attn:w4a4:a4rs<tau>`): tau 6 0.97508, tau 5 0.97506, tau 4 0.97529, against 0.9751 without
 the skip: no measurable cost down to tau 4 on this metric, so the long form's default tau is
 chosen by step time alone (below).
+
+### The long form's default, decided at the step (2026-09-06)
+
+768x1344, 124 frames, three steps through the C pipeline, the three settings interleaved
+twice (the GPU showed 37-38% use from elsewhere before every run after the first):
+
+| round | skip off (plain, carried scale) | tau 6 twin | tau 4 twin |
+| --- | ---: | ---: | ---: |
+| 1 | 110.1 / 113.1 s | 127.9 / 126.8 | 126.6 / 126.2 |
+| 2 | 128.8 / 129.1 s | 128.7 / 128.0 | 124.9 / 125.4 |
+
+With the carried key scale in the plain kernel the twins no longer earn their idle cost: tau 6
+is a wash and tau 4 is about 3% at the step. The plain kernel is the default at every length;
+`H3_ATTN_SKIP_TAU=4` is the opt-in (no measured velocity cost). On an idle GPU the 768 step
+is 110-114 s, from 126-131 s at the start of this round and about 160 s with f16 attention:
+30 steps at 768 are about 57 minutes.
+
+Two process lessons from the round. The C kernel cache was keyed by stem and config only, so
+an edited kernel source reused a stale binary: a spilling twin ran the 768 step at 263 s
+before the cause was found. Both caches now carry a source hash. And a variant must be A/B'd
+in every form it ships in: the carried scale was measured on the plain kernel and shipped to
+the twins untested, where it spilled.

@@ -317,9 +317,9 @@ public:
         {
             std::string stem = d.causal ? "attention_gqa8c_lds_f16_wmma" : (d.head_dim == 64 ? (waves_ == 8 ? "attention_mha648_lds_f16_wmma" : "attention_mha64_lds_f16_wmma") : (waves_ == 8 ? "attention_mha8_lds_f16_wmma" : "attention_mha_lds_f16_wmma"));
             if (d.attn_i4) stem = tokens >= 20000 ? "attention_i4qkl_mha8_lds_f16_wmma" : (waves_ == 8 ? "attention_i4qk_mha8_lds_f16_wmma" : "attention_i4qk_mha_lds_f16_wmma");   // one workgroup per CU past ~20k rows
-            // tile skip: H3_ATTN_SKIP_TAU=<tau> forces the skip twin (i4qk -> i4qks) at that tau, 'off' disables it; unset -> tau 6 on the
-            // long form (1.13x on the 768 step, no measured velocity cost), off below (nothing at 480p; the idle machinery costs 10-13%)
-            double tau = tokens >= 20000 ? 6.0 : 0.0;
+            // tile skip: H3_ATTN_SKIP_TAU=<tau> selects the skip twin (i4qk -> i4qks) at that tau (tau 4: no measured velocity cost,
+            // about 3% on the 768 step against the carried-scale plain kernel); unset or 'off' -> the plain kernel
+            double tau = 0.0;
             if (const char *v = std::getenv("H3_ATTN_SKIP_TAU")) { std::string sv(v); for (auto &ch : sv) ch = char(tolower(ch)); tau = (sv == "off" || sv == "none" || sv == "0" || sv == "1e30" || sv.empty()) ? 0.0 : std::atof(v); }
             const bool skip = d.attn_i4 && tau > 0.0;
             if (skip) { const size_t at = stem.find("i4qk"); stem.replace(at, 4, "i4qks"); }

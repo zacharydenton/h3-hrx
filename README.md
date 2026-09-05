@@ -104,14 +104,15 @@ is the one attention change on this part with a hardware rate behind it.
 
 **Tile skip and step cache (the levers past 2x).** The int4 kernels have tile-skip twins
 (`attention_i4qks*`: a key tile whose scores sit more than tau below every row's running
-max skips its P.V work, SpargeAttn-style). Measured on the fox clip through the C pipeline:
-1.13x on the 768 step (131 -> 114 s at tau 6, no measured velocity cost), nothing at 480p, and
-the twin's branch machinery costs 10-13% when idle, so the builders use the twin only where a
-tau applies: unset means tau 6 past 20k rows and off below; `H3_ATTN_SKIP_TAU=<tau>` forces
-it, `off` disables it. 30 steps at 768 are about 57 minutes. The first-block step cache
-(`cache_threshold` in `h3pipe_params`, `--cache-threshold` in `tools/pipeline_c.py`) is a
-preview knob, not a default: the first threshold that skips anything (0.10) drops the latent
-cosine to 0.94 and the frames to 16.5 dB against the uncached run (`tools/cache_study.py`).
+max skips its P.V work, SpargeAttn-style). Measured on the fox clip through the C pipeline the
+twin's idle branch machinery costs 10-13% and the skipping wins it back: against the plain
+kernel with its key scale carried one tile ahead, tau 6 is a wash and tau 4 about 3% on the
+768 step, so the plain kernel is the default at every length and `H3_ATTN_SKIP_TAU=4` the
+opt-in (no measured velocity cost). On an idle GPU the 768 step is 110-114 s, so 30 steps at
+768 are about 57 minutes. The first-block step cache (`cache_threshold` in `h3pipe_params`,
+`--cache-threshold` in `tools/pipeline_c.py`) is a preview knob, not a default: the first
+threshold that skips anything (0.10) drops the latent cosine to 0.94 and the frames to
+16.5 dB against the uncached run (`tools/cache_study.py`).
 `H3_PROFILE=1` prints per-stage times after each step (proportions only; the synchronization
 inflates the step), `H3_TRACE=1` prints and synchronizes every launch. Every measured lever,
 won or lost, is in `docs/notes.md`.
@@ -136,7 +137,7 @@ LDS operand reads per multiply of the 128x128 tile), 15-17% faster per stage at 
 ## What to expect
 
 At 480p and 4 s (about 10k rows) a step is about 12 s at the rates krea2-loom reaches on
-this part; at 768p and 5 s (about 37k rows) a step is about 114 s (124 frames, tau 6), attention about 75% of it.
+this part; at 768p and 5 s (about 37k rows) a step is 110-114 s (124 frames), attention about 75% of it.
 Attention, not the int4 GEMMs, is the wall at video lengths.
 
 ## Weights and license
