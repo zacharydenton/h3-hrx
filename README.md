@@ -17,6 +17,33 @@ precomputed once per schedule (13B of the 33B never run at inference). Qwen3-VL-
 the encoder, a causal f16 t4 24-channel video VAE and a 40 Hz audio VAE the tokenizers.
 `docs/notes.md` has the side-by-side with Krea 2 and the FLOP arithmetic.
 
+## Status (2026-09-05, day one)
+
+The 50 blocks run in Loom end to end on a 2097-row fixture built from the real checkpoint
+(32 text rows, a 5-frame 480p-class latent grid, 20 audio latents): every kernel passes
+its test against the reference, and the native stack tracks the reference's W4A4
+arithmetic to a final-layer velocity cosine of 0.994 over all 50 blocks, against 0.978
+for int4 versus the int8 checkpoint itself (`tests/test_blocks.py`). One step of those
+50 blocks takes 2.6 s at that size, 52 ms per block:
+
+| stage | share |
+| --- | ---: |
+| gate/up GEMM with the SwiGLU product | 27% |
+| qkv GEMM | 21% |
+| attention (56 heads, 14.5 TFLOP/s) | 20% |
+| down GEMM with the class-gated residual | 14% |
+| out GEMM with the class-gated residual | 7% |
+| prepare kernels, RoPE | 11% |
+
+Two things H3 needed that Krea 2 did not: an f32 residual stream (H3's passes f16's range
+by block 23 and reaches 3e6 by block 36) and f32 LDS in the prepare kernels (the gate/up
+products reach 5e4 and the unnormalised Hadamard stages overflow f16). The raw residual
+stream is dominated by a few huge channels, so cosines on it mislead deep in the stack;
+the final layer's RMSNorm removes them, which is why the velocity is the metric.
+
+Not yet built: the end-to-end clip (text encoder, VAEs and the sampler around the blocks)
+and the lever loop at video lengths.
+
 ## Plan
 
 1. `reference/h3_ref.py`: the block stack on the checkpoint's names, bit-exact against
@@ -38,10 +65,12 @@ Attention, not the int4 GEMMs, is the wall at video lengths.
 
 ## Weights and license
 
-`scripts/download.sh` fetches the FL2VA partition (66 GB transformer, 64 GB encoder,
-VAEs) into `~/h3-models`. The MiniMax H3 Community License permits open-weight use in
-the USA, EU, UK and South Korea; other regions apply to MiniMax for a licence. Read
-`LICENSE` and `docs/QA-about-License.md` in the checkpoint.
+The blocks are exported from the ComfyUI `pruned_int8_convrot` checkpoint in
+`~/comfy-models` (`tools/export_weights.py`, 9.65 GB of int4): the int8 rows are already
+rotated by the same group-256 regular Hadamard the kernels use, so each row is just
+requantised to int4. `scripts/download.sh` fetches the original bf16 release from
+Hugging Face if it is ever needed. The MiniMax H3 Community License permits open-weight
+use in the USA, EU, UK and South Korea; other regions apply to MiniMax for a licence.
 
 ## Environment
 

@@ -68,3 +68,28 @@ partner quad fetched by `kernel.subgroup.shuffle<index>` from 12 lanes away (the
 lane needs an `index.assume` range before the cast). Two harness lessons: the test harness
 cast every plain input to f32 (an `in_i32` kind was added), and a wrong Hadamard in the
 reference cannot be caught by a test that uses the same reference on both sides.
+
+## Day 0, evening: the stack runs; what int4 costs H3
+
+`tests/test_blocks.py` on the 2097-row fixture, native against the reference:
+
+| blocks | stream update cosine vs W4A4 ref | vs int8 | ref W4A4 vs int8 | final velocity cosine vs W4A4 ref | vs int8 | ref W4A4 vs int8 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.99886 | 0.99275 | 0.99167 | 0.99839 | 0.99377 | 0.99370 |
+| 16 | 0.99824 | 0.99669 | 0.99665 | 0.99957 | 0.99837 | 0.99838 |
+| 50 | 0.93470 | 0.87301 | 0.87548 | 0.99387 | 0.97803 | 0.97860 |
+
+The stream columns collapse past block 24 for every quantisation, the reference's own
+included, because the residual stream carries a few channels at 1e6 against an rms of 1e4
+and the cosine of the update is theirs. The final layer's RMSNorm removes them; on the
+velocity, int4 costs 2.2% of cosine over 50 blocks (Krea 2's 28 blocks cost 2.8% on its
+metric) and the native kernels sit 0.6% from the reference's arithmetic, the f16
+intermediates' share. Stage profile at 2097 rows, 50 blocks, 2.57 s: gate|up 681 ms, qkv
+543, attention 516, down 352, out 187, prepare norm 98, prepare down input 82, rope 57,
+prepare out input 50.
+
+Overflows found the hard way: the f16 residual stream (inf from block ~18) and the f16 LDS
+Hadamard in the plain prepare (the gate|up products reach 5e4; four unnormalised radix-4
+stages multiply the range by 256). Both are f32 now; the gate|up output itself stays f16
+with a 5e4 peak on this fixture against 65504, to be revisited (bf16 storage) if a real
+prompt exceeds it.
