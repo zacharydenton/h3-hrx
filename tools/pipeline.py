@@ -138,7 +138,9 @@ def main() -> None:
 
 def write_clip(video: torch.Tensor, wave: torch.Tensor, out: Path) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
-    frames = ((video[0].float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8).permute(1, 2, 3, 0).cpu().numpy()   # [F, H, W, 3]
+    # the decoder returns ImageNet-normalised pixels (what diffusers' MiniMaxH3 decode block undoes)
+    imstd = torch.tensor((0.229, 0.224, 0.225), device=video.device).view(1, 3, 1, 1, 1); immean = torch.tensor((0.485, 0.456, 0.406), device=video.device).view(1, 3, 1, 1, 1)
+    frames = ((video.float() * imstd + immean).clamp(0, 1)[0] * 255).round().to(torch.uint8).permute(1, 2, 3, 0).cpu().numpy()   # [F, H, W, 3]
     f, h, w, _ = frames.shape
     wav = wave.float().cpu().reshape(-1, wave.shape[-1]).T.contiguous().numpy()        # [samples, 2]
     pcm = (np.clip(wav, -1, 1) * 32767).astype(np.int16)

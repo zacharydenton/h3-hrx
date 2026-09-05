@@ -11,7 +11,7 @@ from h3pipe_loom import H3Pipe
 
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("--prompt-file", default=None); ap.add_argument("--step", action="store_true", help="one denoising step vs the Python pipeline"); ap.add_argument("--attrib", action="store_true", help="also the Python step with the C path's int8 numerics per stage")
+    ap = argparse.ArgumentParser(); ap.add_argument("--prompt-file", default=None); ap.add_argument("--step", action="store_true", help="one denoising step vs the Python pipeline"); ap.add_argument("--attrib", action="store_true", help="also the Python step with the C path's int8 numerics per stage"); ap.add_argument("--decode", action="store_true", help="the C video decoder vs tools/decode_loom.py on the fox latents (first 22 frames)")
     ap.add_argument("--height", type=int, default=480); ap.add_argument("--width", type=int, default=864); ap.add_argument("--frames", type=int, default=22); a = ap.parse_args()
     pf = Path(a.prompt_file) if a.prompt_file else min((Path(p) for p in glob.glob(str(ROOT / "build/prompts/*.pt"))), key=lambda p: p.stat().st_size)
     prompt = torch.load(pf); ids = prompt["ids"].numpy().astype(np.int32); print(f"prompt {prompt['prompt'][:60]!r}: {ids.size} tokens")
@@ -26,6 +26,8 @@ def main():
     ok &= c > 0.999
     if a.step or a.attrib:
         ok &= denoise_step(pipe, prompt, ids, a)
+    if a.decode:
+        ok &= decode_video(pipe, a)
     pipe.close()
     return 0 if ok else 1
 
@@ -49,6 +51,34 @@ def w8a8(x, w_rot, b, kpad=None):
     s = xr.abs().amax(dim=1, keepdim=True).clamp_min(1e-30) / 127.0
     xq = (xr / s).round().clamp(-127, 127) * s
     return xq @ w_rot.T + b
+
+
+def decode_video(pipe, a):
+    """The C decoder (chunking, heads, blending, ImageNet mapping) vs the Python Loom decoder on the same latents."""
+    import math
+    from diffusers import AutoencoderKLMiniMaxH3
+    from pipeline import MODELS
+    from decode_loom import LoomClipDecoder
+    dev = "cuda"; fx = torch.load(ROOT / "build/fox_480p_5s_latents.pt"); frames = 22
+    p = H3Pipe.params(height=480, width=864, frames=frames, steps=2); sh = pipe.shape(p)
+    z = fx["video"][0, :, :sh.latent_t].float().numpy()
+    t0 = time.time(); got = pipe.decode_video(p, z); print(f"  C decode {frames} frames in {time.time() - t0:.1f} s")
+    vae = AutoencoderKLMiniMaxH3.from_pretrained(str(MODELS / "vae"), torch_dtype=torch.float32).to(dev).eval(); vae.disable_tiling()
+    mean = torch.tensor(vae.config.latents_mean, device=dev).view(1, -1, 1, 1, 1); std = torch.tensor(vae.config.latents_std, device=dev).view(1, -1, 1, 1, 1)
+    vae._decode_clip = LoomClipDecoder(vae, weights=str(ROOT / "build/weights_vae_i8"), bits=8)
+    with torch.no_grad():
+        t0 = time.time(); video = vae._decode(torch.from_numpy(z)[None].to(dev) * std + mean); torch.cuda.synchronize(); print(f"  Python Loom decode in {time.time() - t0:.1f} s")
+    imstd = torch.tensor((0.229, 0.224, 0.225), device=dev).view(1, 3, 1, 1, 1); immean = torch.tensor((0.485, 0.456, 0.406), device=dev).view(1, 3, 1, 1, 1)
+    want = ((video.float() * imstd + immean).clamp(0, 1)[0] * 255).round().to(torch.uint8).permute(1, 2, 3, 0).cpu().numpy()
+    assert got.shape == want.shape, (got.shape, want.shape)
+    mse = float(((got.astype(np.float32) - want.astype(np.float32)) ** 2).mean()); psnr = 10 * math.log10(255.0 ** 2 / max(mse, 1e-9))
+    print(f"  {'PASS' if psnr > 35 else 'FAIL'} C video decoder vs Python Loom decoder: PSNR {psnr:.2f} dB over {got.shape[0]} frames (max abs {np.abs(got.astype(int) - want.astype(int)).max()})")
+    try:
+        import imageio.v2 as iio
+        strip = np.concatenate([got[2], got[11], got[21]], axis=1); iio.imwrite(str(ROOT / "build/pipe_decode_strip.jpg"), strip)
+    except Exception: pass
+    del vae; torch.cuda.empty_cache()
+    return psnr > 35
 
 
 def denoise_step(pipe, prompt, ids, a):

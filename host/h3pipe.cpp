@@ -41,6 +41,9 @@ constexpr int TEXT_DIM = 5120, VIDEO_PATCH = 96, AUDIO_CH = 32, KPAD = 256, FINA
 constexpr int CLASSES = 12, MODALITIES = 3, MODS_ROWS = 6 * CLASSES;      // the AdaLN table rows per layer
 constexpr int TE_HID = 5120, TE_HEADS = 64, TE_KV = 8, TE_FFN = 25600, TE_ROPE_HALF = 64;
 constexpr int LATENT_CH = 24, FPS = 24, AUDIO_LATENTS_PER_S = 40;
+constexpr int VAE_HID = 2048, VAE_HEADS = 32, VAE_D = 64, VAE_FFN = 8192, VAE_ROPE_HALF = 24, VAE_PT = 4, VAE_PS = 16, VAE_OUT = 3 * VAE_PT * VAE_PS * VAE_PS, VAE_REG = 4;
+constexpr int VAE_CHUNK = 5, VAE_OVERLAP = 2, VAE_TOKEN_DROP = 3, VAE_TRATIO = 4, VAE_CLIP = 17;   // tokens_chunk_size, token_overlap, token_drop, temporal ratio, clip_length
+constexpr float IMAGENET_MEAN[3] = {0.485f, 0.456f, 0.406f}, IMAGENET_STD[3] = {0.229f, 0.224f, 0.225f};
 constexpr double FRAME_RESCALE = 5.0 / 3.0, SPATIAL_SCALE = 32.0;
 constexpr int FRAME_PER_TOKEN[5] = {1, 4, 4, 4, 4};
 constexpr int THREADS = 256;
@@ -405,7 +408,7 @@ public:
         HIP_CHECK(hipMalloc(&mods_, size_t(50) * MODS_ROWS * HID * 4));
         HIP_CHECK(hipMalloc(&final_table_, size_t(4) * HID * 4));
     }
-    ~Pipe() { for (void *p : {ones_, zeros_, mods_, final_table_, x_, cls_, cls0_, tcls_, cos_, sin_, in16_, a_q_, a_s_, out16_, text_copy_, ref_cos_, ref_sin_, te_x_, te_cos_, te_sin_, te_cls_}) if (p) (void)hipFree(p); }
+    ~Pipe() { for (void *p : {ones_, zeros_, mods_, final_table_, x_, cls_, cls0_, tcls_, cos_, sin_, in16_, a_q_, a_s_, out16_, text_copy_, ref_cos_, ref_sin_, te_x_, te_cos_, te_sin_, te_cls_, vx_, vcos_, vsin_, vin16_, va_q_, va_s_, vout16_, vcls_, vnorm_table_}) if (p) (void)hipFree(p); }
 
     Profile prof;
 
@@ -586,11 +589,122 @@ public:
     }
     struct Cancelled {};
 
+    // --- the video decoder: diffusers' chunking and heads around the 36 blocks in Loom ---
+    // one clip: model-space latents z [24][ft][h][w] (already * std + mean) -> ImageNet-space frames [3][ft*4][h*16][w*16]
+    void decode_clip(const float *z, int ft, int h, int w, std::vector<float> &frames) {
+        const size_t N = size_t(ft) * h * w, NT = N + VAE_REG + 1;
+        if (!vae_blob_.dev) { if (vae_dir_.empty()) throw std::invalid_argument("vae_dir is required for video decoding"); vae_blob_.open(vae_dir_); }
+        if (!vae_ || vae_->tokens() != NT) {
+            vae_.reset(); vae_ = std::make_unique<Stack>(comp_, StackDims{VAE_HID, VAE_HEADS, VAE_HEADS, VAE_D, VAE_FFN, 48, 1, vae_bits_, 1e-5f, true, false, false}, NT, 36, vae_blob_, "blocks.%d.", false, (const float *)ones_);
+            for (void *q : {vx_, vcos_, vsin_, vin16_, va_q_, va_s_, vout16_, vcls_}) if (q) (void)hipFree(q);
+            const size_t T = vae_->capacity();
+            HIP_CHECK(hipMalloc(&vx_, T * VAE_HID * 4)); HIP_CHECK(hipMemset(vx_, 0, T * VAE_HID * 4));
+            HIP_CHECK(hipMalloc(&vcos_, T * VAE_ROPE_HALF * 4)); HIP_CHECK(hipMalloc(&vsin_, T * VAE_ROPE_HALF * 4));
+            HIP_CHECK(hipMalloc(&vin16_, T * KPAD * 2)); HIP_CHECK(hipMemset(vin16_, 0, T * KPAD * 2));
+            HIP_CHECK(hipMalloc(&va_q_, T * VAE_HID)); HIP_CHECK(hipMalloc(&va_s_, T * 4));
+            HIP_CHECK(hipMalloc(&vout16_, T * VAE_OUT * 2)); HIP_CHECK(hipMalloc(&vcls_, T * 4)); HIP_CHECK(hipMemset(vcls_, 0, T * 4));
+            // the rotary tables: coordinates 2 * ((i + 0.5) / size) - 1 per axis, angles 2 pi * pos * inv_freq (8 frequencies per axis), zero for the register / cls rows
+            std::vector<float> c(T * VAE_ROPE_HALF, 1.0f), s(T * VAE_ROPE_HALF, 0.0f);
+            const int sizes[3] = {ft, h, w};
+            for (int t = 0; t < ft; ++t) for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
+                const size_t r = (size_t(t) * h + y) * w + x; const int idx[3] = {t, y, x};
+                for (int ax = 0; ax < 3; ++ax) for (int j = 0; j < 8; ++j) {
+                    const double pos = 2.0 * ((idx[ax] + 0.5) / sizes[ax]) - 1.0, inv = std::pow(100.0, -double(j) * 6.0 / 48.0), ang = 2.0 * M_PI * pos * inv;
+                    c[r * VAE_ROPE_HALF + ax * 8 + j] = float(std::cos(ang)); s[r * VAE_ROPE_HALF + ax * 8 + j] = float(std::sin(ang)); } }
+            HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)vcos_, c.data(), c.size() * 4)); HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)vsin_, s.data(), s.size() * 4));
+            vproj_in_prep_.build(comp_, "plain", 8, KPAD); vproj_in_.build(comp_, "resid", 8, true, true, KPAD, VAE_HID, N, 1);
+            vnorm_out_.build(comp_, "lnorm", 8, VAE_HID, 1e-5f, 1); vproj_out_.build(comp_, "plain", 8, true, true, VAE_HID, VAE_OUT, NT);
+            if (!vnorm_table_) { HIP_CHECK(hipMalloc(&vnorm_table_, size_t(2) * VAE_HID * 4)); HIP_CHECK(hipMemset(vnorm_table_, 0, size_t(VAE_HID) * 4));
+                HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)((float *)vnorm_table_ + VAE_HID), (hipDeviceptr_t)glue_.at("vae.norm_out.b", size_t(VAE_HID) * 4), size_t(VAE_HID) * 4)); }
+        }
+        // post_quant_conv (a 24x24 matrix per voxel) on the host, then the tokens padded to K = 256 in f16
+        static std::vector<float> pq_w, pq_b; if (pq_w.empty()) { pq_w = glue_.host_f32("vae.post_quant_conv.w", 24 * 24); pq_b = glue_.host_f32("vae.post_quant_conv.b", 24); }
+        std::vector<uint16_t> in16(N * KPAD, 0);
+        for (size_t v = 0; v < N; ++v) for (int o = 0; o < LATENT_CH; ++o) { float acc = pq_b[o]; for (int i = 0; i < LATENT_CH; ++i) acc += pq_w[o * 24 + i] * z[size_t(i) * N + v]; in16[v * KPAD + o] = f32_to_f16(acc); }
+        HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)vin16_, in16.data(), in16.size() * 2));
+        vproj_in_prep_.run(&prof, "vae proj_in", unsigned(N), vin16_, nullptr, nullptr, nullptr, va_q_, va_s_);
+        HIP_CHECK(hipMemset(vx_, 0, NT * VAE_HID * 4));
+        vproj_in_.run(&prof, "vae proj_in", unsigned(N), va_q_, glue_.at("vae.proj_in.q", size_t(VAE_HID) * KPAD), glue_.at("vae.proj_in.s", size_t(VAE_HID) * 4), va_s_, vx_, ones_, vcls_, glue_.at("vae.proj_in.b", size_t(VAE_HID) * 4));
+        HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)((float *)vx_ + N * VAE_HID), (hipDeviceptr_t)glue_.at("vae.register_tokens", size_t(VAE_REG) * VAE_HID * 4), size_t(VAE_REG) * VAE_HID * 4));   // then a zero cls row
+        vae_->forward(&prof, vx_, vcls_, vcos_, vsin_, [&](int i) { const Stack::Block &b = vae_->block(i); return LayerCond{(const float *)zeros_, (const float *)b.scale1, (const float *)zeros_, (const float *)b.scale2}; });
+        vnorm_out_.run(&prof, "vae norm_out", unsigned(NT), vx_, glue_.at("vae.norm_out.w", size_t(VAE_HID) * 4), vnorm_table_, vcls_, va_q_, va_s_);
+        vproj_out_.run(&prof, "vae proj_out", unsigned(NT), va_q_, glue_.at("vae.proj_out.q", size_t(VAE_OUT) * VAE_HID), glue_.at("vae.proj_out.s", size_t(VAE_OUT) * 4), va_s_, vout16_, nullptr, nullptr, glue_.at("vae.proj_out.b", size_t(VAE_OUT) * 4));
+        std::vector<uint16_t> out16(N * VAE_OUT); HIP_CHECK(hipDeviceSynchronize()); HIP_CHECK(hipMemcpyDtoH(out16.data(), (hipDeviceptr_t)vout16_, out16.size() * 2));
+        // unpatchify: token (t, y, x) holds [3][4][16][16] -> frames [3][ft*4][h*16][w*16]
+        const size_t FH = size_t(h) * VAE_PS, FW = size_t(w) * VAE_PS, FT = size_t(ft) * VAE_PT;
+        frames.assign(size_t(3) * FT * FH * FW, 0.0f);
+        for (int t = 0; t < ft; ++t) for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
+            const uint16_t *tok = out16.data() + ((size_t(t) * h + y) * w + x) * VAE_OUT;
+            for (int c = 0; c < 3; ++c) for (int pt = 0; pt < VAE_PT; ++pt) for (int py = 0; py < VAE_PS; ++py) for (int px = 0; px < VAE_PS; ++px)
+                frames[((size_t(c) * FT + size_t(t) * VAE_PT + pt) * FH + size_t(y) * VAE_PS + py) * FW + size_t(x) * VAE_PS + px] = f16_to_f32(tok[((size_t(c) * VAE_PT + pt) * VAE_PS + py) * VAE_PS + px]);
+        }
+    }
+
+    // the clip loop of diffusers' _decode: 5-token chunks with a 2-token overlap, 17 kept frames per chunk (3 dropped in front), 5-frame cross-fades
+    void decode_video(const h3pipe_params &p, const float *latents, uint8_t *out) {
+        h3pipe_shape sh; h3pipe_shape_for(&p, &sh);
+        const int T = sh.latent_t, H = sh.lat_h, W = sh.lat_w, F = sh.frames;
+        const size_t FH = size_t(H) * VAE_PS, FW = size_t(W) * VAE_PS, plane = FH * FW;
+        std::vector<float> lmean = glue_.host_f32("vae.latents_mean", 24), lstd = glue_.host_f32("vae.latents_std", 24);
+        const int num_tokens = T + VAE_TOKEN_DROP, pad_tokens = ((-num_tokens) % VAE_CHUNK + VAE_CHUNK) % VAE_CHUNK, num_chunks = (num_tokens + pad_tokens) / VAE_CHUNK - 1;
+        const int Tp = T + pad_tokens;
+        std::vector<float> zp(size_t(LATENT_CH) * Tp * H * W);
+        for (int c = 0; c < LATENT_CH; ++c) for (int t = 0; t < Tp; ++t) for (size_t i = 0; i < size_t(H) * W; ++i)
+            zp[(size_t(c) * Tp + t) * H * W + i] = latents[(size_t(c) * T + std::min(t, T - 1)) * H * W + i] * lstd[c] + lmean[c];
+        const int chunk_frames = VAE_CHUNK * VAE_TRATIO, pre = ((-VAE_CLIP) % VAE_TRATIO + VAE_TRATIO) % VAE_TRATIO, overlap_frames = std::max(VAE_OVERLAP * VAE_TRATIO - pre, 0);
+        std::vector<float> dec; std::vector<float> overlap; bool have_overlap = false;   // dec: [3][frames][H][W] accumulated
+        size_t dec_frames = 0;
+        auto append = [&](const std::vector<float> &chunk, size_t nf, size_t src_ft) {
+            const size_t old = dec_frames; dec.resize(size_t(3) * (old + nf) * plane);
+            std::vector<float> tmp(size_t(3) * (old + nf) * plane);
+            for (int c = 0; c < 3; ++c) { memcpy(tmp.data() + size_t(c) * (old + nf) * plane, dec.data() + size_t(c) * old * plane, old * plane * 4); memcpy(tmp.data() + (size_t(c) * (old + nf) + old) * plane, chunk.data() + size_t(c) * src_ft * plane, nf * plane * 4); }
+            dec.swap(tmp); dec_frames = old + nf;
+        };
+        std::vector<float> clip, chunk;
+        for (int i = 0; i < num_chunks; ++i) {
+            const int start = i * VAE_CHUNK, ft = std::min(VAE_CHUNK + VAE_OVERLAP, Tp - start);
+            std::vector<float> z(size_t(LATENT_CH) * ft * H * W);
+            for (int c = 0; c < LATENT_CH; ++c) memcpy(z.data() + size_t(c) * ft * H * W, zp.data() + (size_t(c) * Tp + start) * H * W, size_t(ft) * H * W * 4);
+            decode_clip(z.data(), ft, H, W, clip);
+            const size_t clip_frames = size_t(ft) * VAE_TRATIO;
+            for (int j = 0; j < 2; ++j) {
+                const size_t f0 = size_t(j) * chunk_frames + pre, f1 = std::min(size_t(j + 1) * chunk_frames, clip_frames);
+                if (f0 >= f1) { if (j == 1) have_overlap = false; continue; }
+                const size_t nf = f1 - f0;
+                chunk.assign(size_t(3) * nf * plane, 0.0f);
+                for (int c = 0; c < 3; ++c) memcpy(chunk.data() + size_t(c) * nf * plane, clip.data() + (size_t(c) * clip_frames + f0) * plane, nf * plane * 4);
+                if (j == 0) {
+                    if (have_overlap) {       // cross-fade the overlap's tail into the chunk's head
+                        const size_t ov = overlap.size() / (3 * plane), be = std::min(std::min(ov, nf), size_t(overlap_frames));
+                        for (int c = 0; c < 3; ++c) for (size_t k = 0; k < be; ++k) { const float wb = float(k) / be, wa = 1.0f - wb;
+                            float *dst = chunk.data() + (size_t(c) * nf + k) * plane; const float *src = overlap.data() + (size_t(c) * ov + ov - be + k) * plane;
+                            for (size_t q = 0; q < plane; ++q) dst[q] = wa * src[q] + wb * dst[q]; }
+                    }
+                    append(chunk, nf, nf);
+                } else { overlap = chunk; have_overlap = true; }
+            }
+        }
+        if (have_overlap) append(overlap, overlap.size() / (3 * plane), overlap.size() / (3 * plane));
+        size_t keep = dec_frames;
+        if (pad_tokens > 0) {
+            const int intra_tail = VAE_CLIP % VAE_TRATIO; size_t pad_frames = 0;
+            for (int k = 0; k < pad_tokens; ++k) pad_frames += (intra_tail && (T + k) % VAE_CHUNK == 0) ? size_t(intra_tail) : size_t(VAE_TRATIO);
+            keep = dec_frames - pad_frames;
+        }
+        if (keep != size_t(F)) throw std::runtime_error("decoded " + std::to_string(keep) + " frames, expected " + std::to_string(F));
+        for (size_t f = 0; f < keep; ++f) for (size_t q = 0; q < plane; ++q) for (int c = 0; c < 3; ++c) {
+            const float v = dec[(size_t(c) * dec_frames + f) * plane + q] * IMAGENET_STD[c] + IMAGENET_MEAN[c];
+            out[(f * plane + q) * 3 + c] = uint8_t(std::lround(std::min(std::max(v, 0.0f), 1.0f) * 255.0f));
+        }
+    }
+
 private:
     Compiler comp_;
     Blob glue_, blocks_, te_blob_; Span embed_; std::string te_dir_, vae_dir_; int vae_bits_ = 8;
     std::vector<float> curve_, inv_freq_, final_w_, final_b_; std::vector<std::vector<float>> adaln_w_, adaln_b_;
-    std::unique_ptr<Stack> te_, refiner_, dit_;
+    std::unique_ptr<Stack> te_, refiner_, dit_, vae_; Blob vae_blob_;
+    Prepare vproj_in_prep_, vnorm_out_; Gemm vproj_in_, vproj_out_;
+    void *vx_ = nullptr, *vcos_ = nullptr, *vsin_ = nullptr, *vin16_ = nullptr, *va_q_ = nullptr, *va_s_ = nullptr, *vout16_ = nullptr, *vcls_ = nullptr, *vnorm_table_ = nullptr;
     std::map<std::string, Prepare> prepares_; std::map<std::string, Gemm> gemms_; Prepare final_prep_;
     std::shared_ptr<Kernel> norm_f32_;
     size_t seq_cap_ = 0;
@@ -649,8 +763,14 @@ extern "C" int h3pipe_denoise(h3pipe_session *s, const int32_t *ids, int n, cons
     })
 }
 
-extern "C" int h3pipe_decode_video(h3pipe_session *, const h3pipe_params *, const float *, size_t, uint8_t *, size_t, char *error, size_t cap) {
-    write_error(error, cap, "video decode: not yet in this library"); return H3PIPE_ERROR;
+extern "C" int h3pipe_decode_video(h3pipe_session *s, const h3pipe_params *params, const float *latents, size_t video_elements, uint8_t *frames, size_t frame_bytes, char *error, size_t cap) {
+    GUARD({
+        if (!s || !params || !latents || !frames) throw std::invalid_argument("session, params, latents and frames are required");
+        h3pipe_shape sh; h3pipe_shape_for(params, &sh);
+        if (video_elements != size_t(LATENT_CH) * sh.latent_t * sh.lat_h * sh.lat_w) throw std::invalid_argument("video_latents must hold 24 * latent_t * lat_h * lat_w floats");
+        if (frame_bytes != size_t(sh.frames) * params->height * params->width * 3) throw std::invalid_argument("frames must hold frames * height * width * 3 bytes");
+        std::lock_guard<std::mutex> lock(s->mutex); s->value.decode_video(*params, latents, frames);
+    })
 }
 extern "C" int h3pipe_decode_audio(h3pipe_session *, const float *, size_t, int, float *, size_t, char *error, size_t cap) {
     write_error(error, cap, "audio decode: not yet in this library"); return H3PIPE_ERROR;
