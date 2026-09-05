@@ -134,6 +134,8 @@ def denoise_step(pipe, prompt, ids, a):
             if name.startswith("perturbed"):
                 g = torch.Generator(dev).manual_seed(7); x = x.float(); x = x + torch.randn(x.shape, generator=g, device=dev) * x.abs() * (0.004 if "0.4" in name else 0.001)
             y = blocks.forward(x, rows, mods, cos, sin).to(dev)
+            bad = ~torch.isfinite(y).all(1)
+            if bad.any(): print(f"    [{name}] Python session: {int(bad.sum())} non-finite rows, first {bad.nonzero().flatten()[:6].tolist()} (text {layout.text_len}, audio {layout.audio_rows}, video {layout.video_rows}); x max {x.float().abs().max():.3g}")
             if q_final:
                 fm = ref.final_mods(temb)[tclass]
                 h = R.rms_norm(y, ref.t("final_layer.norm.weight"), ref.eps) * (1.0 + fm[:, 1].to(y.dtype)) + fm[:, 0].to(y.dtype)

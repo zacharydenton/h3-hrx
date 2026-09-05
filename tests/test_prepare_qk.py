@@ -35,7 +35,7 @@ def main():
     with workdir() as tmp:
         tmp = Path(tmp); hs = tmp / "pqk.hsaco"; ns, sym = "h3.prepare_qk_i4", "h3_prepare_qk_i4"
         compile_kernel(ROOT / "kernels/prepare_qk_i4.loom", sym, {f"{ns}.row_stride": HEADS * D, f"{ns}.head_offset": 0, f"{ns}.heads": HEADS, f"{ns}.extra_scale": extra}, hs)
-        (codes, scales), t = launch(hs, sym, ((T * HEADS + 7) // 8, 1, 1), (256, 1, 1),
+        (codes, scales), t = launch(hs, sym, (T, 1, 1), (256, 1, 1),
                                     [("i32", T), ("in_f16", x.numpy()), ("in", mean.numpy()), ("out", ((T, HEADS * 16), np.int32)), ("out", ((T, HEADS), np.float32))], tmp, repeat=1)
     same = np.array_equal(codes, want_codes.numpy()); differ = (codes != want_codes.numpy()).mean()
     print(f"  {'PASS' if differ < 2e-3 else 'FAIL'} prepare_qk_i4 codes: {differ * 100:.4f}% words differ (rounding ties)  {t['per_launch_us'] / 1e3:.3f} ms")

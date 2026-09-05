@@ -188,9 +188,12 @@ private:
 
     void launch(Kernel &k, const char *stage, unsigned gx, unsigned gy, unsigned bx, KernArgs &args) {
         std::chrono::steady_clock::time_point t0;
+        static const bool trace = std::getenv("H3_TRACE") != nullptr;
+        if (trace) { fprintf(stderr, "launch %s grid %u x %u block %u\n", stage, gx, gy, bx); fflush(stderr); }
         if (profile) { HIP_CHECK(hipDeviceSynchronize()); t0 = std::chrono::steady_clock::now(); }
         void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, args.bytes, HIP_LAUNCH_PARAM_BUFFER_SIZE, &args.size, HIP_LAUNCH_PARAM_END};
         HIP_CHECK(hipModuleLaunchKernel(k.function, gx, gy, 1, bx, 1, 1, 0, nullptr, nullptr, config));
+        if (trace) HIP_CHECK(hipDeviceSynchronize());
         if (profile) {
             HIP_CHECK(hipDeviceSynchronize());
             stage_us[stage] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
@@ -229,9 +232,9 @@ private:
         const unsigned qblock = 16 * unsigned(attn_waves_);
         if (attn_i4_) {
             { KernArgs a; a.scalar_i32(T); a.pointer(k_); a.pointer(kmean_); launch(k_colmean_, "attention operands", INNER / 256, 1, THREADS, a); }
-            const unsigned pgroups = (T * HEADS + 7) / 8;
-            { KernArgs a; a.scalar_i32(T); a.pointer(q_); a.pointer(zmean_); a.pointer(qi_); a.pointer(qs_); launch(k_prep_q_, "attention operands", pgroups, 1, THREADS, a); }
-            { KernArgs a; a.scalar_i32(T); a.pointer(k_); a.pointer(kmean_); a.pointer(ki_); a.pointer(ks_); launch(k_prep_k_, "attention operands", pgroups, 1, THREADS, a); }
+            { KernArgs a; a.scalar_i32(T); a.pointer(q_); a.pointer(zmean_); a.pointer(qi_); a.pointer(qs_); launch(k_prep_q_, "attention operands", T, 1, THREADS, a); }
+            static const bool smooth = !(std::getenv("H3_KSMOOTH") && std::string(std::getenv("H3_KSMOOTH")) == "0");
+            { KernArgs a; a.scalar_i32(T); a.pointer(k_); a.pointer(smooth ? kmean_ : zmean_); a.pointer(ki_); a.pointer(ks_); launch(k_prep_k_, "attention operands", T, 1, THREADS, a); }
             { KernArgs a; a.scalar_i32(T); a.scalar_i32(HEADS); a.pointer(qi_); a.pointer(qs_); a.pointer(ki_); a.pointer(ks_); a.pointer(v_); a.pointer(attn_);
               launch(k_attention_, "attention", (T + qblock - 1) / qblock, HEADS, 32 * unsigned(attn_waves_), a); }
         } else {

@@ -255,7 +255,7 @@ struct Gemm {
 
 // --- the generic transformer stack -----------------------------------------------------------
 struct StackDims {
-    int hidden, heads, kv_heads, head_dim, ffn, rope_dim, classes, bits; float eps; bool bias, gate_first, causal;
+    int hidden, heads, kv_heads, head_dim, ffn, rope_dim, classes, bits; float eps; bool bias, gate_first, causal; bool attn_i4 = false;   // attn_i4: QK^T in int4 (prepare_qk_i4 operands)
     int inner() const { return heads * head_dim; }
     int kv_inner() const { return kv_heads * head_dim; }
     int qkv() const { return inner() + 2 * kv_inner(); }
@@ -296,8 +296,16 @@ public:
             const std::string ns = "h3." + stem + ".";
             rope_ = c.get(stem, "h3_" + stem, {{ns + "row_stride", std::to_string(d.qkv())}, {ns + "heads", std::to_string(d.heads)}, {ns + "kv_heads", std::to_string(d.kv_heads)}, {ns + "k_offset", std::to_string(d.inner())}, {ns + "eps", num(d.eps)}});
         }
+        if (d.attn_i4) {
+            if (d.causal || d.head_dim != 128) throw std::runtime_error("int4 QK^T attention: MHA with head 128 only");
+            const std::string pq = "h3.prepare_qk_i4.";
+            colmean_ = c.get("colmean_f32", "h3_colmean_f32", {{"h3.colmean_f32.width", std::to_string(d.inner())}});
+            prep_q_ = c.get("prepare_qk_i4", "h3_prepare_qk_i4", {{pq + "row_stride", std::to_string(d.inner())}, {pq + "head_offset", "0"}, {pq + "heads", std::to_string(d.heads)}, {pq + "extra_scale", num(1.0 / std::sqrt(double(d.head_dim)) / 128.0)}});
+            prep_k_ = c.get("prepare_qk_i4", "h3_prepare_qk_i4", {{pq + "row_stride", std::to_string(d.inner())}, {pq + "head_offset", "0"}, {pq + "heads", std::to_string(d.heads)}, {pq + "extra_scale", "1"}});
+        }
         {
             std::string stem = d.causal ? "attention_gqa8c_lds_f16_wmma" : (d.head_dim == 64 ? (waves_ == 8 ? "attention_mha648_lds_f16_wmma" : "attention_mha64_lds_f16_wmma") : (waves_ == 8 ? "attention_mha8_lds_f16_wmma" : "attention_mha_lds_f16_wmma"));
+            if (d.attn_i4) stem = waves_ == 8 ? "attention_i4qk_mha8_lds_f16_wmma" : "attention_i4qk_mha_lds_f16_wmma";
             const std::string ns = "h3." + stem + ".";
             attention_ = c.get(stem, "h3_" + stem, {{ns + "q_stride", std::to_string(d.inner())}, {ns + "kv_stride", std::to_string(d.kv_inner())}, {ns + "tokens", std::to_string(tokens)}, {ns + "token_capacity", std::to_string(capacity_)}, {ns + "scale", num(1.0 / std::sqrt(double(d.head_dim)))}, {ns + "out_stride", std::to_string(d.inner())}});
         }
@@ -311,8 +319,14 @@ public:
         HIP_CHECK(hipMalloc(&attn_, T * size_t(d.inner()) * 2));
         HIP_CHECK(hipMalloc(&gu_, T * size_t(d.ffn) * 2));
         for (auto p : {fused_, q_, k_, v_, attn_}) HIP_CHECK(hipMemset(p, 0, T * size_t(p == fused_ ? d.qkv() : (p == q_ || p == attn_ ? d.inner() : d.kv_inner())) * 2));
+        if (d.attn_i4) {
+            HIP_CHECK(hipMalloc(&qi_, T * size_t(d.heads) * 64)); HIP_CHECK(hipMalloc(&ki_, T * size_t(d.heads) * 64)); HIP_CHECK(hipMalloc(&qs_, T * size_t(d.heads) * 4)); HIP_CHECK(hipMalloc(&ks_, T * size_t(d.heads) * 4));
+            HIP_CHECK(hipMalloc(&kmean_, size_t(d.inner()) * 4)); HIP_CHECK(hipMalloc(&zmean_, size_t(d.inner()) * 4)); HIP_CHECK(hipMemset(zmean_, 0, size_t(d.inner()) * 4));
+            for (auto p : {qi_, ki_}) HIP_CHECK(hipMemset(p, 0, T * size_t(d.heads) * 64));
+            for (auto p : {qs_, ks_}) HIP_CHECK(hipMemset(p, 0, T * size_t(d.heads) * 4));
+        }
     }
-    ~Stack() { for (void *p : {a_q_, a_s_, fused_, q_, k_, v_, attn_, gu_}) if (p) (void)hipFree(p); }
+    ~Stack() { for (void *p : {a_q_, a_s_, fused_, q_, k_, v_, attn_, gu_, qi_, ki_, qs_, ks_, kmean_, zmean_}) if (p) (void)hipFree(p); }
     size_t capacity() const { return capacity_; }
     size_t tokens() const { return tokens_; }
     const std::vector<struct Block_> *dummy = nullptr;
@@ -328,7 +342,14 @@ public:
             prep_norm_.run(prof, "prepare norm", T, x, b.norm1, lc.table_msa, cls, a_q_, a_s_);
             gemm_qkv_.run(prof, "gemm qkv", T, a_q_, b.qkv_q, b.qkv_s, a_s_, fused_, nullptr, nullptr, b.qkv_b);
             { KernArgs a; a.i32(int(T)).ptr(fused_).ptr(b.qnorm).ptr(b.knorm).ptr(cos).ptr(sin).ptr(q_).ptr(k_).ptr(v_); launch(*rope_, prof, "qk norm + rope", T, 1, THREADS, a); }
-            { KernArgs a; a.i32(int(T)).i32(d_.causal ? d_.kv_heads : d_.heads).ptr(q_).ptr(k_).ptr(v_).ptr(attn_);
+            if (d_.attn_i4) {
+                { KernArgs a; a.i32(int(T)).ptr(k_).ptr(kmean_); launch(*colmean_, prof, "attention operands", unsigned(d_.inner() / 256), 1, THREADS, a); }
+                { KernArgs a; a.i32(int(T)).ptr(q_).ptr(zmean_).ptr(qi_).ptr(qs_); launch(*prep_q_, prof, "attention operands", T, 1, THREADS, a); }
+                { KernArgs a; a.i32(int(T)).ptr(k_).ptr(kmean_).ptr(ki_).ptr(ks_); launch(*prep_k_, prof, "attention operands", T, 1, THREADS, a); }
+                KernArgs a; a.i32(int(T)).i32(d_.heads).ptr(qi_).ptr(qs_).ptr(ki_).ptr(ks_).ptr(v_).ptr(attn_);
+                const unsigned qb = 16 * unsigned(waves_); launch(*attention_, prof, "attention", (T + qb - 1) / qb, unsigned(d_.heads), 32 * unsigned(waves_), a);
+            } else {
+              KernArgs a; a.i32(int(T)).i32(d_.causal ? d_.kv_heads : d_.heads).ptr(q_).ptr(k_).ptr(v_).ptr(attn_);
               if (d_.causal) launch(*attention_, prof, "attention", (T + 15) / 16, unsigned(d_.kv_heads), THREADS, a);
               else { const unsigned qb = 16 * unsigned(waves_); launch(*attention_, prof, "attention", (T + qb - 1) / qb, unsigned(d_.heads), 32 * unsigned(waves_), a); } }
             prep_attn_.run(prof, "prepare out input", T, attn_, nullptr, nullptr, nullptr, a_q_, a_s_);
@@ -345,8 +366,9 @@ private:
     std::vector<Block> blocks_;
     Prepare prep_norm_, prep_attn_, prep_down_;
     Gemm gemm_qkv_, gemm_gu_, gemm_out_, gemm_down_;
-    std::shared_ptr<Kernel> rope_, attention_;
-    void *a_q_ = nullptr, *a_s_ = nullptr, *fused_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *attn_ = nullptr, *gu_ = nullptr;
+    std::shared_ptr<Kernel> rope_, attention_, colmean_, prep_q_, prep_k_;
+    void *a_q_ = nullptr, *a_s_ = nullptr, *fused_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *attn_ = nullptr, *gu_ = nullptr,
+         *qi_ = nullptr, *ki_ = nullptr, *qs_ = nullptr, *ks_ = nullptr, *kmean_ = nullptr, *zmean_ = nullptr;
 };
 
 // --- the packed sequence layout (reference/h3_ref.py Layout) --------------------------------
@@ -539,7 +561,9 @@ public:
         { std::vector<float> c(S * ROPE_HALF), s(S * ROPE_HALF);
           for (size_t r = 0; r < S; ++r) for (int ax = 0; ax < 3; ++ax) for (int j = 0; j < 16; ++j) { const float ang = float(lay.pos[3 * r + ax]) * inv_freq_[j]; c[r * ROPE_HALF + ax * 16 + j] = std::cos(ang); s[r * ROPE_HALF + ax * 16 + j] = std::sin(ang); }
           HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)cos_, c.data(), c.size() * 4)); HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)sin_, s.data(), s.size() * 4)); }
-        if (!dit_ || dit_->tokens() != S) { dit_.reset(); dit_ = std::make_unique<Stack>(comp_, StackDims{HID, HEADS, HEADS, HEAD_DIM, FFN, ROPE_DIM, CLASSES, 4, 1e-5f, false, true, false}, S, 50, blocks_, "blocks.%d.", true, nullptr); }
+        if (!dit_ || dit_->tokens() != S) {
+            const char *qk = std::getenv("H3_ATTN_QK"); StackDims dd{HID, HEADS, HEADS, HEAD_DIM, FFN, ROPE_DIM, CLASSES, 4, 1e-5f, false, true, false}; dd.attn_i4 = !(qk && std::string(qk) == "f16");   // int4 QK^T by default
+            dit_.reset(); dit_ = std::make_unique<Stack>(comp_, dd, S, 50, blocks_, "blocks.%d.", true, nullptr); }
         if (!final_prep_.k) { final_prep_.build(comp_, "norm", 8, HID, 1e-5f, 2); }
         Gemm &final_gemm = gemms_[fmt("final_%zu", S)]; if (!final_gemm.k) final_gemm.build(comp_, "plain", 8, true, true, HID, FINAL_N, S);
         // latents as rows: video [Nv][96] (row = (t*(H/2) + hh)*(W/2) + ww, column = c*4 + dy*2 + dx), audio [2*audio_t][32] (row = c*audio_t + t)
