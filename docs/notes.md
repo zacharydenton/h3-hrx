@@ -386,3 +386,36 @@ compile (tests at 13 tokens).
 Runtime dependency: the HIP runtime API for module load, memory and launch (no device code;
 the hosts build with hipcc as a plain C++ compiler). An HSA-only host is a swap of those
 calls, not a rewrite.
+
+## The 30-step target: where the step's time is, and what did not move it (2026-09-06)
+
+30 steps of the 5-second 864x480 clip is 29 evaluations at 29.4 s = 14.2 minutes, plus 17 s
+of prompt encoding and 47 s of decoding. The step is 70% attention, 26% GEMMs. The GEMMs run
+at 78-82 TOPS, 80% of the 100 TOPS target and 70% of the measured 117 peak; even at the
+target they would save 1.5 s of the 29.
+
+Attention at 15427 rows, 8 waves, 56 heads (`tools/ab_attention.py`, calm box):
+
+| variant | TFLOP/s | vs shipped |
+| --- | ---: | ---: |
+| shipped: 8 waves, 16-key tiles, 4 Q fragments hoisted (256 VGPRs, 33 KB LDS) | 17.6 | 1.00 |
+| the same kernel at 2097 rows (a head's K/V fits L2) | 18.6 | its own ceiling |
+| 4 waves at 15427 rows / at 2097 rows | 5.2 / 21.2 | K/V re-streaming |
+| 4 waves, 32-key tiles, at 15427 rows | 7.6 | 1.47x over 4 waves |
+| 16 waves | 16.3 | 0.93x |
+| 8 waves, 32-key tiles (spills 76 B, 45 KB LDS) | 11.3 | 0.64x |
+| 8 waves, no Q hoisting (208 VGPRs, 49 KB LDS) | 15.7 | 0.89x |
+| 8 waves, no hoisting, 32-key tiles (248 VGPRs, 62 KB LDS) | 17.0 | 0.97x |
+| 8 waves, hoist 2, 32-key tiles (spills) | 16.1 | 0.91x |
+
+The reading: at clip length the 8-wave kernel is within 6% of what it does with K/V resident
+in L2, so traffic is no longer the limiter (a split over keys to make concurrent workgroups
+share an L2-sized chunk, with a merge, is worth that 6% at most). The limiter is the
+kernel's inner loop at a third of the fp16 peak: per 16-key tile a wave does 16 WMMAs
+against two barriers, 16 KB of LDS fragment reads, the 64-register accumulator rescale and
+the softmax pass, with two waves per SIMD to hide any of it. Every knob that trades
+registers for fewer barriers loses at the 256-VGPR ceiling. Moving the ceiling means a
+different kernel (lazy rescaling, fragment reuse across query tiles), not a config.
+
+The generator's 8-wave post-pass now classifies the 32-key tile's second K row correctly
+(it produced an undefined name before); the variants live in experiments/.

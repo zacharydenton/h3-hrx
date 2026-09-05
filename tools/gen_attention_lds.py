@@ -492,7 +492,7 @@ def eight_waves(text: str) -> str:
     block = text[start:end]
     k_lines, v_lines = [], []
     for line in block.splitlines():
-        if "%st_row0" in line or "%st_row =" in line or "%k_chunk" in line:
+        if ("%st_row" in line and "%st_row_v" not in line) or "%k_chunk" in line:      # K rows (both halves of a 32-key tile) and K chunks
             k_lines.append(line)
         else:
             v_lines.append(line)
