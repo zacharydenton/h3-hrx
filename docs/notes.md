@@ -521,3 +521,28 @@ the heads, exchanges through LDS -- it is deterministic, fault-free over dozens 
 and bit-exact. The mechanism is unexplained (the wave id is workitem >> 5, the argument
 slots are 32-bit and zeroed); the lesson is the pattern: give each workgroup a token, not a
 flat pair index, and keep subgroup ops out of per-wave branches.
+
+## Saturation, smoothing off, prefetch by length (2026-09-06, later)
+
+The non-finite audio row at 50 layers was not the attention: the stream scanner
+(`H3_DEBUG_NAN`) found an infinite token scale before the down projection at layer 49, i.e.
+one silu(gate) * up value crossed 65504 in the f16 gate|up buffer (the notes already had them
+at 5e4) and the prepare kernel's absmax became inf. The f16 attention path had been sitting
+on that edge; int4 attention nudged one row over it. The GEMM epilogues now saturate to
++-65472 before every f16 store (`tools/gen_gemm.py`), which costs nothing and removes the
+cliff for every path.
+
+K mean smoothing, on the fixture's velocity with GPTQ blocks: 0.9881 with, 0.9899 without
+(f16 attention 0.9912). Off by default (`H3_KSMOOTH=1` keeps it); the column-mean pass goes
+with it.
+
+The double-buffered kernel (`attention_i4qkp_mha8`, ATTN_PREFETCH=1: the next tile's loads
+issued before this tile's compute, one barrier per tile, 256 VGPRs, 19 KB LDS) against the
+shipped int4 kernel, interleaved best-of-4: 0.88x at 15427 rows, 1.39x at 37743 (2.12 vs
+2.94 s per block). The builder and both hosts pick it from 20000 rows.
+
+Where 768 stands: 37743 rows, 50 blocks, attention 2.24 s per block with the prefetch
+kernel (19.3 TFLOP/s-equivalent), the step about 130 s of which attention is 82%; 30 steps
+about 65 minutes. The GEMMs are 6% of it. The remaining attention levers are ping-pong wave
+groups (the register budget at 256 makes it a redesign) and work reduction (step caching,
+sparse attention); the int4 QK^T was the last one with a hardware rate behind it.
