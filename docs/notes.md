@@ -642,3 +642,129 @@ rescale, a select skips the sum update; 240 VGPRs, no spills; 1e30 disables it; 
 and the C stack read H3_ATTN_SKIP_TAU), and the first-block cache in the C pipeline
 (`cache_threshold` in h3pipe_params, ABI 2; `absdiff_sum_f32` partial sums for the relative
 L1; accumulated across skipped steps as TeaCache does; `H3_CACHE_TRACE=1` prints decisions).
+
+## The 4x accounting, measured (2026-09-07)
+
+The two levers above were measured on the fox clip through the C pipeline, GPU otherwise idle
+(the earlier contended numbers are withdrawn):
+
+| 480p, 124 frames (15427 rows), s per step | steps 2 and 3 |
+| --- | ---: |
+| f16 attention | 28.8 / 28.7 |
+| int4 attention, skip off | 23.3 / 24.0 |
+| int4, skip tau 8 | 24.5 / 24.5 |
+| int4, skip tau 6 | 23.6 / 24.1 |
+
+The tile skip buys nothing at 480p: the skipped tiles' P.V work is replaced by the gap
+reduction and the branches, and the kernel is not MMA-bound (below). The step cache
+(`tools/cache_study.py`, 22 frames, 30 steps, 480p, latents against the uncached run):
+
+| threshold | time | video latent cosine | audio | frame PSNR |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 89.6 s (includes first-launch costs) | | | |
+| 0.05 | 71.1 s | 1.0000 | 1.0000 | 138 dB (no evaluation skipped) |
+| 0.10 | 45.6 s | 0.9389 | 0.9707 | 16.5 dB |
+| 0.15 | 45.5 s | 0.9741 | 0.9538 | 22.5 dB |
+| 0.20 | 31.4 s | 0.9710 | 0.9662 | 23.0 dB |
+
+So the first-block criterion has no useful setting on H3: the first threshold that skips
+anything (0.10) drops the latent cosine to 0.94 and the frames to 16.5 dB. The cache stays
+in the API (0 = off) as a knob for previews, not a default. Neither lever delivers its
+planned share of the 4x; the kernel's own ceiling is the remaining question.
+
+### krea2-loom's prefetch schedule, tried here (item 4 of the krea2 review)
+
+krea2-loom's native attention found that at 8k-16k tokens a four-wave kernel with explicit
+next-tile prefetch (global loads issued at the top of the iteration, held in registers
+across the compute, stored into the other LDS slot after it, one barrier per tile; no
+loop-carried values) beat the eight-wave double buffer. `ATTN_PINGPONG=1` in
+`tools/gen_attention_i4qk.py` builds that schedule on the int4 kernels
+(`experiments/attention_i4qkpp*`); all variants compile at 256 VGPRs with no spills and
+pass `tests/test_attention_i4.py` (cosine 0.99999996 against the replica). Interleaved
+best-of-5 (`tools/ab_attention_i4.py`), GPU idle:
+
+| 37743 rows (768) | ms | vs shipped long form |
+| --- | ---: | ---: |
+| `attention_i4qkl_mha8` (8 waves, double buffer, 1 WG/CU), shipped | 1607-1630 | 1.000x |
+| 4 waves, double buffer, 3 WG/CU | 3209 | 0.54x |
+| 4 waves, ping-pong, 3 WG/CU (`i4qkpp`) | 3149 | 0.55x |
+| 4 waves, double buffer, LDS-padded to 2 WG/CU (`i4qkd2`) | 2009 | 0.81x |
+| 4 waves, ping-pong, 2 WG/CU (`i4qkpp2`) | 1588-1596 | 1.012-1.022x |
+| 4 waves, ping-pong, 1 WG/CU (`i4qkpp3`) | 1795 | 0.91x |
+| 8 waves, ping-pong, every lane loads K and V (`i4qkppl`) | 1643 | 0.98x |
+| 8 waves, ping-pong, loads in scf.if branches (`i4qkppy`) | 2085 | 0.77x |
+
+At 15427 rows the shipped 8-wave kernel, the padded long form and `i4qkpp2` are within 1%
+of each other (267-270 ms). The prefetch is real (1.26x over the four-wave double buffer at
+equal occupancy) but the eight-wave kernel already shares each K/V tile across twice the
+queries, and the two end up within 1-2%: every schedule saturates at 25.4-25.7 TFLOP/s-eq,
+a third of the 74 TFLOP/s-eq MMA mix ceiling (int4 QK^T, f16 P.V). The kernel is not
+latency-bound on staging; the ceiling is elsewhere (the eight chained QK^T MMAs per score
+tile, the softmax VALU work, and the LDS V reads are the candidates). Not shipped: about 1%
+of the step for a third host wiring of the long form, and neutral at 480p.
+
+### The remaining dependency, and the runtime that removes it
+
+`libh3pipe.so` runs no HIP device code and no vendor math library, but its host side still
+uses eight HIP runtime calls (hipMalloc/Free, Memset, MemcpyHtoD/DtoD/DtoH, DeviceSynchronize,
+ModuleLoad/ModuleLaunchKernel), so it links libamdhip64 and through it ROCr. hrx-system builds
+`libhrx.so` (`libhrx/include/hrx_runtime.h`, `build-cuda/libhrx/src/libhrx/libhrx.so`) whose only
+shared dependencies are libc and libm: it embeds IREE's AMDGPU HAL and drives the kernel driver
+directly, with no HIP and no ROCr. It has every call the pipeline needs: `hrx_gpu_initialize`
+/ `hrx_gpu_device_get`, `hrx_stream_create`, `hrx_buffer_allocate` (device-local) with
+`hrx_buffer_get_device_ptr` and `hrx_buffer_lookup` (device pointer -> buffer + offset, so the
+blob-offset pointers the pipeline passes around keep working), `hrx_stream_fill_buffer`,
+`hrx_stream_copy_h2d/d2h/copy_buffer`, `hrx_stream_synchronize`, `hrx_executable_load_file`
+(target family "amdgpu") with `hrx_executable_lookup_export_by_name` and
+`hrx_executable_export_info` (constant byte length, binding count, workgroup size), and
+`hrx_stream_dispatch(stream, executable, export, {workgroup_count, workgroup_size, subgroup_size},
+constants, constants_size, bindings[], n, flags)`: scalar launch arguments go in the constants
+block, buffer arguments as (buffer, offset, length) bindings. llama.cpp's `hrx-rfc` branch
+(`ggml/src/ggml-hrx/runtime/command-program-executor.cpp`) dispatches Loom kernels exactly this
+way. Porting `h3pipe.cpp`'s `Kernel`, `launch`, allocation and copy helpers onto it is a
+contained change (one wrapper layer, validated per kernel by the export info) and leaves the
+library with no ROCm userspace dependency at all: the kernel driver, loom-compile at cache-fill
+time, and nothing else. That is the shape "independent inference" asks for, and krea2-loom's
+native path (HIP kernels plus hipBLAS) is the divergence to fold back into it.
+
+### The skip's idle cost, and what ships (2026-09-07, later)
+
+The 768 step through the C pipeline (after fixing a buffer the final norm overran at that
+shape: the pipe's int8 activation buffer was sized for text-width rows), GPU idle:
+
+| 768x1344, 124 frames (37723 rows), s per step | step 1 / step 2 |
+| --- | ---: |
+| int4 attention, skip off | 125.8 / 130.7 |
+| int4 attention, skip tau 6 | 114.8 / 113.8 |
+
+So the tile skip is worth 1.13x on the 768 step, nothing at 480p. But the disassembly of the
+skip kernel's key-tile loop (`llvm-objdump` on the HSACO) shows 897 instructions per tile
+against 487 without the skip: the eight per-fragment `scf.if`s cost about 400 register moves,
+selects and branch bookkeeping per tile even when no tile is ever skipped, and RDNA3 issues
+WMMA through the same pipeline as that VALU work. Interleaved A/B, skip compiled but disabled
+vs the plain kernel: 1620 vs 1463 ms at 37743 rows (plain 1.107x), 273 vs 241 ms at 15427
+(plain 1.132x). A single branch around all eight fragments spills (`st_key`, 100 bytes of
+private) and runs at 0.42x, so the eight-branch form stays as the skip form. Through the C
+pipeline at 480p the two land within run-to-run noise (plain 25.0 / 23.8 s, skip twin never
+skipping 23.3 / 23.3 s), so the kernel-level difference does not show at the step there.
+
+Shipped: the plain kernels keep their names (`attention_i4qk_mha8`, `attention_i4qk_mha`,
+`attention_i4qkl_mha8`) and each has a tile-skip twin (`attention_i4qks_mha8`,
+`attention_i4qks_mha`, `attention_i4qksl_mha8`; `scripts/gen_attention_i4.sh` regenerates all
+six). Both builders choose the twin only when a tau applies: `H3_ATTN_SKIP_TAU=<tau>` forces
+it, `off` disables it, and unset means tau 6 on the long form (rows >= 20000) and off below.
+The builder records the choice in `attention_stem.txt` (the Python host loads that symbol and
+the attention HSACO is rebuilt when it changes). `H3_PROFILE=1` prints synchronized per-stage
+times after each C-pipeline step (they inflate the step about 1.6x because the GPU clocks down
+between synchronized launches; use them for proportions only: attention is about half of the
+480p step), `H3_TRACE=1` prints and synchronizes every launch.
+
+Where the int4 kernel's time goes now, from the plain loop's 487 instructions per key tile:
+16 WMMAs; 88 register moves (the ten loop-carried 8-wide vectors); 72 DPP moves and 20 maxes
+for the four cross-lane rounds of the row max plus the same for the row sum; 16 exps; 16 stores
+and 8 loads to turn the score accumulator layout into the P operand layout through LDS; 88
+selects; 64 `s_delay_alu` stalls. The formulation that removes most of it computes S^T = K Q^T
+instead: the accumulator then holds a query column per lane, the row max and sum become seven
+in-lane maxes plus one cross-half shuffle instead of four DPP rounds each, and the P operand
+comes from one cross-half exchange instead of the LDS round trip. That is the next kernel lever
+(about a third of the loop), and it is a regeneration of the kernel, not a tweak.

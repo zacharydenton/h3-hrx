@@ -120,7 +120,9 @@ public:
         { std::ifstream wf(kernels_dir + "/attention_waves.txt"); if (wf) wf >> attn_waves_; if (attn_waves_ != 4 && attn_waves_ != 8) throw std::runtime_error("attention_waves.txt must say 4 or 8"); }
         std::string qk_mode; { std::ifstream qf(kernels_dir + "/attention_qk.txt"); if (qf) qf >> qk_mode; attn_i4_ = qk_mode == "i4" || qk_mode == "i4l"; }
         if (attn_i4_) {                                              // QK^T in int4: K column means, per-head int4 operands, the int4 attention kernel (i4p: double-buffered tiles)
-            load(k_attention_, "attention", qk_mode == "i4l" ? "h3_attention_i4qkl_mha8_lds_f16_wmma" : (attn_waves_ == 8 ? "h3_attention_i4qk_mha8_lds_f16_wmma" : "h3_attention_i4qk_mha_lds_f16_wmma"));
+            std::string stem; { std::ifstream sf(kernels_dir + "/attention_stem.txt"); if (sf) sf >> stem; }   // the builder's choice (plain or tile-skip twin)
+            if (stem.empty()) stem = qk_mode == "i4l" ? "attention_i4qkl_mha8_lds_f16_wmma" : (attn_waves_ == 8 ? "attention_i4qk_mha8_lds_f16_wmma" : "attention_i4qk_mha_lds_f16_wmma");
+            load(k_attention_, "attention", ("h3_" + stem).c_str());
             load(k_colmean_, "colmean", "h3_colmean_f32"); load(k_prep_q_, "prepare_q_i4", "h3_prepare_qk_i4"); load(k_prep_k_, "prepare_k_i4", "h3_prepare_qk_i4"); load(k_transpose_, "transpose_v", "h3_transpose_f16");
         } else load(k_attention_, "attention", attn_waves_ == 8 ? "h3_attention_mha8_lds_f16_wmma" : "h3_attention_mha_lds_f16_wmma");
         const size_t T = capacity_;

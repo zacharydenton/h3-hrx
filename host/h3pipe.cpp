@@ -195,7 +195,7 @@ void launch(Kernel &k, Profile *prof, const char *stage, unsigned gx, unsigned g
     std::chrono::steady_clock::time_point t0;
     if (prof && prof->on) { HIP_CHECK(hipDeviceSynchronize()); t0 = std::chrono::steady_clock::now(); }
     void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, args.bytes, HIP_LAUNCH_PARAM_BUFFER_SIZE, &args.size, HIP_LAUNCH_PARAM_END};
-    static const bool trace = std::getenv("H3_TRACE") != nullptr;   // H3_TRACE=1: print and synchronize every launch (fault localisation)
+    static const bool trace = std::getenv("H3_TRACE") && *std::getenv("H3_TRACE");   // H3_TRACE=1: print and synchronize every launch (fault localisation)
     if (trace) fprintf(stderr, "launch %-12s grid %u x %u block %u args %zu\n", stage, gx, gy, bx, args.size);
     HIP_CHECK(hipModuleLaunchKernel(k.function, gx, gy, 1, bx, 1, 1, 0, nullptr, nullptr, config));
     if (trace) HIP_CHECK(hipDeviceSynchronize());
@@ -310,9 +310,15 @@ public:
         {
             std::string stem = d.causal ? "attention_gqa8c_lds_f16_wmma" : (d.head_dim == 64 ? (waves_ == 8 ? "attention_mha648_lds_f16_wmma" : "attention_mha64_lds_f16_wmma") : (waves_ == 8 ? "attention_mha8_lds_f16_wmma" : "attention_mha_lds_f16_wmma"));
             if (d.attn_i4) stem = tokens >= 20000 ? "attention_i4qkl_mha8_lds_f16_wmma" : (waves_ == 8 ? "attention_i4qk_mha8_lds_f16_wmma" : "attention_i4qk_mha_lds_f16_wmma");   // one workgroup per CU past ~20k rows
+            // tile skip: H3_ATTN_SKIP_TAU=<tau> forces the skip twin (i4qk -> i4qks) at that tau, 'off' disables it; unset -> tau 6 on the
+            // long form (1.13x on the 768 step, no measured velocity cost), off below (nothing at 480p; the idle machinery costs 10-13%)
+            double tau = tokens >= 20000 ? 6.0 : 0.0;
+            if (const char *v = std::getenv("H3_ATTN_SKIP_TAU")) { std::string sv(v); for (auto &ch : sv) ch = char(tolower(ch)); tau = (sv == "off" || sv == "none" || sv == "0" || sv == "1e30" || sv.empty()) ? 0.0 : std::atof(v); }
+            const bool skip = d.attn_i4 && tau > 0.0;
+            if (skip) { const size_t at = stem.find("i4qk"); stem.replace(at, 4, "i4qks"); }
             const std::string ns = "h3." + stem + ".";
             Cfg acfg = {{ns + "q_stride", std::to_string(d.inner())}, {ns + "kv_stride", std::to_string(d.kv_inner())}, {ns + "tokens", std::to_string(tokens)}, {ns + "token_capacity", std::to_string(capacity_)}, {ns + "scale", num(1.0 / std::sqrt(double(d.head_dim)))}, {ns + "out_stride", std::to_string(d.inner())}};
-            if (d.attn_i4) { const char *tau = std::getenv("H3_ATTN_SKIP_TAU"); acfg.push_back({ns + "skip_tau", tau ? tau : "1e30"}); }   // tile skipping past tau below the running max; 1e30 = off
+            if (skip) acfg.push_back({ns + "skip_tau", num(tau)});
             attention_ = c.get(stem, "h3_" + stem, acfg);
         }
         const size_t T = capacity_;
@@ -442,7 +448,7 @@ public:
     }
     ~Pipe() { for (void *p : {ones_, zeros_, mods_, final_table_, x_, cls_, cls0_, tcls_, cos_, sin_, in16_, a_q_, a_s_, out16_, text_copy_, ref_cos_, ref_sin_, te_x_, te_cos_, te_sin_, te_cls_, vx_, vcos_, vsin_, vin16_, va_q_, va_s_, vout16_, vcls_, vnorm_table_, ah_, aacc_, ahj_, ar_, ar2_, atmp_, ain_, xb0_, prev_b0_, cache_resid_, partials_}) if (p) (void)hipFree(p); }
 
-    Profile prof;
+    Profile prof{std::getenv("H3_PROFILE") != nullptr && *std::getenv("H3_PROFILE") != 0};   // H3_PROFILE=1: synchronized per-stage times printed after every step
 
     // --- the prompt: embedding lookup on the host, the encoder, condition_proj, the refiner ---
     void ensure_seq(size_t seq) {
@@ -642,6 +648,7 @@ public:
             const float sg_v = sv.sigmas[step], r_v = sv.sigmas[step + 1] / sg_v, sg_a = sa.sigmas[step], r_a = sa.sigmas[step + 1] / sg_a;
             for (size_t r = 0; r < Nv; ++r) for (int k = 0; k < VIDEO_PATCH; ++k) { float &x = vrows[r * VIDEO_PATCH + k]; const float v = f16_to_f32(out16[(L + Na + r) * FINAL_N + k]); x = r_v * x + (1.0f - r_v) * (x + sg_v * v); }
             for (size_t r = 0; r < Na; ++r) for (int k = 0; k < AUDIO_CH; ++k) { float &x = arows[r * AUDIO_CH + k]; const float v = f16_to_f32(out16[(L + r) * FINAL_N + VIDEO_PATCH + k]); x = r_a * x + (1.0f - r_a) * (x + sg_a * v); }
+            if (prof.on) { double tot = 0; for (auto &kv : prof.us) tot += kv.second; fprintf(stderr, "  step %zu stages (%.1f s):", step + 1, tot * 1e-6); for (auto &kv : prof.us) if (kv.second > 0.01 * tot) fprintf(stderr, "  %s %.2fs", kv.first.c_str(), kv.second * 1e-6); fprintf(stderr, "\n"); prof.us.clear(); }
             if (progress && progress(user, int(step + 1), int(sv.timesteps.size()), std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count())) throw Cancelled();
         }
         if (p.cache_threshold > 0.0f && std::getenv("H3_CACHE_TRACE")) fprintf(stderr, "  step cache: %d of %zu evaluations skipped\n", cache_skipped_, sv.timesteps.size());

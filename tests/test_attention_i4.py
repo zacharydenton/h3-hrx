@@ -43,7 +43,7 @@ def run(tmp, tokens, heads=HEADS):
     def pad(t, w, dt): out = np.zeros((cap, w), dt); out[:tokens] = t; return out
     vT = np.ascontiguousarray(pad(v.reshape(tokens, -1).numpy(), heads * D, np.float16).T)     # V arrives transposed: [channels][capacity]
     hs = tmp / f"{STEM}.hsaco"
-    compile_kernel(KERNEL, SYM, {f"{NS}.q_stride": heads * D, f"{NS}.kv_stride": heads * D, f"{NS}.tokens": tokens, f"{NS}.token_capacity": cap, f"{NS}.scale": 1.0, f"{NS}.out_stride": heads * D, f"{NS}.skip_tau": float(os.environ.get("ATTN_SKIP_TAU", "1e30"))}, hs)
+    compile_kernel(KERNEL, SYM, {f"{NS}.q_stride": heads * D, f"{NS}.kv_stride": heads * D, f"{NS}.tokens": tokens, f"{NS}.token_capacity": cap, f"{NS}.scale": 1.0, f"{NS}.out_stride": heads * D, **({f"{NS}.skip_tau": float(os.environ.get("ATTN_SKIP_TAU", "1e30"))} if "skip_tau" in KERNEL.read_text() else {})}, hs)
     (out,), t = launch(hs, SYM, ((tokens + 16 * WAVES - 1) // (16 * WAVES), heads, 1), (32 * WAVES, 1, 1),
                        [("i32", tokens), ("i32", heads), ("in_i32", pad(qc.numpy(), heads * 16, np.int32)), ("in", pad(qs.numpy(), heads, np.float32)),
                         ("in_i32", pad(kc.numpy(), heads * 16, np.int32)), ("in", pad(ks.numpy(), heads, np.float32)), ("in_f16", vT),

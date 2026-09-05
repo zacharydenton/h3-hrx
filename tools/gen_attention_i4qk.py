@@ -3,7 +3,9 @@ operands from prepare_qk_i4: per-token, per-head int4 codes and scales, the head
 and PV in f16 as before. Derived from gen_attention_lds.py by substitution: Q lives in registers as eight
 int4 fragments (16 VGPRs instead of 64), a K tile is 16 keys x 16 words staged into LDS, the i32 scores
 become f32 through the row's Q scale (attention scale and the Hadamard's 1/128 folded in) and the key's K scale.
-    ATTN_WAVES=4|8 python3 tools/gen_attention_i4qk.py"""
+    ATTN_WAVES=4|8 python3 tools/gen_attention_i4qk.py
+Variants (written to experiments/): ATTN_PREFETCH=1, ATTN_DIRECT_OUT=1, ATTN_PINGPONG=1 (krea2-loom's schedule; see the
+block at the end and docs/notes.md "The 4x accounting")."""
 import os, re, sys
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
@@ -227,16 +229,18 @@ def add_skip(K: str) -> str:
     return K
 
 if os.environ.get("ATTN_SKIP", "1") == "1":
+    # the plain kernels keep their names; each gets a skip twin (i4qk -> i4qks: attention_i4qks_mha8, attention_i4qksl_mha8, ...)
+    # chosen by the builders only when a tau is set: with the skip disabled the twin is 10-13% slower (phi copies and branch
+    # bookkeeping around the eight per-fragment branches: 897 vs 487 instructions per key tile; docs/notes.md)
     for path in [ROOT / "kernels" / f"{STEM}.loom"] + ([ROOT / "kernels" / f"{os.environ['ATTN_DBUF_STEM']}.loom"] if os.environ.get("ATTN_DBUF_STEM", "").startswith("attention_i4qkl") else []):
         if path.exists():
-            text = path.read_text()
-            stem_here = path.stem
-            if "skip_tau" not in text:
-                saved = NS
-                text = text.replace("h3." + stem_here, "h3." + STEM) if stem_here != STEM else text
-                text = add_skip(text)
-                text = text.replace("h3." + STEM, "h3." + stem_here) if stem_here != STEM else text
-                path.write_text(text); print("tile skip added to", path)
+            text = path.read_text(); stem_here = path.stem
+            assert "skip_tau" not in text, path
+            text = text.replace("h3." + stem_here, "h3." + STEM) if stem_here != STEM else text
+            text = add_skip(text)
+            sstem = stem_here.replace("i4qk", "i4qks")
+            text = text.replace("h3." + STEM, "h3." + sstem).replace("h3_" + stem_here, "h3_" + sstem)
+            (ROOT / "kernels" / f"{sstem}.loom").write_text(text); print("tile-skip twin", ROOT / "kernels" / f"{sstem}.loom")
 
 # --- ATTN_DIRECT_OUT=1: the epilogue stores the accumulator layout straight to global memory (lane holds column
 # lane%16 of rows 2e + lane/16): 64 scalar f16 stores per lane, no LDS round trips or subgroup barriers
@@ -317,3 +321,148 @@ if os.environ.get("ATTN_PREFETCH", "0") == "1" and WAVES == 8:
     K = K.replace(SYM, "h3_" + STEM2).replace(NS, "h3." + STEM2)
     OUT2 = ROOT / "experiments" / f"{STEM2}.loom"
     OUT2.write_text(K); print("wrote", OUT2)
+
+# --- ATTN_PINGPONG=1 (4-wave form): krea2-loom's schedule. The next tile's global loads are issued at the top of the
+# iteration and held in registers across this tile's compute (no loop-carried values); they are stored into the other
+# LDS slot after the compute, followed by the tile's single barrier. The lookahead past the last tile re-reads it.
+# ATTN_PP_PAD adds LDS bytes to cap workgroups per CU. Output: experiments/<stem with i4qk -> i4qkpp>.
+if os.environ.get("ATTN_PINGPONG", "0") == "1" and WAVES == 4:
+    src_path = ROOT / "kernels" / f"{STEM}.loom"
+    K = src_path.read_text()
+    def sub3(old, new, count=1):
+        global K
+        assert K.count(old) == count, (old[:80], K.count(old))
+        K = K.replace(old, new)
+    stage_begin = K.index("    %key_origin1 = index.mul %key_tile, %c16 : index\n")
+    stage_end = K.index("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)\n", stage_begin) + len("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)\n")
+    stage = K[stage_begin:stage_end]
+    names = re.findall(r"^    (%[A-Za-z_][A-Za-z_0-9]*) =", stage, re.M)
+    def rename(text, suffix):
+        mapping = {n: n + suffix for n in names}
+        return re.sub(r"%[A-Za-z_][A-Za-z_0-9]*", lambda m: mapping.get(m[0], m[0]), text)
+    # prologue: tile 0 into slot 0, identical index chain with %c0 for the tile index
+    prologue = rename(stage.replace("%key_tile,", "%c0,"), "_initial")
+    prologue = "".join(l[2:] + "\n" for l in prologue.splitlines())
+    loop_hdr = K.index("  %final_max, %final_sum, ")
+    K = K[:loop_hdr] + prologue + K[loop_hdr:]
+    # loop body: current + other slot views, next-tile loads, compute, stores into the other slot, barrier
+    stage_begin = K.index("    %key_origin1 = index.mul %key_tile, %c16 : index\n")
+    stage_end = K.index("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)\n", stage_begin) + len("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)\n")
+    head = """    %key_origin1 = index.mul %key_tile, %c16 : index
+    %key_origin0 = index.assume %key_origin1 [le(%key_origin1, %tile_origin_limit), mul(%key_origin1, 16)] : index
+    %buf = index.rem %key_tile, %c2 : index
+    %kb_off = index.scale %buf, %kbuf_bytes : index, offset -> offset
+    %k_tile_b = buffer.view %lds[%kb_off] : buffer -> view<16x20xi32>
+    %vb_off0 = index.scale %buf, %vbuf_bytes : index, offset -> offset
+    %vb_off = index.add %v_tile_offset, %vb_off0 : offset
+    %v_tile_b = buffer.view %lds[%vb_off] : buffer -> view<128x24xf16>
+    %key_tile_next = index.add %key_tile, %c1 : index
+    %obuf = index.rem %key_tile_next, %c2 : index
+    %ko_off = index.scale %obuf, %kbuf_bytes : index, offset -> offset
+    %k_tile_o = buffer.view %lds[%ko_off] : buffer -> view<16x20xi32>
+    %vo_off0 = index.scale %obuf, %vbuf_bytes : index, offset -> offset
+    %vo_off = index.add %v_tile_offset, %vo_off0 : offset
+    %v_tile_o = buffer.view %lds[%vo_off] : buffer -> view<128x24xf16>
+    // prefetch the next K and V tile rows into registers (the lookahead past the last tile re-reads it)
+    %key_next0 = index.add %key_origin0, %c16 : index
+    %key_next1 = index.min %key_next0, %tile_origin_limit : index
+    %key_next = index.assume %key_next1 [le(%key_next1, %tile_origin_limit), mul(%key_next1, 16)] : index
+    %st_row0_n = index.add %key_next, %st_key : index
+    %st_row_n = index.assume %st_row0_n [lt(%st_row0_n, %padded_tokens)] : index
+    %k_chunk_n = vector.load %ki_view[%st_row_n, %st_col] : view<[%padded_tokens]x[%ki_words]xi32> -> vector<2xi32>
+    %v_chunk_n = vector.load %v_view[%st_chan, %key_next] : view<[%kv_stride0]x[%padded_tokens]xf16> -> vector<16xf16>
+"""
+    K = K[:stage_begin] + head + K[stage_end:]
+    sub3("    %next_sum = scf.select %keep, %next_sum_full, %row_sum : vector<8xf32>\n    scf.yield %next_max, %next_sum, ",
+         "    %next_sum = scf.select %keep, %next_sum_full, %row_sum : vector<8xf32>\n"
+         "    vector.store %k_chunk_n, %k_tile_o[%st_key, %st_chunk] : vector<2xi32>, view<16x20xi32>\n"
+         "    vector.store %v_chunk_n, %v_tile_o[%st_lane, %c0] : vector<16xf16>, view<128x24xf16>\n"
+         "    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)\n    scf.yield %next_max, %next_sum, ")
+    pad = int(os.environ.get("ATTN_PP_PAD", "0"))
+    if pad:
+        m = re.search(r"  %lds_bytes = index.constant (\d+) : offset\n", K)
+        K = K.replace(m.group(0), f"  %lds_bytes = index.constant {int(m.group(1)) + pad} : offset\n")
+    STEM5 = os.environ.get("ATTN_PP_STEM", STEM.replace("i4qk", "i4qkpp"))
+    K = K.replace("h3_" + STEM, "h3_" + STEM5).replace("h3." + STEM, "h3." + STEM5)
+    OUT5 = ROOT / "experiments" / f"{STEM5}.loom"; OUT5.write_text(K); print("wrote", OUT5, "(ping-pong prefetch)")
+
+# --- ATTN_PINGPONG=1 (8-wave forms): the same schedule on the kernels whose lanes stage either K or V.
+# ATTN_PP_MODE=uncond: every lane loads both its K and V chunk (the duplicate reads hit L2) and stores one;
+# ATTN_PP_MODE=yield: the loads sit in scf.if branches with a zero fill on the other side.
+# ATTN_PP_SRC names the source stem (default the LDS-padded long form).
+if os.environ.get("ATTN_PINGPONG", "0") == "1" and WAVES == 8:
+    SRC = os.environ.get("ATTN_PP_SRC", "attention_i4qkl_mha8_lds_f16_wmma")
+    MODE = os.environ.get("ATTN_PP_MODE", "uncond")
+    K = (ROOT / "kernels" / f"{SRC}.loom").read_text()
+    def sub4(old, new, count=1):
+        global K
+        assert K.count(old) == count, (old[:80], K.count(old))
+        K = K.replace(old, new)
+    if MODE != "uncond":
+        sub4("  %zero_acc = vector.constant 0.0 : vector<8xf32>\n", "  %zero_acc = vector.constant 0.0 : vector<8xf32>\n  %zero_k = vector.constant 0 : vector<2xi32>\n  %zero_v = vector.constant 0.0 : vector<16xf16>\n")
+    stage_begin = K.index("    %key_origin1 = index.mul %key_tile, %c16 : index\n")
+    stage_end = K.index("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)\n", stage_begin) + len("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)\n")
+    stage = K[stage_begin:stage_end]
+    names = re.findall(r"^\s+(%[A-Za-z_][A-Za-z_0-9]*) =", stage, re.M)
+    def rename(text, suffix):
+        mapping = {n: n + suffix for n in names}
+        return re.sub(r"%[A-Za-z_][A-Za-z_0-9]*", lambda m: mapping.get(m[0], m[0]), text)
+    prologue = rename(stage.replace("%key_tile,", "%c0,"), "_initial")
+    prologue = "".join(l[2:] + "\n" for l in prologue.splitlines())
+    loop_hdr = K.index("  %final_max, %final_sum, ")
+    K = K[:loop_hdr] + prologue + K[loop_hdr:]
+    stage_begin = K.index("    %key_origin1 = index.mul %key_tile, %c16 : index\n")
+    stage_end = K.index("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)\n", stage_begin) + len("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)\n")
+    views = """    %key_origin1 = index.mul %key_tile, %c16 : index
+    %key_origin0 = index.assume %key_origin1 [le(%key_origin1, %tile_origin_limit), mul(%key_origin1, 16)] : index
+    %buf = index.rem %key_tile, %c2 : index
+    %kb_off = index.scale %buf, %kbuf_bytes : index, offset -> offset
+    %k_tile_b = buffer.view %lds[%kb_off] : buffer -> view<16x20xi32>
+    %vb_off0 = index.scale %buf, %vbuf_bytes : index, offset -> offset
+    %vb_off = index.add %v_tile_offset, %vb_off0 : offset
+    %v_tile_b = buffer.view %lds[%vb_off] : buffer -> view<128x24xf16>
+    %key_tile_next = index.add %key_tile, %c1 : index
+    %obuf = index.rem %key_tile_next, %c2 : index
+    %ko_off = index.scale %obuf, %kbuf_bytes : index, offset -> offset
+    %k_tile_o = buffer.view %lds[%ko_off] : buffer -> view<16x20xi32>
+    %vo_off0 = index.scale %obuf, %vbuf_bytes : index, offset -> offset
+    %vo_off = index.add %v_tile_offset, %vo_off0 : offset
+    %v_tile_o = buffer.view %lds[%vo_off] : buffer -> view<128x24xf16>
+    // prefetch the next K and V tile rows into registers (the lookahead past the last tile re-reads it)
+    %key_next0 = index.add %key_origin0, %c16 : index
+    %key_next1 = index.min %key_next0, %tile_origin_limit : index
+    %key_next = index.assume %key_next1 [le(%key_next1, %tile_origin_limit), mul(%key_next1, 16)] : index
+    %st_row0_n = index.add %key_next, %st_key : index
+    %st_row_n = index.assume %st_row0_n [lt(%st_row0_n, %padded_tokens)] : index
+"""
+    if MODE == "uncond":
+        loads = """    %k_chunk_n = vector.load %ki_view[%st_row_n, %st_col] : view<[%padded_tokens]x[%ki_words]xi32> -> vector<2xi32>
+    %v_chunk_n = vector.load %v_view[%st_chan, %key_next] : view<[%kv_stride0]x[%padded_tokens]xf16> -> vector<16xf16>
+"""
+    else:
+        loads = """    %k_chunk_n = scf.if %st_is_k -> (vector<2xi32>) {
+      %k_in = vector.load %ki_view[%st_row_n, %st_col] : view<[%padded_tokens]x[%ki_words]xi32> -> vector<2xi32>
+      scf.yield %k_in : vector<2xi32>
+    } else {
+      scf.yield %zero_k : vector<2xi32>
+    }
+    %v_chunk_n = scf.if %st_is_k -> (vector<16xf16>) {
+      scf.yield %zero_v : vector<16xf16>
+    } else {
+      %v_in = vector.load %v_view[%st_chan, %key_next] : view<[%kv_stride0]x[%padded_tokens]xf16> -> vector<16xf16>
+      scf.yield %v_in : vector<16xf16>
+    }
+"""
+    K = K[:stage_begin] + views + loads + K[stage_end:]
+    sub4("    %next_sum = scf.select %keep, %next_sum_full, %row_sum : vector<8xf32>\n    scf.yield %next_max, %next_sum, ",
+         "    %next_sum = scf.select %keep, %next_sum_full, %row_sum : vector<8xf32>\n"
+         "    scf.if %st_is_k {\n      vector.store %k_chunk_n, %k_tile_o[%st_key, %st_chunk] : vector<2xi32>, view<16x20xi32>\n"
+         "    } else {\n      vector.store %v_chunk_n, %v_tile_o[%st_lane, %c0] : vector<16xf16>, view<128x24xf16>\n    }\n"
+         "    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)\n    scf.yield %next_max, %next_sum, ")
+    pad = int(os.environ.get("ATTN_PP_PAD", "0"))
+    if pad:
+        m = re.search(r"  %lds_bytes = index.constant (\d+) : offset\n", K)
+        K = K.replace(m.group(0), f"  %lds_bytes = index.constant {int(m.group(1)) + pad} : offset\n")
+    STEM6 = os.environ.get("ATTN_PP_STEM", SRC.replace("i4qk", "i4qkpp"))
+    K = K.replace("h3_" + SRC, "h3_" + STEM6).replace("h3." + SRC, "h3." + STEM6)
+    OUT6 = ROOT / "experiments" / f"{STEM6}.loom"; OUT6.write_text(K); print("wrote", OUT6, f"(ping-pong prefetch, {MODE})")
