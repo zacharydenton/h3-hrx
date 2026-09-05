@@ -125,3 +125,15 @@ Two paths, to be chosen:
 - int4 per 64/128-group weights with int8 activations: keeps the int4 rate minus the per-group
   float accumulation in the GEMM (each k-group's int32 partial converted and scaled, an
   estimated 15-25% on the GEMM), at 12.6-13.2% velocity error per step.
+
+## Study v4: can the group scales leave the k-loop? (2026-09-05)
+
+The (row, K-group) int4 scales factored as r[n] * t[g] with t folded into the activations,
+so the GEMM stays plain int4: no gain at any group size (w4r256a4 0.97874, w4r64a4 0.97783
+against w4a4 0.97860) -- the scale variation is not separable. True per-group weight scales
+help modestly and monotonically: g64 0.98773, g32 0.98904 with int4 per-token activations;
+g64 with int8 activations 0.99221. The 4-bit weight floor on H3 is about 0.99 cosine /
+13% relative velocity error, and reaching it costs per-group float accumulation inside the
+GEMM's k-loop. Target from the user: 100 TOPS with reasonable quality; the int8 path (54
+TOPS peak) cannot reach it, so this is int4 with group scales, on a GEMM that has to run at
+86% of the iu4 peak.

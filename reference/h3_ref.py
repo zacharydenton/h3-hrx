@@ -75,10 +75,26 @@ def quant_int4_groups(w: torch.Tensor, g: int) -> torch.Tensor:
     return (q * s).reshape(w.shape)
 
 
+def factor_group_scales(w: torch.Tensor, g: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """int4 weights whose per-(row, K-group) scale is factored s[n][g] ~= r[n] * t[g]: t (per group,
+    shared by all rows) folds into the activations, r stays per row, so the GEMM is plain int4.
+    Returns (dequantised weight, r [N, 1], t [K])."""
+    n, k = w.shape
+    wg = w.reshape(n, k // g, g)
+    amax = wg.abs().amax(dim=-1).clamp_min(1e-30)                     # [N, K/g]
+    t = torch.exp(torch.log(amax).mean(dim=0))                        # geometric mean over rows -> [K/g]
+    t = t / t.mean()
+    r = (amax / t[None]).amax(dim=1, keepdim=True) / 7.0              # per row: largest group after t
+    scale = r * t[None]                                               # [N, K/g]
+    q = torch.round(wg / scale[..., None]).clamp(-7, 7)
+    return (q * scale[..., None]).reshape(n, k), r, t.repeat_interleave(g)
+
+
 class QuantLinear:
     """y = x_rot @ W_rot^T with the checkpoint's rotated weights. The mode string names the
     weight and activation treatment, e.g. "w4a4" (the kernels today), "w4g128a8", "w8a8":
       w4     int4 per output row            w4g<G>  int4 per (row, K-group of G)
+      w4r<G> int4 per row with a per-group factor t[g] (rank-1 of the (row, group) scales) folded into x
       w8     the checkpoint's int8 rows     none    no activation quantisation, int8 rows
       a4     int4 per token                 a4g     int4 per (token, 256-group)
       a8     int8 per token
@@ -92,11 +108,17 @@ class QuantLinear:
             self.w = (q * s).to(w_rot.dtype)          # exact int4 codes times per-row scale
         elif wq.startswith("w4g"):
             self.w = quant_int4_groups(w_rot.float(), int(wq[3:])).to(w_rot.dtype)
+        elif wq.startswith("w4r"):
+            w, r, t = factor_group_scales(w_rot.float(), int(wq[3:]))
+            self.w = (w / t[None]).to(w_rot.dtype)     # the GEMM sees q * r; t is applied to the activations
+            self.t = t
         else:
             self.w = w_rot                            # w8 / none: the checkpoint's int8 rows as they are
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         xr = rotate_groups(x.float(), self.h)
+        if hasattr(self, "t"):
+            xr = xr * self.t
         if self.aq == "4":
             q, s = quant_int4_rows(xr); xr = q * s
         elif self.aq == "4g":
