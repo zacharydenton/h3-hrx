@@ -116,3 +116,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    sys.stdout.flush(); sys.stderr.flush()
+    import os; os._exit(0)          # the HIP teardown after 36 GPTQ blocks hangs holding all memory; the file is written
