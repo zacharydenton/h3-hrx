@@ -39,6 +39,12 @@ Attention, not the int4 GEMMs, is the wall at video lengths.
 ## Weights and license
 
 `scripts/download.sh` fetches the FL2VA partition (66 GB transformer, 64 GB encoder,
-VAEs) into `~/h3-models`. The MiniMax H3 Community License carries regional terms with
-an application process for the USA, EU, UK and South Korea; read `LICENSE` in the
-checkpoint before downloading.
+VAEs) into `~/h3-models`. The MiniMax H3 Community License permits open-weight use in
+the USA, EU, UK and South Korea; other regions apply to MiniMax for a licence. Read
+`LICENSE` and `docs/QA-about-License.md` in the checkpoint.
+
+## Environment
+
+The torch side shares `~/code/krea2-loom/.venv` (ROCm torch 2.13, a diffusers dev checkout
+that carries the H3 transformer, VAEs, scheduler and modular pipeline); `scripts/env.sh`
+points at the Loom toolchain.
