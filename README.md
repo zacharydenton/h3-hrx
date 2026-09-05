@@ -43,8 +43,13 @@ products reach 5e4 and the unnormalised Hadamard stages overflow f16). The raw r
 stream is dominated by a few huge channels, so cosines on it mislead deep in the stack;
 the final layer's RMSNorm removes them, which is why the velocity is the metric.
 
-Not yet built: the end-to-end clip (text encoder, VAEs and the sampler around the blocks)
-and the lever loop at video lengths.
+The end-to-end clip runs: `tools/encode_prompt.py` (Qwen3-VL-32B from the int8 file, layer
+50's raw state) then `tools/pipeline.py` (layout, the two schedules through diffusers'
+`MiniMaxH3Scheduler`, the blocks in Loom, the reference's embeddings and final layer,
+diffusers' two VAEs, ffmpeg). A frame of the first smoke clip, 22 frames at 864x480 in 8
+steps with the GPTQ int4 blocks:
+
+![fox](docs/media/smoke_fox_22f_8steps.jpg)
 
 **Quantisation.** Round-to-nearest int4 per row cost 21% relative error on the final
 velocity over 50 blocks; GPTQ at export time (`tools/gptq_export.py`, block by block on the

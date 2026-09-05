@@ -231,3 +231,16 @@ is 256-query workgroups or K/V shared across the two heads a WGP runs.
 VGPRs): 188.6 against 173.3 ms for eight waves. One workgroup per WGP is too little
 occupancy for the halved traffic to pay. Eight waves is the point of the curve; the kernel
 sits at 17.6 TFLOP/s at 10k rows against 21 when K/V fit L2.
+
+## The clip (2026-09-06)
+
+`tools/encode_prompt.py`: transformers' Qwen3-VL built on the meta device with 50 layers,
+the final norm replaced by identity (the conditioning is layer 50's unnormalised state),
+the vision tower and head dropped, the rotary module recreated on the device, the int8
+rows dequantised per row and every block linear wrapped to rotate its input by the same
+Hadamard the rows were rotated by; 72 s to load, 28 tokens for the fox prompt, rms 40.
+`tools/pipeline.py`: the t2va layout from the reference, diffusers' MiniMaxH3Scheduler
+twice (shift 12 and 3), noise drawn in diffusers' order, the head's raw data-ward velocity
+to the scheduler (ComfyUI negates it, diffusers does not), diffusers' VAEs from the
+official repo (their weight names differ from the ComfyUI files), ffmpeg mux. The 22-frame
+8-step smoke clip is a coherent backlit fox on snow (`docs/media/smoke_fox_22f_8steps.jpg`).
