@@ -67,7 +67,8 @@ kernel.def target(@h3_prepare_norm_i4_gfx11) export("h3_prepare_norm_i4") @h3_pr
   %nw_global = buffer.assume.memory_space<global> %norm_weight : buffer
   %tab_global = buffer.assume.memory_space<global> %table : buffer
   %cls_global = buffer.assume.memory_space<global> %cls : buffer
-  %h_view = buffer.view %h_global[%c0_offset] : buffer -> view<[%tokens_b]x[%width]xf16>
+  // the residual stream is f32: H3's grows past f16's range by block 23
+  %h_view = buffer.view %h_global[%c0_offset] : buffer -> view<[%tokens_b]x[%width]xf32>
   %nw_view = buffer.view %nw_global[%c0_offset] : buffer -> view<[%width]xf32>
   // the AdaLN table: rows 2*class (scale) and 2*class + 1 (shift), classes = (timestep, modality) pairs
   %table_rows = index.mul %classes, %c2 : index
@@ -95,8 +96,7 @@ kernel.def target(@h3_prepare_norm_i4_gfx11) export("h3_prepare_norm_i4") @h3_pr
     %ss_chunk = index.add %ss_lane_step, %lane : index
     %ss_i0 = index.mul %ss_chunk, %c8 : index
     %ss_i = index.assume %ss_i0 [le(%ss_i0, %width_last), mul(%ss_i0, 8)] : index
-    %ss_v16 = vector.load %h_view[%row, %ss_i] : view<[%tokens_b]x[%width]xf16> -> vector<8xf16>
-    %ss_x = vector.extf %ss_v16 : vector<8xf16> to vector<8xf32>
+    %ss_x = vector.load %h_view[%row, %ss_i] : view<[%tokens_b]x[%width]xf32> -> vector<8xf32>
     %ss_sq = vector.mulf %ss_x, %ss_x : vector<8xf32>
     %ss_next = vector.addf %ss_acc, %ss_sq : vector<8xf32>
     scf.yield %ss_next : vector<8xf32>
@@ -114,8 +114,7 @@ kernel.def target(@h3_prepare_norm_i4_gfx11) export("h3_prepare_norm_i4") @h3_pr
     %m_chunk = index.add %m_lane_step, %lane : index
     %m_i0 = index.mul %m_chunk, %c8 : index
     %m_i = index.assume %m_i0 [le(%m_i0, %width_last), mul(%m_i0, 8)] : index
-    %m_v16 = vector.load %h_view[%row, %m_i] : view<[%tokens_b]x[%width]xf16> -> vector<8xf16>
-    %m_x = vector.extf %m_v16 : vector<8xf16> to vector<8xf32>
+    %m_x = vector.load %h_view[%row, %m_i] : view<[%tokens_b]x[%width]xf32> -> vector<8xf32>
     %m_n = vector.mulf %m_x, %rms_inv8 : vector<8xf32>
     %m_nw = vector.load %nw_view[%m_i] : view<[%width]xf32> -> vector<8xf32>
     %m_normed = vector.mulf %m_n, %m_nw : vector<8xf32>

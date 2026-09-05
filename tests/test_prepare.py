@@ -48,7 +48,7 @@ def main() -> int:
     ok = True
     with workdir() as tmp:
         tmp = Path(tmp)
-        h = (rng.standard_normal((tokens, width)) * 1.5).astype(np.float16)
+        h = (rng.standard_normal((tokens, width)) * 1.5e5).astype(np.float32)      # the f32 residual stream, at H3's deep-block magnitude
         w = (1.0 + rng.standard_normal(width) * 0.1).astype(np.float32)
         table = (rng.standard_normal((classes * 2, width)) * 0.2).astype(np.float32)     # rows 2c scale, 2c+1 shift
         cls = rng.integers(0, classes, tokens).astype(np.int32)
@@ -56,7 +56,7 @@ def main() -> int:
         normed = hf / np.sqrt((hf * hf).mean(axis=1, keepdims=True) + 1e-5) * w
         x = (1.0 + table[2 * cls]) * normed + table[2 * cls + 1]
         ok &= check("norm", tmp, tokens, width, x.astype(np.float32),
-                    [("in_f16", h), ("in", w), ("in", table), ("in_i32", cls)],
+                    [("in", h), ("in", w), ("in", table), ("in_i32", cls)],
                     {"h3.prepare_norm_i4.eps": 1e-5, "h3.prepare_norm_i4.classes": classes})
         for pw in (7168, 14336):
             x = (rng.standard_normal((tokens, pw)) * 0.5).astype(np.float16)

@@ -63,22 +63,38 @@ def quant_int4_rows(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.round(w / s).clamp(-7, 7), s
 
 
+def quant_int8_rows(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    s = w.abs().amax(dim=-1, keepdim=True).clamp_min(1e-30) / 127.0
+    return torch.round(w / s).clamp(-127, 127), s
+
+
 class QuantLinear:
-    """y = x_rot @ W_rot^T with the checkpoint's rotated weights, in one of the modes above."""
+    """y = x_rot @ W_rot^T with the checkpoint's rotated weights, in one of the modes above.
+    Weights are int4 per row in every quantised mode; the activation treatment is the study:
+      w4a4  : int4 per token                       (the kernels today)
+      w4a4g : int4 per token per 256-group          (needs per-group scales in the GEMM)
+      w4a8  : int8 per token                        (the iu8 WMMA path, half the int4 rate)
+      w8a8  : the checkpoint's int8 weights, int8 per token activations (comfy-kitchen's int8 path)
+    """
 
     def __init__(self, w_rot: torch.Tensor, h: torch.Tensor, quant: str):
         self.h, self.quant = h, quant
-        if quant == "w4a4":
+        if quant in ("w4a4", "w4a4g", "w4a8"):
             q, s = quant_int4_rows(w_rot.float())
             self.w = (q * s).to(w_rot.dtype)          # exact int4 codes times per-row scale
         else:
-            self.w = w_rot
+            self.w = w_rot                            # none / w8a8: the checkpoint's int8 rows as they are
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         xr = rotate_groups(x.float(), self.h)
         if self.quant == "w4a4":
-            q, s = quant_int4_rows(xr)
-            xr = q * s
+            q, s = quant_int4_rows(xr); xr = q * s
+        elif self.quant == "w4a4g":
+            g = self.h.shape[0]
+            xg = xr.reshape(*xr.shape[:-1], xr.shape[-1] // g, g)
+            q, s = quant_int4_rows(xg); xr = (q * s).reshape(xr.shape)
+        elif self.quant in ("w4a8", "w8a8"):
+            q, s = quant_int8_rows(xr); xr = q * s
         return (xr.to(self.w.dtype) @ self.w.t()).to(x.dtype)
 
 
@@ -190,7 +206,7 @@ def time_shift_sigma(sigma: float, from_shift: float, to_shift: float) -> float:
 
 class H3Ref:
     def __init__(self, ckpt: Checkpoint, quant: str = "none", layers: int = 50, eps: float = 1e-5, cache_linears: bool = True):
-        assert quant in ("none", "w4a4")
+        assert quant in ("none", "w4a4", "w4a4g", "w4a8", "w8a8")
         self.ckpt, self.quant, self.layers, self.eps = ckpt, quant, layers, eps
         self.cache_linears = cache_linears          # False: a block's 770 MB of bf16 weights are dropped after use
         self.device, self.dtype = ckpt.device, ckpt.dtype

@@ -55,7 +55,7 @@ class H3Blocks:
         if native.h3_abi_version() != _ABI:
             raise H3Error("ABI mismatch; rebuild with scripts/build_host.sh")
         native.h3_create.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_size_t]
-        native.h3_run.argtypes = [ctypes.c_void_p, _U16P, ctypes.c_size_t, _I32P, ctypes.c_size_t, _F32P, ctypes.c_size_t, _F32P, _F32P, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
+        native.h3_run.argtypes = [ctypes.c_void_p, _F32P, ctypes.c_size_t, _I32P, ctypes.c_size_t, _F32P, ctypes.c_size_t, _F32P, _F32P, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
         native.h3_profile.argtypes = [ctypes.c_void_p, ctypes.c_int]
         native.h3_destroy.argtypes = [ctypes.c_void_p]
         self._native = native
@@ -73,18 +73,18 @@ class H3Blocks:
         except Exception: pass
 
     def forward(self, x: torch.Tensor, cls: torch.Tensor, mods: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        """x [tokens][5376] (any float dtype) -> f16 residual stream after `layers` blocks.
+        """x [tokens][5376] (any float dtype) -> f32 residual stream after `layers` blocks.
         cls [tokens] int (AdaLN row class), mods [layers][72][5376] f32 (mods_table), cos/sin [tokens][48] f32."""
         timing = os.environ.get("H3_TIMING") == "1"
         t0 = time.time()
-        xa = np.ascontiguousarray(x.detach().to(torch.float16).cpu().numpy())
+        xa = np.ascontiguousarray(x.detach().to(torch.float32).cpu().numpy())
         ca_ = np.ascontiguousarray(cls.detach().to(torch.int32).cpu().numpy())
         ma = np.ascontiguousarray(mods.detach().float().cpu().numpy()[: self.layers])
         ca = np.ascontiguousarray(cos.detach().float().cpu().numpy()); sa = np.ascontiguousarray(sin.detach().float().cpu().numpy())
         t1 = time.time()
         assert xa.shape == (self.tokens, R.HIDDEN) and ca_.shape == (self.tokens,) and ma.shape == (self.layers, 6 * _CLASSES, R.HIDDEN) and ca.shape == sa.shape == (self.tokens, 48)
         err = ctypes.create_string_buffer(_ERR)
-        rc = self._native.h3_run(self._handle, xa.ctypes.data_as(_U16P), xa.size, ca_.ctypes.data_as(_I32P), ca_.size, ma.ctypes.data_as(_F32P), ma.size,
+        rc = self._native.h3_run(self._handle, xa.ctypes.data_as(_F32P), xa.size, ca_.ctypes.data_as(_I32P), ca_.size, ma.ctypes.data_as(_F32P), ma.size,
                                  ca.ctypes.data_as(_F32P), sa.ctypes.data_as(_F32P), ca.size, err, _ERR)
         if rc:
             raise H3Error(err.value.decode())

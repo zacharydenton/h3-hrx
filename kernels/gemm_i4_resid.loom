@@ -1,7 +1,7 @@
 // Krea 2's int4 GEMM: loom-gemm's 128x128 register-prefetch tile with grouped
 // rasterization, plus the W4A4 ConvRot epilogue -- the i32 accumulator is scaled by
 // the weight row's scale and the activation token's scale:
-//   x[m, n] = f16( x[m, n] + gate[cls[m]][n] * acc[m, n] * w_scale[n] * a_scale[m] )   (in place on x;
+//   x[m, n] = f32( x[m, n] + gate[cls[m]][n] * acc[m, n] * w_scale[n] * a_scale[m] )   (in place on the f32 x;
 //   gate is a [classes][N] table, cls[m] the row's (timestep, modality) class)
 // A [M][K] and W [N][K] are int4 nibbles (low first), both already Hadamard-rotated
 // along K (the weights offline, the activations by the prepare kernel).
@@ -113,7 +113,7 @@ kernel.def target(@h3_gemm_i4_resid_gfx11) export("h3_gemm_i4_resid") @h3_gemm_i
   %a_scale_view = buffer.view %a_scale_global[%c0_offset] : buffer -> view<[%m_bounded]xf32>
   %gate_view = buffer.view %gate_global[%c0_offset] : buffer -> view<[%classes]x[%n_size]xf32>
   %cls_view = buffer.view %cls_global[%c0_offset] : buffer -> view<[%m_bounded]xi32>
-  %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_bounded]x[%n_size]xf16>
+  %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_bounded]x[%n_size]xf32>
 
   %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
   // Stages: 128 rows of 20 quads (64 bytes of k, 16 of padding against bank conflicts).
@@ -295,11 +295,9 @@ kernel.def target(@h3_gemm_i4_resid_gfx11) export("h3_gemm_i4_resid") @h3_gemm_i
         %a_scale_vector = vector.splat %a_scale_value : vector<4xf32>
         %scaled = vector.mulf %scaled0, %a_scale_vector : vector<4xf32>
         %gated = vector.mulf %scaled, %gate_values : vector<4xf32>
-        %prior_half = vector.load %c_view[%bounded, %out_col] : view<[%m_bounded]x[%n_size]xf16> -> vector<4xf16>
-        %prior = vector.extf %prior_half : vector<4xf16> to vector<4xf32>
+        %prior = vector.load %c_view[%bounded, %out_col] : view<[%m_bounded]x[%n_size]xf32> -> vector<4xf32>
         %summed = vector.addf %prior, %gated : vector<4xf32>
-        %narrow = vector.fptrunc %summed : vector<4xf32> to vector<4xf16>
-        vector.store %narrow, %c_view[%bounded, %out_col] : vector<4xf16>, view<[%m_bounded]x[%n_size]xf16>
+        vector.store %summed, %c_view[%bounded, %out_col] : vector<4xf32>, view<[%m_bounded]x[%n_size]xf32>
       }
     }
     kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)

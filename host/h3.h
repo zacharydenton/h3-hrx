@@ -15,13 +15,14 @@ uint32_t h3_abi_version(void);
 // sequence length); weights_dir holds weights.bin + manifest.txt from tools/export_weights.py.
 int h3_create(const char *weights_dir, const char *kernels_dir, int tokens, int layers,
               h3_session **out_session, char *error, size_t error_capacity);
-// x: f16 [tokens][5376] in and out (the residual stream after all blocks);
+// x: f32 [tokens][5376] in and out (the residual stream after all blocks; f32 because H3's
+//    stream grows past f16's range by block 23);
 // cls: i32 [tokens], each row's AdaLN class (timestep class * 3 + modality), < H3_CLASSES;
 // mods: f32 [layers][6 * H3_CLASSES][5376], per layer four tables in this order:
 //   [H3_CLASSES][2][5376] (scale_msa, shift_msa), [H3_CLASSES][5376] gate_msa,
 //   [H3_CLASSES][2][5376] (scale_mlp, shift_mlp), [H3_CLASSES][5376] gate_mlp;
 // cos/sin: f32 [tokens][48] (the angle of each rotated pair).
-int h3_run(h3_session *s, uint16_t *x, size_t x_elements, const int32_t *cls, size_t cls_elements,
+int h3_run(h3_session *s, float *x, size_t x_elements, const int32_t *cls, size_t cls_elements,
            const float *mods, size_t mods_elements, const float *cos, const float *sin, size_t rope_elements,
            char *error, size_t error_capacity);
 int h3_profile(h3_session *s, int enable);

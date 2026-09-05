@@ -56,6 +56,10 @@ def main() -> int:
     temb = fx["temb"].to(device)
     x0 = fx["x"].to(device, torch.bfloat16); rows = fx["rows"].to(device); cos, sin = fx["cos"].to(device), fx["sin"].to(device)
     mods = mods_table(refs["none"], temb, 50)
+    layout = R.Layout(*fx["layout"]); tclass = layout.tclass.to(device)
+    def velocity(x):
+        v, a = refs["none"].final(x.to(torch.bfloat16), temb, tclass, layout)
+        return torch.cat([v.flatten(), a.flatten()])
     ok = True
     for n in [int(v) for v in a.curve.split(",")]:
         loom = H3Blocks(tokens, layers=n)
@@ -69,8 +73,12 @@ def main() -> int:
         upd = lambda t: (t - x0.float()).flatten()
         cos_sim = lambda p, q: torch.nn.functional.cosine_similarity(p, q, dim=0).item()
         c_w, c_n, c_ref = cos_sim(upd(y), upd(outs["w4a4"])), cos_sim(upd(y), upd(outs["none"])), cos_sim(upd(outs["w4a4"]), upd(outs["none"]))
-        print(f"  {n:3d} blocks {dt * 1e3:8.0f} ms:  update cosine vs w4a4 {c_w:.5f}  update cosine vs none {c_n:.5f}  (reference w4a4 vs none {c_ref:.5f})")
-        ok &= c_w > 0.99 if n == 1 else c_w > 0.9
+        with torch.no_grad():
+            vy, vw, vn = velocity(y), velocity(outs["w4a4"]), velocity(outs["none"])
+        v_w, v_n, v_ref = cos_sim(vy, vw), cos_sim(vy, vn), cos_sim(vw, vn)
+        print(f"  {n:3d} blocks {dt * 1e3:8.0f} ms:  stream update cosine vs w4a4 {c_w:.5f} vs none {c_n:.5f} (ref {c_ref:.5f});  "
+              f"final velocity cosine vs w4a4 {v_w:.5f} vs none {v_n:.5f} (ref {v_ref:.5f})")
+        ok &= v_w > 0.99
         loom.close()
     return 0 if ok else 1
 

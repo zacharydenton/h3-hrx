@@ -63,10 +63,10 @@ kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_
   %qs_global = buffer.assume.memory_space<global> %q_scale : buffer
   %qw_view = buffer.view %q_global[%c0_offset] : buffer -> view<[%tokens_b]x[%word_width]xi32>
   %qs_view = buffer.view %qs_global[%c0_offset] : buffer -> view<[%tokens_b]xf32>
-  %row_bytes0 = index.mul %width, %c2 : index
+  %row_bytes0 = index.mul %width, %c4 : index
   %row_bytes = index.cast %row_bytes0 : index to offset
   %lds = buffer.alloca<workgroup> align(16) %row_bytes : buffer
-  %x_view = buffer.view %lds[%c0_offset] : buffer -> view<[%width]xf16>
+  %x_view = buffer.view %lds[%c0_offset] : buffer -> view<[%width]xf32>
 
   // the row as produced (the gate|up GEMM's fused silu(g)*u output)
   scf.for %m_j = [%c0 to %chunks_per_lane step %c1] {
@@ -76,8 +76,7 @@ kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_
     %m_i = index.assume %m_i0 [le(%m_i0, %width_last), mul(%m_i0, 8)] : index
     %m_v16 = vector.load %h_view[%row, %m_i] : view<[%tokens_b]x[%width]xf16> -> vector<8xf16>
     %m_out = vector.extf %m_v16 : vector<8xf16> to vector<8xf32>
-    %m_out_h = vector.fptrunc %m_out : vector<8xf32> to vector<8xf16>
-    vector.store %m_out_h, %x_view[%m_i] : vector<8xf16>, view<[%width]xf16>
+    vector.store %m_out, %x_view[%m_i] : vector<8xf32>, view<[%width]xf32>
   }
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
@@ -98,14 +97,10 @@ kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_
     %i1 = index.add %base, %c1 : index
     %i2 = index.add %i1, %c1 : index
     %i3 = index.add %i2, %c1 : index
-    %e0_h = view.load %x_view[%base] : view<[%width]xf16> -> f16
-    %e0 = scalar.extf %e0_h : f16 to f32
-    %e1_h = view.load %x_view[%i1] : view<[%width]xf16> -> f16
-    %e1 = scalar.extf %e1_h : f16 to f32
-    %e2_h = view.load %x_view[%i2] : view<[%width]xf16> -> f16
-    %e2 = scalar.extf %e2_h : f16 to f32
-    %e3_h = view.load %x_view[%i3] : view<[%width]xf16> -> f16
-    %e3 = scalar.extf %e3_h : f16 to f32
+    %e0 = view.load %x_view[%base] : view<[%width]xf32> -> f32
+    %e1 = view.load %x_view[%i1] : view<[%width]xf32> -> f32
+    %e2 = view.load %x_view[%i2] : view<[%width]xf32> -> f32
+    %e3 = view.load %x_view[%i3] : view<[%width]xf32> -> f32
     %s01 = scalar.addf %e0, %e1 : f32
     %s23 = scalar.addf %e2, %e3 : f32
     %d01 = scalar.subf %e0, %e1 : f32
@@ -114,14 +109,10 @@ kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_
     %o1 = scalar.subf %s01, %d23 : f32
     %o2 = scalar.addf %d01, %s23 : f32
     %o3 = scalar.subf %s23, %d01 : f32
-    %o0_h = scalar.fptrunc %o0 : f32 to f16
-    view.store %o0_h, %x_view[%base] : f16, view<[%width]xf16>
-    %o1_h = scalar.fptrunc %o1 : f32 to f16
-    view.store %o1_h, %x_view[%i1] : f16, view<[%width]xf16>
-    %o2_h = scalar.fptrunc %o2 : f32 to f16
-    view.store %o2_h, %x_view[%i2] : f16, view<[%width]xf16>
-    %o3_h = scalar.fptrunc %o3 : f32 to f16
-    view.store %o3_h, %x_view[%i3] : f16, view<[%width]xf16>
+    view.store %o0, %x_view[%base] : f32, view<[%width]xf32>
+    view.store %o1, %x_view[%i1] : f32, view<[%width]xf32>
+    view.store %o2, %x_view[%i2] : f32, view<[%width]xf32>
+    view.store %o3, %x_view[%i3] : f32, view<[%width]xf32>
   }
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
   scf.for %t_j = [%c0 to %quads_per_lane step %c1] {
@@ -140,14 +131,10 @@ kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_
     %i1 = index.add %base, %c4 : index
     %i2 = index.add %i1, %c4 : index
     %i3 = index.add %i2, %c4 : index
-    %e0_h = view.load %x_view[%base] : view<[%width]xf16> -> f16
-    %e0 = scalar.extf %e0_h : f16 to f32
-    %e1_h = view.load %x_view[%i1] : view<[%width]xf16> -> f16
-    %e1 = scalar.extf %e1_h : f16 to f32
-    %e2_h = view.load %x_view[%i2] : view<[%width]xf16> -> f16
-    %e2 = scalar.extf %e2_h : f16 to f32
-    %e3_h = view.load %x_view[%i3] : view<[%width]xf16> -> f16
-    %e3 = scalar.extf %e3_h : f16 to f32
+    %e0 = view.load %x_view[%base] : view<[%width]xf32> -> f32
+    %e1 = view.load %x_view[%i1] : view<[%width]xf32> -> f32
+    %e2 = view.load %x_view[%i2] : view<[%width]xf32> -> f32
+    %e3 = view.load %x_view[%i3] : view<[%width]xf32> -> f32
     %s01 = scalar.addf %e0, %e1 : f32
     %s23 = scalar.addf %e2, %e3 : f32
     %d01 = scalar.subf %e0, %e1 : f32
@@ -156,14 +143,10 @@ kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_
     %o1 = scalar.subf %s01, %d23 : f32
     %o2 = scalar.addf %d01, %s23 : f32
     %o3 = scalar.subf %s23, %d01 : f32
-    %o0_h = scalar.fptrunc %o0 : f32 to f16
-    view.store %o0_h, %x_view[%base] : f16, view<[%width]xf16>
-    %o1_h = scalar.fptrunc %o1 : f32 to f16
-    view.store %o1_h, %x_view[%i1] : f16, view<[%width]xf16>
-    %o2_h = scalar.fptrunc %o2 : f32 to f16
-    view.store %o2_h, %x_view[%i2] : f16, view<[%width]xf16>
-    %o3_h = scalar.fptrunc %o3 : f32 to f16
-    view.store %o3_h, %x_view[%i3] : f16, view<[%width]xf16>
+    view.store %o0, %x_view[%base] : f32, view<[%width]xf32>
+    view.store %o1, %x_view[%i1] : f32, view<[%width]xf32>
+    view.store %o2, %x_view[%i2] : f32, view<[%width]xf32>
+    view.store %o3, %x_view[%i3] : f32, view<[%width]xf32>
   }
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
   scf.for %t_j = [%c0 to %quads_per_lane step %c1] {
@@ -182,14 +165,10 @@ kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_
     %i1 = index.add %base, %c16 : index
     %i2 = index.add %i1, %c16 : index
     %i3 = index.add %i2, %c16 : index
-    %e0_h = view.load %x_view[%base] : view<[%width]xf16> -> f16
-    %e0 = scalar.extf %e0_h : f16 to f32
-    %e1_h = view.load %x_view[%i1] : view<[%width]xf16> -> f16
-    %e1 = scalar.extf %e1_h : f16 to f32
-    %e2_h = view.load %x_view[%i2] : view<[%width]xf16> -> f16
-    %e2 = scalar.extf %e2_h : f16 to f32
-    %e3_h = view.load %x_view[%i3] : view<[%width]xf16> -> f16
-    %e3 = scalar.extf %e3_h : f16 to f32
+    %e0 = view.load %x_view[%base] : view<[%width]xf32> -> f32
+    %e1 = view.load %x_view[%i1] : view<[%width]xf32> -> f32
+    %e2 = view.load %x_view[%i2] : view<[%width]xf32> -> f32
+    %e3 = view.load %x_view[%i3] : view<[%width]xf32> -> f32
     %s01 = scalar.addf %e0, %e1 : f32
     %s23 = scalar.addf %e2, %e3 : f32
     %d01 = scalar.subf %e0, %e1 : f32
@@ -198,14 +177,10 @@ kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_
     %o1 = scalar.subf %s01, %d23 : f32
     %o2 = scalar.addf %d01, %s23 : f32
     %o3 = scalar.subf %s23, %d01 : f32
-    %o0_h = scalar.fptrunc %o0 : f32 to f16
-    view.store %o0_h, %x_view[%base] : f16, view<[%width]xf16>
-    %o1_h = scalar.fptrunc %o1 : f32 to f16
-    view.store %o1_h, %x_view[%i1] : f16, view<[%width]xf16>
-    %o2_h = scalar.fptrunc %o2 : f32 to f16
-    view.store %o2_h, %x_view[%i2] : f16, view<[%width]xf16>
-    %o3_h = scalar.fptrunc %o3 : f32 to f16
-    view.store %o3_h, %x_view[%i3] : f16, view<[%width]xf16>
+    view.store %o0, %x_view[%base] : f32, view<[%width]xf32>
+    view.store %o1, %x_view[%i1] : f32, view<[%width]xf32>
+    view.store %o2, %x_view[%i2] : f32, view<[%width]xf32>
+    view.store %o3, %x_view[%i3] : f32, view<[%width]xf32>
   }
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
   scf.for %t_j = [%c0 to %quads_per_lane step %c1] {
@@ -224,14 +199,10 @@ kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_
     %i1 = index.add %base, %c64 : index
     %i2 = index.add %i1, %c64 : index
     %i3 = index.add %i2, %c64 : index
-    %e0_h = view.load %x_view[%base] : view<[%width]xf16> -> f16
-    %e0 = scalar.extf %e0_h : f16 to f32
-    %e1_h = view.load %x_view[%i1] : view<[%width]xf16> -> f16
-    %e1 = scalar.extf %e1_h : f16 to f32
-    %e2_h = view.load %x_view[%i2] : view<[%width]xf16> -> f16
-    %e2 = scalar.extf %e2_h : f16 to f32
-    %e3_h = view.load %x_view[%i3] : view<[%width]xf16> -> f16
-    %e3 = scalar.extf %e3_h : f16 to f32
+    %e0 = view.load %x_view[%base] : view<[%width]xf32> -> f32
+    %e1 = view.load %x_view[%i1] : view<[%width]xf32> -> f32
+    %e2 = view.load %x_view[%i2] : view<[%width]xf32> -> f32
+    %e3 = view.load %x_view[%i3] : view<[%width]xf32> -> f32
     %s01 = scalar.addf %e0, %e1 : f32
     %s23 = scalar.addf %e2, %e3 : f32
     %d01 = scalar.subf %e0, %e1 : f32
@@ -240,14 +211,10 @@ kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_
     %o1 = scalar.subf %s01, %d23 : f32
     %o2 = scalar.addf %d01, %s23 : f32
     %o3 = scalar.subf %s23, %d01 : f32
-    %o0_h = scalar.fptrunc %o0 : f32 to f16
-    view.store %o0_h, %x_view[%base] : f16, view<[%width]xf16>
-    %o1_h = scalar.fptrunc %o1 : f32 to f16
-    view.store %o1_h, %x_view[%i1] : f16, view<[%width]xf16>
-    %o2_h = scalar.fptrunc %o2 : f32 to f16
-    view.store %o2_h, %x_view[%i2] : f16, view<[%width]xf16>
-    %o3_h = scalar.fptrunc %o3 : f32 to f16
-    view.store %o3_h, %x_view[%i3] : f16, view<[%width]xf16>
+    view.store %o0, %x_view[%base] : f32, view<[%width]xf32>
+    view.store %o1, %x_view[%i1] : f32, view<[%width]xf32>
+    view.store %o2, %x_view[%i2] : f32, view<[%width]xf32>
+    view.store %o3, %x_view[%i3] : f32, view<[%width]xf32>
   }
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
@@ -257,8 +224,7 @@ kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_
     %a_chunk = index.add %a_lane_step, %lane : index
     %a_i0 = index.mul %a_chunk, %c8 : index
     %a_i = index.assume %a_i0 [le(%a_i0, %width_last), mul(%a_i0, 8)] : index
-    %a_x_h = vector.load %x_view[%a_i] : view<[%width]xf16> -> vector<8xf16>
-    %a_x = vector.extf %a_x_h : vector<8xf16> to vector<8xf32>
+    %a_x = vector.load %x_view[%a_i] : view<[%width]xf32> -> vector<8xf32>
     %a_abs = vector.absf %a_x : vector<8xf32>
     %a_next = vector.maxnumf %a_acc, %a_abs : vector<8xf32>
     scf.yield %a_next : vector<8xf32>
@@ -276,8 +242,7 @@ kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_
     %q_i0 = index.mul %q_chunk, %c8 : index
     %q_i = index.assume %q_i0 [le(%q_i0, %width_last), mul(%q_i0, 8)] : index
     %q_w = index.assume %q_chunk [lt(%q_chunk, %word_width)] : index
-    %q_x_h = vector.load %x_view[%q_i] : view<[%width]xf16> -> vector<8xf16>
-    %q_x = vector.extf %q_x_h : vector<8xf16> to vector<8xf32>
+    %q_x = vector.load %x_view[%q_i] : view<[%width]xf32> -> vector<8xf32>
     %q_r = vector.mulf %q_x, %inv_s8 : vector<8xf32>
     %q_f = vector.roundevenf %q_r : vector<8xf32>
     %q_c = vector.maxnumf %q_f, %neg_seven8 : vector<8xf32>

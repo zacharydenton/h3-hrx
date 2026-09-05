@@ -63,7 +63,8 @@ FORM = {
   %nw_global = buffer.assume.memory_space<global> %norm_weight : buffer
   %tab_global = buffer.assume.memory_space<global> %table : buffer
   %cls_global = buffer.assume.memory_space<global> %cls : buffer
-  %h_view = buffer.view %h_global[%c0_offset] : buffer -> view<[%tokens_b]x[%width]xf16>
+  // the residual stream is f32: H3's grows past f16's range by block 23
+  %h_view = buffer.view %h_global[%c0_offset] : buffer -> view<[%tokens_b]x[%width]xf32>
   %nw_view = buffer.view %nw_global[%c0_offset] : buffer -> view<[%width]xf32>
   // the AdaLN table: rows 2*class (scale) and 2*class + 1 (shift), classes = (timestep, modality) pairs
   %table_rows = index.mul %classes, %c2 : index
@@ -79,8 +80,7 @@ FORM = {
 """,
         form="""  // sum of squares, then normalise, scale and modulate into LDS
   %ss_v = scf.for %ss_j = [%c0 to %chunks_per_lane step %c1](%ss_acc = %zero8 : vector<8xf32>) -> (vector<8xf32>) {
-""" + chunk("ss") + """    %ss_v16 = vector.load %h_view[%row, %ss_i] : view<[%tokens_b]x[%width]xf16> -> vector<8xf16>
-    %ss_x = vector.extf %ss_v16 : vector<8xf16> to vector<8xf32>
+""" + chunk("ss") + """    %ss_x = vector.load %h_view[%row, %ss_i] : view<[%tokens_b]x[%width]xf32> -> vector<8xf32>
     %ss_sq = vector.mulf %ss_x, %ss_x : vector<8xf32>
     %ss_next = vector.addf %ss_acc, %ss_sq : vector<8xf32>
     scf.yield %ss_next : vector<8xf32>
@@ -94,8 +94,7 @@ FORM = {
   %rms_inv = scalar.rsqrtf %mean_eps : f32
   %rms_inv8 = vector.splat %rms_inv : vector<8xf32>
   scf.for %m_j = [%c0 to %chunks_per_lane step %c1] {
-""" + chunk("m") + """    %m_v16 = vector.load %h_view[%row, %m_i] : view<[%tokens_b]x[%width]xf16> -> vector<8xf16>
-    %m_x = vector.extf %m_v16 : vector<8xf16> to vector<8xf32>
+""" + chunk("m") + """    %m_x = vector.load %h_view[%row, %m_i] : view<[%tokens_b]x[%width]xf32> -> vector<8xf32>
     %m_n = vector.mulf %m_x, %rms_inv8 : vector<8xf32>
     %m_nw = vector.load %nw_view[%m_i] : view<[%width]xf32> -> vector<8xf32>
     %m_normed = vector.mulf %m_n, %m_nw : vector<8xf32>
@@ -124,7 +123,7 @@ FORM = {
 
 def kernel(name: str) -> str:
     f = FORM[name]
-    lds = "f16" if name == "plain" else "f32"
+    lds = "f32"      # f16 LDS overflows: H3's gate|up products reach 5e4 and the unnormalised stages grow 4x each
     lds_bytes = 2 if lds == "f16" else 4
     ns, sym = f"h3.prepare_{name}_i4", f"h3_prepare_{name}_i4"
     extra_cfg = "" if name in ("norm", "plain") else f"\nconfig.decl @{ns}.gate_stride : %value: index where [range(%value, 256, 65536), mul(%value, 256)]\n"
@@ -319,5 +318,5 @@ def uniform_loops(text: str) -> str:
                         "  %quads_per_lane = index.div %quads, %lanes : index\n  %chunks_per_lane = index.div %word_width, %lanes : index\n")
 
 for name in FORM:
-    (OUT / f"prepare_{name}_i4.loom").write_text(uniform_loops(lds_type(kernel(name), "f16" if name == "plain" else "f32")))
+    (OUT / f"prepare_{name}_i4.loom").write_text(uniform_loops(lds_type(kernel(name), "f32")))
     print("wrote", f"prepare_{name}_i4.loom")

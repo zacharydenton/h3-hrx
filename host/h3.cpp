@@ -117,7 +117,7 @@ public:
         load(k_rope_, "rope_qknorm", "h3_rope_qknorm_f16");
         load(k_attention_, "attention", "h3_attention_mha_lds_f16_wmma");
         const size_t T = capacity_;
-        HIP_CHECK(hipMalloc(&x_, T * HIDDEN * 2));
+        HIP_CHECK(hipMalloc(&x_, T * HIDDEN * 4));            // the residual stream, f32
         HIP_CHECK(hipMalloc(&a_q_, T * FFN / 2));               // the widest prepared operand (down's K = 14336)
         HIP_CHECK(hipMalloc(&a_s_, T * 4));
         HIP_CHECK(hipMalloc(&fused_, T * QKV * 2));
@@ -130,7 +130,7 @@ public:
         HIP_CHECK(hipMalloc(&cls_, T * 4));
         HIP_CHECK(hipMalloc(&cos_, T * ROPE_HALF * 4));
         HIP_CHECK(hipMalloc(&sin_, T * ROPE_HALF * 4));
-        for (void *p : {x_, fused_, q_, k_, v_, cls_}) HIP_CHECK(hipMemset(p, 0, p == cls_ ? T * 4 : (p == x_ ? T * HIDDEN * 2 : (p == fused_ ? T * QKV * 2 : T * INNER * 2))));   // headroom rows stay zero
+        for (void *p : {x_, fused_, q_, k_, v_, cls_}) HIP_CHECK(hipMemset(p, 0, p == cls_ ? T * 4 : (p == x_ ? T * HIDDEN * 4 : (p == fused_ ? T * QKV * 2 : T * INNER * 2))));   // headroom rows stay zero
     }
     ~Session() {
         for (void *p : {x_, a_q_, a_s_, fused_, q_, k_, v_, attn_, gu_, mods_, cls_, cos_, sin_, weights_}) if (p) (void)hipFree(p);
@@ -138,7 +138,7 @@ public:
             if (k->module) (void)hipModuleUnload(k->module);
     }
 
-    void run(uint16_t *x, size_t x_elements, const int32_t *cls, size_t cls_elements, const float *mods, size_t mods_elements,
+    void run(float *x, size_t x_elements, const int32_t *cls, size_t cls_elements, const float *mods, size_t mods_elements,
              const float *cos, const float *sin, size_t rope_elements) {
         std::lock_guard<std::mutex> lock(mutex_);
         const size_t T = tokens_;
@@ -147,14 +147,14 @@ public:
         for (size_t i = 0; i < T; ++i) if (cls[i] < 0 || cls[i] >= CLASSES) throw std::invalid_argument("cls value out of range");
         if (mods_elements != size_t(layers_) * MODS_PER_LAYER) throw std::invalid_argument("mods has the wrong element count");
         if (rope_elements != T * ROPE_HALF) throw std::invalid_argument("cos/sin have the wrong element count");
-        HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)x_, x, T * HIDDEN * 2));
+        HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)x_, x, T * HIDDEN * 4));
         HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)cls_, cls, T * 4));
         HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)mods_, mods, mods_elements * 4));
         HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)cos_, cos, rope_elements * 4));
         HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)sin_, sin, rope_elements * 4));
         for (int i = 0; i < layers_; ++i) block(i);
         HIP_CHECK(hipDeviceSynchronize());
-        HIP_CHECK(hipMemcpyDtoH(x, (hipDeviceptr_t)x_, T * HIDDEN * 2));
+        HIP_CHECK(hipMemcpyDtoH(x, (hipDeviceptr_t)x_, T * HIDDEN * 4));
         if (profile) {
             double total = 0; for (auto &e : stage_us) total += e.second;
             std::vector<std::pair<double, std::string>> rows;
@@ -260,7 +260,7 @@ extern "C" int h3_create(const char *weights_dir, const char *kernels_dir, int t
       catch (...) { write_error(error, cap, "unknown C++ exception"); return H3_ERROR; }
 }
 
-extern "C" int h3_run(h3_session *s, uint16_t *x, size_t x_elements, const int32_t *cls, size_t cls_elements,
+extern "C" int h3_run(h3_session *s, float *x, size_t x_elements, const int32_t *cls, size_t cls_elements,
                       const float *mods, size_t mods_elements, const float *cos, const float *sin, size_t rope_elements,
                       char *error, size_t cap) {
     if (error && cap) error[0] = 0;
