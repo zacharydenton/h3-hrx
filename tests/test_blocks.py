@@ -45,6 +45,7 @@ def main() -> int:
     ap.add_argument("--curve", default="1,2,4,8,16,50")
     ap.add_argument("--profile", action="store_true")
     ap.add_argument("--fixture", default=str(ROOT / "build/fixture.pt"))
+    ap.add_argument("--weights", default=None, help="weights directory (default build/weights; build/weights_gptq for the GPTQ export)")
     a = ap.parse_args()
     device = "cuda"
     fpath = Path(a.fixture)
@@ -62,7 +63,7 @@ def main() -> int:
         return torch.cat([v.flatten(), a.flatten()])
     ok = True
     for n in [int(v) for v in a.curve.split(",")]:
-        loom = H3Blocks(tokens, layers=n)
+        loom = H3Blocks(tokens, layers=n, weights=a.weights)
         if a.profile:
             loom.profile(True)
         t0 = time.time()

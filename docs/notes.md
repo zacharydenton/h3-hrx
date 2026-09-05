@@ -153,3 +153,13 @@ second, f32, accumulator set: the group's int32 partials are converted and scale
 once per group. With 64x64 wave tiles that is 128 + 128 accumulator VGPRs and does not fit;
 with 32x64 tiles (the 128x128 kernel) it does, at 0.75 LDS reads per multiply. The
 throughput and quality mechanisms compete for the same registers.
+
+## GPTQ at export time (2026-09-05, running)
+
+The per-row int4 format is the plain GEMM's, so the only lever that costs no registers is a
+better quantiser: `tools/gptq_export.py` runs GPTQ block by block on the fixture's
+activations (each block calibrated on the output of the already-quantised blocks before
+it), per-row scales from the unquantised row, Hessians damped in f64 because the 2097
+calibration rows are fewer than K. It writes `build/weights_gptq/` in the runtime's format
+and reports the 50-block velocity cosine against the int8 checkpoint (round-to-nearest:
+0.97860). 37 s per block.
