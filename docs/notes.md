@@ -768,3 +768,31 @@ instead: the accumulator then holds a query column per lane, the row max and sum
 in-lane maxes plus one cross-half shuffle instead of four DPP rounds each, and the P operand
 comes from one cross-half exchange instead of the LDS round trip. That is the next kernel lever
 (about a third of the loop), and it is a regeneration of the kernel, not a tweak.
+
+### 32-key tiles on the int4 kernel: lost (2026-09-07)
+
+`tools/gen_attention_i4_32.py` builds two forms from the shipped 16-key kernel: a fused 32-key
+tile (two K rows and two V chunks per lane per barrier, one max over both sub-tiles, two P round
+trips, 16 int4 + 16 f16 MMAs per barrier; 248 VGPRs, no spills) and a plain unroll by two (the
+16-key body twice under one barrier; 256 VGPRs, 72 bytes spilled). Both are correct
+(`tests/test_attention_i4.py` cosine 0.99999996) and both lose, interleaved best-of-5:
+
+| 15427 rows | ms | vs 16-key |
+| --- | ---: | ---: |
+| 16-key, shipped | 218-227 | 1.000x |
+| fused 32-key | 279-282 | 0.78-0.81x |
+| unrolled by two | 385 | 0.57x |
+
+At 37743 rows the fused form is 0.77x of the long form. The f16 kernel's 1.47x from 32-key
+tiles came from a four-wave kernel with LDS headroom; the int4 kernel is already at the
+register ceiling (240 of 256, one workgroup per CU by VGPRs alone, so the LDS pad of the long
+form is not what its 11% came from), and every per-tile cost it would amortise was measured
+small. The key-scale prefetch (1.036x / 1.068x) is the one lever of this round that shipped.
+
+Where this leaves the kernel: 30 TFLOP/s-eq is 40% of the int4/f16 mixed MMA ceiling; the f16
+P.V half alone runs at about 50% of the part's f16 peak, which is the range published
+attention kernels reach on RDNA3. The ablations put every remaining overhead below 7% and the
+rest in overlapping latency that no single removal exposes. A further 2x on the kernel is not
+on this list; the remaining step-level levers cut attention work instead: a lower skip tau
+(quality trade), and a two-pass final-max skip for the late layers where 60-80% of tiles are
+skippable under the final max but only 40-60% under the running max.
