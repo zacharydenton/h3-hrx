@@ -269,7 +269,10 @@ kernel.def target(@h3_attention_i4qksl_mha8_lds_f16_wmma_gfx11) export("h3_atten
   %qs_row7 = index.assume %qs_row7b [lt(%qs_row7b, %padded_tokens)] : index
   %qs7 = view.load %qs_view[%qs_row7, %head] : view<[%padded_tokens]x[%head_limit]xf32> -> f32
   %qs_vec = vector.from_elements %qs0, %qs1, %qs2, %qs3, %qs4, %qs5, %qs6, %qs7 : vector<8xf32>
-  %final_max, %final_sum, %final0, %final1, %final2, %final3, %final4, %final5, %final6, %final7 = scf.for %key_tile = [%c0 to %key_tile_count step %c1](%row_max = %negative_vector : vector<8xf32>, %row_sum = %zero_vector : vector<8xf32>, %acc0 = %init : vector<8xf32>, %acc1 = %init : vector<8xf32>, %acc2 = %init : vector<8xf32>, %acc3 = %init : vector<8xf32>, %acc4 = %init : vector<8xf32>, %acc5 = %init : vector<8xf32>, %acc6 = %init : vector<8xf32>, %acc7 = %init : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
+  %ks_key0 = index.assume %lane_column [lt(%lane_column, %padded_tokens)] : index
+  %ks_first = view.load %ks_view[%ks_key0, %kv_head] : view<[%padded_tokens]x[%kv_head_limit]xf32> -> f32
+  %ks_last = index.sub %padded_tokens, %c1 : index
+  %final_max, %final_sum, %final0, %final1, %final2, %final3, %final4, %final5, %final6, %final7, %ks_end = scf.for %key_tile = [%c0 to %key_tile_count step %c1](%row_max = %negative_vector : vector<8xf32>, %row_sum = %zero_vector : vector<8xf32>, %acc0 = %init : vector<8xf32>, %acc1 = %init : vector<8xf32>, %acc2 = %init : vector<8xf32>, %acc3 = %init : vector<8xf32>, %acc4 = %init : vector<8xf32>, %acc5 = %init : vector<8xf32>, %acc6 = %init : vector<8xf32>, %acc7 = %init : vector<8xf32>, %ks_carry = %ks_first : f32) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, f32) {
     %key_origin1 = index.mul %key_tile, %c16 : index
     %key_origin0 = index.assume %key_origin1 [le(%key_origin1, %tile_origin_limit), mul(%key_origin1, 16)] : index
     %buf = index.rem %key_tile, %c2 : index
@@ -319,8 +322,7 @@ kernel.def target(@h3_attention_i4qksl_mha8_lds_f16_wmma_gfx11) export("h3_atten
     %raw_scores_i = vector.mma %lhs7, %rhs7, %qk6 : vector<2xi32>, vector<2xi32>, vector<8xi32>
     %raw_scores = vector.sitofp %raw_scores_i : vector<8xi32> to vector<8xf32>
     %ks_key = index.assume %local_key_safe [lt(%local_key_safe, %padded_tokens)] : index
-    %ks_col = view.load %ks_view[%ks_key, %kv_head] : view<[%padded_tokens]x[%kv_head_limit]xf32> -> f32
-    %ks_vec = vector.splat %ks_col : vector<8xf32>
+    %ks_vec = vector.splat %ks_carry : vector<8xf32>
     %qk_scaled = vector.mulf<reassoc|nnan|ninf|nsz|contract> %raw_scores, %qs_vec : vector<8xf32>
     %scaled0 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %qk_scaled, %ks_vec : vector<8xf32>
     %scaled = scf.if %key_valid -> (vector<8xf32>) {
@@ -439,7 +441,12 @@ kernel.def target(@h3_attention_i4qksl_mha8_lds_f16_wmma_gfx11) export("h3_atten
       scf.yield %acc7 : vector<8xf32>
     }
     %next_sum = scf.select %keep, %next_sum_full, %row_sum : vector<8xf32>
-    scf.yield %next_max, %next_sum, %next0, %next1, %next2, %next3, %next4, %next5, %next6, %next7 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %ks_key_n0 = index.add %local_key, %c16 : index
+    %ks_key_n1 = index.min %ks_key_n0, %ks_last : index
+    %ks_key_n = index.assume %ks_key_n1 [lt(%ks_key_n1, %padded_tokens)] : index
+    %ks_next = view.load %ks_view[%ks_key_n, %kv_head] : view<[%padded_tokens]x[%kv_head_limit]xf32> -> f32
+    scf.yield %next_max, %next_sum, %next0, %next1, %next2, %next3, %next4, %next5, %next6, %next7, %ks_next : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, f32
   }
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
   // the row sum: the per-lane partials of the 16 lanes of this half
