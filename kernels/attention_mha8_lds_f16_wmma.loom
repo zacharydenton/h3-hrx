@@ -64,6 +64,10 @@ kernel.def target(@h3_attention_mha8_lds_f16_wmma_gfx11) export("h3_attention_mh
   %c128 = index.constant 128 : index
   %c256 = index.constant 256 : index
   %c136 = index.constant 136 : index
+  %cd = index.constant 128 : index
+  %c_klanes = index.constant 128 : index
+  %c_kvlanes = index.constant 256 : index
+  %c_nf = index.constant 8 : index
   %c0_offset = index.constant 0 : offset
   %k_tile_offset = index.constant 0 : offset
   %v_tile_offset = index.constant 4352 : offset
@@ -105,7 +109,7 @@ kernel.def target(@h3_attention_mha8_lds_f16_wmma_gfx11) export("h3_attention_mh
 
   %tile_id = kernel.workgroup.id<x> : index
   %kv_head_raw = kernel.workgroup.id<y> : index
-  %kv_head_limit = index.div %kv_stride0, %c128 : index
+  %kv_head_limit = index.div %kv_stride0, %cd : index
   %kv_head = index.rem %kv_head_raw, %kv_head_limit : index
   %workitem = kernel.workitem.id<x> : index
   %wave0 = kernel.subgroup.id : index
@@ -115,7 +119,7 @@ kernel.def target(@h3_attention_mha8_lds_f16_wmma_gfx11) export("h3_attention_mh
   %lane_group = index.div %lane, %c16 : index
   %lane_group_even = index.cmp eq, %lane_group, %c0 : index
   // this wave's query head, and its channels in q and out
-  %head_limit = index.div %out_stride0, %c128 : index
+  %head_limit = index.div %out_stride0, %cd : index
   %rounded = index.add %tokens0, %c15 : index
   %tiles_per_image = index.div %rounded, %c16 : index
   // MHA: this wave is query tile 8 * workgroup + wave of head kv_head (tiles past the sequence write nothing)
@@ -124,8 +128,8 @@ kernel.def target(@h3_attention_mha8_lds_f16_wmma_gfx11) export("h3_attention_mh
   %tile_in_image0 = index.add %tile4, %wave : index
   %tile_limit = index.sub %tiles_per_image, %c1 : index
   %tile_in_image = index.min %tile_in_image0, %tile_limit : index
-  %head_base0 = index.mul %head, %c128 : index
-  %kv_base0 = index.mul %kv_head, %c128 : index
+  %head_base0 = index.mul %head, %cd : index
+  %kv_base0 = index.mul %kv_head, %cd : index
   %query_origin0 = index.mul %tile_in_image, %c16 : index
   %tile_origin_limit = index.sub %padded_tokens, %c16 : index
 
@@ -152,9 +156,9 @@ kernel.def target(@h3_attention_mha8_lds_f16_wmma_gfx11) export("h3_attention_mh
   %result_view = buffer.view %lds[%wave_result_offset] : buffer -> view<16x16xf32>
 
   // cooperative staging map: lane -> key workitem/8, 16-channel chunk (workitem%8)*16
-  %st_lane = index.rem %workitem, %c128 : index
-  %st_key = index.div %st_lane, %c8 : index
-  %st_chunk0 = index.rem %st_lane, %c8 : index
+  %st_lane = index.rem %workitem, %c_klanes : index
+  %st_key = index.div %st_lane, %c_nf : index
+  %st_chunk0 = index.rem %st_lane, %c_nf : index
   %st_chunk = index.mul %st_chunk0, %c16 : index
   %st_col0 = index.add %kv_base0, %st_chunk : index
   %kv_col_limit = index.sub %kv_stride0, %c16 : index
@@ -163,8 +167,8 @@ kernel.def target(@h3_attention_mha8_lds_f16_wmma_gfx11) export("h3_attention_mh
   // V staging: lane -> (key = workitem mod 16, channel chunk = workitem / 16), transposed into LDS
   %st_key_v = index.rem %st_lane, %c16 : index
   %st_chunk_v0 = index.div %st_lane, %c16 : index
-  %st_is_k = index.cmp ult, %workitem, %c128 : index
-  %st_is_v = index.cmp ult, %workitem, %c256 : index
+  %st_is_k = index.cmp ult, %workitem, %c_klanes : index
+  %st_is_v = index.cmp ult, %workitem, %c_kvlanes : index
   %st_chunk_v = index.mul %st_chunk_v0, %c16 : index
   %st_col_v0 = index.add %kv_base0, %st_chunk_v : index
   %st_col_v = index.assume %st_col_v0 [le(%st_col_v0, %kv_col_limit), mul(%st_col_v0, 16)] : index
@@ -395,7 +399,7 @@ kernel.def target(@h3_attention_mha8_lds_f16_wmma_gfx11) export("h3_attention_mh
   %publish_col_group = index.rem %lane, %c4 : index
   %publish_col = index.mul %publish_col_group, %c4 : index
   %publish_limit = index.sub %out_stride0, %c4 : index
-  scf.for %fragment = [%c0 to %c8 step %c1] {
+  scf.for %fragment = [%c0 to %c_nf step %c1] {
     %is1 = index.cmp eq, %fragment, %c1 : index
     %pick1 = scf.select %is1, %out1, %out0 : vector<8xf32>
     %is2 = index.cmp eq, %fragment, %c2 : index

@@ -23,10 +23,13 @@ PACKETS = (TM + TN) * 4 // 256
 A_PACKETS = TM * 4 // 256
 
 
-def generate(mode: str) -> str:
-    STEM = {"plain": "gemm_i4_256", "resid": "gemm_i4_resid_256", "swiglu": "gemm_i4_swiglu_256"}[mode]
+def generate(mode: str, bias: bool = False, gate_first: bool = True) -> str:
+    """bias: a per-column f32 bias added to every output before the epilogue's own arithmetic
+    (the VAE decoder's linears have biases); gate_first: which interleaved half the SwiGLU
+    applies silu to (ComfyUI's fc1: gate first; diffusers' SwiGLU: linear first, gate second)."""
+    STEM = {"plain": "gemm_i4_256", "resid": "gemm_i4_resid_256", "swiglu": "gemm_i4_swiglu_256"}[mode] + ("b" if bias else "") + ("" if gate_first else "_gs")
     SYM, NS = "h3_" + STEM, "h3." + STEM
-    extra_args = {"plain": "", "resid": ", %gate: buffer, %cls: buffer", "swiglu": ""}[mode]
+    extra_args = {"plain": "", "resid": ", %gate: buffer, %cls: buffer", "swiglu": ""}[mode] + (", %bias: buffer" if bias else "")
     extra_cfg = "\nconfig.decl @" + NS + ".m_group : %value: index where [range(%value, 1, 4)]\n" + ("\nconfig.decl @" + NS + ".classes : %value: index where [range(%value, 1, 64)]\n" if mode == "resid" else "")
     K = ""
     K += f"""// int4 GEMM on the gfx11 WMMA with 64x64 wave tiles: C[m, n] = f16(scale[n] * sum_k A[m, k] * W[n, k])
@@ -151,6 +154,8 @@ def generate(mode: str) -> str:
       %a_scale_global = buffer.assume.memory_space<global> %a_scale : buffer
       %a_scale_view = buffer.view %a_scale_global[%c0_offset] : buffer -> view<[%m_bounded]xf32>
     """
+    if bias:
+        K += "      %bias_global = buffer.assume.memory_space<global> %bias : buffer\n      %bias_view = buffer.view %bias_global[%c0_offset] : buffer -> view<[%n_size]xf32>\n"
     if mode == "plain":
         K += "      %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_bounded]x[%n_size]xf16>\n"
     elif mode == "resid":
@@ -299,8 +304,14 @@ def generate(mode: str) -> str:
             %bounded = index.assume %out_row [lt(%out_row, %m_bounded)] : index
             %a_scale_value = view.load %a_scale_view[%bounded] : view<[%m_bounded]xf32> -> f32
             %a_scale_vector = vector.splat %a_scale_value : vector<4xf32>
-            %scaled = vector.mulf %scaled0, %a_scale_vector : vector<4xf32>
+            %scaled1 = vector.mulf %scaled0, %a_scale_vector : vector<4xf32>
 """
+        if bias:
+            K += """            %bias_values = vector.load %bias_view[%out_col] : view<[%n_size]xf32> -> vector<4xf32>
+            %scaled = vector.addf %scaled1, %bias_values : vector<4xf32>
+"""
+        else:
+            K += "            %scaled = vector.addf %scaled1, %zero4 : vector<4xf32>\n"
         if mode == "plain":
             K += """            %narrow = vector.fptrunc %scaled : vector<4xf32> to vector<4xf16>
             vector.store %narrow, %c_view[%bounded, %out_col] : vector<4xf16>, view<[%m_bounded]x[%n_size]xf16>
@@ -358,9 +369,21 @@ def generate(mode: str) -> str:
             %bounded = index.assume %out_row [lt(%out_row, %m_bounded)] : index
             %a_scale_value = view.load %a_scale_view[%bounded] : view<[%m_bounded]xf32> -> f32
             %a_scale_vector = vector.splat %a_scale_value : vector<4xf32>
-            %g = vector.mulf %gate_scaled0, %a_scale_vector : vector<4xf32>
-            %u = vector.mulf %up_scaled0, %a_scale_vector : vector<4xf32>
-            %neg_g = vector.subf %zero4, %g : vector<4xf32>
+            %g0 = vector.mulf %gate_scaled0, %a_scale_vector : vector<4xf32>
+            %u0 = vector.mulf %up_scaled0, %a_scale_vector : vector<4xf32>
+"""
+        if bias:
+            K += """            %gate_bias = vector.load %bias_view[%gate_col] : view<[%n_size]xf32> -> vector<4xf32>
+            %up_bias = vector.load %bias_view[%up_col] : view<[%n_size]xf32> -> vector<4xf32>
+            %g1 = vector.addf %g0, %gate_bias : vector<4xf32>
+            %u1 = vector.addf %u0, %up_bias : vector<4xf32>
+"""
+        else:
+            K += "            %g1 = vector.addf %g0, %zero4 : vector<4xf32>\n            %u1 = vector.addf %u0, %zero4 : vector<4xf32>\n"
+        # the silu goes on the "gate" half: the first interleaved 16 (gate_first) or the second
+        K += ("            %g = vector.addf %g1, %zero4 : vector<4xf32>\n            %u = vector.addf %u1, %zero4 : vector<4xf32>\n" if gate_first else
+              "            %g = vector.addf %u1, %zero4 : vector<4xf32>\n            %u = vector.addf %g1, %zero4 : vector<4xf32>\n")
+        K += f"""            %neg_g = vector.subf %zero4, %g : vector<4xf32>
             %e = vector.expf<afn> %neg_g : vector<4xf32>
             %den = vector.addf %one4, %e : vector<4xf32>
             %sig = vector.divf %one4, %den : vector<4xf32>
@@ -383,4 +406,8 @@ if __name__ == "__main__":
     for mode in ("plain", "resid", "swiglu"):
         stem = {"plain": "gemm_i4_256", "resid": "gemm_i4_resid_256", "swiglu": "gemm_i4_swiglu_256"}[mode]
         (ROOT / "kernels" / f"{stem}.loom").write_text(generate(mode))
+        print("wrote", stem)
+    # the VAE decoder's family: biases everywhere, diffusers' SwiGLU order (linear first, gate second)
+    for mode, stem in (("plain", "gemm_i4_256b"), ("resid", "gemm_i4_resid_256b"), ("swiglu", "gemm_i4_swiglu_256b_gs")):
+        (ROOT / "kernels" / f"{stem}.loom").write_text(generate(mode, bias=True, gate_first=(mode != "swiglu")))
         print("wrote", stem)

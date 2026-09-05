@@ -11,13 +11,16 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 from kernel_test import compile_kernel, launch, report, workdir
 
-HEADS, D = 56, 128
-STEM = "attention_mha_lds_f16_wmma"
+import os
+D = int(os.environ.get("ATTN_D", "128"))
+HEADS = 32 if D == 64 else 56
+WAVES = int(os.environ.get("ATTN_WAVES", "4"))
+STEM = os.environ.get("ATTN", {(128, 4): "attention_mha_lds_f16_wmma", (128, 8): "attention_mha8_lds_f16_wmma", (64, 4): "attention_mha64_lds_f16_wmma", (64, 8): "attention_mha648_lds_f16_wmma"}[(D, WAVES)])
 NS, SYM = "h3." + STEM, "h3_" + STEM
 
 
 def capacity_for(tokens: int) -> int:
-    return max((tokens + 16 + 31) // 32 * 32, (tokens + 63) // 64 * 64)
+    return max((tokens + 16 + 31) // 32 * 32, (tokens + 16 * WAVES - 1) // (16 * WAVES) * (16 * WAVES))
 
 
 def run(tmp: Path, tokens: int, heads=HEADS) -> bool:
@@ -32,7 +35,7 @@ def run(tmp: Path, tokens: int, heads=HEADS) -> bool:
     cfg = {f"{NS}.q_stride": heads * D, f"{NS}.kv_stride": heads * D, f"{NS}.tokens": tokens, f"{NS}.token_capacity": capacity,
            f"{NS}.scale": 1.0 / math.sqrt(D), f"{NS}.out_stride": heads * D}
     compile_kernel(ROOT / "kernels" / f"{STEM}.loom", SYM, cfg, hs)
-    (out,), t = launch(hs, SYM, ((tokens + 63) // 64, heads, 1), (128, 1, 1),
+    (out,), t = launch(hs, SYM, ((tokens + 16 * WAVES - 1) // (16 * WAVES), heads, 1), (32 * WAVES, 1, 1),
                        [("i32", tokens), ("i32", heads), ("in_f16", pad(q)), ("in_f16", pad(k)), ("in_f16", pad(v)),
                         ("out_f16", ((tokens, heads * D), np.float16))], tmp, repeat=3)
     us = t["per_launch_us"]; flops = 4.0 * tokens * tokens * D * heads

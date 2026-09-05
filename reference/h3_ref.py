@@ -214,10 +214,10 @@ def rope_tables(position_ids: torch.Tensor, inv_freq: torch.Tensor, device) -> t
     return torch.cos(half), torch.sin(half)
 
 
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """x [S, heads, 128]: rotate-half on the first 96 channels, the rest pass through."""
-    half = ROPE_DIM // 2
-    x1, x2, rest = x[..., :half], x[..., half:ROPE_DIM], x[..., ROPE_DIM:]
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rope_dim: int = ROPE_DIM) -> torch.Tensor:
+    """x [S, heads, D]: rotate-half on the first rope_dim channels, the rest pass through."""
+    half = rope_dim // 2
+    x1, x2, rest = x[..., :half], x[..., half:rope_dim], x[..., rope_dim:]
     c, s = cos[:, None, :].to(x.dtype), sin[:, None, :].to(x.dtype)
     return torch.cat([x1 * c - x2 * s, x1 * s + x2 * c, rest], dim=-1)
 

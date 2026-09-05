@@ -11,12 +11,16 @@ sys.path.insert(0, str(ROOT / "tools")); sys.path.insert(0, str(ROOT / "referenc
 from kernel_test import compile_kernel, launch, report, workdir
 import h3_ref as R
 
-NS, SYM = "h3.rope_qknorm_f16", "h3_rope_qknorm_f16"
+import os
+D = int(os.environ.get("ROPE_D", "128"))
+STEM = "rope_qknorm_f16" if D == 128 else "rope64_qknorm_f16"
+NS, SYM = "h3." + STEM, "h3_" + STEM
 
 
 def main() -> int:
     torch.manual_seed(0)
-    tokens, heads, d = 200, 56, 128
+    tokens, heads, d = 200, (56 if D == 128 else 32), D
+    rope_dim = 96 if D == 128 else 48
     stride, k_off = 3 * heads * d, heads * d
     fused = (torch.randn(tokens, stride) * 0.7).half()
     qw = (1.0 + torch.randn(d) * 0.1).float(); kw = (1.0 + torch.randn(d) * 0.1).float()
@@ -24,13 +28,15 @@ def main() -> int:
     pos = layout.position_ids.repeat((tokens + layout.seq_len - 1) // layout.seq_len, 1)[:tokens]
     inv_freq = 10000.0 ** (-torch.arange(0, 32, 2, dtype=torch.float32) / 32)
     cos, sin = R.rope_tables(pos, inv_freq, "cpu")
+    if D == 64:                                   # the decoder rotates 48 channels: 8 frequencies per axis
+        cos, sin = cos[:, :24].contiguous(), sin[:, :24].contiguous()
     q = fused[:, :heads * d].view(tokens, heads, d)
     k = fused[:, k_off:k_off + heads * d].view(tokens, heads, d)
-    want_q = R.apply_rope(R.rms_norm(q, qw), cos, sin).reshape(tokens, -1)
-    want_k = R.apply_rope(R.rms_norm(k, kw), cos, sin).reshape(tokens, -1)
+    want_q = R.apply_rope(R.rms_norm(q, qw), cos, sin, rope_dim).reshape(tokens, -1)
+    want_k = R.apply_rope(R.rms_norm(k, kw), cos, sin, rope_dim).reshape(tokens, -1)
     with workdir() as tmp:
         tmp = Path(tmp); hs = tmp / "rope.hsaco"
-        compile_kernel(ROOT / "kernels/rope_qknorm_f16.loom", SYM,
+        compile_kernel(ROOT / "kernels" / f"{STEM}.loom", SYM,
                        {f"{NS}.row_stride": stride, f"{NS}.heads": heads, f"{NS}.k_offset": k_off, f"{NS}.eps": 1e-5}, hs)
         (qo, ko, vo), t = launch(hs, SYM, (tokens, 1, 1), (256, 1, 1),
                                  [("i32", tokens), ("in_f16", fused.numpy()), ("in", qw.numpy()), ("in", kw.numpy()),
