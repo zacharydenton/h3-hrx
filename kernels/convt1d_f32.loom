@@ -1,0 +1,91 @@
+// ConvTranspose1d: out[o][m] = b[o] + sum_{i,k: m + pad - k = n*stride, 0 <= n < len} w[i][o][k] * x[i][n]
+// f32, channel-major; out has olen = (len - 1) * stride + ksize - 2 * pad samples. One lane per output sample.
+amdgpu.target<gfx11-generic> @h3_convt1d_f32_gfx11 {subgroup_size = 32}
+
+config.decl @h3.convt1d_f32.cin : %value: index where [range(%value, 1, 4096)]
+
+config.decl @h3.convt1d_f32.cout : %value: index where [range(%value, 1, 4096)]
+
+config.decl @h3.convt1d_f32.ksize : %value: index where [range(%value, 1, 64)]
+
+config.decl @h3.convt1d_f32.stride : %value: index where [range(%value, 1, 64)]
+
+config.decl @h3.convt1d_f32.pad : %value: index where [range(%value, 0, 1024)]
+
+config.decl @h3.convt1d_f32.len_bound : %value: index where [range(%value, 256, 4194304), mul(%value, 256)]
+
+kernel.def target(@h3_convt1d_f32_gfx11) export("h3_convt1d_f32") @h3_convt1d_f32(%len: index, %olen: index) {
+  %c1 = index.constant 1 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %cout = config.get @h3.convt1d_f32.cout : index
+  %rounded = index.add %olen, %c255 : index
+  %groups = index.div %rounded, %c256 : index
+  kernel.launch.config workgroups(%groups, %cout, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%len: index, %olen: index, %x: buffer, %w: buffer, %b: buffer, %out: buffer) {
+  %cin = config.get @h3.convt1d_f32.cin : index
+  %cout = config.get @h3.convt1d_f32.cout : index
+  %ksize = config.get @h3.convt1d_f32.ksize : index
+  %stride = config.get @h3.convt1d_f32.stride : index
+  %pad = config.get @h3.convt1d_f32.pad : index
+  %len_bound = config.get @h3.convt1d_f32.len_bound : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  %c0_offset = index.constant 0 : offset
+  %len_b = index.assume %len [range(%len, 1, 4194304), le(%len, %len_bound)] : index
+  %olen_b = index.assume %olen [range(%olen, 1, 4194304), le(%olen, %len_bound)] : index
+  %wg = kernel.workgroup.id<x> : index
+  %o0 = kernel.workgroup.id<y> : index
+  %o = index.assume %o0 [lt(%o0, %cout)] : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %wg, %c256 : index
+  %m = index.add %base, %lane : index
+  %wrow = index.mul %cout, %ksize : index
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %w_global = buffer.assume.memory_space<global> %w : buffer
+  %b_global = buffer.assume.memory_space<global> %b : buffer
+  %out_global = buffer.assume.memory_space<global> %out : buffer
+  %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%cin]x[%len_b]xf32>
+  %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%cin]x[%wrow]xf32>
+  %b_view = buffer.view %b_global[%c0_offset] : buffer -> view<[%cout]xf32>
+  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%cout]x[%olen_b]xf32>
+  %active = index.cmp ult, %m, %olen_b : index
+  scf.if %active {
+    %mm = index.assume %m [lt(%m, %olen_b)] : index
+    %bias = view.load %b_view[%o] : view<[%cout]xf32> -> f32
+    %t_plus = index.add %mm, %pad : index
+    %orow = index.mul %o, %ksize : index
+    %acc = scf.for %i = [%c0 to %cin step %c1](%acc_i = %bias : f32) -> (f32) {
+      %ii = index.assume %i [lt(%i, %cin)] : index
+      %acc_k = scf.for %k = [%c0 to %ksize step %c1](%acc_kk = %acc_i : f32) -> (f32) {
+        %kk = index.assume %k [lt(%k, %ksize)] : index
+        %tap0 = index.add %orow, %kk : index
+        %tap = index.assume %tap0 [lt(%tap0, %wrow)] : index
+        %ge = index.cmp uge, %t_plus, %kk : index
+        %t_raw = index.sub %t_plus, %kk : index
+        %t0 = scf.select %ge, %t_raw, %c0 : index
+        %t = index.assume %t0 [range(%t0, 0, 4194304)] : index
+        %rem = index.rem %t, %stride : index
+        %aligned = index.cmp eq, %rem, %c0 : index
+        %n_raw = index.div %t, %stride : index
+        %lt = index.cmp ult, %n_raw, %len_b : index
+        %v0 = scalar.andi %ge, %aligned : i1
+        %valid = scalar.andi %v0, %lt : i1
+        %next = scf.if %valid -> (f32) {
+          %n = index.assume %n_raw [range(%n_raw, 0, 4194304), lt(%n_raw, %len_b)] : index
+          %wv = view.load %w_view[%ii, %tap] : view<[%cin]x[%wrow]xf32> -> f32
+          %xv = view.load %x_view[%ii, %n] : view<[%cin]x[%len_b]xf32> -> f32
+          %fma = scalar.fmaf %wv, %xv, %acc_kk : f32
+          scf.yield %fma : f32
+        } else {
+          scf.yield %acc_kk : f32
+        }
+        scf.yield %next : f32
+      }
+      scf.yield %acc_k : f32
+    }
+    view.store %acc, %out_view[%o, %mm] : f32, view<[%cout]x[%olen_b]xf32>
+  }
+  kernel.return
+}

@@ -1,0 +1,67 @@
+// BigVGAN's anti-aliased activation, second half: the 12-tap low-pass at stride 2 with replicate
+// padding (5 left, 6 right): out[c][n] = sum_k fir[k] * y[c][clamp(2n + k - 5, 0, len2 - 1)].
+// y [C][len2] -> out [C][len2 / 2]. One lane per output sample.
+amdgpu.target<gfx11-generic> @h3_down2_f32_gfx11 {subgroup_size = 32}
+
+config.decl @h3.down2_f32.channels : %value: index where [range(%value, 1, 4096)]
+
+config.decl @h3.down2_f32.len_bound : %value: index where [range(%value, 256, 4194304), mul(%value, 256)]
+
+kernel.def target(@h3_down2_f32_gfx11) export("h3_down2_f32") @h3_down2_f32(%len2: index) {
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %channels = config.get @h3.down2_f32.channels : index
+  %olen = index.div %len2, %c2 : index
+  %rounded = index.add %olen, %c255 : index
+  %groups = index.div %rounded, %c256 : index
+  kernel.launch.config workgroups(%groups, %channels, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%len2: index, %y: buffer, %fir: buffer, %out: buffer) {
+  %channels = config.get @h3.down2_f32.channels : index
+  %len_bound = config.get @h3.down2_f32.len_bound : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c5 = index.constant 5 : index
+  %c12 = index.constant 12 : index
+  %c256 = index.constant 256 : index
+  %c0_offset = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %len2_b = index.assume %len2 [range(%len2, 2, 8388608), mul(%len2, 2), le(%len2, %len_bound)] : index
+  %olen = index.div %len2_b, %c2 : index
+  %len_last = index.sub %len2_b, %c1 : index
+  %wg = kernel.workgroup.id<x> : index
+  %c_0 = kernel.workgroup.id<y> : index
+  %ch = index.assume %c_0 [lt(%c_0, %channels)] : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %wg, %c256 : index
+  %n = index.add %base, %lane : index
+  %y_global = buffer.assume.memory_space<global> %y : buffer
+  %f_global = buffer.assume.memory_space<global> %fir : buffer
+  %out_global = buffer.assume.memory_space<global> %out : buffer
+  %y_view = buffer.view %y_global[%c0_offset] : buffer -> view<[%channels]x[%len2_b]xf32>
+  %f_view = buffer.view %f_global[%c0_offset] : buffer -> view<12xf32>
+  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%channels]x[%olen]xf32>
+  %active = index.cmp ult, %n, %olen : index
+  scf.if %active {
+    %nn = index.assume %n [lt(%n, %olen)] : index
+    %n2 = index.mul %nn, %c2 : index
+    %acc = scf.for %k = [%c0 to %c12 step %c1](%acc_k = %zero : f32) -> (f32) {
+      %kk = index.assume %k [lt(%k, %c12)] : index
+      %j = index.add %n2, %kk : index
+      %low = index.cmp ult, %j, %c5 : index
+      %j5 = index.sub %j, %c5 : index
+      %src0 = scf.select %low, %c0, %j5 : index
+      %high = index.cmp ugt, %src0, %len_last : index
+      %src1 = scf.select %high, %len_last, %src0 : index
+      %src = index.assume %src1 [range(%src1, 0, 8388608), lt(%src1, %len2_b)] : index
+      %fv = view.load %f_view[%kk] : view<12xf32> -> f32
+      %yv = view.load %y_view[%ch, %src] : view<[%channels]x[%len2_b]xf32> -> f32
+      %fma = scalar.fmaf %fv, %yv, %acc_k : f32
+      scf.yield %fma : f32
+    }
+    view.store %acc, %out_view[%ch, %nn] : f32, view<[%channels]x[%olen]xf32>
+  }
+  kernel.return
+}

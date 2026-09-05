@@ -1,0 +1,97 @@
+// BigVGAN's anti-aliased activation, first half: 2x upsample through the 12-tap Kaiser-sinc filter
+// (replicate padding of 5, transposed conv stride 2, times 2, cropped by 15 each side) then SnakeBeta:
+//   y = u + sin(alpha[c] * u)^2 / beta[c]   (alpha, beta already exponentiated)
+// x [C][len] -> out [C][2 len]. One lane per output sample.
+amdgpu.target<gfx11-generic> @h3_up2_snake_f32_gfx11 {subgroup_size = 32}
+
+config.decl @h3.up2_snake_f32.channels : %value: index where [range(%value, 1, 4096)]
+
+config.decl @h3.up2_snake_f32.len_bound : %value: index where [range(%value, 256, 4194304), mul(%value, 256)]
+
+kernel.def target(@h3_up2_snake_f32_gfx11) export("h3_up2_snake_f32") @h3_up2_snake_f32(%len: index) {
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %channels = config.get @h3.up2_snake_f32.channels : index
+  %olen = index.mul %len, %c2 : index
+  %rounded = index.add %olen, %c255 : index
+  %groups = index.div %rounded, %c256 : index
+  kernel.launch.config workgroups(%groups, %channels, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%len: index, %x: buffer, %fir: buffer, %alpha: buffer, %beta: buffer, %out: buffer) {
+  %channels = config.get @h3.up2_snake_f32.channels : index
+  %len_bound = config.get @h3.up2_snake_f32.len_bound : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c5 = index.constant 5 : index
+  %c10 = index.constant 10 : index
+  %c12 = index.constant 12 : index
+  %c15 = index.constant 15 : index
+  %c256 = index.constant 256 : index
+  %c0_offset = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %two = scalar.constant 2.0 : f32
+  %len_b = index.assume %len [range(%len, 1, 4194304), le(%len, %len_bound)] : index
+  %olen = index.mul %len_b, %c2 : index
+  %len_last = index.sub %len_b, %c1 : index
+  %padded = index.add %len_b, %c10 : index
+  %wg = kernel.workgroup.id<x> : index
+  %c_0 = kernel.workgroup.id<y> : index
+  %ch = index.assume %c_0 [lt(%c_0, %channels)] : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %wg, %c256 : index
+  %m = index.add %base, %lane : index
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %f_global = buffer.assume.memory_space<global> %fir : buffer
+  %a_global = buffer.assume.memory_space<global> %alpha : buffer
+  %b_global = buffer.assume.memory_space<global> %beta : buffer
+  %out_global = buffer.assume.memory_space<global> %out : buffer
+  %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%channels]x[%len_b]xf32>
+  %f_view = buffer.view %f_global[%c0_offset] : buffer -> view<12xf32>
+  %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<[%channels]xf32>
+  %b_view = buffer.view %b_global[%c0_offset] : buffer -> view<[%channels]xf32>
+  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%channels]x[%olen]xf32>
+  %active = index.cmp ult, %m, %olen : index
+  scf.if %active {
+    %mm = index.assume %m [lt(%m, %olen)] : index
+    %t_plus = index.add %mm, %c15 : index
+    %acc = scf.for %k = [%c0 to %c12 step %c1](%acc_k = %zero : f32) -> (f32) {
+      %kk = index.assume %k [lt(%k, %c12)] : index
+      %ge = index.cmp uge, %t_plus, %kk : index
+      %t = index.sub %t_plus, %kk : index
+      %rem = index.rem %t, %c2 : index
+      %aligned = index.cmp eq, %rem, %c0 : index
+      %j = index.div %t, %c2 : index
+      %inside = index.cmp ult, %j, %padded : index
+      %v0 = scalar.andi %ge, %aligned : i1
+      %valid = scalar.andi %v0, %inside : i1
+      %next = scf.if %valid -> (f32) {
+        // replicate padding of 5: source clamp(j - 5, 0, len - 1)
+        %low = index.cmp ult, %j, %c5 : index
+        %j5 = index.sub %j, %c5 : index
+        %src0 = scf.select %low, %c0, %j5 : index
+        %high = index.cmp ugt, %src0, %len_last : index
+        %src1 = scf.select %high, %len_last, %src0 : index
+        %src = index.assume %src1 [range(%src1, 0, 4194304), lt(%src1, %len_b)] : index
+        %fv = view.load %f_view[%kk] : view<12xf32> -> f32
+        %xv = view.load %x_view[%ch, %src] : view<[%channels]x[%len_b]xf32> -> f32
+        %fma = scalar.fmaf %fv, %xv, %acc_k : f32
+        scf.yield %fma : f32
+      } else {
+        scf.yield %acc_k : f32
+      }
+      scf.yield %next : f32
+    }
+    %u = scalar.mulf %acc, %two : f32
+    %al = view.load %a_view[%ch] : view<[%channels]xf32> -> f32
+    %be = view.load %b_view[%ch] : view<[%channels]xf32> -> f32
+    %arg = scalar.mulf %al, %u : f32
+    %s = scalar.sinf<afn> %arg : f32
+    %s2 = scalar.mulf %s, %s : f32
+    %q = scalar.divf %s2, %be : f32
+    %y = scalar.addf %u, %q : f32
+    view.store %y, %out_view[%ch, %mm] : f32, view<[%channels]x[%olen]xf32>
+  }
+  kernel.return
+}

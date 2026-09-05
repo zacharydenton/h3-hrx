@@ -408,7 +408,7 @@ public:
         HIP_CHECK(hipMalloc(&mods_, size_t(50) * MODS_ROWS * HID * 4));
         HIP_CHECK(hipMalloc(&final_table_, size_t(4) * HID * 4));
     }
-    ~Pipe() { for (void *p : {ones_, zeros_, mods_, final_table_, x_, cls_, cls0_, tcls_, cos_, sin_, in16_, a_q_, a_s_, out16_, text_copy_, ref_cos_, ref_sin_, te_x_, te_cos_, te_sin_, te_cls_, vx_, vcos_, vsin_, vin16_, va_q_, va_s_, vout16_, vcls_, vnorm_table_}) if (p) (void)hipFree(p); }
+    ~Pipe() { for (void *p : {ones_, zeros_, mods_, final_table_, x_, cls_, cls0_, tcls_, cos_, sin_, in16_, a_q_, a_s_, out16_, text_copy_, ref_cos_, ref_sin_, te_x_, te_cos_, te_sin_, te_cls_, vx_, vcos_, vsin_, vin16_, va_q_, va_s_, vout16_, vcls_, vnorm_table_, ah_, aacc_, ahj_, ar_, ar2_, atmp_, ain_}) if (p) (void)hipFree(p); }
 
     Profile prof;
 
@@ -589,6 +589,78 @@ public:
     }
     struct Cancelled {};
 
+    // --- the audio decoder: BigVGAN in f32 SIMT Loom kernels ---
+    struct Conv { std::shared_ptr<Kernel> k; int cin, cout, ksize, dil, pad; };
+    Conv conv_kernel(int cin, int cout, int ksize, int dil, int pad, bool accumulate, size_t len_bound) {
+        const std::string ns = "h3.conv1d_f32.";
+        return Conv{comp_.get("conv1d_f32", "h3_conv1d_f32", {{ns + "cin", std::to_string(cin)}, {ns + "cout", std::to_string(cout)}, {ns + "ksize", std::to_string(ksize)}, {ns + "dilation", std::to_string(dil)}, {ns + "pad", std::to_string(pad)}, {ns + "accumulate", accumulate ? "1" : "0"}, {ns + "len_bound", std::to_string(len_bound)}}), cin, cout, ksize, dil, pad};
+    }
+    void conv_run(const Conv &c, const char *stage, size_t len, const void *x, const void *w, const void *b, void *out) {
+        KernArgs a; a.i32(int(len)).ptr(x).ptr(w).ptr(b).ptr(out); launch(*c.k, &prof, stage, unsigned((len + 255) / 256), unsigned(c.cout), THREADS, a);
+    }
+    static size_t round256(size_t n) { return (n + 255) / 256 * 256; }
+    void axpy(float av, float bv, size_t count, const void *x, void *y) {
+        const std::string ns = "h3.axpy_f32.";
+        auto k = comp_.get("axpy_f32", "h3_axpy_f32", {{ns + "a", num(av)}, {ns + "b", num(bv)}});
+        KernArgs a; a.i32(int(count)).ptr(x).ptr(y); launch(*k, &prof, "audio axpy", unsigned((count + 255) / 256), 1, THREADS, a);
+    }
+    // the anti-aliased SnakeBeta: x [C][len] -> out [C][len] through the 2x buffer
+    void snake(int channels, size_t len, const void *x, const void *alpha, const void *beta, void *tmp2, void *out) {
+        const std::string nu = "h3.up2_snake_f32.", nd = "h3.down2_f32.";
+        auto up = comp_.get("up2_snake_f32", "h3_up2_snake_f32", {{nu + "channels", std::to_string(channels)}, {nu + "len_bound", std::to_string(round256(len))}});
+        auto down = comp_.get("down2_f32", "h3_down2_f32", {{nd + "channels", std::to_string(channels)}, {nd + "len_bound", std::to_string(round256(2 * len))}});
+        const void *fir = glue_.at("audio.fir", 12 * 4);
+        { KernArgs a; a.i32(int(len)).ptr(x).ptr(fir).ptr(alpha).ptr(beta).ptr(tmp2); launch(*up, &prof, "audio snake up", unsigned((2 * len + 255) / 256), unsigned(channels), THREADS, a); }
+        { KernArgs a; a.i32(int(2 * len)).ptr(tmp2).ptr(fir).ptr(out); launch(*down, &prof, "audio snake down", unsigned((len + 255) / 256), unsigned(channels), THREADS, a); }
+    }
+    void decode_audio(const float *latents, int audio_t, float *samples) {
+        static const int RATES[7] = {5, 5, 2, 2, 2, 2, 2}, UPK[7] = {9, 9, 4, 4, 4, 4, 4}, RESK[3] = {3, 7, 11}, DIL[3] = {1, 3, 5};
+        const int T = audio_t; const size_t L_out = size_t(T) * 800;
+        const size_t cap = std::max<size_t>(size_t(2048) * T, size_t(8) * L_out) + 4096;    // the widest [C][len] plane of the stack
+        if (audio_cap_ < cap) {
+            for (void *q : {ah_, aacc_, ahj_, ar_, ar2_, atmp_, ain_}) if (q) (void)hipFree(q);
+            HIP_CHECK(hipMalloc(&ah_, cap * 4)); HIP_CHECK(hipMalloc(&aacc_, cap * 4)); HIP_CHECK(hipMalloc(&ahj_, cap * 4)); HIP_CHECK(hipMalloc(&ar_, cap * 4)); HIP_CHECK(hipMalloc(&ar2_, cap * 4));
+            HIP_CHECK(hipMalloc(&atmp_, cap * 8)); HIP_CHECK(hipMalloc(&ain_, size_t(32) * T * 4 + 4096)); audio_cap_ = cap;
+        }
+        std::vector<float> lmean = glue_.host_f32("audio.latents_mean", 32), lstd = glue_.host_f32("audio.latents_std", 32);
+        std::vector<float> in(size_t(32) * T), out(L_out);
+        for (int ch = 0; ch < 2; ++ch) {
+            for (int c = 0; c < 32; ++c) for (int t = 0; t < T; ++t) in[size_t(c) * T + t] = latents[(size_t(ch) * 32 + c) * T + t] * lstd[c] + lmean[c];
+            HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)ain_, in.data(), in.size() * 4));
+            // dec_in_proj (32 -> 2048, k 1), conv_pre (2048 -> 1024, k 7)
+            conv_run(conv_kernel(32, 2048, 1, 1, 0, false, round256(T)), "audio dec_in_proj", T, ain_, glue_.at("audio.dec_in_proj.w", size_t(2048) * 32 * 4), glue_.at("audio.dec_in_proj.b", 2048 * 4), ar_);
+            conv_run(conv_kernel(2048, 1024, 7, 1, 3, false, round256(T)), "audio conv_pre", T, ar_, glue_.at("audio.conv_pre.w", size_t(1024) * 2048 * 7 * 4), glue_.at("audio.conv_pre.b", 1024 * 4), ah_);
+            size_t len = size_t(T); int C = 1024;
+            for (int i = 0; i < 7; ++i) {
+                const int Cout = C / 2, k = UPK[i], rate = RATES[i], pad = (k - rate) / 2; const size_t olen = (len - 1) * rate + k - 2 * pad;
+                { const std::string ns = "h3.convt1d_f32.";
+                  auto kt = comp_.get("convt1d_f32", "h3_convt1d_f32", {{ns + "cin", std::to_string(C)}, {ns + "cout", std::to_string(Cout)}, {ns + "ksize", std::to_string(k)}, {ns + "stride", std::to_string(rate)}, {ns + "pad", std::to_string(pad)}, {ns + "len_bound", std::to_string(round256(olen))}});
+                  KernArgs a; a.i32(int(len)).i32(int(olen)).ptr(ah_).ptr(glue_.at(fmt("audio.ups.%d.w", i), size_t(C) * Cout * k * 4)).ptr(glue_.at(fmt("audio.ups.%d.b", i), size_t(Cout) * 4)).ptr(ar_);
+                  launch(*kt, &prof, "audio upsample", unsigned((olen + 255) / 256), unsigned(Cout), THREADS, a); }
+                len = olen; C = Cout; const size_t plane = size_t(C) * len;
+                HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)ah_, (hipDeviceptr_t)ar_, plane * 4)); HIP_CHECK(hipMemset(aacc_, 0, plane * 4));
+                for (int j = 0; j < 3; ++j) {                                   // the three AMP blocks, averaged
+                    const int r = i * 3 + j, kk = RESK[j];
+                    HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)ahj_, (hipDeviceptr_t)ah_, plane * 4));
+                    for (int d = 0; d < 3; ++d) {
+                        const std::string act1 = fmt("audio.res.%d.act.%d.", r, 2 * d), act2 = fmt("audio.res.%d.act.%d.", r, 2 * d + 1);
+                        snake(C, len, ahj_, glue_.at(act1 + "alpha", size_t(C) * 4), glue_.at(act1 + "beta", size_t(C) * 4), atmp_, ar_);
+                        conv_run(conv_kernel(C, C, kk, DIL[d], (kk * DIL[d] - DIL[d]) / 2, false, round256(len)), "audio res conv1", len, ar_, glue_.at(fmt("audio.res.%d.c1.%d.w", r, d), size_t(C) * C * kk * 4), glue_.at(fmt("audio.res.%d.c1.%d.b", r, d), size_t(C) * 4), ar2_);
+                        snake(C, len, ar2_, glue_.at(act2 + "alpha", size_t(C) * 4), glue_.at(act2 + "beta", size_t(C) * 4), atmp_, ar_);
+                        conv_run(conv_kernel(C, C, kk, 1, (kk - 1) / 2, true, round256(len)), "audio res conv2", len, ar_, glue_.at(fmt("audio.res.%d.c2.%d.w", r, d), size_t(C) * C * kk * 4), glue_.at(fmt("audio.res.%d.c2.%d.b", r, d), size_t(C) * 4), ahj_);
+                    }
+                    axpy(1.0f, 1.0f, plane, ahj_, aacc_);
+                }
+                axpy(1.0f / 3.0f, 0.0f, plane, aacc_, ah_);
+            }
+            snake(C, len, ah_, glue_.at("audio.post.alpha", size_t(C) * 4), glue_.at("audio.post.beta", size_t(C) * 4), atmp_, ar_);
+            conv_run(conv_kernel(C, 1, 7, 1, 3, false, round256(len)), "audio conv_post", len, ar_, glue_.at("audio.conv_post.w", size_t(C) * 7 * 4), zeros_, ar2_);
+            if (len != L_out) throw std::runtime_error("audio length " + std::to_string(len) + " != " + std::to_string(L_out));
+            HIP_CHECK(hipDeviceSynchronize()); HIP_CHECK(hipMemcpyDtoH(out.data(), (hipDeviceptr_t)ar2_, L_out * 4));
+            for (size_t i = 0; i < L_out; ++i) samples[size_t(ch) * L_out + i] = std::min(std::max(out[i], -1.0f), 1.0f);
+        }
+    }
+
     // --- the video decoder: diffusers' chunking and heads around the 36 blocks in Loom ---
     // one clip: model-space latents z [24][ft][h][w] (already * std + mean) -> ImageNet-space frames [3][ft*4][h*16][w*16]
     void decode_clip(const float *z, int ft, int h, int w, std::vector<float> &frames) {
@@ -704,6 +776,7 @@ private:
     std::vector<float> curve_, inv_freq_, final_w_, final_b_; std::vector<std::vector<float>> adaln_w_, adaln_b_;
     std::unique_ptr<Stack> te_, refiner_, dit_, vae_; Blob vae_blob_;
     Prepare vproj_in_prep_, vnorm_out_; Gemm vproj_in_, vproj_out_;
+    size_t audio_cap_ = 0; void *ah_ = nullptr, *aacc_ = nullptr, *ahj_ = nullptr, *ar_ = nullptr, *ar2_ = nullptr, *atmp_ = nullptr, *ain_ = nullptr;
     void *vx_ = nullptr, *vcos_ = nullptr, *vsin_ = nullptr, *vin16_ = nullptr, *va_q_ = nullptr, *va_s_ = nullptr, *vout16_ = nullptr, *vcls_ = nullptr, *vnorm_table_ = nullptr;
     std::map<std::string, Prepare> prepares_; std::map<std::string, Gemm> gemms_; Prepare final_prep_;
     std::shared_ptr<Kernel> norm_f32_;
@@ -772,6 +845,11 @@ extern "C" int h3pipe_decode_video(h3pipe_session *s, const h3pipe_params *param
         std::lock_guard<std::mutex> lock(s->mutex); s->value.decode_video(*params, latents, frames);
     })
 }
-extern "C" int h3pipe_decode_audio(h3pipe_session *, const float *, size_t, int, float *, size_t, char *error, size_t cap) {
-    write_error(error, cap, "audio decode: not yet in this library"); return H3PIPE_ERROR;
+extern "C" int h3pipe_decode_audio(h3pipe_session *s, const float *latents, size_t audio_elements, int audio_t, float *samples, size_t sample_elements, char *error, size_t cap) {
+    GUARD({
+        if (!s || !latents || !samples || audio_t < 1) throw std::invalid_argument("session, latents (audio_t >= 1) and samples are required");
+        if (audio_elements != size_t(2) * AUDIO_CH * audio_t) throw std::invalid_argument("audio_latents must hold 2 * 32 * audio_t floats");
+        if (sample_elements != size_t(2) * audio_t * 800) throw std::invalid_argument("samples must hold 2 * audio_t * 800 floats");
+        std::lock_guard<std::mutex> lock(s->mutex); s->value.decode_audio(latents, audio_t, samples);
+    })
 }

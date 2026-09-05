@@ -1,0 +1,39 @@
+// y = a * x + b * y over `count` floats (a, b compile-time): copies, sums and the 1/3 averaging of BigVGAN's blocks.
+amdgpu.target<gfx11-generic> @h3_axpy_f32_gfx11 {subgroup_size = 32}
+
+config.decl @h3.axpy_f32.a : f32
+
+config.decl @h3.axpy_f32.b : f32
+
+kernel.def target(@h3_axpy_f32_gfx11) export("h3_axpy_f32") @h3_axpy_f32(%count: index) {
+  %c1 = index.constant 1 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %rounded = index.add %count, %c255 : index
+  %groups = index.div %rounded, %c256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%count: index, %x: buffer, %y: buffer) {
+  %a = config.get @h3.axpy_f32.a : f32
+  %b = config.get @h3.axpy_f32.b : f32
+  %c256 = index.constant 256 : index
+  %c0_offset = index.constant 0 : offset
+  %count_b = index.assume %count [range(%count, 1, 1073741824)] : index
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %wg, %c256 : index
+  %i = index.add %base, %lane : index
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %y_global = buffer.assume.memory_space<global> %y : buffer
+  %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%count_b]xf32>
+  %y_view = buffer.view %y_global[%c0_offset] : buffer -> view<[%count_b]xf32>
+  %active = index.cmp ult, %i, %count_b : index
+  scf.if %active {
+    %ii = index.assume %i [lt(%i, %count_b)] : index
+    %xv = view.load %x_view[%ii] : view<[%count_b]xf32> -> f32
+    %yv = view.load %y_view[%ii] : view<[%count_b]xf32> -> f32
+    %ax = scalar.mulf %a, %xv : f32
+    %r = scalar.fmaf %b, %yv, %ax : f32
+    view.store %r, %y_view[%ii] : f32, view<[%count_b]xf32>
+  }
+  kernel.return
+}
