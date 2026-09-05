@@ -340,6 +340,16 @@ class H3Ref:
             elif mode in ("a4r", "a4r32"):
                 kf = kf - kf.mean(0, keepdim=True); g = 32 if mode == "a4r32" else None
                 q, k = (qr(qf @ H, 4, g) @ H.T).to(q.dtype), (qr(kf @ H, 4, g) @ H.T).to(k.dtype)
+            elif mode in ("a4c16", "a4c128", "a4cg", "a4cr16", "a4crg"):   # SageAttention2: Q and K centred, int4 per token, exact correction restored (a4cr*: also rotated)
+                qb = {"a4c16": 16, "a4c128": 128, "a4cg": 0, "a4cr16": 16, "a4crg": 0}[mode]
+                qm = torch.cat([blk.mean(0, keepdim=True).expand_as(blk) for blk in qf.split(qb, dim=0)], 0) if qb else qf.mean(0, keepdim=True).expand_as(qf)
+                if mode.startswith("a4cr"):
+                    kc = qr((kf - kf.mean(0, keepdim=True)) @ H, 4) @ H.T; qc = qr((qf - qm) @ H, 4) @ H.T
+                else:
+                    kc = qr(kf - kf.mean(0, keepdim=True), 4); qc = qr(qf - qm, 4)
+                scores = (torch.einsum("thd,shd->hts", qc, kc) + torch.einsum("thd,shd->hts", qm, kc)) / math.sqrt(HEAD_DIM)
+                o = (torch.softmax(scores, -1) @ v.float().transpose(0, 1)).transpose(0, 1)
+                return o.reshape(s, INNER).to(v.dtype)
             else:
                 raise ValueError(mode)
         o = F.scaled_dot_product_attention(q.transpose(0, 1)[None], k.transpose(0, 1)[None], v.transpose(0, 1)[None])

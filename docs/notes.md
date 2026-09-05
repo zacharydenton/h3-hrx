@@ -546,3 +546,34 @@ kernel (19.3 TFLOP/s-equivalent), the step about 130 s of which attention is 82%
 about 65 minutes. The GEMMs are 6% of it. The remaining attention levers are ping-pong wave
 groups (the register budget at 256 makes it a redesign) and work reduction (step caching,
 sparse attention); the int4 QK^T was the last one with a hardware rate behind it.
+
+## SageAttention2's smoothing, measured on H3 (2026-09-06)
+
+krea2-loom has an SA2-style kernel (`kernels/attention_sage_i4.loom`, `tools/gen_sage_attention.py`,
+`docs/native-attention.md`) of the same structure as ours plus SA2's Q half: Q centred per 16-row
+query tile, K centred over the sequence, and a precomputed correction table q_mean . K_c per
+(head, query tile, key) added to the scores. Its probe on Krea 2 found centring far better than
+rotation (block 0: 0.9989 vs 0.9362). On H3 it is the other way round.
+
+Per block (`tools/attn_quant_study.py`, real activations, sigma 0.9, rel err / worst head):
+
+| layer | int8 | int4 rotated (shipped) | SA2 centred + correction | centred + rotation |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 0.4% / 1% | 4.7% / 8.9% | 6.9% / 24% | 3.5% / 7.0% |
+| 25 | 0.6% / 1% | 10.3% / 14.6% | 10.0% / 23.6% | 8.4% / 19% |
+| 49 | 2.9% / 8.9% | 22.9% / 52% | 48.7% / 120% | 23.8% / 59% |
+
+The granularity of Q's centring (16 rows, 128 rows, the whole sequence) barely matters. Full
+stack (`tools/quant_study.py attn:...`, velocity cosine vs the int8 checkpoint): centred
+0.9922, centred + rotation 0.9973, rotation alone 0.9975; with int4 GEMMs 0.9747 / 0.9781 /
+0.9763 against 0.9786 for the GEMMs alone. So on H3 the rotation carries the accuracy, SA2's
+centring adds at most 0.2 cosine points on the full stack, and a correction table costs
+(heads x query tiles x keys) floats: 3.3 GB at 480p, 20 GB at 768, or a 128-MAC dot per key
+per tile inside the kernel. Not adopted. What SA2 gave this part is what is already in: int4
+QK^T on WMMA with per-token, per-head scales. Its FP8 P.V half has no gfx11 equivalent (no
+FP8 WMMA before gfx12); our P.V stays f16. Its "per-thread" scales are 8 tokens per scale,
+coarser than ours.
+
+H3's late layers are the limit of int4 QK^T under any smoothing (layer 49 at 23% per block,
+|k| to 378, |q| to 187); keeping the last layers in f16 attention did not move the velocity
+(0.9972 vs 0.9975 with layers 45+ exact), because the velocity error is set by the middle.

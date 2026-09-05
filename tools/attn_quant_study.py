@@ -66,6 +66,14 @@ def main():
                     base = attention(q, k, v)
                     kbar = k.mean(0, keepdim=True)                                   # smoothing: softmax-invariant per query row
                     qr, kr, vr = q @ H, k @ H, v @ H                                 # the same rotation on q and k keeps q.k
+                    def centered(qb):                    # Q centred per query block of qb rows (SA2: 16), K over the sequence, exact correction q_mean . K_c
+                        qm = torch.cat([blk.mean(0, keepdim=True).expand_as(blk) for blk in q.split(qb, dim=0)], 0) if qb else q.mean(0, keepdim=True).expand_as(q)
+                        qc, kc = q - qm, k - kbar
+                        return qc, kc, qm
+                    def attn_corr(qq, kk, qm, kk_ref, vv):
+                        """attention with quantised centred operands and the exact correction q_mean . K_c (per query row, per key)"""
+                        s = torch.einsum("thd,shd->hts", qq, kk) + torch.einsum("thd,shd->hts", qm, kk_ref)
+                        return (torch.softmax(s / math.sqrt(R.HEAD_DIM), -1) @ vv.transpose(0, 1)).transpose(0, 1)
                     variants = {
                         "K,Q int8 per token": (quant_rows(q, 8), quant_rows(k, 8), v),
                         "K,Q int4 per token": (quant_rows(q, 4), quant_rows(k, 4), v),
@@ -76,9 +84,15 @@ def main():
                         "+ V int8 per token rotated": (quant_rows(qr, 8) @ H.T, quant_rows((k - kbar) @ H, 4) @ H.T, quant_rows(vr, 8) @ H.T),
                         "V int8 per token rotated only": (q, k, quant_rows(vr, 8) @ H.T),
                     }
+                    extra = {}
+                    for qb, tag in ((16, "Q per 16-row block"), (128, "Q per 128-row block"), (0, "Q per head, whole sequence")):
+                        qc, kc, qm = centered(qb)
+                        kq = quant_rows(kc, 4)
+                        extra[f"SA2: Q,K centred ({tag}) + correction, int4 per token"] = (quant_rows(qc, 4), kq, qm, kq)
+                        extra[f"SA2 + rotation ({tag})"] = (quant_rows(qc @ H, 4) @ H.T, quant_rows(kc @ H, 4) @ H.T, qm, quant_rows(kc @ H, 4) @ H.T)
                     print(f"  layer {i:2d}  |q| {q.abs().max():.1f} |k| {k.abs().max():.1f} |v| {v.abs().max():.1f}")
-                    for name, (qq, kk, vv) in variants.items():
-                        out = attention(qq, kk, vv)
+                    for name, (qq, kk, *rest) in list(variants.items()) + list(extra.items()):
+                        out = attn_corr(qq, kk, rest[0], rest[1], v) if len(rest) == 2 else attention(qq, kk, rest[0])
                         err = ((out - base).norm() / base.norm()).item()
                         per_head = ((out - base).flatten(0, 0).transpose(0, 1).flatten(1).norm(dim=1) / base.transpose(0, 1).flatten(1).norm(dim=1))
                         print(f"    {name:48s} rel err {err:.4f}  worst head {per_head.max().item():.4f}")
