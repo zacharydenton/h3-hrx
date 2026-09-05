@@ -80,7 +80,7 @@ public:
         if (tokens < 16 || tokens > 65536) throw std::invalid_argument("tokens must be 16..65536");
         if (layers < 1 || layers > 50) throw std::invalid_argument("layers must be 1..50");
         HIP_CHECK(hipInit(0));
-        capacity_ = std::max<size_t>((tokens + 16 + 31) / 32 * 32, (tokens + 63) / 64 * 64);   // tokens+16 headroom, whole 64-key blocks
+        capacity_ = std::max<size_t>((tokens + 16 + 31) / 32 * 32, (tokens + 127) / 128 * 128);   // tokens+16 headroom, whole query blocks of up to 128 rows
         auto spans = read_manifest(weights_dir + "/manifest.txt");
         auto blob = read_file(weights_dir + "/weights.bin");
         for (const auto &e : spans)
@@ -117,7 +117,8 @@ public:
         load(k_gemm_out_, "gemm_out", ("h3_gemm_i4_resid" + sfx).c_str());
         load(k_gemm_down_, "gemm_down", ("h3_gemm_i4_resid" + sfx).c_str());
         load(k_rope_, "rope_qknorm", "h3_rope_qknorm_f16");
-        load(k_attention_, "attention", "h3_attention_mha_lds_f16_wmma");
+        { std::ifstream wf(kernels_dir + "/attention_waves.txt"); if (wf) wf >> attn_waves_; if (attn_waves_ != 4 && attn_waves_ != 8) throw std::runtime_error("attention_waves.txt must say 4 or 8"); }
+        load(k_attention_, "attention", attn_waves_ == 8 ? "h3_attention_mha8_lds_f16_wmma" : "h3_attention_mha_lds_f16_wmma");
         const size_t T = capacity_;
         HIP_CHECK(hipMalloc(&x_, T * HIDDEN * 4));            // the residual stream, f32
         HIP_CHECK(hipMalloc(&a_q_, T * FFN / 2));               // the widest prepared operand (down's K = 14336)
@@ -216,7 +217,8 @@ private:
         { KernArgs a; a.scalar_i32(T); a.pointer(fused_); a.pointer(b.qnorm); a.pointer(b.knorm); a.pointer(cos_); a.pointer(sin_); a.pointer(q_); a.pointer(k_); a.pointer(v_);
           launch(k_rope_, "qk norm + rope", T, 1, THREADS, a); }
         { KernArgs a; a.scalar_i32(T); a.scalar_i32(HEADS); a.pointer(q_); a.pointer(k_); a.pointer(v_); a.pointer(attn_);
-          launch(k_attention_, "attention", unsigned((T + 63) / 64), HEADS, 128, a); }
+          const unsigned qblock = 16 * unsigned(attn_waves_);
+          launch(k_attention_, "attention", (T + qblock - 1) / qblock, HEADS, 32 * unsigned(attn_waves_), a); }
         { KernArgs a; a.scalar_i32(T); a.pointer(attn_); a.pointer(a_q_); a.pointer(a_s_);
           launch(k_prep_attn_, "prepare out input", T, 1, ATTN_LANES, a); }
         gemm(k_gemm_out_, "gemm out + residual", b.out_q, b.out_s, HIDDEN, x_, gate_msa);
@@ -229,7 +231,7 @@ private:
     }
 
     int tokens_, layers_;
-    size_t capacity_ = 0, gemm_tile_ = 128;
+    size_t capacity_ = 0, gemm_tile_ = 128, attn_waves_ = 4;
     std::mutex mutex_;
     std::vector<Block> blocks_;
     void *weights_ = nullptr, *x_ = nullptr, *a_q_ = nullptr, *a_s_ = nullptr, *fused_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr,

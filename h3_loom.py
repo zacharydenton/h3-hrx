@@ -48,7 +48,7 @@ class H3Blocks:
         weights = Path(weights or ROOT / "build/weights")
         library = Path(library or ROOT / "build/libh3.so")
         kernels = ROOT / "build/kernels" / f"T{tokens}"
-        if not (kernels / "attention.hsaco").exists():
+        if not (kernels / "attention_waves.txt").exists():
             subprocess.run([sys.executable, str(ROOT / "scripts/build_kernels.py"), str(tokens)], check=True, capture_output=True)
         native = ctypes.CDLL(str(library))
         native.h3_abi_version.restype = ctypes.c_uint32

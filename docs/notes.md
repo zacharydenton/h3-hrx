@@ -213,3 +213,14 @@ falls with length because each workgroup of 64 queries streams its head's whole 
 (10317 x 128 x 2 x 2 B = 5.3 MB, past L2) -- 162 workgroups x 56 heads x 5.3 MB = 48 GB per
 block, 2.4 TB per step, 133 GB/s over the 18 s: the memory system's streaming rate. The
 lever is queries per K/V pass: eight-wave workgroups (128 queries) halve the traffic.
+
+## Eight-wave attention workgroups -- won 1.89x at 10317 rows (2026-09-06)
+
+`ATTN_WAVES=8` in the generator: 128 queries share each staged K/V tile, the 256 lanes split
+the staging (lanes 0..127 K, 128..255 V transposed), scratch and Q regions per wave, LDS
+33 KB, 256 VGPRs without spills. Interleaved A/B: 10317 rows 173 ms against 329 (17.6 vs
+9.3 TFLOP/s, 1.894x); 2097 rows 6.85 against 5.86 ms (0.855x: too few workgroups). The
+builder picks 8 waves from 4096 rows and writes `attention_waves.txt`; the host reads it
+for the grid and block. The remaining gap to the 21 TFLOP/s the kernel reaches when K/V
+fit L2 is the same streaming traffic at half the volume; the next step in that direction
+is 256-query workgroups or K/V shared across the two heads a WGP runs.
