@@ -93,3 +93,35 @@ Hadamard in the plain prepare (the gate|up products reach 5e4; four unnormalised
 stages multiply the range by 256). Both are f32 now; the gate|up output itself stays f16
 with a 5e4 peak on this fixture against 65504, to be revisited (bf16 storage) if a real
 prompt exceeds it.
+
+## The quantisation study, and the fork it forces (2026-09-05)
+
+`tools/quant_study.py`: 50 blocks on the fixture, the final-layer velocity against the int8
+checkpoint with float activations (ComfyUI's path):
+
+| weights | activations | cosine | rel rms err |
+| --- | --- | ---: | ---: |
+| int4 per row (the kernels today) | int4 per token | 0.97860 | 0.2091 |
+| int4 per 256-group | int4 per token | 0.98795 | 0.1572 |
+| int4 per 128-group | int4 per token | 0.98757 | 0.1587 |
+| int4 per 128-group | int8 per token | 0.99141 | 0.1323 |
+| int4 per 64-group | int8 per token | 0.99221 | 0.1261 |
+| int4 per row; fc2 int8 | int4; int8 | 0.98122 | 0.1953 |
+| int4 per row; fc2 and out_proj int8 | int4; int8 | 0.98939 | 0.1458 |
+| int4 per 128-group; fc2 int8 | int8 | 0.99176 | 0.1297 |
+| int8 as shipped | int8 per token | 0.99972 | 0.0238 |
+
+The loss is the 4-bit weights, not the activations: int8 activations on the int8 weights cost
+2.4% of velocity, while every int4-weight configuration costs 12.6% or more, and finer weight
+groups buy only a third of the gap back. H3 is an order of magnitude more sensitive to 4-bit
+weights than Krea 2 was (its W4A4 reference sat 2.8% from bf16). Note the published int8
+checkpoint is itself the quantiser's choice for this model.
+
+Two paths, to be chosen:
+- W8A8: the checkpoint's int8 rows unchanged, int8 per-token activations, on the iu8 WMMA
+  (loom-gemm's int8 kernel: 36 TOPS measured, 67% of the 54 peak, against 75 for int4). At
+  video lengths attention dominates and the step grows by roughly a fifth; at short sequences
+  the GEMMs take twice as long. Quality 0.9997.
+- int4 per 64/128-group weights with int8 activations: keeps the int4 rate minus the per-group
+  float accumulation in the GEMM (each k-group's int32 partial converted and scaled, an
+  estimated 15-25% on the GEMM), at 12.6-13.2% velocity error per step.

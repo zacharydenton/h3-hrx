@@ -44,6 +44,12 @@ the final layer's RMSNorm removes them, which is why the velocity is the metric.
 Not yet built: the end-to-end clip (text encoder, VAEs and the sampler around the blocks)
 and the lever loop at video lengths.
 
+**Open decision.** On this model 4-bit weights cost 13-21% relative error on the final
+velocity over 50 blocks, whatever the activation treatment, while int8 weights with int8
+activations cost 2.4% (`docs/notes.md`, the quantisation study). The int4 path is built and
+measured; the W8A8 path (the checkpoint's own int8 rows on the `iu8` WMMA at about half the
+int4 rate) is the quality-preserving one and is a kernel-family port away.
+
 ## Plan
 
 1. `reference/h3_ref.py`: the block stack on the checkpoint's names, bit-exact against
