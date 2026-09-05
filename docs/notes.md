@@ -281,3 +281,9 @@ Since the decoder is a small share of a clip, the generators gained an int8 mode
 WMMA: fragments of vector<4xi32>, 64-k steps, 228 VGPRs; int8 prepare kernels packing four
 bytes per word -- the per-lane chunk count must come from elements, not words) and the
 session, builder, export and wrapper take `bits`. GPTQ for the int4 decoder runs alongside.
+
+W8A8 through the native session (`tests/test_vae_blocks.py --bits 8`): frame PSNR 52.04 dB at
+36 blocks, update cosine 0.99992 -- lossless class, the same number as the torch study.
+20.8 s per clip against torch's 161 s while GPTQ shared the GPU; attention (head 64) took
+59% of it at a poor 3 TFLOP/s, the head-64 kernel doing half the multiplies per tile for
+the same barriers and staging. Calm numbers and the two-query-tiles-per-wave variant follow.
