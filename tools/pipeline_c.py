@@ -14,7 +14,7 @@ FPS, RATE = 24, 32000
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("prompt"); ap.add_argument("--height", type=int, default=480); ap.add_argument("--width", type=int, default=864)
     ap.add_argument("--frames", type=int, default=124); ap.add_argument("--steps", type=int, default=50); ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--cache-threshold", type=float, default=0.0, help="first-block step cache threshold (0 = off)"); ap.add_argument("--vae-bits", type=int, default=8); ap.add_argument("--out", default=str(ROOT / "build/clip_c.mp4")); ap.add_argument("--latents-out", default=None)
+    ap.add_argument("--cache-threshold", type=float, default=0.0, help="first-block step cache threshold (0 = off)"); ap.add_argument("--vae-bits", type=int, default=8); ap.add_argument("--out", default=str(ROOT / "build/clip_c.mp4")); ap.add_argument("--latents-out", default=None); ap.add_argument("--no-decode", action="store_true", help="stop after denoising (timing runs)")
     a = ap.parse_args()
     from transformers import AutoTokenizer
     ids = AutoTokenizer.from_pretrained(str(TOK))(a.prompt, add_special_tokens=False)["input_ids"]
@@ -25,6 +25,7 @@ def main():
     video, audio = pipe.denoise(ids, p, progress=lambda step, n, sec: print(f"  step {step}/{n}  {sec:.1f} s", flush=True) or 0)
     print(f"denoised in {time.time() - t0:.1f} s", flush=True)
     if a.latents_out: np.savez(a.latents_out, video=video, audio=audio)
+    if a.no_decode: return
     t0 = time.time(); frames = pipe.decode_video(p, video); print(f"video decoded in {time.time() - t0:.1f} s", flush=True)
     t0 = time.time(); samples = pipe.decode_audio(audio); print(f"audio decoded in {time.time() - t0:.1f} s", flush=True)
     out = Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)
