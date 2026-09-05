@@ -121,11 +121,29 @@ FORM = {
 }
 
 
-def kernel(name: str) -> str:
+def pack_tail(bits: int) -> str:
+    """The 8 quantised codes of a lane's chunk into the output row: int4 as one i32 of nibbles
+    (low first), int8 as two i32 of bytes."""
+    out = "".join(f"    %q_e{j} = vector.extract %q_n[{j}] : vector<8xi32> -> i32\n" for j in range(8))
+    if bits == 4:
+        out += "".join(f"    %q_s{j} = scalar.shli %q_e{j}, %sh{4*j} : i32\n" for j in range(1, 8))
+        out += "    %q_o1 = scalar.ori %q_e0, %q_s1 : i32\n" + "".join(f"    %q_o{j} = scalar.ori %q_o{j-1}, %q_s{j} : i32\n" for j in range(2, 8))
+        out += "    view.store %q_o7, %qw_view[%row, %q_w] : i32, view<[%tokens_b]x[%word_width]xi32>\n"
+    else:
+        out += "".join(f"    %q_s{j} = scalar.shli %q_e{j}, %sh{8*(j%4)} : i32\n" for j in (1, 2, 3, 5, 6, 7))
+        out += "    %q_lo1 = scalar.ori %q_e0, %q_s1 : i32\n    %q_lo2 = scalar.ori %q_lo1, %q_s2 : i32\n    %q_lo = scalar.ori %q_lo2, %q_s3 : i32\n"
+        out += "    %q_hi1 = scalar.ori %q_e4, %q_s5 : i32\n    %q_hi2 = scalar.ori %q_hi1, %q_s6 : i32\n    %q_hi = scalar.ori %q_hi2, %q_s7 : i32\n"
+        out += "    %q_words = vector.from_elements %q_lo, %q_hi : vector<2xi32>\n"
+        out += "    %q_w2 = index.mul %q_chunk, %c2 : index\n    %q_w2b = index.assume %q_w2 [le(%q_w2, %word_last), mul(%q_w2, 2)] : index\n"
+        out += "    vector.store %q_words, %qw_view[%row, %q_w2b] : vector<2xi32>, view<[%tokens_b]x[%word_width]xi32>\n"
+    return out
+
+
+def kernel(name: str, bits: int = 4) -> str:
     f = FORM[name]
     lds = "f32"      # f16 LDS overflows: H3's gate|up products reach 5e4 and the unnormalised stages grow 4x each
     lds_bytes = 2 if lds == "f16" else 4
-    ns, sym = f"h3.prepare_{name}_i4", f"h3_prepare_{name}_i4"
+    ns, sym = f"h3.prepare_{name}_i{bits}", f"h3_prepare_{name}_i{bits}"
     extra_cfg = "" if name in ("norm", "plain") else f"\nconfig.decl @{ns}.gate_stride : %value: index where [range(%value, 256, 65536), mul(%value, 256)]\n"
     extra_get = "" if name in ("norm", "plain") else f"  %gate_stride = config.get @{ns}.gate_stride : index\n"
     gate_last = "" if name in ("norm", "plain") else "  %gate_last = index.sub %gate_stride, %c8 : index\n"
@@ -179,12 +197,19 @@ kernel.def target(@{sym}_gfx11) export("{sym}") @{sym}(%tokens: index) {{
   %seven8 = vector.splat %seven : vector<8xf32>
   %neg_seven8 = vector.splat %neg_seven : vector<8xf32>
   %fifteen8 = vector.splat %fifteen : vector<8xi32>
+  %qmax = scalar.constant 127.0 : f32
+  %neg_qmax = scalar.constant -127.0 : f32
+  %qmax8 = vector.splat %qmax : vector<8xf32>
+  %neg_qmax8 = vector.splat %neg_qmax : vector<8xf32>
+  %mask = scalar.constant 255 : i32
+  %mask8 = vector.splat %mask : vector<8xi32>
   %tokens_b = index.assume %tokens [range(%tokens, 1, 1048576)] : index
   %token = kernel.workgroup.id<x> : index
   %row = index.assume %token [lt(%token, %tokens_b)] : index
   %lane = kernel.workitem.id<x> : index
   %half_width = index.div %width, %c2 : index
-  %word_width = index.div %width, %c8 : index
+  %word_width = index.div %width, %c{8 if bits == 4 else 4} : index
+  %word_last = index.sub %word_width, %c2 : index
   %width_last = index.sub %width, %c8 : index
 {gate_last}  %quads = index.div %width, %c4 : index
 {f["views"]}  %q_global = buffer.assume.memory_space<global> %q : buffer
@@ -215,7 +240,7 @@ kernel.def target(@{sym}_gfx11) export("{sym}") @{sym}(%tokens: index) {{
   %row_max0 = kernel.workgroup.reduce<maxnumf> %amax : f32
   %row_max = scalar.mulf %row_max0, %sixteenth : f32
   %row_max_safe = scalar.maxnumf %row_max, %tiny : f32
-  %s = scalar.divf %row_max_safe, %seven : f32
+  %s = scalar.divf %row_max_safe, %{"seven" if bits == 4 else "qmax"} : f32
   %inv_s = scalar.divf %sixteenth, %s : f32
   %inv_s8 = vector.splat %inv_s : vector<8xf32>
   scf.for %q_j = [%c0 to %chunks_per_lane step %c1] {{
@@ -227,34 +252,11 @@ kernel.def target(@{sym}_gfx11) export("{sym}") @{sym}(%tokens: index) {{
     %q_x = vector.load %x_view[%q_i] : view<[%width]xf32> -> vector<8xf32>
     %q_r = vector.mulf %q_x, %inv_s8 : vector<8xf32>
     %q_f = vector.roundevenf %q_r : vector<8xf32>
-    %q_c = vector.maxnumf %q_f, %neg_seven8 : vector<8xf32>
-    %q_d = vector.minnumf %q_c, %seven8 : vector<8xf32>
+    %q_c = vector.maxnumf %q_f, %{"neg_seven8" if bits == 4 else "neg_qmax8"} : vector<8xf32>
+    %q_d = vector.minnumf %q_c, %{"seven8" if bits == 4 else "qmax8"} : vector<8xf32>
     %q_q = vector.fptosi %q_d : vector<8xf32> to vector<8xi32>
-    %q_n = vector.andi %q_q, %fifteen8 : vector<8xi32>
-    %q_e0 = vector.extract %q_n[0] : vector<8xi32> -> i32
-    %q_e1 = vector.extract %q_n[1] : vector<8xi32> -> i32
-    %q_e2 = vector.extract %q_n[2] : vector<8xi32> -> i32
-    %q_e3 = vector.extract %q_n[3] : vector<8xi32> -> i32
-    %q_e4 = vector.extract %q_n[4] : vector<8xi32> -> i32
-    %q_e5 = vector.extract %q_n[5] : vector<8xi32> -> i32
-    %q_e6 = vector.extract %q_n[6] : vector<8xi32> -> i32
-    %q_e7 = vector.extract %q_n[7] : vector<8xi32> -> i32
-    %q_s1 = scalar.shli %q_e1, %sh4 : i32
-    %q_s2 = scalar.shli %q_e2, %sh8 : i32
-    %q_s3 = scalar.shli %q_e3, %sh12 : i32
-    %q_s4 = scalar.shli %q_e4, %sh16 : i32
-    %q_s5 = scalar.shli %q_e5, %sh20 : i32
-    %q_s6 = scalar.shli %q_e6, %sh24 : i32
-    %q_s7 = scalar.shli %q_e7, %sh28 : i32
-    %q_o1 = scalar.ori %q_e0, %q_s1 : i32
-    %q_o2 = scalar.ori %q_o1, %q_s2 : i32
-    %q_o3 = scalar.ori %q_o2, %q_s3 : i32
-    %q_o4 = scalar.ori %q_o3, %q_s4 : i32
-    %q_o5 = scalar.ori %q_o4, %q_s5 : i32
-    %q_o6 = scalar.ori %q_o5, %q_s6 : i32
-    %q_o7 = scalar.ori %q_o6, %q_s7 : i32
-    view.store %q_o7, %qw_view[%row, %q_w] : i32, view<[%tokens_b]x[%word_width]xi32>
-  }}
+    %q_n = vector.andi %q_q, %{"fifteen8" if bits == 4 else "mask8"} : vector<8xi32>
+{pack_tail(bits)}  }}
   // the token scale, by one lane, after the last loop (a divergent region before a
   // loop is rejected by the branch lowering)
   %is_first = index.cmp eq, %lane, %c0 : index
@@ -315,8 +317,9 @@ def uniform_loops(text: str) -> str:
     text = re.sub(r"scf\.for %(\w+)0 = \[%lane to (%\w+) step %lanes\]((?:\(.*?\) -> \(.*?\))?) \{\n", repl, text)
     return text.replace("  %quads = index.div %width, %c4 : index\n",
                         "  %quads = index.div %width, %c4 : index\n  %width_per_lane = index.div %width, %lanes : index\n"
-                        "  %quads_per_lane = index.div %quads, %lanes : index\n  %chunks_per_lane = index.div %word_width, %lanes : index\n")
+                        "  %quads_per_lane = index.div %quads, %lanes : index\n  %chunk_count = index.div %width, %c8 : index\n  %chunks_per_lane = index.div %chunk_count, %lanes : index\n")
 
 for name in FORM:
-    (OUT / f"prepare_{name}_i4.loom").write_text(uniform_loops(lds_type(kernel(name), "f32")))
-    print("wrote", f"prepare_{name}_i4.loom")
+    for bits in (4, 8):
+        (OUT / f"prepare_{name}_i{bits}.loom").write_text(uniform_loops(lds_type(kernel(name, bits), "f32")))
+        print("wrote", f"prepare_{name}_i{bits}.loom")

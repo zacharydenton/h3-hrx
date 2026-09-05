@@ -85,6 +85,8 @@ public:
                 throw std::runtime_error("manifest span '" + e.first + "' runs past weights.bin");
         HIP_CHECK(hipMalloc(&weights_, blob.size()));
         HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)weights_, blob.data(), blob.size()));
+        { std::ifstream bf(kernels_dir + "/bits.txt"); if (bf) bf >> bits_; if (bits_ != 4 && bits_ != 8) throw std::runtime_error("bits.txt must say 4 or 8"); }
+        const size_t per = bits_ == 4 ? 2 : 1;                       // K elements per weight byte
         auto need = [&](const std::string &name, size_t bytes) {
             auto it = spans.find(name);
             if (it == spans.end()) throw std::runtime_error("missing tensor " + name);
@@ -95,29 +97,30 @@ public:
         for (int i = 0; i < layers; ++i) {
             std::string p = "blocks." + std::to_string(i);
             Block b;
-            b.qkv_q = need(p + ".qkv.q", size_t(QKV) * HIDDEN / 2);   b.qkv_s = need(p + ".qkv.s", size_t(QKV) * 4);   b.qkv_b = need(p + ".qkv.b", size_t(QKV) * 4);
-            b.out_q = need(p + ".out.q", size_t(HIDDEN) * INNER / 2);  b.out_s = need(p + ".out.s", size_t(HIDDEN) * 4);  b.out_b = need(p + ".out.b", size_t(HIDDEN) * 4);
-            b.gu_q = need(p + ".gu.q", size_t(2 * FFN) * HIDDEN / 2);  b.gu_s = need(p + ".gu.s", size_t(2 * FFN) * 4);   b.gu_b = need(p + ".gu.b", size_t(2 * FFN) * 4);
-            b.down_q = need(p + ".down.q", size_t(HIDDEN) * FFN / 2);  b.down_s = need(p + ".down.s", size_t(HIDDEN) * 4); b.down_b = need(p + ".down.b", size_t(HIDDEN) * 4);
+            b.qkv_q = need(p + ".qkv.q", size_t(QKV) * HIDDEN / per);   b.qkv_s = need(p + ".qkv.s", size_t(QKV) * 4);   b.qkv_b = need(p + ".qkv.b", size_t(QKV) * 4);
+            b.out_q = need(p + ".out.q", size_t(HIDDEN) * INNER / per);  b.out_s = need(p + ".out.s", size_t(HIDDEN) * 4);  b.out_b = need(p + ".out.b", size_t(HIDDEN) * 4);
+            b.gu_q = need(p + ".gu.q", size_t(2 * FFN) * HIDDEN / per);  b.gu_s = need(p + ".gu.s", size_t(2 * FFN) * 4);   b.gu_b = need(p + ".gu.b", size_t(2 * FFN) * 4);
+            b.down_q = need(p + ".down.q", size_t(HIDDEN) * FFN / per);  b.down_s = need(p + ".down.s", size_t(HIDDEN) * 4); b.down_b = need(p + ".down.b", size_t(HIDDEN) * 4);
             b.norm1 = need(p + ".norm1", HIDDEN * 4); b.norm2 = need(p + ".norm2", HIDDEN * 4);
             b.scale1 = need(p + ".scale1", HIDDEN * 4); b.scale2 = need(p + ".scale2", HIDDEN * 4);
             blocks_.push_back(b);
         }
         auto load = [&](Kernel &k, const char *stem, const char *symbol) { k.load(kernels_dir + "/" + stem + ".hsaco", symbol); };
-        load(k_prep_norm_, "prepare_norm_i4", "h3_prepare_norm_i4");
-        load(k_prep_attn_, "prepare_attn_i4", "h3_prepare_plain_i4");
-        load(k_prep_down_, "prepare_down_i4", "h3_prepare_plain_i4");
-        load(k_gemm_qkv_, "gemm_qkv", "h3_gemm_i4_256b");
-        load(k_gemm_gu_, "gemm_gu", "h3_gemm_i4_swiglu_256b_gs");
-        load(k_gemm_out_, "gemm_out", "h3_gemm_i4_resid_256b");
-        load(k_gemm_down_, "gemm_down", "h3_gemm_i4_resid_256b");
+        const std::string ib = bits_ == 4 ? "i4" : "i8";
+        load(k_prep_norm_, "prepare_norm_i4", ("h3_prepare_norm_" + ib).c_str());
+        load(k_prep_attn_, "prepare_attn_i4", ("h3_prepare_plain_" + ib).c_str());
+        load(k_prep_down_, "prepare_down_i4", ("h3_prepare_plain_" + ib).c_str());
+        load(k_gemm_qkv_, "gemm_qkv", ("h3_gemm_" + ib + "_256b").c_str());
+        load(k_gemm_gu_, "gemm_gu", ("h3_gemm_" + ib + "_swiglu_256b_gs").c_str());
+        load(k_gemm_out_, "gemm_out", ("h3_gemm_" + ib + "_resid_256b").c_str());
+        load(k_gemm_down_, "gemm_down", ("h3_gemm_" + ib + "_resid_256b").c_str());
         load(k_rope_, "rope_qknorm", "h3_rope64_qknorm_f16");
         { std::ifstream wf(kernels_dir + "/attention_waves.txt"); if (wf) wf >> attn_waves_; if (attn_waves_ != 4 && attn_waves_ != 8) throw std::runtime_error("attention_waves.txt must say 4 or 8"); }
         load(k_attention_, "attention", attn_waves_ == 8 ? "h3_attention_mha648_lds_f16_wmma" : "h3_attention_mha64_lds_f16_wmma");
         gemm_tile_ = 256;
         const size_t T = capacity_;
         HIP_CHECK(hipMalloc(&x_, T * HIDDEN * 4));            // the residual stream, f32
-        HIP_CHECK(hipMalloc(&a_q_, T * FFN / 2));               // the widest prepared operand (down's K = 14336)
+        HIP_CHECK(hipMalloc(&a_q_, T * FFN));                   // the widest prepared operand, sized for int8
         HIP_CHECK(hipMalloc(&a_s_, T * 4));
         HIP_CHECK(hipMalloc(&fused_, T * QKV * 2));
         HIP_CHECK(hipMalloc(&q_, T * INNER * 2));
@@ -222,7 +225,7 @@ private:
     }
 
     int tokens_, layers_;
-    size_t capacity_ = 0, gemm_tile_ = 128, attn_waves_ = 4;
+    size_t capacity_ = 0, gemm_tile_ = 128, attn_waves_ = 4, bits_ = 4;
     std::mutex mutex_;
     std::vector<Block> blocks_;
     void *weights_ = nullptr, *x_ = nullptr, *a_q_ = nullptr, *a_s_ = nullptr, *fused_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr,

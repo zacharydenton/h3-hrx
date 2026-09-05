@@ -23,11 +23,12 @@ PACKETS = (TM + TN) * 4 // 256
 A_PACKETS = TM * 4 // 256
 
 
-def generate(mode: str, bias: bool = False, gate_first: bool = True) -> str:
+def generate(mode: str, bias: bool = False, gate_first: bool = True, bits: int = 4) -> str:
     """bias: a per-column f32 bias added to every output before the epilogue's own arithmetic
     (the VAE decoder's linears have biases); gate_first: which interleaved half the SwiGLU
     applies silu to (ComfyUI's fc1: gate first; diffusers' SwiGLU: linear first, gate second)."""
-    STEM = {"plain": "gemm_i4_256", "resid": "gemm_i4_resid_256", "swiglu": "gemm_i4_swiglu_256"}[mode] + ("b" if bias else "") + ("" if gate_first else "_gs")
+    STEM = {"plain": "gemm_i4_256", "resid": "gemm_i4_resid_256", "swiglu": "gemm_i4_swiglu_256"}[mode].replace("i4", f"i{bits}") + ("b" if bias else "") + ("" if gate_first else "_gs")
+    KSTEP, SUBS, KQ, FRAG, PREGS = (128, 8, 8, "vector<2xi32>", 2) if bits == 4 else (64, 4, 4, "vector<4xi32>", 4)   # k per step, sub-steps, k per i32 quad, fragment payload
     SYM, NS = "h3_" + STEM, "h3." + STEM
     extra_args = {"plain": "", "resid": ", %gate: buffer, %cls: buffer", "swiglu": ""}[mode] + (", %bias: buffer" if bias else "")
     extra_cfg = "\nconfig.decl @" + NS + ".m_group : %value: index where [range(%value, 1, 4)]\n" + ("\nconfig.decl @" + NS + ".classes : %value: index where [range(%value, 1, 64)]\n" if mode == "resid" else "")
@@ -43,7 +44,7 @@ def generate(mode: str, bias: bool = False, gate_first: bool = True) -> str:
 
     amdgpu.target<gfx11-generic> @{SYM}_gfx11 {{subgroup_size = 32}}
 
-    config.decl @{NS}.k_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+    config.decl @{NS}.k_size : %value: index where [range(%value, {KSTEP}, 65536), mul(%value, {KSTEP})]
 
     config.decl @{NS}.n_size : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
 {extra_cfg}
@@ -67,7 +68,7 @@ def generate(mode: str, bias: bool = False, gate_first: bool = True) -> str:
     }} launch(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer{extra_args}) {{
       %k_size0 = config.get @{NS}.k_size : index
       %n_size0 = config.get @{NS}.n_size : index
-      %k_size = index.assume %k_size0 [range(%k_size0, 128, 65536), mul(%k_size0, 128)] : index
+      %k_size = index.assume %k_size0 [range(%k_size0, {KSTEP}, 65536), mul(%k_size0, {KSTEP})] : index
       %n_size = index.assume %n_size0 [range(%n_size0, 128, 32768), mul(%n_size0, 128)] : index
 
       %c0 = index.constant 0 : index
@@ -112,7 +113,7 @@ def generate(mode: str, bias: bool = False, gate_first: bool = True) -> str:
       %k = index.constant 16 : index
       %zero_i32x8 = vector.constant 0 : vector<8xi32>
       %zero_i32x4 = vector.constant 0 : vector<4xi32>
-      %i4_schema = encoding.define #encoding.operand<element_format=i4, payload_elements=16, payload_registers=2> : encoding<schema>
+      %i4_schema = encoding.define #encoding.operand<element_format=i{bits}, payload_elements=16, payload_registers={PREGS}> : encoding<schema>
 
       %workitem = kernel.workitem.id<x> : index
       %subgroup0 = kernel.subgroup.id : index
@@ -142,7 +143,7 @@ def generate(mode: str, bias: bool = False, gate_first: bool = True) -> str:
       %wave_col = index.mul %wave_n, %c64 : index
       %base_m = index.mul %tile_m_id, %c256 : index
       %base_n = index.mul %tile_n_id, %c128 : index
-      %k_quads = index.div %k_size, %c8 : index
+      %k_quads = index.div %k_size, %c{KQ} : index
 
       %a_global = buffer.assume.memory_space<global> %a : buffer
       %w_global = buffer.assume.memory_space<global> %w : buffer
@@ -212,7 +213,7 @@ def generate(mode: str, bias: bool = False, gate_first: bool = True) -> str:
     inits = ", ".join([f"%r{x} = %acc_init : {V8}" for x in ACC] + [f"%ca{i} = %ga{i} : {V4}" for i in range(A_PACKETS)] + [f"%cw{i} = %gw{i} : {V4}" for i in range(PACKETS - A_PACKETS)])
     types = ", ".join([V8] * len(ACC) + [V4] * PACKETS)
     K += f"""
-      {carried} = scf.for %k_base = [%c0 to %k_size step %c128]({inits}) -> ({types}) {{
+      {carried} = scf.for %k_base = [%c0 to %k_size step %c{KSTEP}]({inits}) -> ({types}) {{
         // Stage what we were handed.
     """
     for i in range(A_PACKETS):
@@ -222,9 +223,9 @@ def generate(mode: str, bias: bool = False, gate_first: bool = True) -> str:
     K += """    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
         // Prefetch the next step (zero past K) while the WMMAs run on this one.
-        %k_next = index.add %k_base, %c128 : index
+        %k_next = index.add %k_base, %c{KSTEP} : index
         %in_k = index.cmp ult, %k_next, %k_size : index
-        %kq_next0 = index.div %k_next, %c8 : index
+        %kq_next0 = index.div %k_next, %c{KQ} : index
         %kq_slot = index.add %kq_next0, %st_quad : index
         %kq_safe = scf.select %in_k, %kq_slot, %st_quad : index
         %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), mul(%kq_safe, 4)] : index
@@ -234,21 +235,22 @@ def generate(mode: str, bias: bool = False, gate_first: bool = True) -> str:
         K += f"    %na{i} = scf.if %load_a{i} -> ({V4}) {{\n      %v = vector.load %a_view[%a_row{i}, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> {V4}\n      scf.yield %v : {V4}\n    }} else {{\n      scf.yield %zero_i32x4 : {V4}\n    }}\n"
     for i in range(PACKETS - A_PACKETS):
         K += f"    %nw{i} = scf.if %in_k -> ({V4}) {{\n      %v = vector.load %w_view[%w_row{i}, %kq_next] : view<[%n_size]x[%k_quads]xi32> -> {V4}\n      scf.yield %v : {V4}\n    }} else {{\n      scf.yield %zero_i32x4 : {V4}\n    }}\n"
-    K += "\n    // Eight 16-wide sub-steps over the staged 64 bytes: 4 A + 4 W runs, 16 WMMAs each.\n"
+    K += f"\n    // {SUBS} 16-wide sub-steps over the staged 64 bytes: 4 A + 4 W runs, 16 WMMAs each.\n"
     prev = {x: f"%r{x}" for x in ACC}
-    for s in range(8):
+    step = 2 if bits == 4 else 4     # i32 quads per sub-step
+    for s in range(SUBS):
         for i in range(FM):
-            K += f"    %da{i}_{s} = vector.load %a_stage[%fa{i}, %c{2*s}] : view<{TM}x20xi32> -> {V2}\n"
+            K += f"    %da{i}_{s} = vector.load %a_stage[%fa{i}, %c{step*s}] : view<{TM}x20xi32> -> {FRAG}\n"
         for j in range(FN):
-            K += f"    %db{j}_{s} = vector.load %w_stage[%fb{j}, %c{2*s}] : view<{TN}x20xi32> -> {V2}\n"
+            K += f"    %db{j}_{s} = vector.load %w_stage[%fb{j}, %c{step*s}] : view<{TN}x20xi32> -> {FRAG}\n"
         for i in range(FM):
-            K += f"    %la{i}_{s} = vector.fragment<lhs> %da{i}_{s} shape [%m, %k] using {{schema = %i4_schema : encoding<schema>}} : {V2}\n"
+            K += f"    %la{i}_{s} = vector.fragment<lhs> %da{i}_{s} shape [%m, %k] using {{schema = %i4_schema : encoding<schema>}} : {FRAG}\n"
         for j in range(FN):
-            K += f"    %rb{j}_{s} = vector.fragment<rhs> %db{j}_{s} shape [%k, %n] using {{schema = %i4_schema : encoding<schema>}} : {V2}\n"
+            K += f"    %rb{j}_{s} = vector.fragment<rhs> %db{j}_{s} shape [%k, %n] using {{schema = %i4_schema : encoding<schema>}} : {FRAG}\n"
         for i in range(FM):
             for j in range(FN):
                 x = f"{i}{j}"
-                K += f"    %o{x}_{s} = vector.mma %la{i}_{s}, %rb{j}_{s}, {prev[x]} : {V2}, {V2}, {V8}\n"
+                K += f"    %o{x}_{s} = vector.mma %la{i}_{s}, %rb{j}_{s}, {prev[x]} : {FRAG}, {FRAG}, {V8}\n"
                 prev[x] = f"%o{x}_{s}"
     yields = ", ".join([prev[x] for x in ACC] + [f"%na{i}" for i in range(A_PACKETS)] + [f"%nw{i}" for i in range(PACKETS - A_PACKETS)])
     K += f"""    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
@@ -399,7 +401,7 @@ def generate(mode: str, bias: bool = False, gate_first: bool = True) -> str:
     K += """      kernel.return
     }
 """
-    return K
+    return K.replace("{KSTEP}", str(KSTEP)).replace("{KQ}", str(KQ))     # placeholders that sit in plain strings
 
 
 if __name__ == "__main__":
@@ -410,4 +412,8 @@ if __name__ == "__main__":
     # the VAE decoder's family: biases everywhere, diffusers' SwiGLU order (linear first, gate second)
     for mode, stem in (("plain", "gemm_i4_256b"), ("resid", "gemm_i4_resid_256b"), ("swiglu", "gemm_i4_swiglu_256b_gs")):
         (ROOT / "kernels" / f"{stem}.loom").write_text(generate(mode, bias=True, gate_first=(mode != "swiglu")))
+        print("wrote", stem)
+    # the same family in int8 (W8A8): the decoder when int4 is not enough, and the text encoder
+    for mode, stem in (("plain", "gemm_i8_256b"), ("resid", "gemm_i8_resid_256b"), ("swiglu", "gemm_i8_swiglu_256b_gs")):
+        (ROOT / "kernels" / f"{stem}.loom").write_text(generate(mode, bias=True, gate_first=(mode != "swiglu"), bits=8))
         print("wrote", stem)

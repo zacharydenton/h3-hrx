@@ -12,7 +12,7 @@ from h3vae_loom import H3VaeBlocks
 
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("--curve", default="1,4,12,36"); ap.add_argument("--latents", default=str(ROOT / "build/fox_480p_5s_latents.pt")); ap.add_argument("--profile", action="store_true")
+    ap = argparse.ArgumentParser(); ap.add_argument("--curve", default="1,4,12,36"); ap.add_argument("--latents", default=str(ROOT / "build/fox_480p_5s_latents.pt")); ap.add_argument("--profile", action="store_true"); ap.add_argument("--weights", default=None); ap.add_argument("--bits", type=int, default=4)
     a = ap.parse_args(); dev = "cuda"
     from diffusers import AutoencoderKLMiniMaxH3
     vae = AutoencoderKLMiniMaxH3.from_pretrained(str(MODELS / "vae"), torch_dtype=torch.float32).to(dev).eval(); vae.disable_tiling()
@@ -29,7 +29,7 @@ def main():
             ref = hs.clone()
             for blk in vae.decoder.transformer_blocks[:depth]:
                 ref = blk(ref, (pos_cos, pos_sin))
-        loom = H3VaeBlocks(n, layers=depth)
+        loom = H3VaeBlocks(n, layers=depth, weights=a.weights, bits=a.bits)
         if a.profile: loom.profile(True)
         t0 = time.time(); got = loom.forward(hs[0], cos, sin).to(dev)[None]; dt = time.time() - t0; loom.close()
         upd = lambda t: (t - hs).flatten()

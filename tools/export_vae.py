@@ -26,7 +26,9 @@ LAYERS = 36
 
 
 def main() -> None:
-    out = ROOT / "build/weights_vae"; out.mkdir(parents=True, exist_ok=True)
+    import argparse
+    ap = argparse.ArgumentParser(); ap.add_argument("--bits", type=int, default=4); a = ap.parse_args()
+    out = ROOT / ("build/weights_vae" if a.bits == 4 else "build/weights_vae_i8"); out.mkdir(parents=True, exist_ok=True)
     index = json.loads((VAE / "diffusion_pytorch_model.safetensors.index.json").read_text())["weight_map"]
     files = {}
     def get(name):
@@ -37,8 +39,11 @@ def main() -> None:
     h = R.hadamard(R.HADAMARD_GROUP).cuda()
     def quant(w):
         wr = R.rotate_groups(w.cuda().float(), h)
-        q, s = R.quant_int4_rows(wr)
-        return pack_i4(q.to(torch.int16).cpu()), s.view(-1).cpu()
+        if a.bits == 4:
+            q, s = R.quant_int4_rows(wr)
+            return pack_i4(q.to(torch.int16).cpu()), s.view(-1).cpu()
+        q, s = R.quant_int8_rows(wr)
+        return q.to(torch.int8).cpu(), s.view(-1).cpu()
     blobs = []
     def add(name, t): blobs.append((name, t.contiguous().cpu()))
     t0 = time.time()
@@ -61,7 +66,7 @@ def main() -> None:
             manifest.append(f"{name} {offset} {len(b)} {t.dtype} {'x'.join(map(str, t.shape))}")
             f.write(b); offset += len(b)
     (out / "manifest.txt").write_text("\n".join(manifest) + "\n")
-    (out / "config.json").write_text(json.dumps(dict(layers=LAYERS, hidden=2048, heads=32, head_dim=64, ffn=8192, rope_dim=48, group=256), indent=1))
+    (out / "config.json").write_text(json.dumps(dict(layers=LAYERS, hidden=2048, heads=32, head_dim=64, ffn=8192, rope_dim=48, group=256, bits=a.bits), indent=1))
     print(f"wrote {out}/weights.bin: {offset / 1e9:.2f} GB, {len(manifest)} tensors, {time.time() - t0:.0f} s")
 
 

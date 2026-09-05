@@ -36,13 +36,13 @@ def decoder_head(vae, hs, num_patches, fhw):
 
 
 class LoomClipDecoder:
-    def __init__(self, vae, layers=36, profile=False):
-        self.vae, self.layers, self.profile, self.sessions = vae, layers, profile, {}
+    def __init__(self, vae, layers=36, profile=False, weights=None, bits=4):
+        self.vae, self.layers, self.profile, self.sessions, self.weights, self.bits = vae, layers, profile, {}, weights, bits
     def __call__(self, z):
         hs, cos, sin, num_patches, fhw = decoder_tokens(self.vae, z)
         n = hs.shape[1]
         if n not in self.sessions:
-            self.sessions[n] = H3VaeBlocks(n, layers=self.layers)
+            self.sessions[n] = H3VaeBlocks(n, layers=self.layers, weights=self.weights, bits=self.bits)
             if self.profile: self.sessions[n].profile(True)
         y = self.sessions[n].forward(hs[0], cos, sin).to(hs.device, hs.dtype)[None]
         return decoder_head(self.vae, y, num_patches, fhw)
@@ -52,7 +52,7 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument("latents"); ap.add_argument("--out", default=str(ROOT / "build/loom_decode.mp4"))
     ap.add_argument("--clips", type=int, default=None, help="decode only the first N latent chunks (debug)")
     ap.add_argument("--compare", action="store_true", help="also decode the first clip in torch fp32 and report PSNR")
-    ap.add_argument("--profile", action="store_true")
+    ap.add_argument("--profile", action="store_true"); ap.add_argument("--weights", default=None, help="build/weights_vae (RTN) or build/weights_vae_gptq"); ap.add_argument("--bits", type=int, default=4)
     a = ap.parse_args(); dev = "cuda"
     from diffusers import AutoencoderKLMiniMaxH3, AutoencoderKLMiniMaxH3Audio
     fx = torch.load(a.latents); latents, audio = fx["video"].to(dev), fx["audio"].to(dev)
@@ -60,7 +60,7 @@ def main():
     vae.disable_tiling()
     mean = torch.tensor(vae.config.latents_mean, device=dev).view(1, -1, 1, 1, 1); std = torch.tensor(vae.config.latents_std, device=dev).view(1, -1, 1, 1, 1)
     z = (latents * std + mean).float()
-    loom = LoomClipDecoder(vae, profile=a.profile)
+    loom = LoomClipDecoder(vae, profile=a.profile, weights=a.weights, bits=a.bits)
     if a.compare:
         zc = z[:, :, :vae.tokens_chunk_size + vae.token_overlap]
         with torch.no_grad():

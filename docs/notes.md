@@ -253,3 +253,31 @@ the two VAE decodes in torch (the video decoder is the slow one, several minutes
 size). The frames are temporally coherent and on prompt (`docs/media/fox_480p_5s_strip.jpg`).
 Attention at video length is the next lever; the budget that resists a 256-query pass is
 LDS (Q tiles for 16 waves) and registers (two query tiles per wave).
+
+## The video VAE decoder in Loom (2026-09-06)
+
+diffusers keeps the decoder in fp32 (`_keep_in_fp32_modules`), which is why the torch
+decode is slow: 161 s per 7-latent-frame clip (11345 tokens through 36 blocks of width 2048,
+32 heads of 64, SwiGLU 8192), about 19 minutes for the 5-second clip. In Loom it is the
+H3 block session with the decoder's shapes: the int4 GEMM family gained biases and
+diffusers' SwiGLU order (silu on the second half), the attention generator a head size of
+64 (176 VGPRs, 7-9 KB of LDS), the RoPE kernel a two-channels-per-lane variant (the
+rotate-half partner sits 12 lanes away in both), and prepare-norm with a zero one-class
+AdaLN table is the decoder's RMSNorm. `tools/decode_loom.py` keeps diffusers' post_quant_conv,
+proj_in, register/cls tokens, rotary grid, norm_out, proj_out, unpatchify and temporal
+chunk blending around the native blocks.
+
+Quantisation study on one clip (`tools/vae_quant_study.py`, frame PSNR against fp32):
+
+| weights | activations | PSNR |
+| --- | --- | ---: |
+| int4 per row (RTN) | int4 per token | 28.31 dB |
+| int4 per row (RTN) | float | 30.73 dB |
+| int8 per row | int8 per token | 52.03 dB |
+
+The native int4 decoder reproduces the study exactly (28.28 dB through the head at 36
+blocks, update cosine 0.9868): the kernels are faithful, the int4 weights are the loss.
+Since the decoder is a small share of a clip, the generators gained an int8 mode (the iu8
+WMMA: fragments of vector<4xi32>, 64-k steps, 228 VGPRs; int8 prepare kernels packing four
+bytes per word -- the per-lane chunk count must come from elements, not words) and the
+session, builder, export and wrapper take `bits`. GPTQ for the int4 decoder runs alongside.

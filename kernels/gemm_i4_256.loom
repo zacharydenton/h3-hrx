@@ -260,7 +260,7 @@ config.decl @h3.gemm_i4_256.m_group : %value: index where [range(%value, 1, 4)]
       scf.yield %zero_i32x4 : vector<4xi32>
     }
 
-    // Eight 16-wide sub-steps over the staged 64 bytes: 4 A + 4 W runs, 16 WMMAs each.
+    // 8 16-wide sub-steps over the staged 64 bytes: 4 A + 4 W runs, 16 WMMAs each.
     %da0_0 = vector.load %a_stage[%fa0, %c0] : view<256x20xi32> -> vector<2xi32>
     %da1_0 = vector.load %a_stage[%fa1, %c0] : view<256x20xi32> -> vector<2xi32>
     %da2_0 = vector.load %a_stage[%fa2, %c0] : view<256x20xi32> -> vector<2xi32>

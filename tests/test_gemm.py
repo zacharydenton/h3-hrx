@@ -31,16 +31,21 @@ def interleave(w):
     return np.stack([w[:inter].reshape(inter // 16, 16, -1), w[inter:].reshape(inter // 16, 16, -1)], axis=1).reshape(w.shape[0], -1)
 
 
-def run(tmp, mode, tile_m, M, K, N, rng):
+def run(tmp, mode, tile_m, M, K, N, rng, bits=4, bias=False):
     stem = {"plain": "gemm_i4", "resid": "gemm_i4_resid", "swiglu": "gemm_i4_swiglu"}[mode] + ("_256" if tile_m == 256 else "")
+    stem = stem.replace("i4", f"i{bits}") + ("b" if bias else "") + ("_gs" if (bias and mode == "swiglu") else "")
     ns, sym = "h3." + stem, "h3_" + stem
-    a = rng.integers(-7, 8, (M, K)).astype(np.int8); w = rng.integers(-7, 8, (N, K)).astype(np.int8)
-    w_scale = (rng.random(N, dtype=np.float32) * 0.5 + 0.5) / K * 8
-    a_scale = (rng.random(M, dtype=np.float32) * 0.5 + 0.5) / 7
+    lim = 7 if bits == 4 else 127
+    a = rng.integers(-lim, lim + 1, (M, K)).astype(np.int8); w = rng.integers(-lim, lim + 1, (N, K)).astype(np.int8)
+    w_scale = (rng.random(N, dtype=np.float32) * 0.5 + 0.5) / K * 8 * (7.0 / lim)
+    a_scale = (rng.random(M, dtype=np.float32) * 0.5 + 0.5) / lim
     full = (a.astype(np.float64) @ w.astype(np.float64).T) * w_scale[None] * a_scale[:, None]
+    b_vec = (rng.standard_normal(N) * 0.1).astype(np.float32) if bias else None
+    if bias: full = full + b_vec[None]
     g = m_group(M, tile_m); gy = ((M + tile_m - 1) // tile_m + g - 1) // g * g
     cfg = {f"{ns}.k_size": K, f"{ns}.n_size": N, f"{ns}.m_group": g}
-    args = [("i32", M), ("in_u8", pack_i4(a)), ("in_u8", pack_i4(w if mode != "swiglu" else interleave(w))), ("in", w_scale if mode != "swiglu" else interleave(w_scale[:, None])[:, 0]), ("in", a_scale)]
+    pack = pack_i4 if bits == 4 else (lambda q: q.view(np.uint8))
+    args = [("i32", M), ("in_u8", pack(a)), ("in_u8", pack(w if mode != "swiglu" else interleave(w))), ("in", w_scale if mode != "swiglu" else interleave(w_scale[:, None])[:, 0]), ("in", a_scale)]
     if mode == "plain":
         args.append(("out_f16", ((M, N), np.float16))); want = full
     elif mode == "resid":
@@ -50,7 +55,10 @@ def run(tmp, mode, tile_m, M, K, N, rng):
         args += [("inout", (x, x.shape)), ("in", gate), ("in_i32", cls)]; want = x.astype(np.float64) + gate[cls] * full
     else:
         args.append(("out_f16", ((M, N // 2), np.float16)))
-        gate, up = full[:, :N // 2], full[:, N // 2:]; want = gate / (1 + np.exp(-gate)) * up
+        first, second = full[:, :N // 2], full[:, N // 2:]
+        want = (first / (1 + np.exp(-first)) * second) if not bias else (second / (1 + np.exp(-second)) * first)   # _gs: silu on the second half
+    if bias:
+        args.append(("in", b_vec if mode != "swiglu" else interleave(b_vec[:, None])[:, 0]))
     hs = tmp / f"{stem}_{K}_{N}.hsaco"
     compile_kernel(ROOT / "kernels" / f"{stem}.loom", sym, cfg, hs)
     (out,), t = launch(hs, sym, (N // 128, gy, 1), (256, 1, 1), args, tmp, repeat=1 if mode == "resid" else 3)   # in place: once
@@ -62,14 +70,15 @@ def main() -> int:
     M = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 2097
     tiles = [int(v) for v in sys.argv[2:] if v in ("128", "256")] or [128, 256]
     modes = [v for v in sys.argv[2:] if v in ("plain", "resid", "swiglu")] or ["plain", "resid", "swiglu"]
+    family = next((v for v in sys.argv[2:] if v in ("i4", "i4b", "i8b")), "i4")     # i4: the H3 blocks; i4b / i8b: the VAE decoder's (biases, diffusers' SwiGLU order)
     rng = np.random.default_rng(0)
     ok = True
     with workdir() as tmp:
         tmp = Path(tmp)
-        shapes = {"plain": (5376, 21504), "resid": (7168, 5376), "swiglu": (5376, 28672)}
-        for tile_m in tiles:
+        shapes = {"plain": (5376, 21504), "resid": (7168, 5376), "swiglu": (5376, 28672)} if family == "i4" else {"plain": (2048, 6144), "resid": (8192, 2048), "swiglu": (2048, 16384)}
+        for tile_m in (tiles if family == "i4" else [256]):
             for mode in modes:
-                ok &= run(tmp, mode, tile_m, M, *shapes[mode], rng)
+                ok &= run(tmp, mode, tile_m, M, *shapes[mode], rng, bits=(8 if family == "i8b" else 4), bias=(family != "i4"))
     return 0 if ok else 1
 
 
