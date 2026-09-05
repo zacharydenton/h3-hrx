@@ -16,11 +16,12 @@ WAVES = int(os.environ.get("ATTN_WAVES", "4"))         # waves (query tiles) per
 D = int(os.environ.get("ATTN_D", "128"))               # head size: 128 (H3 blocks) or 64 (the VAE decoder)
 NF = D // 16                                           # 16-channel fragments per head
 assert D in (64, 128)
-assert GQA == 4 and WAVES == 4 or GQA == 1 and WAVES in (4, 8, 16)
+CAUSAL = os.environ.get("ATTN_CAUSAL", "0") == "1"      # keys <= query (the text encoder); the key loop stops at the query tile
+assert GQA == 4 and WAVES == 4 or GQA == 1 and WAVES in (4, 8, 16) or GQA == 8 and WAVES == 8
 QBLOCK = 16 * WAVES                                     # query rows per workgroup
-STEM = os.environ.get("ATTN_STEM", ({4: "attention_mha_lds_f16_wmma", 8: "attention_mha8_lds_f16_wmma", 16: "attention_mha16_lds_f16_wmma"}[WAVES].replace("mha", f"mha{D}" if D != 128 else "mha")) if GQA == 1 else "attention_gqa_lds_f16_wmma")
+STEM = os.environ.get("ATTN_STEM", ({4: "attention_mha_lds_f16_wmma", 8: "attention_mha8_lds_f16_wmma", 16: "attention_mha16_lds_f16_wmma"}[WAVES].replace("mha", f"mha{D}" if D != 128 else "mha")) if GQA == 1 else ("attention_gqa8c_lds_f16_wmma" if GQA == 8 else "attention_gqa_lds_f16_wmma"))
 assert TILE in (16, 32)
-OUT = ROOT / ("kernels" if STEM in ("attention_gqa_lds_f16_wmma", "attention_mha_lds_f16_wmma", "attention_mha8_lds_f16_wmma", "attention_mha64_lds_f16_wmma", "attention_mha648_lds_f16_wmma") else "experiments") / f"{STEM}.loom"   # 16 waves lost (0.92x): experiments/
+OUT = ROOT / ("kernels" if STEM in ("attention_gqa_lds_f16_wmma", "attention_mha_lds_f16_wmma", "attention_mha8_lds_f16_wmma", "attention_mha64_lds_f16_wmma", "attention_mha648_lds_f16_wmma", "attention_gqa8c_lds_f16_wmma") else "experiments") / f"{STEM}.loom"   # 16 waves lost (0.92x): experiments/
 NS, SYM = "h3." + STEM, "h3_" + STEM
 ROW = D + 8   # LDS row length in halves for a D-channel tile
 import os
@@ -68,8 +69,8 @@ kernel.def target(@{SYM}_gfx11) export("{SYM}") @{SYM}(%token_count: index, %kv_
   %c256 = index.constant 256 : index
   %c512 = index.constant 512 : index
   %tokens0 = config.get @{NS}.tokens : index
-  %rounded = index.add %tokens0, %c{15 if GQA == 4 else QBLOCK - 1} : index
-  %tiles = index.div %rounded, %c{16 if GQA == 4 else QBLOCK} : index
+  %rounded = index.add %tokens0, %c{15 if GQA != 1 else QBLOCK - 1} : index
+  %tiles = index.div %rounded, %c{16 if GQA != 1 else QBLOCK} : index
   kernel.launch.config workgroups(%tiles, %kv_head_count, %c1) workgroup_size(%c{32 * WAVES}, %c1, %c1) : index
 }} launch(%token_count: index, %q: buffer, %k: buffer, %v: buffer, %out: buffer) {{
   %q_stride0 = config.get @{NS}.q_stride : index
@@ -99,6 +100,9 @@ kernel.def target(@{SYM}_gfx11) export("{SYM}") @{SYM}(%token_count: index, %kv_
   %c256 = index.constant 256 : index
   %c{ROW} = index.constant {ROW} : index
   %cd = index.constant {D} : index
+  %c10 = index.constant 10 : index
+  %c12 = index.constant 12 : index
+  %c14 = index.constant 14 : index
   %c_klanes = index.constant {16 * NF} : index
   %c_kvlanes = index.constant {32 * NF} : index
   %c_nf = index.constant {NF} : index
@@ -156,11 +160,11 @@ kernel.def target(@{SYM}_gfx11) export("{SYM}") @{SYM}(%token_count: index, %kv_
   %head_limit = index.div %out_stride0, %cd : index
   %rounded = index.add %tokens0, %c15 : index
   %tiles_per_image = index.div %rounded, %c16 : index
-{"""  %head0 = index.mul %kv_head, %c4 : index
+{f"""  %head0 = index.mul %kv_head, %c{GQA} : index
   %head1 = index.add %head0, %wave : index
   %head = index.rem %head1, %head_limit : index
   %tile_in_image = index.rem %tile_id, %tiles_per_image : index
-""" if GQA == 4 else """  // MHA: this wave is query tile 4 * workgroup + wave of head kv_head (tiles past the sequence write nothing)
+""" if GQA != 1 else """  // MHA: this wave is query tile 4 * workgroup + wave of head kv_head (tiles past the sequence write nothing)
   %head = index.rem %kv_head, %head_limit : index
   %tile4 = index.mul %tile_id, %c4 : index
   %tile_in_image0 = index.add %tile4, %wave : index
@@ -211,7 +215,7 @@ kernel.def target(@{SYM}_gfx11) export("{SYM}") @{SYM}(%token_count: index, %kv_
   %st_col_v0 = index.add %kv_base0, %st_chunk_v : index
   %st_col_v = index.assume %st_col_v0 [le(%st_col_v0, %kv_col_limit), mul(%st_col_v0, 16)] : index
   %init = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
-{"  %key_tile_count = index.add %tiles_per_image, %c0 : index" if TILE == 16 else "  %key_rounded = index.add %tokens0, %c31 : index" + chr(10) + "  %key_tile_count = index.div %key_rounded, %c32 : index"}
+{"  %key_tile_count = index.add %tile_in_image, %c1 : index" if CAUSAL else "  %key_tile_count = index.add %tiles_per_image, %c0 : index" if TILE == 16 else "  %key_rounded = index.add %tokens0, %c31 : index" + chr(10) + "  %key_tile_count = index.div %key_rounded, %c32 : index"}
 {"  %st_key_hi = index.add %st_key, %c16 : index" + chr(10) + "  %st_key_v_hi = index.add %st_key_v, %c16 : index" + chr(10) + "  %lane_column_hi = index.add %lane_column, %c16 : index" + chr(10) if TILE == 32 else ""}
 """
 if QROW:
@@ -343,13 +347,19 @@ if TILE == 32:
         out = "%raw_scores_hi" if c == NF - 1 else f"%qk_hi{c}"
         K += f"    {out} = vector.mma %lhs{c}, %rhs_hi{c}, {prev} : vector<16xf16>, vector<16xf16>, vector<8xf32>\n"
         prev = out
-K += """    %scaled0 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %raw_scores, %scale_vector : vector<8xf32>
-    %scaled = scf.if %key_valid -> (vector<8xf32>) {
+K += "    %scaled0 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %raw_scores, %scale_vector : vector<8xf32>\n"
+K += "    %" + ("scaled_masked_pre" if CAUSAL else "scaled") + """ = scf.if %key_valid -> (vector<8xf32>) {
       scf.yield %scaled0 : vector<8xf32>
     } else {
       scf.yield %negative_vector : vector<8xf32>
     }
 """
+if CAUSAL:
+    # lane holds key column lane_column and query rows query_origin + 2e + lane_group (e = 0..7):
+    # keys past the row's own position get -inf, built as an additive mask of 8 selects
+    K += "".join(f"    %crow{e} = index.add %query_origin0, %c{2 * e} : index\n    %crow{e}g = index.add %crow{e}, %lane_group : index\n    %cok{e} = index.cmp ule, %local_key, %crow{e}g : index\n    %cm{e} = scf.select %cok{e}, %zero_f32, %negative_large : f32\n" for e in range(8))
+    K += "    %causal_mask = vector.from_elements " + ", ".join(f"%cm{e}" for e in range(8)) + " : vector<8xf32>\n"
+    K += "    %scaled = vector.addf %scaled_masked_pre, %causal_mask : vector<8xf32>\n"
 if TILE == 32:
     K += """    %scaled_hi0 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %raw_scores_hi, %scale_vector : vector<8xf32>
     %scaled_hi = scf.if %key_valid_hi -> (vector<8xf32>) {
@@ -473,7 +483,8 @@ K += f"""    vector.fragment.store<result> {sel}, %result_view[%c0, %c0] shape [
 def eight_waves(text: str) -> str:
     """Post-pass for WAVES == 8: the workgroup covers 8 query tiles, and the 256 lanes split the
     staging -- lanes 0..127 stage K (one 16-channel chunk each), 128..255 stage V transposed."""
-    text = text.replace("  %tile4 = index.mul %tile_id, %c4 : index", f"  %tile4 = index.mul %tile_id, %c{WAVES} : index")
+    if GQA == 1:
+        text = text.replace("  %tile4 = index.mul %tile_id, %c4 : index", f"  %tile4 = index.mul %tile_id, %c{WAVES} : index")
     text = text.replace("query tile 4 * workgroup + wave", f"query tile {WAVES} * workgroup + wave")
     start = text.index("    %st_row0 = index.add %key_origin0, %st_key : index\n")
     end_line = f"    view.store %ve15, %v_tile[%vr15, %st_key_v] : f16, view<{D}x{VROW}xf16>\n"

@@ -1,0 +1,31 @@
+// Which rows of a 16x16 f32 WMMA accumulator does each lane hold? A[r][k] = r for k = 0 (else 0),
+// B[k][c] = 1 for k = 0 (else 0), so S[r][c] = r everywhere; each lane's 8 payload values are
+// the rows it holds. Output [32 lanes][8] f32.
+amdgpu.target<gfx11-generic> @probe_gfx11 {subgroup_size = 32}
+
+kernel.def target(@probe_gfx11) export("probe_wmma_layout") @probe_wmma_layout() {
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  kernel.launch.config workgroups(%c1, %c1, %c1) workgroup_size(%c32, %c1, %c1) : index
+} launch(%a: buffer, %b: buffer, %out: buffer) {
+  %c0 = index.constant 0 : index
+  %c8 = index.constant 8 : index
+  %c0_offset = index.constant 0 : offset
+  %m = index.constant 16 : index
+  %n = index.constant 16 : index
+  %k = index.constant 16 : index
+  %zero = vector.constant 0.0 : vector<8xf32>
+  %lane = kernel.subgroup.lane.id : index
+  %a_global = buffer.assume.memory_space<global> %a : buffer
+  %b_global = buffer.assume.memory_space<global> %b : buffer
+  %o_global = buffer.assume.memory_space<global> %out : buffer
+  %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<16x16xf16>
+  %b_view = buffer.view %b_global[%c0_offset] : buffer -> view<16x16xf16>
+  %o_view = buffer.view %o_global[%c0_offset] : buffer -> view<32x8xf32>
+  %lhs = vector.fragment.load<lhs> %a_view[%c0, %c0] shape [%m, %k] : view<16x16xf16> -> vector<16xf16>
+  %rhs = vector.fragment.load<rhs> %b_view[%c0, %c0] shape [%k, %n] : view<16x16xf16> -> vector<16xf16>
+  %init = vector.fragment<init> %zero shape [%m, %n] : vector<8xf32>
+  %acc = vector.mma %lhs, %rhs, %init : vector<16xf16>, vector<16xf16>, vector<8xf32>
+  vector.store %acc, %o_view[%lane, %c0] : vector<8xf32>, view<32x8xf32>
+  kernel.return
+}

@@ -46,7 +46,7 @@ def generate(mode: str, bias: bool = False, gate_first: bool = True, bits: int =
 
     config.decl @{NS}.k_size : %value: index where [range(%value, {KSTEP}, 65536), mul(%value, {KSTEP})]
 
-    config.decl @{NS}.n_size : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
+    config.decl @{NS}.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
 {extra_cfg}
     kernel.def target(@{SYM}_gfx11) export("{SYM}") @{SYM}(%m_size: index) {{
       %c1 = index.constant 1 : index
@@ -69,7 +69,7 @@ def generate(mode: str, bias: bool = False, gate_first: bool = True, bits: int =
       %k_size0 = config.get @{NS}.k_size : index
       %n_size0 = config.get @{NS}.n_size : index
       %k_size = index.assume %k_size0 [range(%k_size0, {KSTEP}, 65536), mul(%k_size0, {KSTEP})] : index
-      %n_size = index.assume %n_size0 [range(%n_size0, 128, 32768), mul(%n_size0, 128)] : index
+      %n_size = index.assume %n_size0 [range(%n_size0, 128, 65536), mul(%n_size0, 128)] : index
 
       %c0 = index.constant 0 : index
       %c1 = index.constant 1 : index
@@ -416,4 +416,8 @@ if __name__ == "__main__":
     # the same family in int8 (W8A8): the decoder when int4 is not enough, and the text encoder
     for mode, stem in (("plain", "gemm_i8_256b"), ("resid", "gemm_i8_resid_256b"), ("swiglu", "gemm_i8_swiglu_256b_gs")):
         (ROOT / "kernels" / f"{stem}.loom").write_text(generate(mode, bias=True, gate_first=(mode != "swiglu"), bits=8))
+        print("wrote", stem)
+    # the text encoder's family: int8, no biases, gate-first SwiGLU (Qwen3)
+    for mode, stem in (("plain", "gemm_i8_256"), ("resid", "gemm_i8_resid_256"), ("swiglu", "gemm_i8_swiglu_256")):
+        (ROOT / "kernels" / f"{stem}.loom").write_text(generate(mode, bits=8))
         print("wrote", stem)

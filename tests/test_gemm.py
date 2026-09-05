@@ -70,15 +70,15 @@ def main() -> int:
     M = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 2097
     tiles = [int(v) for v in sys.argv[2:] if v in ("128", "256")] or [128, 256]
     modes = [v for v in sys.argv[2:] if v in ("plain", "resid", "swiglu")] or ["plain", "resid", "swiglu"]
-    family = next((v for v in sys.argv[2:] if v in ("i4", "i4b", "i8b")), "i4")     # i4: the H3 blocks; i4b / i8b: the VAE decoder's (biases, diffusers' SwiGLU order)
+    family = next((v for v in sys.argv[2:] if v in ("i4", "i4b", "i8b", "i8")), "i4")     # i4: the H3 blocks; i4b / i8b: the VAE decoder's (biases, diffusers' SwiGLU order); i8: the text encoder's
     rng = np.random.default_rng(0)
     ok = True
     with workdir() as tmp:
         tmp = Path(tmp)
-        shapes = {"plain": (5376, 21504), "resid": (7168, 5376), "swiglu": (5376, 28672)} if family == "i4" else {"plain": (2048, 6144), "resid": (8192, 2048), "swiglu": (2048, 16384)}
+        shapes = {"i4": {"plain": (5376, 21504), "resid": (7168, 5376), "swiglu": (5376, 28672)}, "i8": {"plain": (5120, 10240), "resid": (8192, 5120), "swiglu": (5120, 51200)}}.get(family, {"plain": (2048, 6144), "resid": (8192, 2048), "swiglu": (2048, 16384)})
         for tile_m in (tiles if family == "i4" else [256]):
             for mode in modes:
-                ok &= run(tmp, mode, tile_m, M, *shapes[mode], rng, bits=(8 if family == "i8b" else 4), bias=(family != "i4"))
+                ok &= run(tmp, mode, tile_m, M, *shapes[mode], rng, bits=(8 if family in ("i8b", "i8") else 4), bias=(family not in ("i4", "i8")))
     return 0 if ok else 1
 
 

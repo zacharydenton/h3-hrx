@@ -11,6 +11,8 @@ config.decl @h3.rope128_qknorm_f16.row_stride : %value: index where [range(%valu
 
 config.decl @h3.rope128_qknorm_f16.heads : %value: index where [range(%value, 1, 256)]
 
+config.decl @h3.rope128_qknorm_f16.kv_heads : %value: index where [range(%value, 1, 256)]
+
 config.decl @h3.rope128_qknorm_f16.k_offset : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
 
 config.decl @h3.rope128_qknorm_f16.eps : f32
@@ -44,8 +46,11 @@ kernel.def target(@h3_rope128_qknorm_f16_gfx11) export("h3_rope128_qknorm_f16") 
   %wave = index.assume %wave0 [range(%wave0, 0, 7)] : index
   %lane = kernel.subgroup.lane.id : index
   %lane_col = index.mul %lane, %cch : index
-  %qk_heads = index.add %heads, %heads : index
-  %heads_total = index.add %qk_heads, %heads : index
+  %kv_heads = config.get @h3.rope128_qknorm_f16.kv_heads : index
+  %qk_heads = index.add %heads, %kv_heads : index
+  %heads_total = index.add %qk_heads, %kv_heads : index
+  %kv_width = index.mul %kv_heads, %cd : index
+  %kv_limit = index.sub %kv_width, %cch : index
   %rounds0 = index.add %heads_total, %c7 : index
   %rounds = index.div %rounds0, %c8 : index
   %qkv_global = buffer.assume.memory_space<global> %qkv : buffer
@@ -59,9 +64,9 @@ kernel.def target(@h3_rope128_qknorm_f16_gfx11) export("h3_rope128_qknorm_f16") 
   %sin_global = buffer.assume.memory_space<global> %sin : buffer
   %qkv_view = buffer.view %qkv_global[%c0_offset] : buffer -> view<[%tokens_b]x[%row_stride]xf16>
   %qo_view = buffer.view %qo_global[%c0_offset] : buffer -> view<[%tokens_b]x[%width]xf16>
-  %ko_view = buffer.view %ko_global[%c0_offset] : buffer -> view<[%tokens_b]x[%width]xf16>
-  %vo_view = buffer.view %vo_global[%c0_offset] : buffer -> view<[%tokens_b]x[%width]xf16>
-  %v_offset = index.add %k_offset, %width : index
+  %ko_view = buffer.view %ko_global[%c0_offset] : buffer -> view<[%tokens_b]x[%kv_width]xf16>
+  %vo_view = buffer.view %vo_global[%c0_offset] : buffer -> view<[%tokens_b]x[%kv_width]xf16>
+  %v_offset = index.add %k_offset, %kv_width : index
   %w_limit = index.sub %width, %cch : index
   %qw_view = buffer.view %qw_global[%c0_offset] : buffer -> view<128xf32>
   %kw_view = buffer.view %kw_global[%c0_offset] : buffer -> view<128xf32>
@@ -108,8 +113,8 @@ kernel.def target(@h3_rope128_qknorm_f16_gfx11) export("h3_rope128_qknorm_f16") 
       %v16 = vector.load %qkv_view[%row, %col] : view<[%tokens_b]x[%row_stride]xf16> -> vector<4xf16>
       scf.if %is_v {
         %vc0 = index.add %v_base0, %lane_col : index
-        %vc = index.assume %vc0 [le(%vc0, %w_limit), mul(%vc0, 4)] : index
-        vector.store %v16, %vo_view[%row, %vc] : vector<4xf16>, view<[%tokens_b]x[%width]xf16>
+        %vc = index.assume %vc0 [le(%vc0, %kv_limit), mul(%vc0, 4)] : index
+        vector.store %v16, %vo_view[%row, %vc] : vector<4xf16>, view<[%tokens_b]x[%kv_width]xf16>
       } else {
         %v = vector.extf %v16 : vector<4xf16> to vector<4xf32>
         %sq = vector.mulf %v, %v : vector<4xf32>
@@ -153,8 +158,8 @@ kernel.def target(@h3_rope128_qknorm_f16_gfx11) export("h3_rope128_qknorm_f16") 
           vector.store %out16, %qo_view[%row, %qc] : vector<4xf16>, view<[%tokens_b]x[%width]xf16>
         } else {
           %kc0 = index.add %k_base0, %lane_col : index
-          %kc = index.assume %kc0 [le(%kc0, %w_limit), mul(%kc0, 4)] : index
-          vector.store %out16, %ko_view[%row, %kc] : vector<4xf16>, view<[%tokens_b]x[%width]xf16>
+          %kc = index.assume %kc0 [le(%kc0, %kv_limit), mul(%kc0, 4)] : index
+          vector.store %out16, %ko_view[%row, %kc] : vector<4xf16>, view<[%tokens_b]x[%kv_width]xf16>
         }
       }
     }

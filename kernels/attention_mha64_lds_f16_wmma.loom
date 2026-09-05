@@ -65,6 +65,9 @@ kernel.def target(@h3_attention_mha64_lds_f16_wmma_gfx11) export("h3_attention_m
   %c256 = index.constant 256 : index
   %c72 = index.constant 72 : index
   %cd = index.constant 64 : index
+  %c10 = index.constant 10 : index
+  %c12 = index.constant 12 : index
+  %c14 = index.constant 14 : index
   %c_klanes = index.constant 64 : index
   %c_kvlanes = index.constant 128 : index
   %c_nf = index.constant 4 : index

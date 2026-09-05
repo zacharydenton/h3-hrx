@@ -1,5 +1,5 @@
 """kernels/rope*_qknorm_f16.loom: per-head RMSNorm (weight w[c]) and rotate-half RoPE on q and
-k from a fused [tokens][row_stride] projection (q at 0, k at k_offset, v after k), written to
+k from a fused [tokens][row_stride] projection (q at 0, k at k_offset, v after k; kv_heads k/v heads), written to
 contiguous q/k/v [tokens][heads*D]. One workgroup of 256 lanes per token, a wave per head,
 D/32 channels per lane; channels c < R/2 pair with c + R/2, the partner quad R/2/(D/32) lanes
 away through a subgroup shuffle; channels >= R pass through. Variants:
@@ -32,6 +32,8 @@ amdgpu.target<gfx11-generic> @{SYM}_gfx11 {{subgroup_size = 32}}
 config.decl @{NS}.row_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
 
 config.decl @{NS}.heads : %value: index where [range(%value, 1, 256)]
+
+config.decl @{NS}.kv_heads : %value: index where [range(%value, 1, 256)]
 
 config.decl @{NS}.k_offset : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
 
@@ -66,8 +68,11 @@ kernel.def target(@{SYM}_gfx11) export("{SYM}") @{SYM}(%tokens: index) {{
   %wave = index.assume %wave0 [range(%wave0, 0, 7)] : index
   %lane = kernel.subgroup.lane.id : index
   %lane_col = index.mul %lane, %cch : index
-  %qk_heads = index.add %heads, %heads : index
-  %heads_total = index.add %qk_heads, %heads : index
+  %kv_heads = config.get @{NS}.kv_heads : index
+  %qk_heads = index.add %heads, %kv_heads : index
+  %heads_total = index.add %qk_heads, %kv_heads : index
+  %kv_width = index.mul %kv_heads, %cd : index
+  %kv_limit = index.sub %kv_width, %cch : index
   %rounds0 = index.add %heads_total, %c7 : index
   %rounds = index.div %rounds0, %c8 : index
   %qkv_global = buffer.assume.memory_space<global> %qkv : buffer
@@ -81,9 +86,9 @@ kernel.def target(@{SYM}_gfx11) export("{SYM}") @{SYM}(%tokens: index) {{
   %sin_global = buffer.assume.memory_space<global> %sin : buffer
   %qkv_view = buffer.view %qkv_global[%c0_offset] : buffer -> view<[%tokens_b]x[%row_stride]xf16>
   %qo_view = buffer.view %qo_global[%c0_offset] : buffer -> view<[%tokens_b]x[%width]xf16>
-  %ko_view = buffer.view %ko_global[%c0_offset] : buffer -> view<[%tokens_b]x[%width]xf16>
-  %vo_view = buffer.view %vo_global[%c0_offset] : buffer -> view<[%tokens_b]x[%width]xf16>
-  %v_offset = index.add %k_offset, %width : index
+  %ko_view = buffer.view %ko_global[%c0_offset] : buffer -> view<[%tokens_b]x[%kv_width]xf16>
+  %vo_view = buffer.view %vo_global[%c0_offset] : buffer -> view<[%tokens_b]x[%kv_width]xf16>
+  %v_offset = index.add %k_offset, %kv_width : index
   %w_limit = index.sub %width, %cch : index
   %qw_view = buffer.view %qw_global[%c0_offset] : buffer -> view<{D}xf32>
   %kw_view = buffer.view %kw_global[%c0_offset] : buffer -> view<{D}xf32>
@@ -130,8 +135,8 @@ kernel.def target(@{SYM}_gfx11) export("{SYM}") @{SYM}(%tokens: index) {{
       %v16 = vector.load %qkv_view[%row, %col] : view<[%tokens_b]x[%row_stride]xf16> -> vector<{CH}xf16>
       scf.if %is_v {{
         %vc0 = index.add %v_base0, %lane_col : index
-        %vc = index.assume %vc0 [le(%vc0, %w_limit), mul(%vc0, {CH})] : index
-        vector.store %v16, %vo_view[%row, %vc] : vector<{CH}xf16>, view<[%tokens_b]x[%width]xf16>
+        %vc = index.assume %vc0 [le(%vc0, %kv_limit), mul(%vc0, {CH})] : index
+        vector.store %v16, %vo_view[%row, %vc] : vector<{CH}xf16>, view<[%tokens_b]x[%kv_width]xf16>
       }} else {{
         %v = vector.extf %v16 : vector<{CH}xf16> to vector<{CH}xf32>
         %sq = vector.mulf %v, %v : vector<{CH}xf32>
@@ -175,8 +180,8 @@ kernel.def target(@{SYM}_gfx11) export("{SYM}") @{SYM}(%tokens: index) {{
           vector.store %out16, %qo_view[%row, %qc] : vector<{CH}xf16>, view<[%tokens_b]x[%width]xf16>
         }} else {{
           %kc0 = index.add %k_base0, %lane_col : index
-          %kc = index.assume %kc0 [le(%kc0, %w_limit), mul(%kc0, {CH})] : index
-          vector.store %out16, %ko_view[%row, %kc] : vector<{CH}xf16>, view<[%tokens_b]x[%width]xf16>
+          %kc = index.assume %kc0 [le(%kc0, %kv_limit), mul(%kc0, {CH})] : index
+          vector.store %out16, %ko_view[%row, %kc] : vector<{CH}xf16>, view<[%tokens_b]x[%kv_width]xf16>
         }}
       }}
     }}
