@@ -1,0 +1,7 @@
+.venv/
+build/
+host/loomrun
+__pycache__/
+*.pyc
+*.hsaco
+*.log
