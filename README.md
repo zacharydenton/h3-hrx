@@ -19,12 +19,14 @@ the encoder, a causal f16 t4 24-channel video VAE and a 40 Hz audio VAE the toke
 
 ## Status (2026-09-05, day one)
 
-The 50 blocks run in Loom end to end on a 2097-row fixture built from the real checkpoint
-(32 text rows, a 5-frame 480p-class latent grid, 20 audio latents): every kernel passes
-its test against the reference, and the native stack tracks the reference's W4A4
-arithmetic to a final-layer velocity cosine of 0.994 over all 50 blocks, against 0.978
-for int4 versus the int8 checkpoint itself (`tests/test_blocks.py`). One step of those
-50 blocks takes 2.6 s at that size, 52 ms per block:
+The 50 blocks run in Loom end to end. On the 2097-row fixture built from the real
+checkpoint (32 text rows, a 5-frame 480p-class latent grid, 20 audio latents) every
+kernel passes its test against the reference and the native stack reaches a final-layer
+velocity cosine of 0.991 against the int8 checkpoint with the GPTQ weights
+(`tests/test_blocks.py --weights build/weights_gptq`). A 50-block step takes 1.62 s at
+that size on a calm box; at 10317 rows (480p, 4 s of video) it takes 14.6 s, of which
+attention is 8.9 s at 17 TFLOP/s and the four GEMMs 5.0 s at 78-82 TOPS. The 2097-row
+profile:
 
 | stage | share |
 | --- | ---: |

@@ -13,11 +13,11 @@ import os
 TILE = int(os.environ.get("ATTN_TILE", "16"))          # keys per staged tile (16 or 32)
 GQA = int(os.environ.get("ATTN_GQA", "1"))             # query heads per key-value head; 1 = MHA: the waves are query tiles of one head
 WAVES = int(os.environ.get("ATTN_WAVES", "4"))         # waves (query tiles) per workgroup in MHA mode: 4 or 8; all share each K/V tile
-assert GQA == 4 and WAVES == 4 or GQA == 1 and WAVES in (4, 8)
+assert GQA == 4 and WAVES == 4 or GQA == 1 and WAVES in (4, 8, 16)
 QBLOCK = 16 * WAVES                                     # query rows per workgroup
-STEM = os.environ.get("ATTN_STEM", ("attention_mha8_lds_f16_wmma" if WAVES == 8 else "attention_mha_lds_f16_wmma") if GQA == 1 else "attention_gqa_lds_f16_wmma")
+STEM = os.environ.get("ATTN_STEM", ({4: "attention_mha_lds_f16_wmma", 8: "attention_mha8_lds_f16_wmma", 16: "attention_mha16_lds_f16_wmma"}[WAVES]) if GQA == 1 else "attention_gqa_lds_f16_wmma")
 assert TILE in (16, 32)
-OUT = ROOT / ("kernels" if STEM in ("attention_gqa_lds_f16_wmma", "attention_mha_lds_f16_wmma", "attention_mha8_lds_f16_wmma") else "experiments") / f"{STEM}.loom"
+OUT = ROOT / ("kernels" if STEM in ("attention_gqa_lds_f16_wmma", "attention_mha_lds_f16_wmma", "attention_mha8_lds_f16_wmma", "attention_mha16_lds_f16_wmma") else "experiments") / f"{STEM}.loom"
 NS, SYM = "h3." + STEM, "h3_" + STEM
 ROW = 136   # LDS row length in halves for a 128-channel tile (272-byte rows)
 import os
@@ -196,6 +196,7 @@ kernel.def target(@{SYM}_gfx11) export("{SYM}") @{SYM}(%token_count: index, %kv_
   %st_key_v = index.rem %st_lane, %c16 : index
   %st_chunk_v0 = index.div %st_lane, %c16 : index
   %st_is_k = index.cmp ult, %workitem, %c128 : index
+  %st_is_v = index.cmp ult, %workitem, %c256 : index
   %st_chunk_v = index.mul %st_chunk_v0, %c16 : index
   %st_col_v0 = index.add %kv_base0, %st_chunk_v : index
   %st_col_v = index.assume %st_col_v0 [le(%st_col_v0, %kv_col_limit), mul(%st_col_v0, 16)] : index
@@ -462,8 +463,8 @@ K += f"""    vector.fragment.store<result> {sel}, %result_view[%c0, %c0] shape [
 def eight_waves(text: str) -> str:
     """Post-pass for WAVES == 8: the workgroup covers 8 query tiles, and the 256 lanes split the
     staging -- lanes 0..127 stage K (one 16-channel chunk each), 128..255 stage V transposed."""
-    text = text.replace("  %tile4 = index.mul %tile_id, %c4 : index", "  %tile4 = index.mul %tile_id, %c8 : index")
-    text = text.replace("query tile 4 * workgroup + wave", "query tile 8 * workgroup + wave")
+    text = text.replace("  %tile4 = index.mul %tile_id, %c4 : index", f"  %tile4 = index.mul %tile_id, %c{WAVES} : index")
+    text = text.replace("query tile 4 * workgroup + wave", f"query tile {WAVES} * workgroup + wave")
     start = text.index("    %st_row0 = index.add %key_origin0, %st_key : index\n")
     end_line = f"    view.store %ve15, %v_tile[%vr15, %st_key_v] : f16, view<128x{VROW}xf16>\n"
     end = text.index(end_line) + len(end_line)
@@ -474,11 +475,14 @@ def eight_waves(text: str) -> str:
             k_lines.append(line)
         else:
             v_lines.append(line)
-    new = "    scf.if %st_is_k {\n" + "".join("  " + l + "\n" for l in k_lines) + "    } else {\n" + "".join("  " + l + "\n" for l in v_lines) + "    }\n"
+    v_body = "".join("  " + l + "\n" for l in v_lines)
+    if WAVES == 16:      # lanes 256..511 stage nothing
+        v_body = "      scf.if %st_is_v {\n" + "".join("  " + l + "\n" for l in v_body.splitlines()) + "      }\n"
+    new = "    scf.if %st_is_k {\n" + "".join("  " + l + "\n" for l in k_lines) + "    } else {\n" + v_body + "    }\n"
     return text[:start] + new + text[end:]
 
 
-if WAVES == 8:
+if WAVES >= 8:
     K = eight_waves(K)
 OUT.write_text(K)
 print("wrote", OUT)

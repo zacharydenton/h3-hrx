@@ -22,7 +22,7 @@ def main() -> int:
     q = (torch.randn(tokens, HEADS, D) * 0.5).half(); k = (torch.randn(tokens, KV, D) * 0.5).half(); v = (torch.randn(tokens, KV, D) * 0.5).half()
     qf, kf, vf = (t.float().cuda() for t in (q, k, v))
     want = torch.nn.functional.scaled_dot_product_attention(qf.transpose(0, 1)[None], kf.transpose(0, 1)[None], vf.transpose(0, 1)[None])[0].transpose(0, 1).reshape(tokens, HEADS * D).cpu().numpy()
-    capacity = max((tokens + 16 + 31) // 32 * 32, (tokens + 127) // 128 * 128)
+    capacity = max((tokens + 16 + 31) // 32 * 32, (tokens + 255) // 256 * 256)
     def pad(t):
         out = np.zeros((capacity, t.shape[1] * D), np.float16); out[:tokens] = t.reshape(tokens, -1).numpy(); return out
     vt = np.ascontiguousarray(pad(v).T)
@@ -41,7 +41,7 @@ def main() -> int:
             for stem in ((a_stem, b_stem) if r % 2 == 0 else (b_stem, a_stem)):
                 hs, sym = built[stem]
                 if "mha" in stem:     # query tiles of one head per workgroup: 4 waves (64 rows) or 8 (mha8, 128 rows)
-                    waves = 8 if "mha8" in stem else 4
+                    waves = 16 if "mha16" in stem else (8 if "mha8" in stem else 4)
                     (out,), t = launch(hs, sym, ((tokens + 16 * waves - 1) // (16 * waves), HEADS, 1), (32 * waves, 1, 1),
                                        [("i32", tokens), ("i32", HEADS), ("in_f16", pad(q)), ("in_f16", pad(k)), ("in_f16", pad(v)), ("out_f16", ((tokens, HEADS * D), np.float16))], tmp, repeat=3)
                 elif "lds" in stem:     # four query heads per workgroup, V in its natural layout
