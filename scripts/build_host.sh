@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+mkdir -p build
+/opt/rocm/bin/hipcc -O2 -Wall -Werror -fPIC -shared -o build/libh3.so host/h3.cpp
+printf 'built build/libh3.so\n'

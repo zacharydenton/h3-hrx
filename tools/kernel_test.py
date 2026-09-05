@@ -41,6 +41,10 @@ def launch(hsaco: Path, kernel: str, grid, block, args, workdir: Path, repeat: i
             path = workdir / f"in{index}.bin"
             np.ascontiguousarray(value, dtype=np.float16).tofile(path)
             cmd += ["--in", str(path)]
+        elif kind == "in_i32":
+            path = workdir / f"in{index}.bin"
+            np.ascontiguousarray(value, dtype=np.int32).tofile(path)
+            cmd += ["--in", str(path)]
         elif kind == "in_u8":
             path = workdir / f"in{index}.bin"
             np.ascontiguousarray(value, dtype=np.uint8).tofile(path)

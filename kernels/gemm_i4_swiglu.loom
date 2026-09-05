@@ -1,0 +1,312 @@
+// MiniMax H3's gate|up GEMM with the SwiGLU product in the epilogue: the weight rows are
+// interleaved in 16-row groups [gate o..o+15 | up o..o+15], so every wave holds the gate
+// and up fragments of the same 16 outputs side by side (fj = 0,1 and 2,3) and writes
+//   C[m, o] = f16( silu(g) * u ),  g = acc_gate * w_scale * a_scale,  u = acc_up * w_scale * a_scale
+// to a [M][N/2] output. Everything before the epilogue is gemm_i4.loom.
+//
+amdgpu.target<gfx11-generic> @h3_gemm_i4_swiglu_gfx11 {subgroup_size = 32}
+
+config.decl @h3.gemm_i4_swiglu.k_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+
+config.decl @h3.gemm_i4_swiglu.n_size : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
+
+// m-tiles per raster group: chosen per token count so the tile rows divide with as few ghost rows as possible
+config.decl @h3.gemm_i4_swiglu.m_group : %value: index where [range(%value, 1, 4)]
+
+kernel.def target(@h3_gemm_i4_swiglu_gfx11) export("h3_gemm_i4_swiglu") @h3_gemm_i4_swiglu(%m_size: index) {
+  %c1 = index.constant 1 : index
+  %c127 = index.constant 127 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %n_size0 = config.get @h3.gemm_i4_swiglu.n_size : index
+  %m_rounded = index.add %m_size, %c127 : index
+  %m_tiles = index.div %m_rounded, %c128 : index
+  %m_group = config.get @h3.gemm_i4_swiglu.m_group : index
+  %m_group_less = index.sub %m_group, %c1 : index
+  %m_tiles3 = index.add %m_tiles, %m_group_less : index
+  %m_groups = index.div %m_tiles3, %m_group : index
+  %m_tiles_padded = index.mul %m_groups, %m_group : index
+  %n_tiles = index.div %n_size0, %c128 : index
+  kernel.launch.config workgroups(%n_tiles, %m_tiles_padded, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer) {
+  %k_size0 = config.get @h3.gemm_i4_swiglu.k_size : index
+  %n_size0 = config.get @h3.gemm_i4_swiglu.n_size : index
+  %k_size = index.assume %k_size0 [range(%k_size0, 128, 65536), mul(%k_size0, 128)] : index
+  %n_size = index.assume %n_size0 [range(%n_size0, 128, 32768), mul(%n_size0, 128)] : index
+
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c20 = index.constant 20 : index
+  %c32 = index.constant 32 : index
+  %c48 = index.constant 48 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %c256 = index.constant 256 : index
+  %c0_offset = index.constant 0 : offset
+  %lds_bytes = index.constant 20480 : offset
+  %w_stage_offset = index.constant 10240 : offset
+  %wave_result_bytes = index.constant 2048 : offset
+  %up_stage_offset = index.constant 1024 : offset
+  %m = index.constant 16 : index
+  %n = index.constant 16 : index
+  %k = index.constant 16 : index
+  %zero_i32x8 = vector.constant 0 : vector<8xi32>
+  %zero_i32x4 = vector.constant 0 : vector<4xi32>
+  %i4_schema = encoding.define #encoding.operand<element_format=i4, payload_elements=16, payload_registers=2> : encoding<schema>
+
+  %workitem = kernel.workitem.id<x> : index
+  %subgroup0 = kernel.subgroup.id : index
+  %subgroup = index.assume %subgroup0 [range(%subgroup0, 0, 7)] : index
+  %lane = kernel.subgroup.lane.id : index
+  %lane16 = index.rem %lane, %c16 : index
+  %m_bounded = index.assume %m_size [range(%m_size, 1, 16777216)] : index
+  %c127 = index.constant 127 : index
+  // Rasterization: the launch is n_tiles x (m_tiles rounded up to a multiple of m_group),
+  // and tiles are visited in groups of m_group m-tiles per sweep of n, so each W tile is
+  // read m_group times in quick succession from cache instead of once per row of tiles.
+  // A tile row past M is a ghost: its A rows load as zero and it writes nothing.
+  %wg_x = kernel.workgroup.id<x> : index
+  %wg_y = kernel.workgroup.id<y> : index
+  %c_n_tiles = index.div %n_size, %c128 : index
+  %linear0 = index.mul %wg_y, %c_n_tiles : index
+  %linear = index.add %linear0, %wg_x : index
+  %m_group = config.get @h3.gemm_i4_swiglu.m_group : index
+  %group_span = index.mul %c_n_tiles, %m_group : index
+  %group = index.div %linear, %group_span : index
+  %in_group = index.rem %linear, %group_span : index
+  %group_m = index.mul %group, %m_group : index
+  %m_in_group = index.rem %in_group, %m_group : index
+  %tile_m_id = index.add %group_m, %m_in_group : index
+  %tile_n_id0 = index.div %in_group, %m_group : index
+  %tile_n_id = index.assume %tile_n_id0 [lt(%tile_n_id0, %c_n_tiles)] : index
+
+  // Wave grid 4 (m) x 2 (n): rows wave_row..+32, columns wave_col..+64 of the tile.
+  %wave_m = index.div %subgroup, %c2 : index
+  %wave_n = index.rem %subgroup, %c2 : index
+  %wave_row = index.mul %wave_m, %c32 : index
+  %wave_col = index.mul %wave_n, %c64 : index
+  %base_m = index.mul %tile_m_id, %c128 : index
+  %base_n = index.mul %tile_n_id, %c128 : index
+  %k_quads = index.div %k_size, %c8 : index
+
+  %a_global = buffer.assume.memory_space<global> %a : buffer
+  %w_global = buffer.assume.memory_space<global> %w : buffer
+  %scale_global = buffer.assume.memory_space<global> %scale : buffer
+  %a_scale_global = buffer.assume.memory_space<global> %a_scale : buffer
+  %c_global = buffer.assume.memory_space<global> %c : buffer
+  // A and W as rows of K/4 i32 quads; C as f16.
+  %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<[%m_bounded]x[%k_quads]xi32>
+  %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%n_size]x[%k_quads]xi32>
+  %scale_view = buffer.view %scale_global[%c0_offset] : buffer -> view<[%n_size]xf32>
+  %a_scale_view = buffer.view %a_scale_global[%c0_offset] : buffer -> view<[%m_bounded]xf32>
+  %n_half = index.div %n_size, %c2 : index
+  %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_bounded]x[%n_half]xf16>
+
+  %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
+  // Stages: 128 rows of 20 quads (64 bytes of k, 16 of padding against bank conflicts).
+  %a_stage = buffer.view %lds[%c0_offset] : buffer -> view<128x20xi32>
+  %w_stage = buffer.view %lds[%w_stage_offset] : buffer -> view<128x20xi32>
+  %wave_result_offset = index.scale %subgroup, %wave_result_bytes : index, offset -> offset
+  %result_view = buffer.view %lds[%wave_result_offset] : buffer -> view<16x16xi32>
+  %wave_up_offset = index.add %wave_result_offset, %up_stage_offset : offset
+  %up_view = buffer.view %lds[%wave_up_offset] : buffer -> view<16x16xi32>
+
+  // Staging map: packet p = workitem + 256*i (i = 0, 1) covers row p/4, quad column (p%4)*4.
+  %pk0 = index.add %workitem, %c0 : index
+  %pk1 = index.add %workitem, %c256 : index
+  %st_row0 = index.div %pk0, %c4 : index
+  %st_row1 = index.div %pk1, %c4 : index
+  %st_sub = index.rem %workitem, %c4 : index
+  %st_quad = index.mul %st_sub, %c4 : index
+  %a_m0 = index.add %base_m, %st_row0 : index
+  %a_m1 = index.add %base_m, %st_row1 : index
+  %a_ok0 = index.cmp ult, %a_m0, %m_bounded : index
+  %a_ok1 = index.cmp ult, %a_m1, %m_bounded : index
+  %a_safe0 = scf.select %a_ok0, %a_m0, %c0 : index
+  %a_safe1 = scf.select %a_ok1, %a_m1, %c0 : index
+  %a_row0 = index.assume %a_safe0 [lt(%a_safe0, %m_bounded)] : index
+  %a_row1 = index.assume %a_safe1 [lt(%a_safe1, %m_bounded)] : index
+  %w_n0 = index.add %base_n, %st_row0 : index
+  %w_n1 = index.add %base_n, %st_row1 : index
+  %w_row0 = index.assume %w_n0 [lt(%w_n0, %n_size)] : index
+  %w_row1 = index.assume %w_n1 [lt(%w_n1, %n_size)] : index
+  // A step is 16 quads; this lane's slot within it is st_quad. Global columns are
+  // step + slot, bounded by K/4 - 4 and 4-aligned.
+  %k_quad_limit = index.sub %k_quads, %c4 : index
+
+  // Operand rows this lane reads: A rows wave_row + 16i + lane16, W rows wave_col + 16j + lane16.
+  %fa0 = index.add %wave_row, %lane16 : index
+  %fa1 = index.add %fa0, %c16 : index
+  %fb0 = index.add %wave_col, %lane16 : index
+  %fb1 = index.add %fb0, %c16 : index
+  %fb2 = index.add %fb0, %c32 : index
+  %fb3 = index.add %fb0, %c48 : index
+
+  %acc_init = vector.fragment<init> %zero_i32x8 shape [%m, %n] : vector<8xi32>
+
+  // Gather of one k step (64 bytes = 16 quads) into registers, at quad column kq.
+  %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), mul(%st_quad, 4)] : index
+  %ga0_first = scf.if %a_ok0 -> (vector<4xi32>) {
+    %v = vector.load %a_view[%a_row0, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+    scf.yield %v : vector<4xi32>
+  } else {
+    scf.yield %zero_i32x4 : vector<4xi32>
+  }
+  %ga1_first = scf.if %a_ok1 -> (vector<4xi32>) {
+    %v = vector.load %a_view[%a_row1, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+    scf.yield %v : vector<4xi32>
+  } else {
+    scf.yield %zero_i32x4 : vector<4xi32>
+  }
+  %gw0_first = vector.load %w_view[%w_row0, %kq_first] : view<[%n_size]x[%k_quads]xi32> -> vector<4xi32>
+  %gw1_first = vector.load %w_view[%w_row1, %kq_first] : view<[%n_size]x[%k_quads]xi32> -> vector<4xi32>
+
+  %acc00, %acc01, %acc02, %acc03, %acc10, %acc11, %acc12, %acc13, %a_last0, %a_last1, %w_last0, %w_last1 = scf.for %k_base = [%c0 to %k_size step %c128](%r00 = %acc_init : vector<8xi32>, %r01 = %acc_init : vector<8xi32>, %r02 = %acc_init : vector<8xi32>, %r03 = %acc_init : vector<8xi32>, %r10 = %acc_init : vector<8xi32>, %r11 = %acc_init : vector<8xi32>, %r12 = %acc_init : vector<8xi32>, %r13 = %acc_init : vector<8xi32>, %ca0 = %ga0_first : vector<4xi32>, %ca1 = %ga1_first : vector<4xi32>, %cw0 = %gw0_first : vector<4xi32>, %cw1 = %gw1_first : vector<4xi32>) -> (vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>) {
+    // Stage what we were handed.
+    vector.store %ca0, %a_stage[%st_row0, %st_quad] : vector<4xi32>, view<128x20xi32>
+    vector.store %ca1, %a_stage[%st_row1, %st_quad] : vector<4xi32>, view<128x20xi32>
+    vector.store %cw0, %w_stage[%st_row0, %st_quad] : vector<4xi32>, view<128x20xi32>
+    vector.store %cw1, %w_stage[%st_row1, %st_quad] : vector<4xi32>, view<128x20xi32>
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+    // Prefetch the next step (zero past K) while the WMMAs run on this one.
+    %k_next = index.add %k_base, %c128 : index
+    %in_k = index.cmp ult, %k_next, %k_size : index
+    %kq_next0 = index.div %k_next, %c8 : index
+    %kq_slot = index.add %kq_next0, %st_quad : index
+    %kq_safe = scf.select %in_k, %kq_slot, %st_quad : index
+    %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), mul(%kq_safe, 4)] : index
+    %load_a0 = scalar.andi %in_k, %a_ok0 : i1
+    %load_a1 = scalar.andi %in_k, %a_ok1 : i1
+    %na0 = scf.if %load_a0 -> (vector<4xi32>) {
+      %v = vector.load %a_view[%a_row0, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+      scf.yield %v : vector<4xi32>
+    } else {
+      scf.yield %zero_i32x4 : vector<4xi32>
+    }
+    %na1 = scf.if %load_a1 -> (vector<4xi32>) {
+      %v = vector.load %a_view[%a_row1, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+      scf.yield %v : vector<4xi32>
+    } else {
+      scf.yield %zero_i32x4 : vector<4xi32>
+    }
+    %nw0 = scf.if %in_k -> (vector<4xi32>) {
+      %v = vector.load %w_view[%w_row0, %kq_next] : view<[%n_size]x[%k_quads]xi32> -> vector<4xi32>
+      scf.yield %v : vector<4xi32>
+    } else {
+      scf.yield %zero_i32x4 : vector<4xi32>
+    }
+    %nw1 = scf.if %in_k -> (vector<4xi32>) {
+      %v = vector.load %w_view[%w_row1, %kq_next] : view<[%n_size]x[%k_quads]xi32> -> vector<4xi32>
+      scf.yield %v : vector<4xi32>
+    } else {
+      scf.yield %zero_i32x4 : vector<4xi32>
+    }
+
+    // Eight 16-wide sub-steps over the staged 64 bytes (128 nibbles).
+    %n00, %n01, %n02, %n03, %n10, %n11, %n12, %n13 = scf.for %kq = [%c0 to %c16 step %c2](%h00 = %r00 : vector<8xi32>, %h01 = %r01 : vector<8xi32>, %h02 = %r02 : vector<8xi32>, %h03 = %r03 : vector<8xi32>, %h10 = %r10 : vector<8xi32>, %h11 = %r11 : vector<8xi32>, %h12 = %r12 : vector<8xi32>, %h13 = %r13 : vector<8xi32>) -> (vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>) unroll {
+      %da0 = vector.load %a_stage[%fa0, %kq] : view<128x20xi32> -> vector<2xi32>
+      %da1 = vector.load %a_stage[%fa1, %kq] : view<128x20xi32> -> vector<2xi32>
+      %db0 = vector.load %w_stage[%fb0, %kq] : view<128x20xi32> -> vector<2xi32>
+      %db1 = vector.load %w_stage[%fb1, %kq] : view<128x20xi32> -> vector<2xi32>
+      %db2 = vector.load %w_stage[%fb2, %kq] : view<128x20xi32> -> vector<2xi32>
+      %db3 = vector.load %w_stage[%fb3, %kq] : view<128x20xi32> -> vector<2xi32>
+      %la0 = vector.fragment<lhs> %da0 shape [%m, %k] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+      %la1 = vector.fragment<lhs> %da1 shape [%m, %k] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+      %rb0 = vector.fragment<rhs> %db0 shape [%k, %n] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+      %rb1 = vector.fragment<rhs> %db1 shape [%k, %n] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+      %rb2 = vector.fragment<rhs> %db2 shape [%k, %n] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+      %rb3 = vector.fragment<rhs> %db3 shape [%k, %n] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+      %o00 = vector.mma %la0, %rb0, %h00 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+      %o01 = vector.mma %la0, %rb1, %h01 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+      %o02 = vector.mma %la0, %rb2, %h02 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+      %o03 = vector.mma %la0, %rb3, %h03 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+      %o10 = vector.mma %la1, %rb0, %h10 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+      %o11 = vector.mma %la1, %rb1, %h11 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+      %o12 = vector.mma %la1, %rb2, %h12 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+      %o13 = vector.mma %la1, %rb3, %h13 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+      scf.yield %o00, %o01, %o02, %o03, %o10, %o11, %o12, %o13 : vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    scf.yield %n00, %n01, %n02, %n03, %n10, %n11, %n12, %n13, %na0, %na1, %nw0, %nw1 : vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>
+  }
+
+  // Publish through LDS: per pair of fragments (gate fj, up fj+1) of the same 16
+  // outputs, both staged, then each lane takes two vector4 slices of each.
+  %publish_row0 = index.div %lane, %c4 : index
+  %publish_col_group = index.rem %lane, %c4 : index
+  %publish_col = index.mul %publish_col_group, %c4 : index
+  %publish_col_half = index.mul %publish_col_group, %c2 : index
+  %one_f32 = scalar.constant 1.0 : f32
+  %zero_f32_e = scalar.constant 0.0 : f32
+  %one4 = vector.splat %one_f32 : vector<4xf32>
+  %zero4 = vector.splat %zero_f32_e : vector<4xf32>
+
+  scf.for %pair = [%c0 to %c4 step %c1] {
+    %fi = index.div %pair, %c2 : index
+    %pj = index.rem %pair, %c2 : index
+    %is1 = index.cmp eq, %pair, %c1 : index
+    %is2 = index.cmp eq, %pair, %c2 : index
+    %is3 = index.cmp eq, %pair, %c3 : index
+    %g1 = scf.select %is1, %acc02, %acc00 : vector<8xi32>
+    %g2 = scf.select %is2, %acc10, %g1 : vector<8xi32>
+    %gate_frag = scf.select %is3, %acc12, %g2 : vector<8xi32>
+    %u1 = scf.select %is1, %acc03, %acc01 : vector<8xi32>
+    %u2 = scf.select %is2, %acc11, %u1 : vector<8xi32>
+    %up_frag = scf.select %is3, %acc13, %u2 : vector<8xi32>
+    vector.fragment.store<result> %gate_frag, %result_view[%c0, %c0] shape [%m, %n] : vector<8xi32>, view<16x16xi32>
+    vector.fragment.store<result> %up_frag, %up_view[%c0, %c0] shape [%m, %n] : vector<8xi32>, view<16x16xi32>
+    kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+
+    %frag_row_offset = index.mul %fi, %c16 : index
+    %gate_col_offset = index.mul %pj, %c32 : index
+    %gate_tile_col = index.add %wave_col, %gate_col_offset : index
+    %gate_col_local = index.add %gate_tile_col, %publish_col : index
+    %gate_col = index.add %base_n, %gate_col_local : index
+    %up_col = index.add %gate_col, %c16 : index
+    %gate_scale = vector.load %scale_view[%gate_col] : view<[%n_size]xf32> -> vector<4xf32>
+    %up_scale = vector.load %scale_view[%up_col] : view<[%n_size]xf32> -> vector<4xf32>
+    // output column: 16 outputs per 32 interleaved input columns
+    %out_col0 = index.div %gate_col, %c2 : index
+    %out_col1 = index.add %out_col0, %publish_col : index
+    %out_col2 = index.sub %out_col1, %publish_col_half : index
+    %out_col = index.assume %out_col2 [lt(%out_col2, %n_half)] : index
+
+    scf.for %half = [%c0 to %c2 step %c1] {
+      %row_offset = index.mul %half, %c8 : index
+      %publish_row = index.add %publish_row0, %row_offset : index
+      %gate_values = vector.load %result_view[%publish_row, %publish_col] : view<16x16xi32> -> vector<4xi32>
+      %up_values = vector.load %up_view[%publish_row, %publish_col] : view<16x16xi32> -> vector<4xi32>
+      %gate_f32 = vector.sitofp %gate_values : vector<4xi32> to vector<4xf32>
+      %up_f32 = vector.sitofp %up_values : vector<4xi32> to vector<4xf32>
+      %gate_scaled0 = vector.mulf %gate_f32, %gate_scale : vector<4xf32>
+      %up_scaled0 = vector.mulf %up_f32, %up_scale : vector<4xf32>
+      %row_in_wave = index.add %frag_row_offset, %publish_row : index
+      %row_local = index.add %wave_row, %row_in_wave : index
+      %out_row = index.add %base_m, %row_local : index
+      %writes = index.cmp ult, %out_row, %m_bounded : index
+      scf.if %writes {
+        %bounded = index.assume %out_row [lt(%out_row, %m_bounded)] : index
+        %a_scale_value = view.load %a_scale_view[%bounded] : view<[%m_bounded]xf32> -> f32
+        %a_scale_vector = vector.splat %a_scale_value : vector<4xf32>
+        %g = vector.mulf %gate_scaled0, %a_scale_vector : vector<4xf32>
+        %u = vector.mulf %up_scaled0, %a_scale_vector : vector<4xf32>
+        %neg_g = vector.subf %zero4, %g : vector<4xf32>
+        %e = vector.expf<afn> %neg_g : vector<4xf32>
+        %den = vector.addf %one4, %e : vector<4xf32>
+        %sig = vector.divf %one4, %den : vector<4xf32>
+        %silu = vector.mulf %g, %sig : vector<4xf32>
+        %prod = vector.mulf %silu, %u : vector<4xf32>
+        %narrow = vector.fptrunc %prod : vector<4xf32> to vector<4xf16>
+        vector.store %narrow, %c_view[%bounded, %out_col] : vector<4xf16>, view<[%m_bounded]x[%n_half]xf16>
+      }
+    }
+    kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+  }
+  kernel.return
+}

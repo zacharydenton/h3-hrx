@@ -38,3 +38,33 @@ about 35k rows with text and audio. Per block: GEMMs 2 x 35k x 385M = 27 TFLOP, 
 20 TFLOP/s attention): roughly 18 s + 88 s per step. Attention, not the int4 GEMMs, is
 the wall at video lengths; H3's native sparse attention is not in the open release. At
 480p and 4 s (about 10k rows) the same step is about 12 s.
+
+## Day 0, continued: the checkpoint on the box and what the kernels needed
+
+The weights were already here in ComfyUI form (`~/comfy-models`): the FL2VA and Ref2VA
+transformers as `pruned_int8_convrot` (21 GB each), the Qwen3-VL-32B encoder cut to its
+first 50 layers in int8 ConvRot (27 GB), both VAEs. `comfy_quant` says
+`{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256}` with per-row
+`weight_scale`; comfy-kitchen's rotation is the Kronecker power of the *regular* H4 (one
+negative entry per row) normalised by 1/sqrt(256), exactly what krea2-loom's kernels compute,
+so the export is a per-row int8 -> int4 requantisation and nothing is rotated again
+(`tools/export_weights.py`, 9.65 GB in 63 s). ComfyUI's int8 path does not quantise the
+activations (`quantize_input: False`), so "none" in the reference is the production baseline.
+"Pruned": the AdaLN projections read an 8-d curve (`adaln_t_table` [1025][8], lerp on
+t in [0, 1], no silu) instead of the 2688-d time embedding.
+
+`reference/h3_ref.py` is an own torch implementation (no ComfyUI import; its runtime
+packages only exist in the podman image and its code is GPL). It matches ComfyUI's
+`MiniMaxH3Model` to 2e-7 relative at toy size, run inside the image with
+`PYTHONPATH=/opt/ComfyUI` and ComfyUI's `--cpu` (argument parsing must be enabled first).
+
+Kernels from krea2-loom by configuration plus four deltas: the attention generator's MHA
+mode (four query tiles of one head per workgroup, grid ceil(T/64) x 56, 240 VGPRs, passes
+at 100/1000/5504 rows, 14.5 TFLOP/s at 5504); prepare-norm with a plain norm weight and
+per-row (scale, shift) from a class table (class = timestep class * 3 + modality), lane
+count as a config because 5376 and 7168 are not multiples of 2048 (96 / 128 / 256 lanes);
+the residual GEMM's gate from a [classes][N] table; rotate-half RoPE on 96 channels, the
+partner quad fetched by `kernel.subgroup.shuffle<index>` from 12 lanes away (the source
+lane needs an `index.assume` range before the cast). Two harness lessons: the test harness
+cast every plain input to f32 (an `in_i32` kind was added), and a wrong Hadamard in the
+reference cannot be caught by a test that uses the same reference on both sides.

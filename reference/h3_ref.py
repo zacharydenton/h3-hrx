@@ -41,13 +41,15 @@ CKPT = Path.home() / "comfy-models/diffusion_models/minimax_h3_fl2va_pruned_int8
 # --- rotation and quantisation (as krea2-loom) ---------------------------------------------------
 
 def hadamard(n: int) -> torch.Tensor:
-    """Normalised Kronecker power of H4: orthogonal, symmetric, entries +-1/sqrt(n)."""
-    h4 = torch.tensor([[1, 1, 1, 1], [1, -1, 1, -1], [1, 1, -1, -1], [1, -1, -1, 1]], dtype=torch.float64) / 2.0
+    """comfy-kitchen's regular Hadamard: the Kronecker power of the regular H4 (one negative entry
+    per row), normalised by 1/sqrt(n). Orthogonal and symmetric. The kernels' four radix-4
+    stages compute the same matrix with the 1/16 folded into the scale."""
+    h4 = torch.tensor([[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]], dtype=torch.float64)
     h = torch.ones(1, 1, dtype=torch.float64)
     while h.shape[0] < n:
         h = torch.kron(h, h4)
     assert h.shape[0] == n
-    return h.float()
+    return (h / math.sqrt(n)).float()
 
 
 def rotate_groups(x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
@@ -187,9 +189,10 @@ def time_shift_sigma(sigma: float, from_shift: float, to_shift: float) -> float:
 # --- the model ----------------------------------------------------------------------------------
 
 class H3Ref:
-    def __init__(self, ckpt: Checkpoint, quant: str = "none", layers: int = 50, eps: float = 1e-5):
+    def __init__(self, ckpt: Checkpoint, quant: str = "none", layers: int = 50, eps: float = 1e-5, cache_linears: bool = True):
         assert quant in ("none", "w4a4")
         self.ckpt, self.quant, self.layers, self.eps = ckpt, quant, layers, eps
+        self.cache_linears = cache_linears          # False: a block's 770 MB of bf16 weights are dropped after use
         self.device, self.dtype = ckpt.device, ckpt.dtype
         self.h = hadamard(HADAMARD_GROUP).to(ckpt.device)
         self.table = ckpt.tensor("adaln_t_table", torch.float32)              # [1025, 8]
@@ -283,9 +286,12 @@ class H3Ref:
         h = rms_norm(x, self.t(f"{p}.norm2.weight"), self.eps) * (1.0 + scale_mlp) + shift_mlp
         return x + gate_mlp * self.lin(f"{p}.mlp.fc2")(self.swiglu(self.lin(f"{p}.mlp.fc1")(h)))
 
-    def blocks_forward(self, x: torch.Tensor, temb: torch.Tensor, rows: torch.Tensor, cos, sin) -> torch.Tensor:
-        for i in range(self.layers):
+    def blocks_forward(self, x: torch.Tensor, temb: torch.Tensor, rows: torch.Tensor, cos, sin, layers: int | None = None) -> torch.Tensor:
+        for i in range(self.layers if layers is None else layers):
             x = self.block(i, x, self.block_mods(i, temb), rows, cos, sin)
+            if not self.cache_linears:
+                for key in [k for k in self._lin if k.startswith(f"blocks.{i}.")]:
+                    del self._lin[key]
         return x
 
     def final(self, x: torch.Tensor, temb: torch.Tensor, tclass: torch.Tensor, layout: Layout):
