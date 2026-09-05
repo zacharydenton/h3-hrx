@@ -34,13 +34,18 @@ def load_encoder(device="cuda"):
     with torch.device("meta"):
         model = Qwen3VLForConditionalGeneration(cfg)
     model.model.language_model.norm = torch.nn.Identity()       # the conditioning is layer 50's raw output
+    model.model.visual = torch.nn.Identity()                     # text-only presentation: no vision tower
+    model.lm_head = torch.nn.Identity()
+    rot = model.model.language_model.rotary_emb
+    with torch.device(device):
+        model.model.language_model.rotary_emb = type(rot)(config=cfg.text_config)   # its inv_freq buffer, off the meta device
     with open(TE, "rb") as fh:
         n = struct.unpack("<Q", fh.read(8))[0]; header = json.loads(fh.read(n))
     f = safe_open(str(TE), "pt", device="cpu")
     sd = {}
     t0 = time.time()
     for name in header:
-        if name == "__metadata__" or name.endswith(".comfy_quant") or name.endswith(".weight_scale"):
+        if name == "__metadata__" or name.endswith(".comfy_quant") or name.endswith(".weight_scale") or name.startswith("visual."):
             continue
         t = f.get_tensor(name)
         if t.dtype == torch.int8:
@@ -54,9 +59,12 @@ def load_encoder(device="cuda"):
         elif hf.startswith("visual."): hf = "model." + hf
         sd[hf] = t
     missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
-    print(f"encoder loaded in {time.time() - t0:.0f} s; missing {len(missing)} (lm_head/norm expected), unexpected {len(unexpected)}", file=sys.stderr)
+    print(f"encoder loaded in {time.time() - t0:.0f} s; missing {len(missing)}, unexpected {len(unexpected)}", file=sys.stderr)
     if unexpected: print("  unexpected:", unexpected[:5], file=sys.stderr)
-    return model.to(device).eval()
+    meta = [n for n, t in list(model.named_parameters()) + list(model.named_buffers()) if t.device.type == "meta"]
+    if meta:
+        raise SystemExit(f"tensors left on the meta device: {meta[:8]}")
+    return model.eval()
 
 
 class RotatedLinear(torch.nn.Module):

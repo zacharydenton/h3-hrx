@@ -99,7 +99,7 @@ def main() -> None:
     blocks.close()
     print(f"denoised in {time.time() - t_start:.0f} s")
     latents = video_rows.reshape(1, latent_t, lat_h // 2, lat_w // 2, 24, 1, 2, 2).permute(0, 4, 1, 5, 2, 6, 3, 7).reshape(1, 24, latent_t, lat_h, lat_w)
-    audio = audio_rows.reshape(2, audio_t, 32).permute(2, 0, 1)[None]              # [1, 32, 2, audio_t]
+    audio = audio_rows.reshape(2, audio_t, 32).permute(0, 2, 1)                     # [2 (stereo), 32, audio_t]: the audio VAE takes each channel as a batch entry
     if a.latents_out:
         torch.save(dict(video=latents.cpu(), audio=audio.cpu(), frames=frames, size=(a.height, a.width)), a.latents_out)
 
@@ -113,7 +113,7 @@ def main() -> None:
     avae = AutoencoderKLMiniMaxH3Audio.from_pretrained(str(MODELS / "audio_vae"), torch_dtype=torch.float32).to(dev).eval()
     amean = torch.tensor(avae.config.latents_mean, device=dev).view(1, -1, 1); astd = torch.tensor(avae.config.latents_std, device=dev).view(1, -1, 1)
     with torch.no_grad():
-        wave = avae.decode((audio * astd + amean).float(), return_dict=False)[0]              # [1, 2, samples]?
+        wave = avae.decode((audio * astd + amean).float(), return_dict=False)[0]              # [2, 1, samples]
     print("video", tuple(video.shape), "audio", tuple(wave.shape))
     write_clip(video, wave, Path(a.out))
 
@@ -122,8 +122,7 @@ def write_clip(video: torch.Tensor, wave: torch.Tensor, out: Path) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     frames = ((video[0].float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8).permute(1, 2, 3, 0).cpu().numpy()   # [F, H, W, 3]
     f, h, w, _ = frames.shape
-    wav = wave.float().cpu().reshape(-1, wave.shape[-1]) if wave.dim() == 3 else wave.float().cpu()
-    wav = wav.T.contiguous().numpy() if wav.shape[0] <= 2 else wav.numpy()             # [samples, channels]
+    wav = wave.float().cpu().reshape(-1, wave.shape[-1]).T.contiguous().numpy()        # [samples, 2]
     pcm = (np.clip(wav, -1, 1) * 32767).astype(np.int16)
     wav_path = out.with_suffix(".wav"); raw_path = out.with_suffix(".rgb")
     import wave as wavmod
