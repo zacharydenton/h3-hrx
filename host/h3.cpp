@@ -116,6 +116,7 @@ public:
         load(k_gemm_down_, "gemm_down", "h3_gemm_i4_resid");
         load(k_rope_, "rope_qknorm", "h3_rope_qknorm_f16");
         load(k_attention_, "attention", "h3_attention_mha_lds_f16_wmma");
+        { std::ifstream tf(kernels_dir + "/gemm_tile.txt"); if (tf) tf >> gemm_tile_; if (gemm_tile_ != 128 && gemm_tile_ != 256) throw std::runtime_error("gemm_tile.txt must say 128 or 256"); }
         const size_t T = capacity_;
         HIP_CHECK(hipMalloc(&x_, T * HIDDEN * 4));            // the residual stream, f32
         HIP_CHECK(hipMalloc(&a_q_, T * FFN / 2));               // the widest prepared operand (down's K = 14336)
@@ -185,14 +186,14 @@ private:
     }
     // m-tiles per raster group: of 4, 3, 2 the one that pads the tile rows least (ties to the
     // larger); scripts/build_kernels.py compiles the GEMMs with the same rule for this token count.
-    static unsigned gemm_m_group(size_t m) {
+    unsigned gemm_m_group(size_t m) const {
         if (const char* e = std::getenv("H3_M_GROUP")) return unsigned(std::atoi(e));   // A/B override, mirrored in the builder
-        const size_t tiles = (m + 127) / 128;
+        const size_t tiles = (m + gemm_tile_ - 1) / gemm_tile_;
         unsigned best = 4; size_t best_pad = (tiles + 3) / 4 * 4;
         for (unsigned g : {3u, 2u}) { const size_t pad = (tiles + g - 1) / g * g; if (pad < best_pad) { best = g; best_pad = pad; } }
         return best;
     }
-    static unsigned gemm_grid_y(size_t m) { const unsigned g = gemm_m_group(m); return unsigned(((m + 127) / 128 + g - 1) / g * g); }
+    unsigned gemm_grid_y(size_t m) const { const unsigned g = gemm_m_group(m); return unsigned(((m + gemm_tile_ - 1) / gemm_tile_ + g - 1) / g * g); }
 
     void gemm(Kernel &k, const char *stage, char *w_q, char *w_s, int n, void *out, const float *gate) {
         KernArgs a;
@@ -227,7 +228,7 @@ private:
     }
 
     int tokens_, layers_;
-    size_t capacity_ = 0;
+    size_t capacity_ = 0, gemm_tile_ = 128;
     std::mutex mutex_;
     std::vector<Block> blocks_;
     void *weights_ = nullptr, *x_ = nullptr, *a_q_ = nullptr, *a_s_ = nullptr, *fused_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr,
