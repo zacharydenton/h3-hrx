@@ -187,3 +187,19 @@ six GEMM kernels pass `tests/test_gemm.py` against float64. Block-level A/B at 2
 
 `H3_GEMM_TILE` selects the tile in the builder (default 256); the host reads it from the
 kernel directory. Calm-box numbers to follow.
+
+## Calm-box numbers, 2026-09-06
+
+2097 rows, GPTQ weights, 256-row GEMM tile, 50 blocks in 1.62 s (32 ms per block):
+
+| stage | ms | share | rate |
+| --- | ---: | ---: | ---: |
+| gate/up + swiglu | 447 | 27.6% | 72 TOPS |
+| qkv | 336 | 20.7% | 72 TOPS |
+| attention | 301 | 18.6% | 21 TFLOP/s |
+| down + residual | 265 | 16.3% | 61 TOPS |
+| out + residual | 123 | 7.6% | 66 TOPS |
+| prepare norm, rope, prepare inputs | 150 | 9.2% | |
+
+At 2097 rows the 256-row tile pads to 9 tiles (9% ghost rows), so the GEMMs run at about
+79 TOPS on real rows. The 100 TOPS target is 86% of the iu4 peak; the GEMM sits at 62-68%.

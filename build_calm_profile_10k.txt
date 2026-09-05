@@ -1,0 +1,12 @@
+  attention                18004.872 ms   75.7%
+  gemm gate|up + swiglu     1949.222 ms    8.2%
+  gemm qkv                  1496.148 ms    6.3%
+  gemm down + residual      1117.918 ms    4.7%
+  gemm out + residual        509.249 ms    2.1%
+  prepare norm               245.737 ms    1.0%
+  qk norm + rope             218.623 ms    0.9%
+  prepare down input         169.886 ms    0.7%
+  prepare out input           78.322 ms    0.3%
+  total                    23789.976 ms
+fixture: 10317 tokens (layout (32, 25, 30, 54, 80)), t_video 0.1000, t_audio 0.3077
+   50 blocks    23852 ms (profile only)
