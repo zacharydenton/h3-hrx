@@ -119,7 +119,7 @@ def denoise_step(pipe, prompt, ids, a):
     audio_rows = torch.from_numpy(na).to(dev).permute(0, 2, 1).reshape(-1, 32).contiguous()
     blocks = H3Blocks(layout.seq_len, layers=50, weights=str(ROOT / "build/weights_gptq"))
     variants = [("float", False, False, False)]
-    if a.attrib: variants += [("int8 embedders", True, False, False), ("perturbed 0.4%", False, False, False), ("perturbed 0.1%", False, False, False)]
+    if a.attrib: variants += [("int8 embedders", True, False, False), ("C text rows + int8 embedders", True, False, True), ("perturbed 0.1%", False, False, False)]
     wants = {}
     with torch.no_grad():
         temb = ref.t_emb(torch.tensor([vs.timesteps[0].item(), as_.timesteps[0].item()]))

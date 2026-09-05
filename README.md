@@ -91,6 +91,17 @@ through the native runtime), matching the best per-group scheme at no kernel cos
 weights would cost 2.4% but cap the GEMMs at the part's 54 TOPS int8 peak; the target is
 100 TOPS. `build/weights_gptq` is the export to use.
 
+**Int4 QK^T attention.** SageAttention's idea with this part's arithmetic: int8 WMMA runs at the
+f16 rate on gfx1151, int4 at 2.2x, and the 50-block velocity study showed int4 Q and K (per
+token and head, the head rotated by a Hadamard in the prepare kernel) cost one point on top of
+the int4 GEMMs (velocity cosine 0.990 against 0.991 with f16 attention). `prepare_qk_i4` and
+`tools/gen_attention_i4qk.py` (QK^T in int4 with i32 accumulation, PV in f16) give attention
+1.44x at the 480p clip length and, with the double-buffered variant chosen past 20k rows,
+1.39x at 1344x768: the 480p step goes 14.6 -> 11.9 s, the 768 step is about 130 s (attention
+82%), so 30 steps at 768 are about 65 minutes. `H3_ATTN_QK=f16` restores the f16 kernel.
+Torch's SDPA and AMD's hrx-demos attention both sit at ~18 TFLOP/s f16 here; the int4 kernel
+is the one attention change on this part with a hardware rate behind it.
+
 **GEMM tile.** The four GEMMs run on a 256x128 workgroup tile of 64x64 wave tiles (half the
 LDS operand reads per multiply of the 128x128 tile), 15-17% faster per stage at 2097 rows;
 `H3_GEMM_TILE=128` builds the smaller tile for comparison.
