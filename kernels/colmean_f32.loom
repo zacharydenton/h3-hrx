@@ -1,0 +1,42 @@
+// Column means of an f16 [tokens][width] matrix into f32 [width]: the K smoothing vector of the
+// int4 QK^T attention. One lane per column, a workgroup per 256 columns, a loop over the rows.
+amdgpu.target<gfx11-generic> @h3_colmean_f32_gfx11 {subgroup_size = 32}
+
+config.decl @h3.colmean_f32.width : %value: index where [range(%value, 256, 65536), mul(%value, 256)]
+
+kernel.def target(@h3_colmean_f32_gfx11) export("h3_colmean_f32") @h3_colmean_f32(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  %width = config.get @h3.colmean_f32.width : index
+  %groups = index.div %width, %c256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%tokens: index, %x: buffer, %mean: buffer) {
+  %width = config.get @h3.colmean_f32.width : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  %c0_offset = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %tokens_b = index.assume %tokens [range(%tokens, 1, 1048576)] : index
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %wg, %c256 : index
+  %col0 = index.add %base, %lane : index
+  %col = index.assume %col0 [lt(%col0, %width)] : index
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %m_global = buffer.assume.memory_space<global> %mean : buffer
+  %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%tokens_b]x[%width]xf16>
+  %m_view = buffer.view %m_global[%c0_offset] : buffer -> view<[%width]xf32>
+  %sum = scf.for %t = [%c0 to %tokens_b step %c1](%acc = %zero : f32) -> (f32) {
+    %tt = index.assume %t [lt(%t, %tokens_b)] : index
+    %vh = view.load %x_view[%tt, %col] : view<[%tokens_b]x[%width]xf16> -> f16
+    %v = scalar.extf %vh : f16 to f32
+    %next = scalar.addf %acc, %v : f32
+    scf.yield %next : f32
+  }
+  %tokens_i = index.cast %tokens_b : index to i32
+  %tokens_f = scalar.sitofp %tokens_i : i32 to f32
+  %m = scalar.divf %sum, %tokens_f : f32
+  view.store %m, %m_view[%col] : f32, view<[%width]xf32>
+  kernel.return
+}

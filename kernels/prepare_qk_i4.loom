@@ -1,0 +1,185 @@
+// SageAttention-style operands for the int4 QK^T attention: per (token, head), subtract a
+// per-channel mean (K smoothing; zero for Q), rotate the 128 channels by the Sylvester
+// Hadamard H_128 (unnormalised butterflies: two within the lane's four values, five across
+// lanes by xor shuffles; the 1/128 rides in Q's scale), quantise to int4 per (token, head)
+// with an absmax/7 scale, and pack 8 codes per i32 word (low nibble first: the GEMM /
+// WMMA int4 operand layout). One wave per (token, head), eight per workgroup.
+//   x [tokens][row_stride] f16 (heads x 128 at head_offset), mean [row_stride] f32
+//   -> codes [tokens][heads * 16] i32, scales [tokens][heads] f32 (= absmax/7 * extra_scale)
+amdgpu.target<gfx11-generic> @h3_prepare_qk_i4_gfx11 {subgroup_size = 32}
+
+config.decl @h3.prepare_qk_i4.row_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+
+config.decl @h3.prepare_qk_i4.head_offset : %value: index where [range(%value, 0, 65536), mul(%value, 128)]
+
+config.decl @h3.prepare_qk_i4.heads : %value: index where [range(%value, 1, 256)]
+
+config.decl @h3.prepare_qk_i4.extra_scale : f32
+
+kernel.def target(@h3_prepare_qk_i4_gfx11) export("h3_prepare_qk_i4") @h3_prepare_qk_i4(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %c7 = index.constant 7 : index
+  %c8 = index.constant 8 : index
+  %c256 = index.constant 256 : index
+  %heads = config.get @h3.prepare_qk_i4.heads : index
+  %pairs = index.mul %tokens, %heads : index
+  %rounded = index.add %pairs, %c7 : index
+  %groups = index.div %rounded, %c8 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%tokens: index, %x: buffer, %mean: buffer, %codes: buffer, %scales: buffer) {
+  %row_stride = config.get @h3.prepare_qk_i4.row_stride : index
+  %head_offset = config.get @h3.prepare_qk_i4.head_offset : index
+  %heads = config.get @h3.prepare_qk_i4.heads : index
+  %extra = config.get @h3.prepare_qk_i4.extra_scale : f32
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c128 = index.constant 128 : index
+  %c0_offset = index.constant 0 : offset
+  %i32_1 = scalar.constant 1 : i32
+  %i32_2 = scalar.constant 2 : i32
+  %i32_4 = scalar.constant 4 : i32
+  %i32_8 = scalar.constant 8 : i32
+  %i32_16 = scalar.constant 16 : i32
+  %i32_32 = scalar.constant 32 : i32
+  %sh4 = scalar.constant 4 : i32
+  %sh8 = scalar.constant 8 : i32
+  %sh12 = scalar.constant 12 : i32
+  %sh16 = scalar.constant 16 : i32
+  %fifteen = scalar.constant 15 : i32
+  %seven = scalar.constant 7.0 : f32
+  %neg_seven = scalar.constant -7.0 : f32
+  %tiny = scalar.constant 1.0000000000000001e-30 : f32
+  %zero = scalar.constant 0.0 : f32
+  %seven4 = vector.splat %seven : vector<4xf32>
+  %neg_seven4 = vector.splat %neg_seven : vector<4xf32>
+  %fifteen4 = vector.splat %fifteen : vector<4xi32>
+  %tokens_b = index.assume %tokens [range(%tokens, 1, 1048576)] : index
+  %words = index.mul %heads, %c16 : index
+  %wg = kernel.workgroup.id<x> : index
+  %wave0 = kernel.subgroup.id : index
+  %wave = index.assume %wave0 [range(%wave0, 0, 7)] : index
+  %lane0 = kernel.subgroup.lane.id : index
+  %lane = index.assume %lane0 [range(%lane0, 0, 31)] : index
+  %pair0 = index.mul %wg, %c8 : index
+  %pair = index.add %pair0, %wave : index
+  %pairs = index.mul %tokens_b, %heads : index
+  %active = index.cmp ult, %pair, %pairs : index
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %m_global = buffer.assume.memory_space<global> %mean : buffer
+  %c_global = buffer.assume.memory_space<global> %codes : buffer
+  %s_global = buffer.assume.memory_space<global> %scales : buffer
+  %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%tokens_b]x[%row_stride]xf16>
+  %m_view = buffer.view %m_global[%c0_offset] : buffer -> view<[%row_stride]xf32>
+  %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%tokens_b]x[%words]xi32>
+  %s_view = buffer.view %s_global[%c0_offset] : buffer -> view<[%tokens_b]x[%heads]xf32>
+  scf.if %active {
+    %token0 = index.div %pair, %heads : index
+    %token = index.assume %token0 [lt(%token0, %tokens_b)] : index
+    %head0 = index.rem %pair, %heads : index
+    %head = index.assume %head0 [lt(%head0, %heads)] : index
+    %hcol0 = index.mul %head, %c128 : index
+    %hcol1 = index.add %hcol0, %head_offset : index
+    %lane4 = index.mul %lane, %c4 : index
+    %col0 = index.add %hcol1, %lane4 : index
+    %col_limit = index.sub %row_stride, %c4 : index
+    %col = index.assume %col0 [le(%col0, %col_limit), mul(%col0, 4)] : index
+    %x4h = vector.load %x_view[%token, %col] : view<[%tokens_b]x[%row_stride]xf16> -> vector<4xf16>
+    %x4 = vector.extf %x4h : vector<4xf16> to vector<4xf32>
+    %m4 = vector.load %m_view[%col] : view<[%row_stride]xf32> -> vector<4xf32>
+    %y = vector.subf %x4, %m4 : vector<4xf32>
+    // H_128, unnormalised: within the lane (index bits 0, 1), then across lanes (bits 2..6)
+    %a = vector.extract %y[0] : vector<4xf32> -> f32
+    %b = vector.extract %y[1] : vector<4xf32> -> f32
+    %c = vector.extract %y[2] : vector<4xf32> -> f32
+    %d = vector.extract %y[3] : vector<4xf32> -> f32
+    %ab_p = scalar.addf %a, %b : f32
+    %ab_m = scalar.subf %a, %b : f32
+    %cd_p = scalar.addf %c, %d : f32
+    %cd_m = scalar.subf %c, %d : f32
+    %e0 = scalar.addf %ab_p, %cd_p : f32
+    %e1 = scalar.addf %ab_m, %cd_m : f32
+    %e2 = scalar.subf %ab_p, %cd_p : f32
+    %e3 = scalar.subf %ab_m, %cd_m : f32
+    %s0 = vector.from_elements %e0, %e1, %e2, %e3 : vector<4xf32>
+    %p1, %ok1 = kernel.subgroup.shuffle<xor> %s0, %i32_1, %i32_32 : vector<4xf32>, i32, i32
+    %lb1 = index.rem %lane, %c2 : index
+    %hi1 = index.cmp eq, %lb1, %c1 : index
+    %sum1 = vector.addf %s0, %p1 : vector<4xf32>
+    %dif1 = vector.subf %p1, %s0 : vector<4xf32>
+    %s1 = scf.select %hi1, %dif1, %sum1 : vector<4xf32>
+    %p2, %ok2 = kernel.subgroup.shuffle<xor> %s1, %i32_2, %i32_32 : vector<4xf32>, i32, i32
+    %lq2 = index.div %lane, %c2 : index
+    %lb2 = index.rem %lq2, %c2 : index
+    %hi2 = index.cmp eq, %lb2, %c1 : index
+    %sum2 = vector.addf %s1, %p2 : vector<4xf32>
+    %dif2 = vector.subf %p2, %s1 : vector<4xf32>
+    %s2 = scf.select %hi2, %dif2, %sum2 : vector<4xf32>
+    %p4, %ok4 = kernel.subgroup.shuffle<xor> %s2, %i32_4, %i32_32 : vector<4xf32>, i32, i32
+    %lq4 = index.div %lane, %c4 : index
+    %lb4 = index.rem %lq4, %c2 : index
+    %hi4 = index.cmp eq, %lb4, %c1 : index
+    %sum4 = vector.addf %s2, %p4 : vector<4xf32>
+    %dif4 = vector.subf %p4, %s2 : vector<4xf32>
+    %s4 = scf.select %hi4, %dif4, %sum4 : vector<4xf32>
+    %p8, %ok8 = kernel.subgroup.shuffle<xor> %s4, %i32_8, %i32_32 : vector<4xf32>, i32, i32
+    %lq8 = index.div %lane, %c8 : index
+    %lb8 = index.rem %lq8, %c2 : index
+    %hi8 = index.cmp eq, %lb8, %c1 : index
+    %sum8 = vector.addf %s4, %p8 : vector<4xf32>
+    %dif8 = vector.subf %p8, %s4 : vector<4xf32>
+    %s8 = scf.select %hi8, %dif8, %sum8 : vector<4xf32>
+    %p16, %ok16 = kernel.subgroup.shuffle<xor> %s8, %i32_16, %i32_32 : vector<4xf32>, i32, i32
+    %lq16 = index.div %lane, %c16 : index
+    %lb16 = index.rem %lq16, %c2 : index
+    %hi16 = index.cmp eq, %lb16, %c1 : index
+    %sum16 = vector.addf %s8, %p16 : vector<4xf32>
+    %dif16 = vector.subf %p16, %s8 : vector<4xf32>
+    %r = scf.select %hi16, %dif16, %sum16 : vector<4xf32>
+    // per (token, head) absmax over the 128 rotated values
+    %ra = vector.absf %r : vector<4xf32>
+    %lane_max = vector.reduce<maxnumf> %ra, %zero : vector<4xf32>, f32
+    %amax0 = kernel.subgroup.reduce<maxnumf> %lane_max : f32
+    %amax = scalar.maxnumf %amax0, %tiny : f32
+    %sc = scalar.divf %amax, %seven : f32
+    %inv = scalar.divf %seven, %amax : f32
+    %inv4 = vector.splat %inv : vector<4xf32>
+    %qf = vector.mulf %r, %inv4 : vector<4xf32>
+    %qr = vector.roundevenf %qf : vector<4xf32>
+    %qc = vector.maxnumf %qr, %neg_seven4 : vector<4xf32>
+    %qd = vector.minnumf %qc, %seven4 : vector<4xf32>
+    %qi = vector.fptosi %qd : vector<4xf32> to vector<4xi32>
+    %qn = vector.andi %qi, %fifteen4 : vector<4xi32>
+    %n0 = vector.extract %qn[0] : vector<4xi32> -> i32
+    %n1 = vector.extract %qn[1] : vector<4xi32> -> i32
+    %n2 = vector.extract %qn[2] : vector<4xi32> -> i32
+    %n3 = vector.extract %qn[3] : vector<4xi32> -> i32
+    %n1s = scalar.shli %n1, %sh4 : i32
+    %n2s = scalar.shli %n2, %sh8 : i32
+    %n3s = scalar.shli %n3, %sh12 : i32
+    %h01 = scalar.ori %n0, %n1s : i32
+    %h012 = scalar.ori %h01, %n2s : i32
+    %half = scalar.ori %h012, %n3s : i32
+    // the odd lane's 16 bits join the even lane's word: word = lane / 2 of this head's 16
+    %partner, %okp = kernel.subgroup.shuffle<xor> %half, %i32_1, %i32_32 : i32, i32, i32
+    %partner_hi = scalar.shli %partner, %sh16 : i32
+    %word = scalar.ori %half, %partner_hi : i32
+    %is_even = index.cmp eq, %lb1, %c0 : index
+    scf.if %is_even {
+      %w0 = index.div %lane, %c2 : index
+      %hw = index.mul %head, %c16 : index
+      %wi0 = index.add %hw, %w0 : index
+      %wi = index.assume %wi0 [lt(%wi0, %words)] : index
+      view.store %word, %c_view[%token, %wi] : i32, view<[%tokens_b]x[%words]xi32>
+    }
+    %is_lane0 = index.cmp eq, %lane, %c0 : index
+    scf.if %is_lane0 {
+      %scale = scalar.mulf %sc, %extra : f32
+      view.store %scale, %s_view[%token, %head] : f32, view<[%tokens_b]x[%heads]xf32>
+    }
+  }
+  kernel.return
+}

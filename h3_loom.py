@@ -47,7 +47,7 @@ class H3Blocks:
         self.tokens, self.layers = tokens, layers
         weights = Path(weights or ROOT / "build/weights")
         library = Path(library or ROOT / "build/libh3.so")
-        kernels = ROOT / "build/kernels" / f"T{tokens}"
+        kernels = ROOT / ("build/kernels" if os.environ.get("H3_ATTN_QK", "f16") == "f16" else "build/kernels_i4qk") / f"T{tokens}"
         if not (kernels / "attention_waves.txt").exists():
             subprocess.run([sys.executable, str(ROOT / "scripts/build_kernels.py"), str(tokens)], check=True, capture_output=True)
         native = ctypes.CDLL(str(library))

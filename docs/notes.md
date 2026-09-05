@@ -459,3 +459,27 @@ Two things from the hrx-demos runtime worth copying regardless: benchmarking wit
 device-local buffers (their "rotation prevents a reused allocation from making a cache-hot
 microbenchmark look like model execution"), and the Plan phase (dry-run the request to size
 capacities, live ranges and kernel specialisations before touching model data).
+
+## Native 768: the attention arithmetic has to change (2026-09-06)
+
+1344x768 for 5 s packs ~37.7k rows: per step 1.35 PFLOP of int4 GEMM (17 s at 80 TOPS) and
+2.0 PFLOP of attention (113 s at the 18 TFLOP/s every f16 implementation reaches here): ~65
+minutes for 30 steps, 87% attention. The two concepts on the table:
+
+**SageAttention** (low-precision QK^T with smoothing). Int8 WMMA runs at the f16 rate on
+gfx1151 (54 vs 54), so only int4 (117) changes the MMA time. Per-block attention output error
+on real activations (`tools/attn_quant_study.py`: the fox latents noised to sigma 0.9 / 0.5,
+the real prompt, reference blocks): int8 per token 0.2-3%; int4 per token 4-62%; int4 with the
+same 128-channel Hadamard on q and k (q.k unchanged), K smoothed by its token mean (softmax
+invariant) and 32-channel scale groups 2-22%, the last layer worst. V int8 rotated: 0.5%.
+Per block that looks fatal; over the stack it is not (`tools/quant_study.py attn:...`, final
+velocity vs the int8 checkpoint at 50 blocks): int8 attention 0.99976 / 2.2%, int4 attention
+0.99745 / 7.1%, int4 GEMMs (RTN) 0.97860 / 20.9%, both 0.97625 / 22.0%. Int4 QK^T costs one
+point on top of the int4 GEMMs. Adopted: QK^T in int4 (per-token, per-head scales, the head
+rotated by a Hadamard in the prepare kernel, K mean-smoothed), PV in f16 as now. Q resident
+becomes 16 VGPRs instead of 64, K tiles 1 KB instead of 4 KB.
+
+**FlashAttention-3** (overlap). The applicable part is ping-pong: two wave groups a tile apart
+on triple-buffered K/V tiles so one group's softmax overlaps the other's MMAs instead of the
+whole workgroup running in lockstep behind each barrier. Warp specialisation with async
+copies has no RDNA3 equivalent. Estimated 1.2-1.3x; after the int4 kernel.

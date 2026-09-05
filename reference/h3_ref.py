@@ -316,9 +316,32 @@ class H3Ref:
             q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         return q, k, v
 
-    @staticmethod
-    def sdpa(q, k, v) -> torch.Tensor:
+    attn_quant = None          # attention operand study: "a8" (q, k int8 per token), "a4r" (rotated, K smoothed, int4 per token),
+    attn_exact_from = 99       # "a4r32" (32-channel groups); layers >= attn_exact_from stay exact
+
+    def sdpa(self, q, k, v, layer: int = 0) -> torch.Tensor:
         s = q.shape[0]
+        if self.attn_quant and layer < self.attn_exact_from:
+            mode = self.attn_quant
+            if not hasattr(self, "_h128"):
+                h4 = hadamard(4).double(); h2 = torch.tensor([[1.0, 1.0], [1.0, -1.0]], dtype=torch.float64) / math.sqrt(2.0)
+                self._h128 = torch.kron(torch.kron(torch.kron(h4, h4), h4), h2).float().to(q.device)
+            H = self._h128
+            def qr(x, bits, group=None):
+                qmax = 7 if bits == 4 else 127
+                if group:
+                    xg = x.reshape(*x.shape[:-1], x.shape[-1] // group, group); sc = xg.abs().amax(-1, keepdim=True).clamp_min(1e-12) / qmax
+                    return ((xg / sc).round().clamp(-qmax, qmax) * sc).reshape(x.shape)
+                sc = x.abs().amax(-1, keepdim=True).clamp_min(1e-12) / qmax
+                return (x / sc).round().clamp(-qmax, qmax) * sc
+            qf, kf = q.float(), k.float()
+            if mode == "a8":
+                q, k = qr(qf, 8).to(q.dtype), qr(kf, 8).to(k.dtype)
+            elif mode in ("a4r", "a4r32"):
+                kf = kf - kf.mean(0, keepdim=True); g = 32 if mode == "a4r32" else None
+                q, k = (qr(qf @ H, 4, g) @ H.T).to(q.dtype), (qr(kf @ H, 4, g) @ H.T).to(k.dtype)
+            else:
+                raise ValueError(mode)
         o = F.scaled_dot_product_attention(q.transpose(0, 1)[None], k.transpose(0, 1)[None], v.transpose(0, 1)[None])
         return o[0].transpose(0, 1).reshape(s, INNER)
 
@@ -334,7 +357,7 @@ class H3Ref:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (m[:, j].to(x.dtype) for j in range(6))
         h = rms_norm(x, self.t(f"{p}.norm1.weight"), self.eps) * (1.0 + scale_msa) + shift_msa
         q, k, v = self.qkv_heads(f"{p}.attn", self.lin(f"{p}.attn.qkv_proj")(h), cos, sin)
-        x = x + gate_msa * self.lin(f"{p}.attn.out_proj")(self.sdpa(q, k, v))
+        x = x + gate_msa * self.lin(f"{p}.attn.out_proj")(self.sdpa(q, k, v, i))
         h = rms_norm(x, self.t(f"{p}.norm2.weight"), self.eps) * (1.0 + scale_mlp) + shift_mlp
         return x + gate_mlp * self.lin(f"{p}.mlp.fc2")(self.swiglu(self.lin(f"{p}.mlp.fc1")(h)))
 
