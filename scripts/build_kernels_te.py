@@ -22,7 +22,7 @@ def build(tokens: int) -> Path:
     out.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("H3_GEMM_TILE", "256")
     tiles = (tokens + 255) // 256
-    m_group = min((4, 3, 2), key=lambda g: ((tiles + g - 1) // g * g, -g))
+    m_group = 1 if tiles == 1 else min((4, 3, 2), key=lambda g: ((tiles + g - 1) // g * g, -g))   # a prompt is one row tile: no padded group streaming the weights twice
     capacity = max((tokens + 16 + 31) // 32 * 32, (tokens + 127) // 128 * 128)
     attn = "h3.attention_gqa8c_lds_f16_wmma"
     specs = [

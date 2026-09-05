@@ -287,3 +287,52 @@ W8A8 through the native session (`tests/test_vae_blocks.py --bits 8`): frame PSN
 20.8 s per clip against torch's 161 s while GPTQ shared the GPU; attention (head 64) took
 59% of it at a poor 3 TFLOP/s, the head-64 kernel doing half the multiplies per tile for
 the same barriers and staging. Calm numbers and the two-query-tiles-per-wave variant follow.
+
+## Calm-box decoder, and the text encoder in Loom (2026-09-06)
+
+The W8A8 decoder on a quiet GPU: 6.05 s of block time per 11345-token clip, 45.7 s for the
+124-frame clip (seven chunks, diffusers' head and blending around them) against torch fp32's
+~19 minutes. Attention is 72% of it (4.4 s per clip, 8.6 TFLOP/s: the head-64 kernel does
+half the multiplies per tile for the same staging and barriers). The GEMMs run at
+14-19 TOPS on the decoder's shapes; a two-query-tiles-per-wave attention variant is the
+remaining lever, worth up to ~2x on the decoder.
+
+The text encoder (Qwen3-VL-32B's language model cut to 50 layers, ComfyUI's int8 ConvRot
+file) is the same session shape with three deltas:
+
+- attention: a GQA-8 causal mode of the LDS kernel. A workgroup is one 16-row query tile and
+  one kv head; its eight waves are that kv head's eight query heads, so K/V are staged once
+  for all eight. The key loop stops at the query tile, and the diagonal tile takes an
+  additive mask built from the WMMA accumulator layout probed on gfx1151
+  (`experiments/probe_wmma_layout.loom`: lane l holds column l%16; lanes 0-15 hold rows
+  0,2,..,14 and lanes 16-31 rows 1,3,..,15, element e at row 2e + l/16). Passes vs SDPA
+  (`is_causal`, `enable_gqa`) at 28..1000 tokens, 240 VGPRs.
+- RoPE: a `kv_heads` config (k and v at 8 heads; q at 64), the 128-channel rotate-half
+  variant, the q/k RMSNorm weights from the file.
+- GEMMs: the int8 family without biases (`gemm_i8_256`, `_resid_256`, `_swiglu_256`),
+  n_size bound raised to 65536 for the 51200-wide gate|up; and prepare_plain16_i8, an
+  f16-LDS variant for the 25600-wide down-projection input (25600 f32 does not fit 64 KB;
+  the f16 input is pre-scaled by 1/16 at staging so the four unnormalised Hadamard stages
+  land exactly on the normalised rotation -- codes identical to the f32 kernel, the token
+  scale to f16 precision).
+
+Accuracy vs transformers bf16 (the same weights dequantised; `tests/test_te_blocks.py`, the
+33-token fox prompt): hidden cosine 0.99997 / 0.99996 / 1.0000 / 1.0000 after 1 / 4 / 12 / 50
+layers, median per-token relative error 1.7% at layer 50 (one token 18%, whose residual is
+small next to the 15168-magnitude massive-activation channels). A torch reference with
+per-token int8 activations gives the same numbers, so the loss is W8A8's, not the kernels'.
+
+Two bugs on the way, both in the harness, not the kernels: the numpy view of a CPU f32 input
+shared its memory, so the session's result overwrote the input and the test compared the
+output with itself ("update cosine 0.00000"); and a prompt is a single 256-row tile, for which
+the raster group of two streamed every weight twice -- `m_group = 1` for one tile took the
+50 layers from 564 to 306 ms (the GEMMs at 33 rows still move the 24 GB of int8 weights at
+~90 GB/s of 200; a skinny-M weight-streaming kernel would halve it again, for a once-per-
+prompt 0.3 s).
+
+The pipeline now encodes uncached prompts in Loom and decodes video through the W8A8 Loom
+session by default (`--torch-decode`, `--vae-bits 4` with the GPTQ export for the int4
+decoder). Left in torch: the audio VAE (BigVGAN: 65 M parameters of narrow 1-D
+convolutions, Snake activations and anti-aliasing filters across seven upsampling stages;
+launch-bound, a different kernel family), the scheduler step, the VAE heads and the prompt
+embedding lookup.

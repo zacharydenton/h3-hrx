@@ -43,17 +43,29 @@ products reach 5e4 and the unnormalised Hadamard stages overflow f16). The raw r
 stream is dominated by a few huge channels, so cosines on it mislead deep in the stack;
 the final layer's RMSNorm removes them, which is why the velocity is the metric.
 
-The end-to-end clip runs: `tools/encode_prompt.py` (Qwen3-VL-32B from the int8 file, layer
-50's raw state) then `tools/pipeline.py` (layout, the two schedules through diffusers'
-`MiniMaxH3Scheduler`, the blocks in Loom, the reference's embeddings and final layer,
-diffusers' two VAEs, ffmpeg). The first full clip: 124 frames (5.2 s) at 864x480 with
-stereo audio, 49 denoising steps with the GPTQ int4 blocks, frames 5, 60 and 118:
+The end-to-end clip runs from one command, `tools/pipeline.py "<prompt>"`: the prompt
+through the text encoder in Loom (Qwen3-VL-32B's 50 layers, W8A8 from the int8 file, layer
+50's raw state, 0.3 s for a 33-token prompt), the layout and the two schedules through
+diffusers' `MiniMaxH3Scheduler`, the 50 blocks in Loom, the video VAE's 36 decoder blocks
+in Loom (W8A8, 46 s for the 124-frame clip against about 19 minutes for diffusers' fp32
+decoder), and diffusers' audio VAE plus ffmpeg. The first full clip: 124 frames (5.2 s) at
+864x480 with stereo audio, 49 denoising steps with the GPTQ int4 blocks, frames 5, 60 and
+118:
 
 ![fox](docs/media/fox_480p_5s_strip.jpg)
 
 That render packs 15427 rows and takes 29.4 s per step (attention 70%, the four GEMMs
-26%): 24 minutes of denoising, plus the encoder once per prompt and the VAE decode in
-torch. `docs/media/smoke_fox_22f_8steps.jpg` is the 22-frame smoke clip.
+26%): 24 minutes of denoising. `docs/media/smoke_fox_22f_8steps.jpg` is the 22-frame smoke
+clip.
+
+**What is in Loom and what is not.** In Loom: the DiT blocks, the text encoder's layers
+(`tests/test_te_blocks.py`: hidden cosine 1.0000 after 50 layers against transformers bf16,
+median per-token error 1.7%, the W8A8 floor) and the video decoder's blocks
+(`tests/test_vae_blocks.py --bits 8`: frame PSNR 52 dB, lossless class; the int4 GPTQ
+decoder is the `--vae-bits 4` option). In torch: the audio VAE (a BigVGAN vocoder of 65 M
+parameters in narrow 1-D convolutions, launch-bound, a different kernel family), the
+scheduler step, the two VAEs' heads and the embedding lookups, together a few seconds of a
+25-minute clip.
 
 **Quantisation.** Round-to-nearest int4 per row cost 21% relative error on the final
 velocity over 50 blocks; GPTQ at export time (`tools/gptq_export.py`, block by block on the

@@ -23,7 +23,6 @@ sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "reference")); sys.
 import h3_ref as R
 from h3_loom import H3Blocks, mods_table
 from encode_prompt import prompt_path, encode_loom, TOK
-from decode_loom import LoomClipDecoder
 
 MODELS = Path.home() / "h3-models"
 FPS, AUDIO_RATE, AUDIO_LATENTS_PER_S = 24, 32000, 40
@@ -122,6 +121,7 @@ def main() -> None:
     else:                                                                    # the 36 decoder blocks in Loom, diffusers' chunking and head around them
         vae = AutoencoderKLMiniMaxH3.from_pretrained(str(MODELS / "vae"), torch_dtype=torch.float32).to(dev).eval(); vae.disable_tiling()
         mean = torch.tensor(vae.config.latents_mean, device=dev).view(1, -1, 1, 1, 1); std = torch.tensor(vae.config.latents_std, device=dev).view(1, -1, 1, 1, 1)
+        from decode_loom import LoomClipDecoder                             # (decode_loom imports write_clip from here)
         vae_weights = a.vae_weights or str(ROOT / ("build/weights_vae_i8" if a.vae_bits == 8 else "build/weights_vae_gptq"))
         vae._decode_clip = LoomClipDecoder(vae, profile=a.profile, weights=vae_weights, bits=a.vae_bits)
         with torch.no_grad():

@@ -194,6 +194,7 @@ private:
     // m-tiles per raster group, the same rule as scripts/build_kernels_te.py.
     unsigned gemm_m_group(size_t m) const {
         const size_t tiles = (m + GEMM_TILE - 1) / GEMM_TILE;
+        if (tiles == 1) return 1;
         unsigned best = 4; size_t best_pad = (tiles + 3) / 4 * 4;
         for (unsigned g : {3u, 2u}) { const size_t pad = (tiles + g - 1) / g * g; if (pad < best_pad) { best = g; best_pad = pad; } }
         return best;
