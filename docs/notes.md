@@ -163,3 +163,27 @@ it), per-row scales from the unquantised row, Hessians damped in f64 because the
 calibration rows are fewer than K. It writes `build/weights_gptq/` in the runtime's format
 and reports the 50-block velocity cosine against the int8 checkpoint (round-to-nearest:
 0.97860). 37 s per block.
+
+## GPTQ result, and the 64x64-wave GEMM in the runtime (2026-09-06)
+
+GPTQ per-row int4 (sequential over the 50 blocks, per-row scales, damped f64 Hessians):
+final-layer velocity cosine 0.99220 / rel rms 0.1250 in the reference against 0.97860 /
+0.2091 for round-to-nearest -- the same quality the best per-group configuration reached
+(0.99221) with no kernel cost, so the plain int4 GEMM format stays. Through the native
+runtime (`tests/test_blocks.py --weights build/weights_gptq`): 0.99120 at 50 blocks against
+the int8 path, 0.99614 at one block. `build/weights_gptq` is now the default export to use.
+
+`tools/gen_gemm.py` puts the three H3 epilogues on loom-gemm's 256x128 tile (lever 9); all
+six GEMM kernels pass `tests/test_gemm.py` against float64. Block-level A/B at 2097 rows,
+50 blocks, same contended window (another session's job on the GPU):
+
+| stage | 128-row tile | 256-row tile |
+| --- | ---: | ---: |
+| gate/up + swiglu | 880 ms | 714 ms |
+| qkv | 610 | 518 |
+| down + residual | 380 | 338 |
+| out + residual | 244 | 203 |
+| forward | 2974 | 2518 |
+
+`H3_GEMM_TILE` selects the tile in the builder (default 256); the host reads it from the
+kernel directory. Calm-box numbers to follow.

@@ -110,13 +110,14 @@ public:
         load(k_prep_norm_, "prepare_norm_i4", "h3_prepare_norm_i4");
         load(k_prep_attn_, "prepare_attn_i4", "h3_prepare_plain_i4");
         load(k_prep_down_, "prepare_down_i4", "h3_prepare_plain_i4");
-        load(k_gemm_qkv_, "gemm_qkv", "h3_gemm_i4");
-        load(k_gemm_gu_, "gemm_gu", "h3_gemm_i4_swiglu");
-        load(k_gemm_out_, "gemm_out", "h3_gemm_i4_resid");
-        load(k_gemm_down_, "gemm_down", "h3_gemm_i4_resid");
+        { std::ifstream tf(kernels_dir + "/gemm_tile.txt"); if (tf) tf >> gemm_tile_; if (gemm_tile_ != 128 && gemm_tile_ != 256) throw std::runtime_error("gemm_tile.txt must say 128 or 256"); }
+        const std::string sfx = gemm_tile_ == 256 ? "_256" : "";      // the 64x64-wave kernels export a suffixed symbol
+        load(k_gemm_qkv_, "gemm_qkv", ("h3_gemm_i4" + sfx).c_str());
+        load(k_gemm_gu_, "gemm_gu", ("h3_gemm_i4_swiglu" + sfx).c_str());
+        load(k_gemm_out_, "gemm_out", ("h3_gemm_i4_resid" + sfx).c_str());
+        load(k_gemm_down_, "gemm_down", ("h3_gemm_i4_resid" + sfx).c_str());
         load(k_rope_, "rope_qknorm", "h3_rope_qknorm_f16");
         load(k_attention_, "attention", "h3_attention_mha_lds_f16_wmma");
-        { std::ifstream tf(kernels_dir + "/gemm_tile.txt"); if (tf) tf >> gemm_tile_; if (gemm_tile_ != 128 && gemm_tile_ != 256) throw std::runtime_error("gemm_tile.txt must say 128 or 256"); }
         const size_t T = capacity_;
         HIP_CHECK(hipMalloc(&x_, T * HIDDEN * 4));            // the residual stream, f32
         HIP_CHECK(hipMalloc(&a_q_, T * FFN / 2));               // the widest prepared operand (down's K = 14336)
