@@ -137,3 +137,19 @@ g64 with int8 activations 0.99221. The 4-bit weight floor on H3 is about 0.99 co
 GEMM's k-loop. Target from the user: 100 TOPS with reasonable quality; the int8 path (54
 TOPS peak) cannot reach it, so this is int4 with group scales, on a GEMM that has to run at
 86% of the iu4 peak.
+
+## Study v5: per-group both sides
+
+| weights | activations | cosine | rel rms err |
+| --- | --- | ---: | ---: |
+| int4 per 128-group | int4 per 256-group | 0.99056 | 0.1381 |
+| int4 per 64-group | int4 per 256-group | 0.98915 | 0.1484 |
+| int4 per 32-group | int4 per 256-group | 0.99120 | 0.1329 |
+| int4 per 32-group | int8 per token | 0.99314 | 0.1175 |
+
+So "reasonable" int4 on H3 means per-group weight scales (32-128) with per-group activation
+scales, at 0.99 cosine / 13% relative velocity error. The kernel cost of group scales is a
+second, f32, accumulator set: the group's int32 partials are converted and scaled into it
+once per group. With 64x64 wave tiles that is 128 + 128 accumulator VGPRs and does not fit;
+with 32x64 tiles (the 128x128 kernel) it does, at 0.75 LDS reads per multiply. The
+throughput and quality mechanisms compete for the same registers.
