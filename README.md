@@ -44,11 +44,16 @@ the final layer's RMSNorm removes them, which is why the velocity is the metric.
 Not yet built: the end-to-end clip (text encoder, VAEs and the sampler around the blocks)
 and the lever loop at video lengths.
 
-**Open decision.** On this model 4-bit weights cost 13-21% relative error on the final
-velocity over 50 blocks, whatever the activation treatment, while int8 weights with int8
-activations cost 2.4% (`docs/notes.md`, the quantisation study). The int4 path is built and
-measured; the W8A8 path (the checkpoint's own int8 rows on the `iu8` WMMA at about half the
-int4 rate) is the quality-preserving one and is a kernel-family port away.
+**Quantisation.** Round-to-nearest int4 per row cost 21% relative error on the final
+velocity over 50 blocks; GPTQ at export time (`tools/gptq_export.py`, block by block on the
+fixture's activations) brings the same format to 12.5%, velocity cosine 0.992 (0.991
+through the native runtime), matching the best per-group scheme at no kernel cost. Int8
+weights would cost 2.4% but cap the GEMMs at the part's 54 TOPS int8 peak; the target is
+100 TOPS. `build/weights_gptq` is the export to use.
+
+**GEMM tile.** The four GEMMs run on a 256x128 workgroup tile of 64x64 wave tiles (half the
+LDS operand reads per multiply of the 128x128 tile), 15-17% faster per stage at 2097 rows;
+`H3_GEMM_TILE=128` builds the smaller tile for comparison.
 
 ## Plan
 
