@@ -613,3 +613,32 @@ Epilogue follow-up: a direct-store epilogue (`ATTN_DIRECT_OUT`, 64 scalar f16 st
 from the accumulator layout, no LDS round trips or subgroup barriers) is correct and a wash
 (1.03x at 15427 rows, 0.97x at 37743): the ablation's 12% was the output writes themselves,
 which any epilogue pays. Kept in experiments/.
+
+## Toward 4x: what H3's attention can skip (2026-09-07)
+
+The MMA floor of the int4 kernel at 768 is 0.55 s per block (QK^T at the int4 rate, P.V at
+the f16 rate) against 1.51 s now, so 4x on attention (0.8 s) is not reachable by overhead
+alone; P.V has to be skipped where it contributes nothing. `tools/attn_sparsity_study.py`
+measures that on the full 480p fox clip (15412 rows), per (head, 16-row query tile, 16-key
+tile): a tile is skippable when every row's max score in it sits more than tau below the
+row's running max (what an online-softmax kernel can know) or its final max (an upper bound):
+
+| running-max rule, tau 6 | layer 0 | 10 | 25 | 40 | 49 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| sigma 0.9 | 13% | 18% | 38% | 22% | 51% |
+| sigma 0.5 | 16% | 21% | 44% | 35% | 60% |
+| sigma 0.2 | 20% | 23% | 46% | 41% | 62% |
+
+Per-block output error 0.4-2.4% at tau 6, 0.04-0.35% at tau 8 (which skips about two thirds
+as much). The final-max rule reaches 81% at layer 49 but only helps a two-pass kernel, whose
+second QK^T pass costs what it saves. So the kernel's tile skip is worth about 1.2-1.3x on
+attention averaged over the stack, more on the late layers: real but not the 2x. The rest
+of a 4x on the step has to come from the step cache (blocks 1..49 reused when block 0's
+output moves little between steps), which is the other lever built here.
+
+Implemented: `skip_tau` config on the int4 kernels (one reduction and one cross-half shuffle
+per tile give the wave-uniform gap; eight per-fragment branches skip the V loads, P.V MMAs and
+rescale, a select skips the sum update; 240 VGPRs, no spills; 1e30 disables it; the builder
+and the C stack read H3_ATTN_SKIP_TAU), and the first-block cache in the C pipeline
+(`cache_threshold` in h3pipe_params, ABI 2; `absdiff_sum_f32` partial sums for the relative
+L1; accumulated across skipped steps as TeaCache does; `H3_CACHE_TRACE=1` prints decisions).

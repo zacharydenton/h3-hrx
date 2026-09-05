@@ -53,7 +53,8 @@ def build(tokens: int) -> Path:
         (g4("gemm_i4_resid"), "h3_" + g4("gemm_i4_resid"), "gemm_out", {"h3." + g4("gemm_i4_resid") + ".k_size": INNER, "h3." + g4("gemm_i4_resid") + ".n_size": HIDDEN, "h3." + g4("gemm_i4_resid") + ".m_group": m_group, "h3." + g4("gemm_i4_resid") + ".classes": CLASSES}),
         (g4("gemm_i4_resid"), "h3_" + g4("gemm_i4_resid"), "gemm_down", {"h3." + g4("gemm_i4_resid") + ".k_size": FFN, "h3." + g4("gemm_i4_resid") + ".n_size": HIDDEN, "h3." + g4("gemm_i4_resid") + ".m_group": m_group, "h3." + g4("gemm_i4_resid") + ".classes": CLASSES}),
         ("rope_qknorm_f16", "h3_rope_qknorm_f16", "rope_qknorm", {"h3.rope_qknorm_f16.row_stride": 3 * INNER, "h3.rope_qknorm_f16.heads": HEADS, "h3.rope_qknorm_f16.kv_heads": HEADS, "h3.rope_qknorm_f16.k_offset": INNER, "h3.rope_qknorm_f16.eps": 1e-5}),
-        (attn_stem, "h3_" + attn_stem, "attention", {f"{attn}.q_stride": INNER, f"{attn}.kv_stride": INNER, f"{attn}.tokens": tokens, f"{attn}.token_capacity": capacity, f"{attn}.scale": D ** -0.5, f"{attn}.out_stride": INNER}),
+        (attn_stem, "h3_" + attn_stem, "attention", {f"{attn}.q_stride": INNER, f"{attn}.kv_stride": INNER, f"{attn}.tokens": tokens, f"{attn}.token_capacity": capacity, f"{attn}.scale": D ** -0.5, f"{attn}.out_stride": INNER,
+                                                     **({f"{attn}.skip_tau": float(os.environ.get("H3_ATTN_SKIP_TAU", "1e30"))} if ATTN_QK == "i4" else {})}),
     ]
     if ATTN_QK == "i4":
         pq = "h3.prepare_qk_i4."

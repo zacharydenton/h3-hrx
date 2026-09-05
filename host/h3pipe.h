@@ -11,7 +11,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define H3PIPE_ABI_VERSION 1u
+#define H3PIPE_ABI_VERSION 2u
 enum { H3PIPE_OK = 0, H3PIPE_ERROR = 1, H3PIPE_CANCELLED = 2, H3PIPE_INVALID_ARGUMENT = 64 };
 typedef struct h3pipe_session h3pipe_session;
 
@@ -32,6 +32,7 @@ typedef struct {
     int steps;                   // sigma grid points (steps - 1 model evaluations), as diffusers
     uint64_t seed;
     float video_shift, audio_shift;   // 0 -> the model's defaults (12, 3)
+    float cache_threshold;            // first-block step cache: skip blocks 1..49 while the accumulated relative change of block 0's output stays below this (0 = off; 0.05-0.15 typical)
 } h3pipe_params;
 
 typedef struct {

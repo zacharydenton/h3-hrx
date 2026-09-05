@@ -1,0 +1,65 @@
+// Partial sums for a relative L1 distance: per workgroup of 256 lanes x 8 elements, out[2*g] = sum |a - b|,
+// out[2*g + 1] = sum |b| over its 2048 elements (the host adds the partials). The step cache's change metric.
+amdgpu.target<gfx11-generic> @h3_absdiff_sum_f32_gfx11 {subgroup_size = 32}
+
+kernel.def target(@h3_absdiff_sum_f32_gfx11) export("h3_absdiff_sum_f32") @h3_absdiff_sum_f32(%count: index) {
+  %c1 = index.constant 1 : index
+  %c2047 = index.constant 2047 : index
+  %c2048 = index.constant 2048 : index
+  %c256 = index.constant 256 : index
+  %rounded = index.add %count, %c2047 : index
+  %groups = index.div %rounded, %c2048 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%count: index, %a: buffer, %b: buffer, %out: buffer) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c8 = index.constant 8 : index
+  %c2048 = index.constant 2048 : index
+  %c0_offset = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %zero8 = vector.splat %zero : vector<8xf32>
+  %count_b = index.assume %count [range(%count, 8, 1073741824), mul(%count, 8)] : index
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %base0 = index.mul %wg, %c2048 : index
+  %lane8 = index.mul %lane, %c8 : index
+  %i0 = index.add %base0, %lane8 : index
+  %last = index.sub %count_b, %c8 : index
+  %a_global = buffer.assume.memory_space<global> %a : buffer
+  %b_global = buffer.assume.memory_space<global> %b : buffer
+  %o_global = buffer.assume.memory_space<global> %out : buffer
+  %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<[%count_b]xf32>
+  %b_view = buffer.view %b_global[%c0_offset] : buffer -> view<[%count_b]xf32>
+  %groups0 = index.add %count_b, %c2048 : index
+  %groups1 = index.sub %groups0, %c1 : index
+  %groups = index.div %groups1, %c2048 : index
+  %ocount = index.mul %groups, %c2 : index
+  %o_view = buffer.view %o_global[%c0_offset] : buffer -> view<[%ocount]xf32>
+  %inside = index.cmp ule, %i0, %last : index
+  %d, %m = scf.if %inside -> (f32, f32) {
+    %i = index.assume %i0 [le(%i0, %last), mul(%i0, 8)] : index
+    %av = vector.load %a_view[%i] : view<[%count_b]xf32> -> vector<8xf32>
+    %bv = vector.load %b_view[%i] : view<[%count_b]xf32> -> vector<8xf32>
+    %diff = vector.subf %av, %bv : vector<8xf32>
+    %ad = vector.absf %diff : vector<8xf32>
+    %ab = vector.absf %bv : vector<8xf32>
+    %sd = vector.reduce<addf> %ad, %zero : vector<8xf32>, f32
+    %sm = vector.reduce<addf> %ab, %zero : vector<8xf32>, f32
+    scf.yield %sd, %sm : f32, f32
+  } else {
+    scf.yield %zero, %zero : f32, f32
+  }
+  %td = kernel.workgroup.reduce<addf> %d : f32
+  %tm = kernel.workgroup.reduce<addf> %m : f32
+  %is0 = index.cmp eq, %lane, %c0 : index
+  scf.if %is0 {
+    %og0 = index.mul %wg, %c2 : index
+    %og = index.assume %og0 [lt(%og0, %ocount)] : index
+    %og1a = index.add %og0, %c1 : index
+    %og1 = index.assume %og1a [lt(%og1a, %ocount)] : index
+    view.store %td, %o_view[%og] : f32, view<[%ocount]xf32>
+    view.store %tm, %o_view[%og1] : f32, view<[%ocount]xf32>
+  }
+  kernel.return
+}

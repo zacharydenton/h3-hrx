@@ -340,6 +340,18 @@ class H3Ref:
             elif mode in ("a4r", "a4r32"):
                 kf = kf - kf.mean(0, keepdim=True); g = 32 if mode == "a4r32" else None
                 q, k = (qr(qf @ H, 4, g) @ H.T).to(q.dtype), (qr(kf @ H, 4, g) @ H.T).to(k.dtype)
+            elif mode.startswith("a4rs"):                        # int4 rotated + the kernel's tile skip (running-max rule, 16x16 tiles, tau = the number after a4rs)
+                tau = float(mode[4:]); q4 = (qr(qf @ H, 4) @ H.T); k4 = (qr(kf @ H, 4) @ H.T)
+                S = q4.shape[0]; nq = (S + 15) // 16; nk = nq; out = torch.empty_like(v.float())
+                for hd in range(HEADS):
+                    sc = (q4[:, hd] @ k4[:, hd].T) / math.sqrt(HEAD_DIM)
+                    sp = F.pad(sc, (0, nk * 16 - S, 0, nq * 16 - S), value=-1e9).reshape(nq, 16, nk, 16)
+                    row_tile_max = sp.amax(dim=3); running = torch.cummax(row_tile_max, dim=2).values
+                    prev = torch.cat([torch.full_like(running[:, :, :1], -1e9), running[:, :, :-1]], dim=2)
+                    skip = (row_tile_max < (prev - tau)).all(dim=1)
+                    mask = skip[:, None, :, None].expand(nq, 16, nk, 16).reshape(nq * 16, nk * 16)[:S, :S]
+                    out[:, hd] = torch.softmax(sc.masked_fill(mask, -1e9), -1) @ v[:, hd].float()
+                return out.reshape(S, INNER).to(v.dtype)
             elif mode in ("a4c16", "a4c128", "a4cg", "a4cr16", "a4crg"):   # SageAttention2: Q and K centred, int4 per token, exact correction restored (a4cr*: also rotated)
                 qb = {"a4c16": 16, "a4c128": 128, "a4cg": 0, "a4cr16": 16, "a4crg": 0}[mode]
                 qm = torch.cat([blk.mean(0, keepdim=True).expand_as(blk) for blk in qf.split(qb, dim=0)], 0) if qb else qf.mean(0, keepdim=True).expand_as(qf)

@@ -308,7 +308,9 @@ public:
             std::string stem = d.causal ? "attention_gqa8c_lds_f16_wmma" : (d.head_dim == 64 ? (waves_ == 8 ? "attention_mha648_lds_f16_wmma" : "attention_mha64_lds_f16_wmma") : (waves_ == 8 ? "attention_mha8_lds_f16_wmma" : "attention_mha_lds_f16_wmma"));
             if (d.attn_i4) stem = tokens >= 20000 ? "attention_i4qkl_mha8_lds_f16_wmma" : (waves_ == 8 ? "attention_i4qk_mha8_lds_f16_wmma" : "attention_i4qk_mha_lds_f16_wmma");   // one workgroup per CU past ~20k rows
             const std::string ns = "h3." + stem + ".";
-            attention_ = c.get(stem, "h3_" + stem, {{ns + "q_stride", std::to_string(d.inner())}, {ns + "kv_stride", std::to_string(d.kv_inner())}, {ns + "tokens", std::to_string(tokens)}, {ns + "token_capacity", std::to_string(capacity_)}, {ns + "scale", num(1.0 / std::sqrt(double(d.head_dim)))}, {ns + "out_stride", std::to_string(d.inner())}});
+            Cfg acfg = {{ns + "q_stride", std::to_string(d.inner())}, {ns + "kv_stride", std::to_string(d.kv_inner())}, {ns + "tokens", std::to_string(tokens)}, {ns + "token_capacity", std::to_string(capacity_)}, {ns + "scale", num(1.0 / std::sqrt(double(d.head_dim)))}, {ns + "out_stride", std::to_string(d.inner())}};
+            if (d.attn_i4) { const char *tau = std::getenv("H3_ATTN_SKIP_TAU"); acfg.push_back({ns + "skip_tau", tau ? tau : "1e30"}); }   // tile skipping past tau below the running max; 1e30 = off
+            attention_ = c.get(stem, "h3_" + stem, acfg);
         }
         const size_t T = capacity_;
         HIP_CHECK(hipMalloc(&a_q_, T * size_t(std::max(d.ffn, std::max(d.hidden, d.inner()))) / per));
@@ -337,9 +339,10 @@ public:
     const Block &block(int i) const { return blocks_[i]; }
 
     // x: f32 [capacity][hidden] (rows past tokens untouched); cls: i32 [tokens]; cos/sin: f32 [tokens][rope_dim/2]
-    void forward(Profile *prof, void *x, const void *cls, const void *cos, const void *sin, const std::function<LayerCond(int)> &cond) {
+    void forward(Profile *prof, void *x, const void *cls, const void *cos, const void *sin, const std::function<LayerCond(int)> &cond, int first = 0, int last = -1) {
         const unsigned T = unsigned(tokens_);
-        for (int i = 0; i < layers_; ++i) {
+        if (last < 0) last = layers_;
+        for (int i = first; i < last; ++i) {
             const Block &b = blocks_[i]; const LayerCond lc = cond(i);
             prep_norm_.run(prof, "prepare norm", T, x, b.norm1, lc.table_msa, cls, a_q_, a_s_);
             gemm_qkv_.run(prof, "gemm qkv", T, a_q_, b.qkv_q, b.qkv_s, a_s_, fused_, nullptr, nullptr, b.qkv_b);
@@ -434,7 +437,7 @@ public:
         HIP_CHECK(hipMalloc(&mods_, size_t(50) * MODS_ROWS * HID * 4));
         HIP_CHECK(hipMalloc(&final_table_, size_t(4) * HID * 4));
     }
-    ~Pipe() { for (void *p : {ones_, zeros_, mods_, final_table_, x_, cls_, cls0_, tcls_, cos_, sin_, in16_, a_q_, a_s_, out16_, text_copy_, ref_cos_, ref_sin_, te_x_, te_cos_, te_sin_, te_cls_, vx_, vcos_, vsin_, vin16_, va_q_, va_s_, vout16_, vcls_, vnorm_table_, ah_, aacc_, ahj_, ar_, ar2_, atmp_, ain_}) if (p) (void)hipFree(p); }
+    ~Pipe() { for (void *p : {ones_, zeros_, mods_, final_table_, x_, cls_, cls0_, tcls_, cos_, sin_, in16_, a_q_, a_s_, out16_, text_copy_, ref_cos_, ref_sin_, te_x_, te_cos_, te_sin_, te_cls_, vx_, vcos_, vsin_, vin16_, va_q_, va_s_, vout16_, vcls_, vnorm_table_, ah_, aacc_, ahj_, ar_, ar2_, atmp_, ain_, xb0_, prev_b0_, cache_resid_, partials_}) if (p) (void)hipFree(p); }
 
     Profile prof;
 
@@ -585,6 +588,7 @@ public:
         if (noise_audio) for (int c = 0; c < 2; ++c) for (int t = 0; t < A; ++t) for (int k = 0; k < AUDIO_CH; ++k) arows[(size_t(c) * A + t) * AUDIO_CH + k] = noise_audio[(size_t(c) * AUDIO_CH + k) * A + t];
         else for (float &v : arows) v = rng.normal();
         Schedule sv(p.steps, p.video_shift > 0 ? p.video_shift : 12.0), sa(p.steps, p.audio_shift > 0 ? p.audio_shift : 3.0);
+        cache_acc_ = 0.0; have_cache_ = false; cache_skipped_ = 0;
         if (sv.timesteps.size() != sa.timesteps.size()) throw std::runtime_error("the two schedules differ in length");
         std::vector<uint16_t> in16(std::max(Na, Nv) * KPAD); std::vector<uint16_t> out16(S * FINAL_N);
         const auto t_start = std::chrono::steady_clock::now();
@@ -602,7 +606,32 @@ public:
             // the text rows are refreshed from a copy each step (the blocks update x in place)
             if (step == 0) { if (!text_copy_) HIP_CHECK(hipMalloc(&text_copy_, seq_cap_ * HID * 4)); HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)text_copy_, (hipDeviceptr_t)x_, L * HID * 4)); }
             else HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)x_, (hipDeviceptr_t)text_copy_, L * HID * 4));
-            dit_->forward(&prof, x_, cls_, cos_, sin_, [&](int i) { return cond(i); });
+            if (p.cache_threshold > 0.0f) {                                          // first-block cache (TeaCache / FBCache style)
+                const size_t n = S * size_t(HID), groups = (n + 2047) / 2048;
+                if (cache_cap_ < n) {
+                    for (void *q : {xb0_, prev_b0_, cache_resid_, partials_}) if (q) (void)hipFree(q);
+                    HIP_CHECK(hipMalloc(&xb0_, n * 4)); HIP_CHECK(hipMalloc(&prev_b0_, n * 4)); HIP_CHECK(hipMalloc(&cache_resid_, n * 4)); HIP_CHECK(hipMalloc(&partials_, groups * 8)); cache_cap_ = n;
+                    absdiff_ = comp_.get("absdiff_sum_f32", "h3_absdiff_sum_f32", {});
+                }
+                dit_->forward(&prof, x_, cls_, cos_, sin_, [&](int i) { return cond(i); }, 0, 1);
+                bool skip = false;
+                if (step > 0) {
+                    KernArgs a; a.i32(int(n)).ptr(x_).ptr(prev_b0_).ptr(partials_); launch(*absdiff_, &prof, "cache metric", unsigned(groups), 1, THREADS, a);
+                    std::vector<float> ps(groups * 2); HIP_CHECK(hipDeviceSynchronize()); HIP_CHECK(hipMemcpyDtoH(ps.data(), (hipDeviceptr_t)partials_, ps.size() * 4));
+                    double d = 0, m = 0; for (size_t i = 0; i < groups; ++i) { d += ps[2 * i]; m += ps[2 * i + 1]; }
+                    const double rel = d / std::max(m, 1e-30); cache_acc_ += rel;
+                    skip = cache_acc_ < p.cache_threshold && have_cache_;
+                    if (std::getenv("H3_CACHE_TRACE")) fprintf(stderr, "  step %zu: block-0 change %.4f, accumulated %.4f -> %s\n", step + 1, rel, cache_acc_, skip ? "cached" : "full");
+                }
+                HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)prev_b0_, (hipDeviceptr_t)x_, n * 4));
+                if (skip) { axpy(1.0f, 1.0f, n, cache_resid_, x_); ++cache_skipped_; }
+                else {
+                    HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)xb0_, (hipDeviceptr_t)x_, n * 4));
+                    dit_->forward(&prof, x_, cls_, cos_, sin_, [&](int i) { return cond(i); }, 1, 50);
+                    HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)cache_resid_, (hipDeviceptr_t)x_, n * 4)); axpy(-1.0f, 1.0f, n, xb0_, cache_resid_);   // residual of blocks 1..49
+                    have_cache_ = true; cache_acc_ = 0.0;
+                }
+            } else dit_->forward(&prof, x_, cls_, cos_, sin_, [&](int i) { return cond(i); });
             final_prep_.run(&prof, "final norm", unsigned(S), x_, glue_.at("h3.final.norm", size_t(HID) * 4), final_table_, tcls_, a_q_, a_s_);
             final_gemm.run(&prof, "final out", unsigned(S), a_q_, glue_.at("h3.final.out.q", size_t(FINAL_N) * HID), glue_.at("h3.final.out.s", size_t(FINAL_N) * 4), a_s_, out16_, nullptr, nullptr, glue_.at("h3.final.out.b", size_t(FINAL_N) * 4));
             HIP_CHECK(hipDeviceSynchronize()); HIP_CHECK(hipMemcpyDtoH(out16.data(), (hipDeviceptr_t)out16_, S * FINAL_N * 2));
@@ -612,6 +641,7 @@ public:
             for (size_t r = 0; r < Na; ++r) for (int k = 0; k < AUDIO_CH; ++k) { float &x = arows[r * AUDIO_CH + k]; const float v = f16_to_f32(out16[(L + r) * FINAL_N + VIDEO_PATCH + k]); x = r_a * x + (1.0f - r_a) * (x + sg_a * v); }
             if (progress && progress(user, int(step + 1), int(sv.timesteps.size()), std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count())) throw Cancelled();
         }
+        if (p.cache_threshold > 0.0f && std::getenv("H3_CACHE_TRACE")) fprintf(stderr, "  step cache: %d of %zu evaluations skipped\n", cache_skipped_, sv.timesteps.size());
         rows_to_tensor(video_out);
         for (int c = 0; c < 2; ++c) for (int t = 0; t < A; ++t) for (int k = 0; k < AUDIO_CH; ++k) audio_out[(size_t(c) * AUDIO_CH + k) * A + t] = arows[(size_t(c) * A + t) * AUDIO_CH + k];
     }
@@ -804,6 +834,8 @@ private:
     std::vector<float> curve_, inv_freq_, final_w_, final_b_; std::vector<std::vector<float>> adaln_w_, adaln_b_;
     std::unique_ptr<Stack> te_, refiner_, dit_, vae_; Blob vae_blob_;
     Prepare vproj_in_prep_, vnorm_out_; Gemm vproj_in_, vproj_out_;
+    std::shared_ptr<Kernel> absdiff_; void *xb0_ = nullptr, *prev_b0_ = nullptr, *cache_resid_ = nullptr, *partials_ = nullptr; size_t cache_cap_ = 0;
+    double cache_acc_ = 0.0; bool have_cache_ = false; int cache_skipped_ = 0;
     size_t audio_cap_ = 0; void *ah_ = nullptr, *aacc_ = nullptr, *ahj_ = nullptr, *ar_ = nullptr, *ar2_ = nullptr, *atmp_ = nullptr, *ain_ = nullptr;
     void *vx_ = nullptr, *vcos_ = nullptr, *vsin_ = nullptr, *vin16_ = nullptr, *va_q_ = nullptr, *va_s_ = nullptr, *vout16_ = nullptr, *vcls_ = nullptr, *vnorm_table_ = nullptr;
     std::map<std::string, Prepare> prepares_; std::map<std::string, Gemm> gemms_; Prepare final_prep_;

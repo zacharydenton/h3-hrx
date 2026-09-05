@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent
-_ABI, _ERR = 1, 4096
+_ABI, _ERR = 2, 4096
 _F32P, _U8P, _I32P = ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_int32)
 PROGRESS = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_double)
 
@@ -20,7 +20,7 @@ class Config(ctypes.Structure):
 
 class Params(ctypes.Structure):
     _fields_ = [("height", ctypes.c_int), ("width", ctypes.c_int), ("frames", ctypes.c_int), ("steps", ctypes.c_int), ("seed", ctypes.c_uint64),
-                ("video_shift", ctypes.c_float), ("audio_shift", ctypes.c_float)]
+                ("video_shift", ctypes.c_float), ("audio_shift", ctypes.c_float), ("cache_threshold", ctypes.c_float)]
 
 
 class Shape(ctypes.Structure):
@@ -64,8 +64,8 @@ class H3Pipe:
         except Exception: pass
 
     @staticmethod
-    def params(height=480, width=864, frames=124, steps=50, seed=0, video_shift=0.0, audio_shift=0.0) -> Params:
-        return Params(height, width, frames, steps, seed, video_shift, audio_shift)
+    def params(height=480, width=864, frames=124, steps=50, seed=0, video_shift=0.0, audio_shift=0.0, cache_threshold=0.0) -> Params:
+        return Params(height, width, frames, steps, seed, video_shift, audio_shift, cache_threshold)
 
     def shape(self, p: Params) -> Shape:
         s = Shape(); self._native.h3pipe_shape_for(ctypes.byref(p), ctypes.byref(s)); return s

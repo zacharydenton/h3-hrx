@@ -14,12 +14,12 @@ FPS, RATE = 24, 32000
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("prompt"); ap.add_argument("--height", type=int, default=480); ap.add_argument("--width", type=int, default=864)
     ap.add_argument("--frames", type=int, default=124); ap.add_argument("--steps", type=int, default=50); ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--vae-bits", type=int, default=8); ap.add_argument("--out", default=str(ROOT / "build/clip_c.mp4")); ap.add_argument("--latents-out", default=None)
+    ap.add_argument("--cache-threshold", type=float, default=0.0, help="first-block step cache threshold (0 = off)"); ap.add_argument("--vae-bits", type=int, default=8); ap.add_argument("--out", default=str(ROOT / "build/clip_c.mp4")); ap.add_argument("--latents-out", default=None)
     a = ap.parse_args()
     from transformers import AutoTokenizer
     ids = AutoTokenizer.from_pretrained(str(TOK))(a.prompt, add_special_tokens=False)["input_ids"]
     t0 = time.time(); pipe = H3Pipe(vae_bits=a.vae_bits); print(f"session in {time.time() - t0:.1f} s; {len(ids)} prompt tokens", flush=True)
-    p = H3Pipe.params(height=a.height, width=a.width, frames=a.frames, steps=a.steps, seed=a.seed); sh = pipe.shape(p)
+    p = H3Pipe.params(height=a.height, width=a.width, frames=a.frames, steps=a.steps, seed=a.seed, cache_threshold=a.cache_threshold); sh = pipe.shape(p)
     print(f"{sh.frames} frames at {a.width}x{a.height}: {sh.latent_t}x{sh.lat_h}x{sh.lat_w} latents, {sh.audio_t} audio latents", flush=True)
     t0 = time.time()
     video, audio = pipe.denoise(ids, p, progress=lambda step, n, sec: print(f"  step {step}/{n}  {sec:.1f} s", flush=True) or 0)

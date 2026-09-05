@@ -191,6 +191,53 @@ if os.environ.get("ATTN_DBUF", "1") == "1":
     OUT3 = (ROOT / "kernels" / f"{STEM3}.loom") if STEM3 == STEM or STEM3 == "attention_i4qkl_mha8_lds_f16_wmma" else (ROOT / "experiments" / f"{STEM3}.loom")
     OUT3.write_text(K); print("wrote", OUT3, "(double-buffered)")
 
+# --- tile skipping (SpargeAttn's P.V skip): after the int4 QK^T, a key tile whose scores sit more than skip_tau below
+# every row's running max contributes weights below exp(-skip_tau); its V loads, P.V MMAs, rescale and sum update are
+# skipped (wave-uniform). skip_tau is a config: 1e30 disables it.
+def add_skip(K: str) -> str:
+    K = K.replace("config.decl @{ns}.scale : f32\n".replace("{ns}", NS), "config.decl @{ns}.scale : f32\n\nconfig.decl @{ns}.skip_tau : f32\n".replace("{ns}", NS))
+    K = K.replace("  %scale = config.get @{ns}.scale : f32\n".replace("{ns}", NS), "  %scale = config.get @{ns}.scale : f32\n  %skip_tau = config.get @{ns}.skip_tau : f32\n  %neg_tau = scalar.negf %skip_tau : f32\n  %i32_16 = scalar.constant 16 : i32\n".replace("{ns}", NS))
+    # eight per-fragment branches: each loads its V fragment and runs its MMA only when the tile is not skipped
+    i0 = K.index("    %vrow0 = index.add %lane_column, %c0 : index\n")
+    i1 = K.index("    %next7 = vector.mma %probability, %v7, %rescaled7 : vector<16xf16>, vector<16xf16>, vector<8xf32>\n") + len("    %next7 = vector.mma %probability, %v7, %rescaled7 : vector<16xf16>, vector<16xf16>, vector<8xf32>\n")
+    gate = """    // tile skip: the largest (tile score - running row max) over the 16 rows, uniform across the wave
+    %gap = vector.subf<reassoc|nnan|ninf|nsz> %tm8, %row_max : vector<8xf32>
+    %gap_lane = vector.reduce<maxnumf> %gap, %negative_large : vector<8xf32>, f32
+    %gap_other, %gok = kernel.subgroup.shuffle<xor> %gap_lane, %i32_16, %i32_32 : f32, i32, i32
+    %gap_max = scalar.maxnumf %gap_lane, %gap_other : f32
+    %skip = scalar.cmpf olt, %gap_max, %neg_tau : f32
+    %keep = scalar.cmpf oge, %gap_max, %neg_tau : f32
+"""
+    body = ""
+    for c in range(8):
+        body += f"""    %next{c} = scf.if %keep -> (vector<8xf32>) {{
+      %vrow{c} = index.add %lane_column, %c{16 * c} : index
+      %v_data{c} = vector.load %v_tile_b[%vrow{c}, %c0] : view<128x24xf16> -> vector<16xf16>
+      %v{c} = vector.fragment<rhs> %v_data{c} shape [%k_frag, %n] : vector<16xf16>
+      %rescaled{c} = vector.mulf<reassoc|nnan|ninf|nsz|contract> %acc{c}, %selected_old_scale : vector<8xf32>
+      %pv{c} = vector.mma %probability, %v{c}, %rescaled{c} : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      scf.yield %pv{c} : vector<8xf32>
+    }} else {{
+      scf.yield %acc{c} : vector<8xf32>
+    }}
+"""
+    body += "    %next_sum = scf.select %keep, %next_sum_full, %row_sum : vector<8xf32>\n"
+    K = K[:i0] + gate + body + K[i1:]
+    K = K.replace("    %next_sum = vector.addf<reassoc|nnan|ninf|nsz> %scaled_sum, %weight : vector<8xf32>\n", "    %next_sum_full = vector.addf<reassoc|nnan|ninf|nsz> %scaled_sum, %weight : vector<8xf32>\n")
+    return K
+
+if os.environ.get("ATTN_SKIP", "1") == "1":
+    for path in [ROOT / "kernels" / f"{STEM}.loom"] + ([ROOT / "kernels" / f"{os.environ['ATTN_DBUF_STEM']}.loom"] if os.environ.get("ATTN_DBUF_STEM", "").startswith("attention_i4qkl") else []):
+        if path.exists():
+            text = path.read_text()
+            stem_here = path.stem
+            if "skip_tau" not in text:
+                saved = NS
+                text = text.replace("h3." + stem_here, "h3." + STEM) if stem_here != STEM else text
+                text = add_skip(text)
+                text = text.replace("h3." + STEM, "h3." + stem_here) if stem_here != STEM else text
+                path.write_text(text); print("tile skip added to", path)
+
 # --- ATTN_DIRECT_OUT=1: the epilogue stores the accumulator layout straight to global memory (lane holds column
 # lane%16 of rows 2e + lane/16): 64 scalar f16 stores per lane, no LDS round trips or subgroup barriers
 if os.environ.get("ATTN_DIRECT_OUT", "0") == "1":

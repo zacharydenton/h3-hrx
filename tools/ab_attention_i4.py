@@ -21,7 +21,7 @@ def main():
             cap = max((tokens + 16 + 31) // 32 * 32, (tokens + 16 * waves - 1) // (16 * waves) * (16 * waves))
             src = ROOT / "kernels" / f"{stem}.loom"; src = src if src.exists() else ROOT / "experiments" / f"{stem}.loom"
             ns, sym = "h3." + stem, "h3_" + stem; hs = tmp / f"{stem}.hsaco"
-            compile_kernel(src, sym, {f"{ns}.q_stride": HEADS * D, f"{ns}.kv_stride": HEADS * D, f"{ns}.tokens": tokens, f"{ns}.token_capacity": cap, f"{ns}.scale": 1.0, f"{ns}.out_stride": HEADS * D}, hs)
+            compile_kernel(src, sym, {f"{ns}.q_stride": HEADS * D, f"{ns}.kv_stride": HEADS * D, f"{ns}.tokens": tokens, f"{ns}.token_capacity": cap, f"{ns}.scale": 1.0, f"{ns}.out_stride": HEADS * D, f"{ns}.skip_tau": float(__import__("os").environ.get("ATTN_SKIP_TAU", "1e30"))}, hs)
             qi = rng.integers(-2**31, 2**31, size=(cap, HEADS * 16), dtype=np.int32); ki = rng.integers(-2**31, 2**31, size=(cap, HEADS * 16), dtype=np.int32)
             qs = (rng.standard_normal((cap, HEADS)) * 1e-3).astype(np.float32); ks = np.abs(rng.standard_normal((cap, HEADS))).astype(np.float32) * 0.05
             vT = (rng.standard_normal((HEADS * D, cap)) * 0.5).astype(np.float16)
