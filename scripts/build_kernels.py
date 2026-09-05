@@ -39,8 +39,7 @@ def build(tokens: int) -> Path:
     m_group = gemm_m_group(tokens)
     waves = int(os.environ.get("H3_ATTN_WAVES", "8" if tokens >= 4096 else "4"))   # query tiles per attention workgroup
     capacity = max((tokens + 16 + 31) // 32 * 32, (tokens + 16 * waves - 1) // (16 * waves) * (16 * waves))   # tokens+16 headroom, whole query blocks
-    PREFETCH_FROM = 20000        # the double-buffered int4 kernel wins past ~20k rows (0.88x at 15427, 1.44x at 37743) and needs 8 waves
-    attn_stem = ("attention_mha8_lds_f16_wmma" if waves == 8 else "attention_mha_lds_f16_wmma") if ATTN_QK == "f16" else ("attention_i4qkp_mha8_lds_f16_wmma" if tokens >= PREFETCH_FROM else ("attention_i4qk_mha8_lds_f16_wmma" if waves == 8 else "attention_i4qk_mha_lds_f16_wmma"))
+    attn_stem = ("attention_mha8_lds_f16_wmma" if waves == 8 else "attention_mha_lds_f16_wmma") if ATTN_QK == "f16" else ("attention_i4qk_mha8_lds_f16_wmma" if waves == 8 else "attention_i4qk_mha_lds_f16_wmma")
     attn = "h3." + attn_stem
     sfx = "_256" if GEMM_TILE == 256 else ""
     g4 = lambda stem: stem + sfx
@@ -59,12 +58,13 @@ def build(tokens: int) -> Path:
         pq = "h3.prepare_qk_i4."
         specs += [("colmean_f32", "h3_colmean_f32", "colmean", {"h3.colmean_f32.width": INNER}),
                   ("prepare_qk_i4", "h3_prepare_qk_i4", "prepare_q_i4", {pq + "row_stride": INNER, pq + "head_offset": 0, pq + "heads": HEADS, pq + "extra_scale": D ** -0.5 / 128.0}),
-                  ("prepare_qk_i4", "h3_prepare_qk_i4", "prepare_k_i4", {pq + "row_stride": INNER, pq + "head_offset": 0, pq + "heads": HEADS, pq + "extra_scale": 1.0})]
+                  ("prepare_qk_i4", "h3_prepare_qk_i4", "prepare_k_i4", {pq + "row_stride": INNER, pq + "head_offset": 0, pq + "heads": HEADS, pq + "extra_scale": 1.0}),
+                  ("transpose_f16", "h3_transpose_f16", "transpose_v", {"h3.transpose_f16.width": INNER, "h3.transpose_f16.row_capacity": capacity})]   # V^T once per block: the int4 kernel stages V by channel rows
     for stem, sym, name, cfg in specs:
         hs = out / f"{name}.hsaco"
         if not hs.exists():
             compile_kernel(ROOT / "kernels" / f"{stem}.loom", sym, cfg, hs)
-    (out / "attention_qk.txt").write_text(("i4p" if attn_stem.startswith("attention_i4qkp") else ATTN_QK) + "\n")
+    (out / "attention_qk.txt").write_text(f"{ATTN_QK}\n")
     (out / "capacity.txt").write_text(f"{capacity}\n")
     (out / "gemm_tile.txt").write_text(f"{GEMM_TILE}\n")
     (out / "attention_waves.txt").write_text(f"{waves}\n")

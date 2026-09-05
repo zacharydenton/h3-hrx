@@ -120,8 +120,8 @@ public:
         { std::ifstream wf(kernels_dir + "/attention_waves.txt"); if (wf) wf >> attn_waves_; if (attn_waves_ != 4 && attn_waves_ != 8) throw std::runtime_error("attention_waves.txt must say 4 or 8"); }
         std::string qk_mode; { std::ifstream qf(kernels_dir + "/attention_qk.txt"); if (qf) qf >> qk_mode; attn_i4_ = qk_mode == "i4" || qk_mode == "i4p"; }
         if (attn_i4_) {                                              // QK^T in int4: K column means, per-head int4 operands, the int4 attention kernel (i4p: double-buffered tiles)
-            load(k_attention_, "attention", qk_mode == "i4p" ? "h3_attention_i4qkp_mha8_lds_f16_wmma" : (attn_waves_ == 8 ? "h3_attention_i4qk_mha8_lds_f16_wmma" : "h3_attention_i4qk_mha_lds_f16_wmma"));
-            load(k_colmean_, "colmean", "h3_colmean_f32"); load(k_prep_q_, "prepare_q_i4", "h3_prepare_qk_i4"); load(k_prep_k_, "prepare_k_i4", "h3_prepare_qk_i4");
+            load(k_attention_, "attention", attn_waves_ == 8 ? "h3_attention_i4qk_mha8_lds_f16_wmma" : "h3_attention_i4qk_mha_lds_f16_wmma");
+            load(k_colmean_, "colmean", "h3_colmean_f32"); load(k_prep_q_, "prepare_q_i4", "h3_prepare_qk_i4"); load(k_prep_k_, "prepare_k_i4", "h3_prepare_qk_i4"); load(k_transpose_, "transpose_v", "h3_transpose_f16");
         } else load(k_attention_, "attention", attn_waves_ == 8 ? "h3_attention_mha8_lds_f16_wmma" : "h3_attention_mha_lds_f16_wmma");
         const size_t T = capacity_;
         HIP_CHECK(hipMalloc(&x_, T * HIDDEN * 4));            // the residual stream, f32
@@ -136,6 +136,7 @@ public:
         if (attn_i4_) {
             HIP_CHECK(hipMalloc(&qi_, T * HEADS * 16 * 4)); HIP_CHECK(hipMalloc(&ki_, T * HEADS * 16 * 4)); HIP_CHECK(hipMalloc(&qs_, T * HEADS * 4)); HIP_CHECK(hipMalloc(&ks_, T * HEADS * 4));
             HIP_CHECK(hipMalloc(&kmean_, INNER * 4)); HIP_CHECK(hipMalloc(&zmean_, INNER * 4)); HIP_CHECK(hipMemset(zmean_, 0, INNER * 4));
+            HIP_CHECK(hipMalloc(&vt_, size_t(INNER) * T * 2)); HIP_CHECK(hipMemset(vt_, 0, size_t(INNER) * T * 2));      // V^T [7168][capacity], zero headroom columns
             for (void *p : {qi_, ki_}) HIP_CHECK(hipMemset(p, 0, T * HEADS * 16 * 4));
             for (void *p : {qs_, ks_}) HIP_CHECK(hipMemset(p, 0, T * HEADS * 4));     // headroom rows: zero codes and scales
         }
@@ -146,8 +147,8 @@ public:
         for (void *p : {x_, fused_, q_, k_, v_, cls_}) HIP_CHECK(hipMemset(p, 0, p == cls_ ? T * 4 : (p == x_ ? T * HIDDEN * 4 : (p == fused_ ? T * QKV * 2 : T * INNER * 2))));   // headroom rows stay zero
     }
     ~Session() {
-        for (void *p : {x_, a_q_, a_s_, fused_, q_, k_, v_, attn_, gu_, mods_, cls_, cos_, sin_, weights_, qi_, ki_, qs_, ks_, kmean_, zmean_}) if (p) (void)hipFree(p);
-        for (Kernel *k : {&k_prep_norm_, &k_prep_attn_, &k_prep_down_, &k_gemm_qkv_, &k_gemm_gu_, &k_gemm_out_, &k_gemm_down_, &k_rope_, &k_attention_, &k_colmean_, &k_prep_q_, &k_prep_k_})
+        for (void *p : {x_, a_q_, a_s_, fused_, q_, k_, v_, attn_, gu_, mods_, cls_, cos_, sin_, weights_, qi_, ki_, qs_, ks_, kmean_, zmean_, vt_}) if (p) (void)hipFree(p);
+        for (Kernel *k : {&k_prep_norm_, &k_prep_attn_, &k_prep_down_, &k_gemm_qkv_, &k_gemm_gu_, &k_gemm_out_, &k_gemm_down_, &k_rope_, &k_attention_, &k_colmean_, &k_prep_q_, &k_prep_k_, &k_transpose_})
             if (k->module) (void)hipModuleUnload(k->module);
     }
 
@@ -245,7 +246,8 @@ private:
             if (smooth) { KernArgs a; a.scalar_i32(T); a.pointer(k_); a.pointer(kmean_); launch(k_colmean_, "attention operands", INNER / 256, 1, THREADS, a); }
             { KernArgs a; a.scalar_i32(T); a.pointer(q_); a.pointer(zmean_); a.pointer(qi_); a.pointer(qs_); launch(k_prep_q_, "attention operands", T, 1, THREADS, a); }
             { KernArgs a; a.scalar_i32(T); a.pointer(k_); a.pointer(smooth ? kmean_ : zmean_); a.pointer(ki_); a.pointer(ks_); launch(k_prep_k_, "attention operands", T, 1, THREADS, a); }
-            { KernArgs a; a.scalar_i32(T); a.scalar_i32(HEADS); a.pointer(qi_); a.pointer(qs_); a.pointer(ki_); a.pointer(ks_); a.pointer(v_); a.pointer(attn_);
+            { KernArgs a; a.scalar_i32(T); a.pointer(v_); a.pointer(vt_); launch(k_transpose_, "attention operands", (T + 31) / 32, INNER / 32, THREADS, a); }
+            { KernArgs a; a.scalar_i32(T); a.scalar_i32(HEADS); a.pointer(qi_); a.pointer(qs_); a.pointer(ki_); a.pointer(ks_); a.pointer(vt_); a.pointer(attn_);
               launch(k_attention_, "attention", (T + qblock - 1) / qblock, HEADS, 32 * unsigned(attn_waves_), a); }
         } else {
             KernArgs a; a.scalar_i32(T); a.scalar_i32(HEADS); a.pointer(q_); a.pointer(k_); a.pointer(v_); a.pointer(attn_);
@@ -287,12 +289,12 @@ private:
 
     int tokens_, layers_;
     size_t capacity_ = 0, gemm_tile_ = 128, attn_waves_ = 4; bool attn_i4_ = false, dumped_ = false;
-    void *qi_ = nullptr, *ki_ = nullptr, *qs_ = nullptr, *ks_ = nullptr, *kmean_ = nullptr, *zmean_ = nullptr;
+    void *qi_ = nullptr, *ki_ = nullptr, *qs_ = nullptr, *ks_ = nullptr, *kmean_ = nullptr, *zmean_ = nullptr, *vt_ = nullptr;
     std::mutex mutex_;
     std::vector<Block> blocks_;
     void *weights_ = nullptr, *x_ = nullptr, *a_q_ = nullptr, *a_s_ = nullptr, *fused_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr,
          *attn_ = nullptr, *gu_ = nullptr, *mods_ = nullptr, *cls_ = nullptr, *cos_ = nullptr, *sin_ = nullptr;
-    Kernel k_prep_norm_, k_prep_attn_, k_prep_down_, k_gemm_qkv_, k_gemm_gu_, k_gemm_out_, k_gemm_down_, k_rope_, k_attention_, k_colmean_, k_prep_q_, k_prep_k_;
+    Kernel k_prep_norm_, k_prep_attn_, k_prep_down_, k_gemm_qkv_, k_gemm_gu_, k_gemm_out_, k_gemm_down_, k_rope_, k_attention_, k_colmean_, k_prep_q_, k_prep_k_, k_transpose_;
 };
 
 void write_error(char *error, size_t capacity, const char *message) noexcept {

@@ -133,6 +133,22 @@ new_scores += """    %raw_scores = vector.sitofp %raw_scores_i : vector<8xi32> t
     %qk_scaled = vector.mulf<reassoc|nnan|ninf|nsz|contract> %raw_scores, %qs_vec : vector<8xf32>
 """
 K = K.replace(old_scores, new_scores)
+# --- V transposed in global memory ([kv_stride][padded_tokens]): staging is one 32-byte load + one 32-byte store per V lane
+sub("  %v_view = buffer.view %v_global[%c0_offset] : buffer -> view<[%padded_tokens]x[%kv_stride0]xf16>\n",
+    "  %v_view = buffer.view %v_global[%c0_offset] : buffer -> view<[%kv_stride0]x[%padded_tokens]xf16>\n")
+sub("""  %st_key_v = index.rem %st_lane, %c16 : index
+""", """  %st_key_v = index.rem %st_lane, %c16 : index
+  %st_chan_v = index.add %kv_base0, %st_lane : index
+  %st_chan_limit = index.sub %kv_stride0, %c1 : index
+  %st_chan = index.assume %st_chan_v [le(%st_chan_v, %st_chan_limit)] : index
+""")
+K = re.sub(r"( *)%st_row_v0 = index.add %key_origin0, %st_key_v : index\n *%st_row_v = index.assume %st_row_v0 \[lt\(%st_row_v0, %padded_tokens\)\] : index\n *%v_chunk = vector.load %v_view\[%st_row_v, %st_col_v\] : view<\[%padded_tokens\]x\[%kv_stride0\]xf16> -> vector<16xf16>\n",
+           r"\1%v_chunk = vector.load %v_view[%st_chan, %key_origin0] : view<[%kv_stride0]x[%padded_tokens]xf16> -> vector<16xf16>\n", K)
+n_stores = len(re.findall(r" *%ve\d+ = vector.extract %v_chunk\[\d+\] : vector<16xf16> -> f16\n *%vr\d+ = index.add %st_chunk_v, %cj\d+ : index\n *view.store %ve\d+, %v_tile\[%vr\d+, %st_key_v\] : f16, view<128x24xf16>\n", K))
+assert n_stores == 16, n_stores
+K = re.sub(r"( *)%ve15 = vector.extract %v_chunk\[15\] : vector<16xf16> -> f16\n *%vr15 = index.add %st_chunk_v, %cj15 : index\n *view.store %ve15, %v_tile\[%vr15, %st_key_v\] : f16, view<128x24xf16>\n",
+           r"\1vector.store %v_chunk, %v_tile[%st_lane, %c0] : vector<16xf16>, view<128x24xf16>\n", K)
+K = re.sub(r" *%ve\d+ = vector.extract %v_chunk\[\d+\] : vector<16xf16> -> f16\n *%vr\d+ = index.add %st_chunk_v, %cj\d+ : index\n *view.store %ve\d+, %v_tile\[%vr\d+, %st_key_v\] : f16, view<128x24xf16>\n", "", K)
 sub("    %scaled0 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %raw_scores, %scale_vector : vector<8xf32>\n",
     "    %scaled0 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %qk_scaled, %ks_vec : vector<8xf32>\n")
 sub("""    %local_key = index.add %key_origin0, %lane_column : index
@@ -203,5 +219,5 @@ if os.environ.get("ATTN_PREFETCH", "0") == "1" and WAVES == 8:
     sub2("  %zero_acc = vector.constant 0.0 : vector<8xf32>\n", "  %zero_acc = vector.constant 0.0 : vector<8xf32>\n  %zero_k = vector.constant 0 : vector<2xi32>\n  %zero_v = vector.constant 0.0 : vector<16xf16>\n")
     STEM2 = STEM.replace("i4qk", "i4qkp")
     K = K.replace(SYM, "h3_" + STEM2).replace(NS, "h3." + STEM2)
-    OUT2 = ROOT / ("kernels" if STEM2 == "attention_i4qkp_mha8_lds_f16_wmma" else "experiments") / f"{STEM2}.loom"
+    OUT2 = ROOT / "experiments" / f"{STEM2}.loom"
     OUT2.write_text(K); print("wrote", OUT2)

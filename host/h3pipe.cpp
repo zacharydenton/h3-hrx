@@ -302,10 +302,11 @@ public:
             colmean_ = c.get("colmean_f32", "h3_colmean_f32", {{"h3.colmean_f32.width", std::to_string(d.inner())}});
             prep_q_ = c.get("prepare_qk_i4", "h3_prepare_qk_i4", {{pq + "row_stride", std::to_string(d.inner())}, {pq + "head_offset", "0"}, {pq + "heads", std::to_string(d.heads)}, {pq + "extra_scale", num(1.0 / std::sqrt(double(d.head_dim)) / 128.0)}});
             prep_k_ = c.get("prepare_qk_i4", "h3_prepare_qk_i4", {{pq + "row_stride", std::to_string(d.inner())}, {pq + "head_offset", "0"}, {pq + "heads", std::to_string(d.heads)}, {pq + "extra_scale", "1"}});
+            transpose_ = c.get("transpose_f16", "h3_transpose_f16", {{"h3.transpose_f16.width", std::to_string(d.inner())}, {"h3.transpose_f16.row_capacity", std::to_string(capacity_)}});
         }
         {
             std::string stem = d.causal ? "attention_gqa8c_lds_f16_wmma" : (d.head_dim == 64 ? (waves_ == 8 ? "attention_mha648_lds_f16_wmma" : "attention_mha64_lds_f16_wmma") : (waves_ == 8 ? "attention_mha8_lds_f16_wmma" : "attention_mha_lds_f16_wmma"));
-            if (d.attn_i4) stem = tokens >= 20000 ? "attention_i4qkp_mha8_lds_f16_wmma" : (waves_ == 8 ? "attention_i4qk_mha8_lds_f16_wmma" : "attention_i4qk_mha_lds_f16_wmma");   // double-buffered tiles win past ~20k rows
+            if (d.attn_i4) stem = waves_ == 8 ? "attention_i4qk_mha8_lds_f16_wmma" : "attention_i4qk_mha_lds_f16_wmma";
             const std::string ns = "h3." + stem + ".";
             attention_ = c.get(stem, "h3_" + stem, {{ns + "q_stride", std::to_string(d.inner())}, {ns + "kv_stride", std::to_string(d.kv_inner())}, {ns + "tokens", std::to_string(tokens)}, {ns + "token_capacity", std::to_string(capacity_)}, {ns + "scale", num(1.0 / std::sqrt(double(d.head_dim)))}, {ns + "out_stride", std::to_string(d.inner())}});
         }
@@ -322,11 +323,12 @@ public:
         if (d.attn_i4) {
             HIP_CHECK(hipMalloc(&qi_, T * size_t(d.heads) * 64)); HIP_CHECK(hipMalloc(&ki_, T * size_t(d.heads) * 64)); HIP_CHECK(hipMalloc(&qs_, T * size_t(d.heads) * 4)); HIP_CHECK(hipMalloc(&ks_, T * size_t(d.heads) * 4));
             HIP_CHECK(hipMalloc(&kmean_, size_t(d.inner()) * 4)); HIP_CHECK(hipMalloc(&zmean_, size_t(d.inner()) * 4)); HIP_CHECK(hipMemset(zmean_, 0, size_t(d.inner()) * 4));
+            HIP_CHECK(hipMalloc(&vt_, size_t(d.inner()) * T * 2)); HIP_CHECK(hipMemset(vt_, 0, size_t(d.inner()) * T * 2));
             for (auto p : {qi_, ki_}) HIP_CHECK(hipMemset(p, 0, T * size_t(d.heads) * 64));
             for (auto p : {qs_, ks_}) HIP_CHECK(hipMemset(p, 0, T * size_t(d.heads) * 4));
         }
     }
-    ~Stack() { for (void *p : {a_q_, a_s_, fused_, q_, k_, v_, attn_, gu_, qi_, ki_, qs_, ks_, kmean_, zmean_}) if (p) (void)hipFree(p); }
+    ~Stack() { for (void *p : {a_q_, a_s_, fused_, q_, k_, v_, attn_, gu_, qi_, ki_, qs_, ks_, kmean_, zmean_, vt_}) if (p) (void)hipFree(p); }
     size_t capacity() const { return capacity_; }
     size_t tokens() const { return tokens_; }
     const std::vector<struct Block_> *dummy = nullptr;
@@ -347,7 +349,8 @@ public:
                 if (smooth) { KernArgs a; a.i32(int(T)).ptr(k_).ptr(kmean_); launch(*colmean_, prof, "attention operands", unsigned(d_.inner() / 256), 1, THREADS, a); }
                 { KernArgs a; a.i32(int(T)).ptr(q_).ptr(zmean_).ptr(qi_).ptr(qs_); launch(*prep_q_, prof, "attention operands", T, 1, THREADS, a); }
                 { KernArgs a; a.i32(int(T)).ptr(k_).ptr(smooth ? kmean_ : zmean_).ptr(ki_).ptr(ks_); launch(*prep_k_, prof, "attention operands", T, 1, THREADS, a); }
-                KernArgs a; a.i32(int(T)).i32(d_.heads).ptr(qi_).ptr(qs_).ptr(ki_).ptr(ks_).ptr(v_).ptr(attn_);
+                { KernArgs a; a.i32(int(T)).ptr(v_).ptr(vt_); launch(*transpose_, prof, "attention operands", (T + 31) / 32, unsigned(d_.inner() / 32), THREADS, a); }
+                KernArgs a; a.i32(int(T)).i32(d_.heads).ptr(qi_).ptr(qs_).ptr(ki_).ptr(ks_).ptr(vt_).ptr(attn_);
                 const unsigned qb = 16 * unsigned(waves_); launch(*attention_, prof, "attention", (T + qb - 1) / qb, unsigned(d_.heads), 32 * unsigned(waves_), a);
             } else {
               KernArgs a; a.i32(int(T)).i32(d_.causal ? d_.kv_heads : d_.heads).ptr(q_).ptr(k_).ptr(v_).ptr(attn_);
@@ -367,9 +370,9 @@ private:
     std::vector<Block> blocks_;
     Prepare prep_norm_, prep_attn_, prep_down_;
     Gemm gemm_qkv_, gemm_gu_, gemm_out_, gemm_down_;
-    std::shared_ptr<Kernel> rope_, attention_, colmean_, prep_q_, prep_k_;
+    std::shared_ptr<Kernel> rope_, attention_, colmean_, prep_q_, prep_k_, transpose_;
     void *a_q_ = nullptr, *a_s_ = nullptr, *fused_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *attn_ = nullptr, *gu_ = nullptr,
-         *qi_ = nullptr, *ki_ = nullptr, *qs_ = nullptr, *ks_ = nullptr, *kmean_ = nullptr, *zmean_ = nullptr;
+         *qi_ = nullptr, *ki_ = nullptr, *qs_ = nullptr, *ks_ = nullptr, *kmean_ = nullptr, *zmean_ = nullptr, *vt_ = nullptr;
 };
 
 // --- the packed sequence layout (reference/h3_ref.py Layout) --------------------------------

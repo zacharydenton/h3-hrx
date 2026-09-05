@@ -152,7 +152,7 @@ kernel.def target(@h3_attention_i4qk_mha8_lds_f16_wmma_gfx11) export("h3_attenti
   %i4_schema = encoding.define #encoding.operand<element_format=i4, payload_elements=16, payload_registers=2> : encoding<schema>
   %zero_i32x8 = vector.constant 0 : vector<8xi32>
   %init_i = vector.fragment<init> %zero_i32x8 shape [%m, %n] : vector<8xi32>
-  %v_view = buffer.view %v_global[%c0_offset] : buffer -> view<[%padded_tokens]x[%kv_stride0]xf16>
+  %v_view = buffer.view %v_global[%c0_offset] : buffer -> view<[%kv_stride0]x[%padded_tokens]xf16>
   %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%token_count]x[%out_stride0]xf16>
 
   %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
@@ -180,6 +180,9 @@ kernel.def target(@h3_attention_i4qk_mha8_lds_f16_wmma_gfx11) export("h3_attenti
   %st_col = index.assume %st_col0 [le(%st_col0, %ki_col_limit), mul(%st_col0, 2)] : index
   // V staging: lane -> (key = workitem mod 16, channel chunk = workitem / 16), transposed into LDS
   %st_key_v = index.rem %st_lane, %c16 : index
+  %st_chan_v = index.add %kv_base0, %st_lane : index
+  %st_chan_limit = index.sub %kv_stride0, %c1 : index
+  %st_chan = index.assume %st_chan_v [le(%st_chan_v, %st_chan_limit)] : index
   %st_chunk_v0 = index.div %st_lane, %c16 : index
   %st_is_k = index.cmp ult, %workitem, %c_klanes : index
   %st_is_v = index.cmp ult, %workitem, %c_kvlanes : index
@@ -269,57 +272,8 @@ kernel.def target(@h3_attention_i4qk_mha8_lds_f16_wmma_gfx11) export("h3_attenti
       %k_chunk = vector.load %ki_view[%st_row, %st_col] : view<[%padded_tokens]x[%ki_words]xi32> -> vector<2xi32>
       vector.store %k_chunk, %k_tile[%st_key, %st_chunk] : vector<2xi32>, view<16x20xi32>
     } else {
-      %st_row_v0 = index.add %key_origin0, %st_key_v : index
-      %st_row_v = index.assume %st_row_v0 [lt(%st_row_v0, %padded_tokens)] : index
-      %v_chunk = vector.load %v_view[%st_row_v, %st_col_v] : view<[%padded_tokens]x[%kv_stride0]xf16> -> vector<16xf16>
-      %ve0 = vector.extract %v_chunk[0] : vector<16xf16> -> f16
-      %vr0 = index.add %st_chunk_v, %cj0 : index
-      view.store %ve0, %v_tile[%vr0, %st_key_v] : f16, view<128x24xf16>
-      %ve1 = vector.extract %v_chunk[1] : vector<16xf16> -> f16
-      %vr1 = index.add %st_chunk_v, %cj1 : index
-      view.store %ve1, %v_tile[%vr1, %st_key_v] : f16, view<128x24xf16>
-      %ve2 = vector.extract %v_chunk[2] : vector<16xf16> -> f16
-      %vr2 = index.add %st_chunk_v, %cj2 : index
-      view.store %ve2, %v_tile[%vr2, %st_key_v] : f16, view<128x24xf16>
-      %ve3 = vector.extract %v_chunk[3] : vector<16xf16> -> f16
-      %vr3 = index.add %st_chunk_v, %cj3 : index
-      view.store %ve3, %v_tile[%vr3, %st_key_v] : f16, view<128x24xf16>
-      %ve4 = vector.extract %v_chunk[4] : vector<16xf16> -> f16
-      %vr4 = index.add %st_chunk_v, %cj4 : index
-      view.store %ve4, %v_tile[%vr4, %st_key_v] : f16, view<128x24xf16>
-      %ve5 = vector.extract %v_chunk[5] : vector<16xf16> -> f16
-      %vr5 = index.add %st_chunk_v, %cj5 : index
-      view.store %ve5, %v_tile[%vr5, %st_key_v] : f16, view<128x24xf16>
-      %ve6 = vector.extract %v_chunk[6] : vector<16xf16> -> f16
-      %vr6 = index.add %st_chunk_v, %cj6 : index
-      view.store %ve6, %v_tile[%vr6, %st_key_v] : f16, view<128x24xf16>
-      %ve7 = vector.extract %v_chunk[7] : vector<16xf16> -> f16
-      %vr7 = index.add %st_chunk_v, %cj7 : index
-      view.store %ve7, %v_tile[%vr7, %st_key_v] : f16, view<128x24xf16>
-      %ve8 = vector.extract %v_chunk[8] : vector<16xf16> -> f16
-      %vr8 = index.add %st_chunk_v, %cj8 : index
-      view.store %ve8, %v_tile[%vr8, %st_key_v] : f16, view<128x24xf16>
-      %ve9 = vector.extract %v_chunk[9] : vector<16xf16> -> f16
-      %vr9 = index.add %st_chunk_v, %cj9 : index
-      view.store %ve9, %v_tile[%vr9, %st_key_v] : f16, view<128x24xf16>
-      %ve10 = vector.extract %v_chunk[10] : vector<16xf16> -> f16
-      %vr10 = index.add %st_chunk_v, %cj10 : index
-      view.store %ve10, %v_tile[%vr10, %st_key_v] : f16, view<128x24xf16>
-      %ve11 = vector.extract %v_chunk[11] : vector<16xf16> -> f16
-      %vr11 = index.add %st_chunk_v, %cj11 : index
-      view.store %ve11, %v_tile[%vr11, %st_key_v] : f16, view<128x24xf16>
-      %ve12 = vector.extract %v_chunk[12] : vector<16xf16> -> f16
-      %vr12 = index.add %st_chunk_v, %cj12 : index
-      view.store %ve12, %v_tile[%vr12, %st_key_v] : f16, view<128x24xf16>
-      %ve13 = vector.extract %v_chunk[13] : vector<16xf16> -> f16
-      %vr13 = index.add %st_chunk_v, %cj13 : index
-      view.store %ve13, %v_tile[%vr13, %st_key_v] : f16, view<128x24xf16>
-      %ve14 = vector.extract %v_chunk[14] : vector<16xf16> -> f16
-      %vr14 = index.add %st_chunk_v, %cj14 : index
-      view.store %ve14, %v_tile[%vr14, %st_key_v] : f16, view<128x24xf16>
-      %ve15 = vector.extract %v_chunk[15] : vector<16xf16> -> f16
-      %vr15 = index.add %st_chunk_v, %cj15 : index
-      view.store %ve15, %v_tile[%vr15, %st_key_v] : f16, view<128x24xf16>
+      %v_chunk = vector.load %v_view[%st_chan, %key_origin0] : view<[%kv_stride0]x[%padded_tokens]xf16> -> vector<16xf16>
+      vector.store %v_chunk, %v_tile[%st_lane, %c0] : vector<16xf16>, view<128x24xf16>
     }
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 

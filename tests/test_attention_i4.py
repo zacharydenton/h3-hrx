@@ -41,15 +41,16 @@ def run(tmp, tokens, heads=HEADS):
         want_exact = torch.nn.functional.scaled_dot_product_attention(qf.transpose(0, 1)[None], kf.transpose(0, 1)[None], vf.transpose(0, 1)[None])[0].transpose(0, 1).reshape(tokens, heads * D).cpu().numpy()
     cap = capacity_for(tokens)
     def pad(t, w, dt): out = np.zeros((cap, w), dt); out[:tokens] = t; return out
+    vT = np.ascontiguousarray(pad(v.reshape(tokens, -1).numpy(), heads * D, np.float16).T)     # V arrives transposed: [channels][capacity]
     hs = tmp / f"{STEM}.hsaco"
     compile_kernel(KERNEL, SYM, {f"{NS}.q_stride": heads * D, f"{NS}.kv_stride": heads * D, f"{NS}.tokens": tokens, f"{NS}.token_capacity": cap, f"{NS}.scale": 1.0, f"{NS}.out_stride": heads * D}, hs)
     (out,), t = launch(hs, SYM, ((tokens + 16 * WAVES - 1) // (16 * WAVES), heads, 1), (32 * WAVES, 1, 1),
                        [("i32", tokens), ("i32", heads), ("in_i32", pad(qc.numpy(), heads * 16, np.int32)), ("in", pad(qs.numpy(), heads, np.float32)),
-                        ("in_i32", pad(kc.numpy(), heads * 16, np.int32)), ("in", pad(ks.numpy(), heads, np.float32)), ("in_f16", pad(v.reshape(tokens, -1).numpy(), heads * D, np.float16)),
+                        ("in_i32", pad(kc.numpy(), heads * 16, np.int32)), ("in", pad(ks.numpy(), heads, np.float32)), ("in_f16", vT),
                         ("out_f16", ((tokens, heads * D), np.float16))], tmp, repeat=3)
     (out2,), _ = launch(hs, SYM, ((tokens + 16 * WAVES - 1) // (16 * WAVES), heads, 1), (32 * WAVES, 1, 1),
                         [("i32", tokens), ("i32", heads), ("in_i32", pad(qc.numpy(), heads * 16, np.int32)), ("in", pad(qs.numpy(), heads, np.float32)),
-                         ("in_i32", pad(kc.numpy(), heads * 16, np.int32)), ("in", pad(ks.numpy(), heads, np.float32)), ("in_f16", pad(v.reshape(tokens, -1).numpy(), heads * D, np.float16)),
+                         ("in_i32", pad(kc.numpy(), heads * 16, np.int32)), ("in", pad(ks.numpy(), heads, np.float32)), ("in_f16", vT),
                          ("out_f16", ((tokens, heads * D), np.float16))], tmp, repeat=1)
     print(f"    deterministic across launches: {np.array_equal(out, out2)} (max |diff| {np.abs(out.astype(np.float32) - out2.astype(np.float32)).max():.3g})")
     us = t["per_launch_us"]; flops = 4.0 * tokens * tokens * D * heads
