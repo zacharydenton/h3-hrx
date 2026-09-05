@@ -195,7 +195,10 @@ void launch(Kernel &k, Profile *prof, const char *stage, unsigned gx, unsigned g
     std::chrono::steady_clock::time_point t0;
     if (prof && prof->on) { HIP_CHECK(hipDeviceSynchronize()); t0 = std::chrono::steady_clock::now(); }
     void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, args.bytes, HIP_LAUNCH_PARAM_BUFFER_SIZE, &args.size, HIP_LAUNCH_PARAM_END};
+    static const bool trace = std::getenv("H3_TRACE") != nullptr;   // H3_TRACE=1: print and synchronize every launch (fault localisation)
+    if (trace) fprintf(stderr, "launch %-12s grid %u x %u block %u args %zu\n", stage, gx, gy, bx, args.size);
     HIP_CHECK(hipModuleLaunchKernel(k.function, gx, gy, 1, bx, 1, 1, 0, nullptr, nullptr, config));
+    if (trace) HIP_CHECK(hipDeviceSynchronize());
     if (prof && prof->on) { HIP_CHECK(hipDeviceSynchronize()); prof->us[stage] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(); }
 }
 
@@ -453,7 +456,7 @@ public:
         HIP_CHECK(hipMalloc(&tcls_, T * 4)); HIP_CHECK(hipMemset(tcls_, 0, T * 4));
         HIP_CHECK(hipMalloc(&cos_, T * ROPE_HALF * 4)); HIP_CHECK(hipMalloc(&sin_, T * ROPE_HALF * 4));
         HIP_CHECK(hipMalloc(&in16_, T * TEXT_DIM * 2)); HIP_CHECK(hipMemset(in16_, 0, T * TEXT_DIM * 2));
-        HIP_CHECK(hipMalloc(&a_q_, T * TEXT_DIM)); HIP_CHECK(hipMalloc(&a_s_, T * 4));
+        HIP_CHECK(hipMalloc(&a_q_, T * size_t(std::max(TEXT_DIM, HID)))); HIP_CHECK(hipMalloc(&a_s_, T * 4));   // the final norm writes HID-wide rows, the embedders TEXT_DIM-wide
         HIP_CHECK(hipMalloc(&out16_, T * FINAL_N * 2));
     }
 
