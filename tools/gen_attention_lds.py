@@ -51,7 +51,7 @@ config.decl @{NS}.kv_stride : %value: index where [range(%value, 128, 32768), mu
 
 config.decl @{NS}.out_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
 
-config.decl @{NS}.tokens : %value: index where [range(%value, 16, 65536)]
+config.decl @{NS}.tokens : %value: index where [range(%value, 1, 65536)]
 
 config.decl @{NS}.token_capacity : %value: index where [range(%value, 32, 1048576), mul(%value, 16)]
 

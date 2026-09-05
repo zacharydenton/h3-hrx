@@ -60,14 +60,29 @@ clip; `docs/media/smoke_sailboat_22f_8steps_fullloom.jpg` the same size through 
 (prompt encoded in Loom in 17 s including the 24 GB weight upload, 2.4 s per step at 2931 rows,
 video decoded in Loom in 10.6 s).
 
-**What is in Loom and what is not.** In Loom: the DiT blocks, the text encoder's layers
-(`tests/test_te_blocks.py`: hidden cosine 1.0000 after 50 layers against transformers bf16,
-median per-token error 1.7%, the W8A8 floor) and the video decoder's blocks
-(`tests/test_vae_blocks.py --bits 8`: frame PSNR 52 dB, lossless class; the int4 GPTQ
-decoder is the `--vae-bits 4` option). In torch: the audio VAE (a BigVGAN vocoder of 65 M
-parameters in narrow 1-D convolutions, launch-bound, a different kernel family), the
-scheduler step, the two VAEs' heads and the embedding lookups, together a few seconds of a
-25-minute clip.
+**The C library.** `host/h3pipe.h` / `build/libh3pipe.so` is the whole pipeline behind a C ABI
+in the shape of dinov3-loom's and scrfd-loom's runners: `h3pipe_create` (weight dirs, the
+kernel sources, a cache dir, the loom-compile path), `h3pipe_denoise` (token ids -> model-space
+latents, optional caller noise, a progress callback), `h3pipe_decode_video` (latents -> RGB8
+frames), `h3pipe_decode_audio` (latents -> stereo samples) and `h3tok_encode` (text -> ids, the
+Qwen2 byte-level BPE in C). Every kernel is Loom, compiled on first use for a shape into the
+cache; the host does the layout, AdaLN curves, scheduler, RNG, patching and blending. Python
+is only the oracle: `tests/test_pipe.py` checks the refined text rows (cosine 0.9998), one
+denoising step from shared noise (update cosine 0.991, the int4 blocks' own floor), the video
+decoder (49.4 dB) and the audio decoder (108.9 dB SNR) against the Python stages;
+`tests/test_tokenizer.py` checks the tokenizer against transformers. `build/h3pipe --prompt
+"..." --frames 22 --steps 8 --out build/clip` writes raw RGB and WAV; `tools/pipeline_c.py`
+drives the library from Python and muxes with ffmpeg. The runtime dependency is the HIP
+runtime API (module load, memory, launch); there is no device code outside Loom.
+
+**What is in Loom and what is not.** In Loom: everything with tensors in it -- the DiT blocks,
+the text encoder's layers (`tests/test_te_blocks.py`: hidden cosine 1.0000 after 50 layers
+against transformers bf16, median per-token error 1.7%, the W8A8 floor), the token refiner,
+the embedders and final layer (int8 GEMMs with padded K / N), the video decoder's blocks and
+heads (`tests/test_vae_blocks.py --bits 8`: frame PSNR 52 dB; the int4 GPTQ decoder is
+`vae_bits 4`) and the audio vocoder (five f32 SIMT kernels). On the host in C: the layout,
+the AdaLN curve tables, the scheduler, noise, patchify and unpatchify, chunk blending and the
+pixel mapping, together well under a second of a clip.
 
 **Quantisation.** Round-to-nearest int4 per row cost 21% relative error on the final
 velocity over 50 blocks; GPTQ at export time (`tools/gptq_export.py`, block by block on the

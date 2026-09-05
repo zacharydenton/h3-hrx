@@ -51,7 +51,7 @@ def main() -> int:
     ok = True
     with workdir() as tmp:
         tmp = Path(tmp)
-        for tokens in ((28, 100, 512, 1000) if GQA == 8 else (100, 1000, 5504)):
+        for tokens in ((13, 28, 100, 512, 1000) if GQA == 8 else (13, 100, 1000, 5504)):
             ok &= run(tmp, tokens)
     return 0 if ok else 1
 

@@ -336,3 +336,53 @@ decoder). Left in torch: the audio VAE (BigVGAN: 65 M parameters of narrow 1-D
 convolutions, Snake activations and anti-aliasing filters across seven upsampling stages;
 launch-bound, a different kernel family), the scheduler step, the VAE heads and the prompt
 embedding lookup.
+
+## The pipeline as one C library, every kernel in Loom (2026-09-06)
+
+`host/h3pipe.cpp` + `host/h3pipe.h` (`build/libh3pipe.so`): prompt token ids in, latents /
+RGB8 frames / stereo samples out, for callers in any language, the same shape as
+dinov3-loom's and scrfd-loom's runners. Nothing between the kernels is Python any more:
+
+- one generic transformer stack serves the text encoder, the token refiner, the 50 DiT
+  blocks and the video decoder (dims, bits, bias, causal / GQA, gate tables, rope variant
+  are parameters);
+- the embedders and the final layer are the int8 GEMM family with padded K (96 -> 256,
+  32 -> 256, 24 -> 256) and N (96 + 32 -> 128, the video and audio output projections
+  stacked into one GEMM); the final norm + AdaLN is the prepare-norm kernel with a
+  two-class table; the decoder's LayerNorm is a new `lnorm` prepare form with the bias in
+  the table's shift row; the refiner's final norm is `norm_mod_f32` (in place, f32);
+- the audio vocoder (BigVGAN) is five f32 SIMT Loom kernels: `conv1d_f32` (dilation,
+  optional accumulate), `convt1d_f32`, `up2_snake_f32` (2x Kaiser-sinc + SnakeBeta),
+  `down2_f32`, `axpy_f32`; weight norm folded and Snake parameters exponentiated at export;
+- the host does the layout, rope tables, AdaLN curves (the 96768x8 projections per layer
+  per step, ~30 ms), the scheduler, its own RNG (splitmix64 + Box-Muller: a seed does not
+  reproduce a torch seed), patchify / unpatchify, the decoder's chunk loop and cross-fades,
+  the ImageNet pixel mapping, and the post_quant_conv (24x24 per voxel);
+- kernels compile on first use for a shape by spawning `loom-compile` into
+  `build/kernel_cache` (the config string is the cache key; Loom compiles in milliseconds);
+- `host/h3tok.cpp`: the Qwen2 byte-level BPE from tokenizer.json (a small JSON reader, the
+  split regex evaluated by hand on code points), identical to transformers on the test
+  prompts including accents, CJK, emoji, contractions and whitespace runs.
+
+Verification (`tests/test_pipe.py`, `tests/test_tokenizer.py`): the refined text rows
+against the reference's `text_in` at cosine 0.9998; one denoising step from shared noise
+against the Python pipeline at update cosine 0.991 (video) / 0.990 (audio), where the int4
+blocks' own sensitivity to a 0.1% input change is 0.994 (`--attrib`); the video decoder
+against the Python Loom decoder at 49.4 dB; the audio decoder against diffusers at 108.9 dB
+SNR. Two bugs found by those tests, both in the host: the sequence buffers were reallocated
+underneath the refiner's identity rope tables (0.982 -> 0.991), and the single-class
+embedder GEMMs indexed their gate table with the layout's class ids.
+
+Timing at 22 frames 864x480 (2931 rows): 2.3 s per step (the Python-driven session: 2.4),
+video decode 7.6 s (Python: 10.6), audio decode 0.5 s (torch: 1.95), session creation 10 s
+plus 17 s the first time a prompt length compiles its kernels and uploads the 24 GB encoder.
+`build/h3pipe --prompt "..."` writes raw RGB + WAV; ffmpeg muxes.
+
+Fixed on the way: the Python clip writer mapped the decoder output as [-1, 1]; diffusers'
+decode block does `clamp(v * imagenet_std + imagenet_mean, 0, 1)`, which both writers now do.
+The attention kernels' `tokens` config allowed 16 at least; prompts shorter than a tile now
+compile (tests at 13 tokens).
+
+Runtime dependency: the HIP runtime API for module load, memory and launch (no device code;
+the hosts build with hipcc as a plain C++ compiler). An HSA-only host is a swap of those
+calls, not a rewrite.
