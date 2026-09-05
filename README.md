@@ -56,7 +56,9 @@ decoder), and diffusers' audio VAE plus ffmpeg. The first full clip: 124 frames 
 
 That render packs 15427 rows and takes 29.4 s per step (attention 70%, the four GEMMs
 26%): 24 minutes of denoising. `docs/media/smoke_fox_22f_8steps.jpg` is the 22-frame smoke
-clip.
+clip; `docs/media/smoke_sailboat_22f_8steps_fullloom.jpg` the same size through the full-Loom path
+(prompt encoded in Loom in 17 s including the 24 GB weight upload, 2.4 s per step at 2931 rows,
+video decoded in Loom in 10.6 s).
 
 **What is in Loom and what is not.** In Loom: the DiT blocks, the text encoder's layers
 (`tests/test_te_blocks.py`: hidden cosine 1.0000 after 50 layers against transformers bf16,
