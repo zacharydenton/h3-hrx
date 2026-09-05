@@ -419,3 +419,43 @@ different kernel (lazy rescaling, fragment reuse across query tiles), not a conf
 
 The generator's 8-wave post-pass now classifies the 32-key tile's second K row correctly
 (it produced an undefined name before); the variants live in experiments/.
+
+## What hrx-demos and torch say about the ceiling (2026-09-06)
+
+Calibration against the two other attention implementations on hand, at the pipeline's own
+shapes, on this box (calm):
+
+| attention, f16, 56 heads x 128 | 15427 rows | 10317 rows |
+| --- | ---: | ---: |
+| ours (8-wave LDS kernel) | 17.6 TFLOP/s | 17.6 |
+| torch 2.13 ROCm SDPA, flash backend (aotriton / CK) | 18.2 | 17.8 |
+| torch SDPA, efficient backend | 18.3 | 18.1 |
+| AMD's hrx-demos Loom kernel (Ideogram, 18 heads x 256, on gfx1100) | 18.6 (12.4 ms "schedule": 24.8) | -- |
+
+The decoder's head-64 shape is the exception: torch flash 13.7 TFLOP/s against our 8.6 at
+11350 rows x 32 heads, so the head-64 kernel has 1.6x of headroom (the two-query-tiles
+lever), worth about 15 s of the 47 s decode.
+
+GEMMs at M = 15427: torch's fp16 hipBLASLt does 33-37 TFLOP/s (18 on the down projection);
+our int4 WMMA family does 78-82 TOPS on the same shapes.
+
+Reading: three independent implementations of f16 WMMA attention on RDNA3.x land at 18 +- 1
+TFLOP/s for head 128 at these lengths, a third of the part's MMA peak. That is the
+architecture's attention rate (a wave32 WMMA does 16x16x16 per 16 CU cycles, and the exp,
+row reductions, accumulator rescale and fragment layout changes cannot hide behind it with
+two waves per SIMD), not a property of one kernel. AMD's demo kernel is a single wave per
+workgroup with K^T and V read as fragments straight from global memory through view layouts
+and the probability tile bounced through LDS to change layout; it reaches the same rate on a
+96-CU part, i.e. half ours per CU, and their case study projects their own best case at
+0.75x of PyTorch's request time with attention accounting for 7 s of 90.
+
+Consequences for the 30-step target: an attention rewrite is bounded by roughly 1.1x here;
+the levers that remain are the head-64 decoder kernel (a decode-only 15 s), and
+step-skipping caches on the DiT (TeaCache / first-block cache: reuse the previous step's
+residual when the first block's delta is small, typically 1.6-2x at 30 steps at a small
+quality cost), which is host logic on the C pipeline.
+
+Two things from the hrx-demos runtime worth copying regardless: benchmarking with rotating
+device-local buffers (their "rotation prevents a reused allocation from making a cache-hot
+microbenchmark look like model execution"), and the Plan phase (dry-run the request to size
+capacities, live ranges and kernel specialisations before touching model data).
