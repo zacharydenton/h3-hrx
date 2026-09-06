@@ -8,14 +8,14 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent
-_ABI, _ERR = 2, 4096
+_ABI, _ERR = 3, 4096
 _F32P, _U8P, _I32P = ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_int32)
 PROGRESS = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_double)
 
 
 class Config(ctypes.Structure):
     _fields_ = [("glue_dir", ctypes.c_char_p), ("blocks_dir", ctypes.c_char_p), ("te_dir", ctypes.c_char_p), ("vae_dir", ctypes.c_char_p),
-                ("kernel_sources", ctypes.c_char_p), ("cache_dir", ctypes.c_char_p), ("loom_compile", ctypes.c_char_p), ("vae_bits", ctypes.c_int)]
+                ("kernel_sources", ctypes.c_char_p), ("cache_dir", ctypes.c_char_p), ("loom_compile", ctypes.c_char_p), ("vae_bits", ctypes.c_int), ("aenc_dir", ctypes.c_char_p)]
 
 
 class Params(ctypes.Structure):
@@ -37,7 +37,7 @@ def default_loom_compile() -> str:
 
 
 class H3Pipe:
-    def __init__(self, glue=None, blocks=None, te=None, vae=None, vae_bits=8, cache=None, library=None):
+    def __init__(self, glue=None, blocks=None, te=None, vae=None, vae_bits=8, cache=None, library=None, aenc=None):
         native = ctypes.CDLL(str(library or os.environ.get("H3PIPE_LIB") or ROOT / "build/libh3pipe.so"))   # H3PIPE_LIB=build/libh3pipe_hrx.so: the libhrx build
         native.h3pipe_abi_version.restype = ctypes.c_uint32
         if native.h3pipe_abi_version() != _ABI: raise H3PipeError("ABI mismatch; rebuild with scripts/build_host.sh")
@@ -48,10 +48,11 @@ class H3Pipe:
         native.h3pipe_denoise.argtypes = [ctypes.c_void_p, _I32P, ctypes.c_int, ctypes.POINTER(Params), _F32P, _F32P, _F32P, ctypes.c_size_t, _F32P, ctypes.c_size_t, PROGRESS, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
         native.h3pipe_decode_video.argtypes = [ctypes.c_void_p, ctypes.POINTER(Params), _F32P, ctypes.c_size_t, _U8P, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
         native.h3pipe_decode_audio.argtypes = [ctypes.c_void_p, _F32P, ctypes.c_size_t, ctypes.c_int, _F32P, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
+        native.h3pipe_encode_audio.argtypes = [ctypes.c_void_p, _F32P, ctypes.c_int, _F32P, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_size_t]
         self._native = native
         cfg = Config(os.fsencode(glue or ROOT / "build/weights_glue"), os.fsencode(blocks or ROOT / "build/weights_gptq"), os.fsencode(te or ROOT / "build/weights_te"),
                      os.fsencode(vae or ROOT / ("build/weights_vae_i8" if vae_bits == 8 else "build/weights_vae_gptq")), os.fsencode(ROOT / "kernels"),
-                     os.fsencode(cache or ROOT / "build/kernel_cache"), os.fsencode(default_loom_compile()), vae_bits)
+                     os.fsencode(cache or ROOT / "build/kernel_cache"), os.fsencode(default_loom_compile()), vae_bits, os.fsencode(aenc or ROOT / "build/weights_aenc"))
         handle = ctypes.c_void_p(); err = ctypes.create_string_buffer(_ERR)
         if native.h3pipe_create(ctypes.byref(cfg), ctypes.byref(handle), err, _ERR): raise H3PipeError(err.value.decode())
         self._handle = handle
@@ -93,6 +94,13 @@ class H3Pipe:
         s = self.shape(p); v = np.ascontiguousarray(np.asarray(video, dtype=np.float32)); frames = np.zeros((s.frames, p.height, p.width, 3), np.uint8); err = ctypes.create_string_buffer(_ERR)
         if self._native.h3pipe_decode_video(self._handle, ctypes.byref(p), v.ctypes.data_as(_F32P), v.size, frames.ctypes.data_as(_U8P), frames.size, err, _ERR): raise H3PipeError(err.value.decode())
         return frames
+
+    def encode_audio(self, samples) -> np.ndarray:
+        """Stereo float samples [2][n] at 32 kHz -> model-space audio latents [2][32][ceil(n / 800)] (the audio VAE's encoder in Loom)."""
+        x = np.ascontiguousarray(np.asarray(samples, dtype=np.float32)); assert x.ndim == 2 and x.shape[0] == 2, x.shape
+        n = x.shape[1]; T = (n + 799) // 800; z = np.zeros((2, 32, T), np.float32); t_out = ctypes.c_int(0); err = ctypes.create_string_buffer(_ERR)
+        if self._native.h3pipe_encode_audio(self._handle, x.ctypes.data_as(_F32P), n, z.ctypes.data_as(_F32P), z.size, ctypes.byref(t_out), err, _ERR): raise H3PipeError(err.value.decode())
+        return z[:, :, :t_out.value]
 
     def decode_audio(self, audio) -> np.ndarray:
         a = np.ascontiguousarray(np.asarray(audio, dtype=np.float32)); audio_t = a.shape[-1]; samples = np.zeros((2, audio_t * 800), np.float32); err = ctypes.create_string_buffer(_ERR)

@@ -11,7 +11,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define H3PIPE_ABI_VERSION 2u
+#define H3PIPE_ABI_VERSION 3u
 enum { H3PIPE_OK = 0, H3PIPE_ERROR = 1, H3PIPE_CANCELLED = 2, H3PIPE_INVALID_ARGUMENT = 64 };
 typedef struct h3pipe_session h3pipe_session;
 
@@ -24,6 +24,7 @@ typedef struct {
     const char *cache_dir;       // where compiled .hsaco files live (created)
     const char *loom_compile;    // path to the loom-compile binary
     int vae_bits;                // 8 or 4, matching vae_dir
+    const char *aenc_dir;        // tools/export_audio_encoder.py: the audio VAE's encoder (reference audio); NULL -> h3pipe_encode_audio unavailable
 } h3pipe_config;
 
 typedef struct {
@@ -66,6 +67,9 @@ int h3pipe_decode_video(h3pipe_session *s, const h3pipe_params *params, const fl
 // Model-space audio latents [2][32][audio_t] -> stereo float samples [2][audio_t * 800] at 32 kHz.
 int h3pipe_decode_audio(h3pipe_session *s, const float *audio_latents, size_t audio_elements, int audio_t,
                         float *samples, size_t sample_elements, char *error, size_t error_capacity);
+// Stereo float samples [2][n_samples] at 32 kHz (right-padded to a multiple of 800 inside) -> model-space audio latents
+// [2][32][audio_t] with audio_t = ceil(n_samples / 800) written to *audio_t; latent_elements must be at least 2*32*audio_t.
+int h3pipe_encode_audio(h3pipe_session *s, const float *samples, int n_samples, float *latents, size_t latent_elements, int *audio_t, char *error, size_t error_capacity);
 #ifdef __cplusplus
 }
 #endif

@@ -1,0 +1,94 @@
+// Strided 1-D convolution on f32 [channels][len] planes (the audio encoder's DAC stack):
+//   out[o][n] = b[o] + sum_i sum_k w[o][i*ksize + k] * x[i][n*stride + k*dilation - pad]
+// One lane per output sample of one output channel; taps outside [0, in_len) contribute zero.
+amdgpu.target<gfx11-generic> @h3_conv1d_s_f32_gfx11 {subgroup_size = 32}
+
+config.decl @h3.conv1d_s_f32.cin : %value: index where [range(%value, 1, 4096)]
+
+config.decl @h3.conv1d_s_f32.cout : %value: index where [range(%value, 1, 4096)]
+
+config.decl @h3.conv1d_s_f32.ksize : %value: index where [range(%value, 1, 64)]
+
+config.decl @h3.conv1d_s_f32.dilation : %value: index where [range(%value, 1, 64)]
+
+config.decl @h3.conv1d_s_f32.pad : %value: index where [range(%value, 0, 1024)]
+
+config.decl @h3.conv1d_s_f32.stride : %value: index where [range(%value, 1, 64)]
+
+config.decl @h3.conv1d_s_f32.in_bound : %value: index where [range(%value, 256, 4194304), mul(%value, 256)]
+
+config.decl @h3.conv1d_s_f32.out_bound : %value: index where [range(%value, 256, 4194304), mul(%value, 256)]
+
+kernel.def target(@h3_conv1d_s_f32_gfx11) export("h3_conv1d_s_f32") @h3_conv1d_s_f32(%out_len: index, %in_len: index) {
+  %c1 = index.constant 1 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %cout = config.get @h3.conv1d_s_f32.cout : index
+  %rounded = index.add %out_len, %c255 : index
+  %groups = index.div %rounded, %c256 : index
+  kernel.launch.config workgroups(%groups, %cout, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%out_len: index, %in_len: index, %x: buffer, %w: buffer, %b: buffer, %out: buffer) {
+  %cin = config.get @h3.conv1d_s_f32.cin : index
+  %cout = config.get @h3.conv1d_s_f32.cout : index
+  %ksize = config.get @h3.conv1d_s_f32.ksize : index
+  %dilation = config.get @h3.conv1d_s_f32.dilation : index
+  %pad = config.get @h3.conv1d_s_f32.pad : index
+  %stride = config.get @h3.conv1d_s_f32.stride : index
+  %in_bound = config.get @h3.conv1d_s_f32.in_bound : index
+  %out_bound = config.get @h3.conv1d_s_f32.out_bound : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  %c0_offset = index.constant 0 : offset
+  %in_b = index.assume %in_len [range(%in_len, 1, 4194304), le(%in_len, %in_bound)] : index
+  %out_b = index.assume %out_len [range(%out_len, 1, 4194304), le(%out_len, %out_bound)] : index
+  %wg = kernel.workgroup.id<x> : index
+  %o0 = kernel.workgroup.id<y> : index
+  %o = index.assume %o0 [lt(%o0, %cout)] : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %wg, %c256 : index
+  %n = index.add %base, %lane : index
+  %taps = index.mul %cin, %ksize : index
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %w_global = buffer.assume.memory_space<global> %w : buffer
+  %b_global = buffer.assume.memory_space<global> %b : buffer
+  %out_global = buffer.assume.memory_space<global> %out : buffer
+  %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%cin]x[%in_b]xf32>
+  %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%cout]x[%taps]xf32>
+  %b_view = buffer.view %b_global[%c0_offset] : buffer -> view<[%cout]xf32>
+  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%cout]x[%out_b]xf32>
+  %active = index.cmp ult, %n, %out_b : index
+  scf.if %active {
+    %nn = index.assume %n [lt(%n, %out_b)] : index
+    %bias = view.load %b_view[%o] : view<[%cout]xf32> -> f32
+    %origin = index.mul %nn, %stride : index
+    %acc = scf.for %i = [%c0 to %cin step %c1](%acc_i = %bias : f32) -> (f32) {
+      %ii = index.assume %i [lt(%i, %cin)] : index
+      %row = index.mul %ii, %ksize : index
+      %acc_k = scf.for %k = [%c0 to %ksize step %c1](%acc_kk = %acc_i : f32) -> (f32) {
+        %kk = index.assume %k [lt(%k, %ksize)] : index
+        %tap0 = index.add %row, %kk : index
+        %tap = index.assume %tap0 [lt(%tap0, %taps)] : index
+        %reach = index.mul %kk, %dilation : index
+        %src_plus = index.add %origin, %reach : index
+        %ge = index.cmp uge, %src_plus, %pad : index
+        %src_raw = index.sub %src_plus, %pad : index
+        %lt = index.cmp ult, %src_raw, %in_b : index
+        %valid = scalar.andi %ge, %lt : i1
+        %next = scf.if %valid -> (f32) {
+          %src = index.assume %src_raw [range(%src_raw, 0, 4194304), lt(%src_raw, %in_b)] : index
+          %wv = view.load %w_view[%o, %tap] : view<[%cout]x[%taps]xf32> -> f32
+          %xv = view.load %x_view[%ii, %src] : view<[%cin]x[%in_b]xf32> -> f32
+          %fma = scalar.fmaf %wv, %xv, %acc_kk : f32
+          scf.yield %fma : f32
+        } else {
+          scf.yield %acc_kk : f32
+        }
+        scf.yield %next : f32
+      }
+      scf.yield %acc_k : f32
+    }
+    view.store %acc, %out_view[%o, %nn] : f32, view<[%cout]x[%out_b]xf32>
+  }
+  kernel.return
+}

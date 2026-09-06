@@ -427,6 +427,7 @@ public:
         rt();
         comp_.exe = cfg.loom_compile; comp_.sources = cfg.kernel_sources; comp_.cache = cfg.cache_dir;
         vae_dir_ = cfg.vae_dir ? cfg.vae_dir : ""; vae_bits_ = cfg.vae_bits ? cfg.vae_bits : 8;
+        aenc_dir_ = cfg.aenc_dir ? cfg.aenc_dir : "";
         glue_.open(cfg.glue_dir, [](const std::string &n) { return n == "te.embed"; });
         embed_ = glue_.span("te.embed");
         blocks_.open(cfg.blocks_dir);
@@ -652,6 +653,98 @@ public:
     }
     struct Cancelled {};
 
+    // --- the audio encoder: the audio VAE's DAC conv stack and posterior head, f32 SIMT Loom kernels (reference audio) ---
+    static size_t pow2_bound(size_t n) { size_t b = 256; while (b < n) b *= 2; return b; }
+    std::shared_ptr<Kernel> conv_s_kernel(int cin, int cout, int ksize, int dil, int pad, int stride, size_t in_len, size_t out_len) {
+        const std::string ns = "h3.conv1d_s_f32.";
+        return comp_.get("conv1d_s_f32", "h3_conv1d_s_f32", {{ns + "cin", std::to_string(cin)}, {ns + "cout", std::to_string(cout)}, {ns + "ksize", std::to_string(ksize)}, {ns + "dilation", std::to_string(dil)}, {ns + "pad", std::to_string(pad)},
+                                                                {ns + "stride", std::to_string(stride)}, {ns + "in_bound", std::to_string(pow2_bound(in_len))}, {ns + "out_bound", std::to_string(pow2_bound(out_len))}});
+    }
+    void conv_s(const char *stage, int cin, int cout, int ksize, int dil, int pad, int stride, size_t in_len, size_t out_len, const void *x, const void *w, const void *b, void *out) {
+        auto k = conv_s_kernel(cin, cout, ksize, dil, pad, stride, in_len, out_len);
+        KernArgs a; a.i32(int(out_len)).i32(int(in_len)).ptr(x).ptr(w).ptr(b).ptr(out); launch(*k, &prof, stage, unsigned((out_len + 255) / 256), unsigned(cout), THREADS, a);
+    }
+    void snake_plain(int channels, size_t len, const void *x, const void *alpha, void *out) {
+        const std::string ns = "h3.snake_f32.";
+        auto k = comp_.get("snake_f32", "h3_snake_f32", {{ns + "channels", std::to_string(channels)}, {ns + "len_bound", std::to_string(pow2_bound(len))}});
+        KernArgs a; a.i32(int(len)).ptr(x).ptr(alpha).ptr(out); launch(*k, &prof, "aenc snake", unsigned((len + 255) / 256), unsigned(channels), THREADS, a);
+    }
+    void layernorm(size_t rows, int width, const void *x, const void *w, const void *b, void *out) {
+        const std::string ns = "h3.layernorm_f32.";
+        auto k = comp_.get("layernorm_f32", "h3_layernorm_f32", {{ns + "width", std::to_string(width)}, {ns + "eps", num(1e-5)}});
+        KernArgs a; a.i32(int(rows)).ptr(x).ptr(w).ptr(b).ptr(out); launch(*k, &prof, "aenc layernorm", unsigned(rows), 1, 32, a);
+    }
+    void matmul(size_t m, int kdim, int n, const void *x, const void *w, const void *b, void *out) {
+        const std::string ns = "h3.matmul_f32.";
+        auto k = comp_.get("matmul_f32", "h3_matmul_f32", {{ns + "k", std::to_string(kdim)}, {ns + "n", std::to_string(n)}});
+        KernArgs a; a.i32(int(m)).ptr(x).ptr(w).ptr(b).ptr(out); launch(*k, &prof, "aenc matmul", unsigned((n + 255) / 256), unsigned(m), THREADS, a);
+    }
+    void transpose_f32(size_t rows, int cols, const void *x, void *out) {
+        const std::string ns = "h3.transpose_f32.";
+        auto k = comp_.get("transpose_f32", "h3_transpose_f32", {{ns + "cols", std::to_string(cols)}});
+        KernArgs a; a.i32(int(rows)).ptr(x).ptr(out); launch(*k, &prof, "aenc transpose", unsigned((rows * size_t(cols) + 255) / 256), 1, THREADS, a);
+    }
+    void encode_audio(const float *samples, int n, float *out, int &audio_t) {
+        if (!aenc_open_) { if (aenc_dir_.empty()) throw std::runtime_error("no audio encoder weights: h3pipe_config.aenc_dir is NULL"); aenc_.open(aenc_dir_); aenc_open_ = true; }
+        const size_t Lp = (size_t(n) + 799) / 800 * 800; const int T = int(Lp / 800); audio_t = T;
+        auto W = [&](const std::string &nm, size_t count) { return aenc_.at(nm, count * 4); };
+        std::vector<void *> owned; auto buf = [&](size_t floats) { void *p = rt().alloc(floats * 4); owned.push_back(p); return p; };
+        const size_t plane = size_t(64) * Lp;
+        void *x0 = buf(Lp), *h = buf(plane), *h2 = buf(plane), *y = buf(plane), *y2 = buf(plane);
+        void *rows = buf(size_t(T) * 2048), *n1 = buf(size_t(T) * 2048), *qkv = buf(size_t(T) * 6144), *pattn = buf(size_t(8) * T * T), *pool = buf(size_t(T) * 32);
+        void *xa = buf(size_t(T) * 32), *xb = buf(size_t(T) * 32), *xc = buf(size_t(T) * 32), *a0 = buf(size_t(T) * 64), *a1 = buf(size_t(T) * 64), *g = buf(size_t(T) * 64);
+        static const int rates[5] = {2, 4, 4, 5, 5};
+        std::vector<float> host(Lp), zrow(size_t(T) * 32);
+        const float *lmean = nullptr; std::vector<float> mean_h(32), std_h(32);
+        rt().d2h(mean_h.data(), W("aenc.latents_mean", 32), 32 * 4); rt().d2h(std_h.data(), W("aenc.latents_std", 32), 32 * 4); (void)lmean;
+        for (int ch = 0; ch < 2; ++ch) {
+            std::fill(host.begin(), host.end(), 0.0f); std::copy(samples + size_t(ch) * n, samples + size_t(ch) * n + n, host.begin());
+            rt().h2d(x0, host.data(), Lp * 4);
+            size_t len = Lp; int dim = 64;
+            conv_s("aenc conv_in", 1, 64, 7, 1, 3, 1, Lp, Lp, x0, W("aenc.conv_in.w", 64 * 7), W("aenc.conv_in.b", 64), h);
+            for (int i = 1; i <= 5; ++i) {
+                for (int r = 0; r < 3; ++r) {
+                    const int dil = r == 0 ? 1 : (r == 1 ? 3 : 9); const std::string p = fmt("aenc.b%d.r%d.", i, r);
+                    snake_plain(dim, len, h, W(p + "act0", dim), y);
+                    conv_s("aenc res conv7", dim, dim, 7, dil, 3 * dil, 1, len, len, y, W(p + "c1.w", size_t(dim) * dim * 7), W(p + "c1.b", dim), y2);
+                    snake_plain(dim, len, y2, W(p + "act1", dim), y);
+                    conv_s("aenc res conv1", dim, dim, 1, 1, 0, 1, len, len, y, W(p + "c2.w", size_t(dim) * dim), W(p + "c2.b", dim), y2);
+                    axpy(1.0f, 1.0f, size_t(dim) * len, y2, h);
+                }
+                const int s = rates[i - 1]; const size_t out_len = len / s; const std::string p = fmt("aenc.b%d.", i);
+                snake_plain(dim, len, h, W(p + "act", dim), y);
+                conv_s("aenc down", dim, 2 * dim, 2 * s, 1, (s + 1) / 2, s, len, out_len, y, W(p + "down.w", size_t(2 * dim) * dim * 2 * s), W(p + "down.b", 2 * dim), h2);
+                std::swap(h, h2); dim *= 2; len = out_len;
+            }
+            if (dim != 2048 || len != size_t(T)) throw std::runtime_error("audio encoder shape mismatch");
+            snake_plain(2048, len, h, W("aenc.act_out", 2048), y);
+            conv_s("aenc conv_out", 2048, 2048, 3, 1, 1, 1, len, len, y, W("aenc.conv_out.w", size_t(2048) * 2048 * 3), W("aenc.conv_out.b", 2048), h);
+            transpose_f32(2048, T, h, rows);                                   // [2048][T] -> [T][2048]
+            // AttnProjection: x = proj(norm3(x)) + attn(norm1(x)); x += mlp(norm2(x))
+            layernorm(T, 2048, rows, W("aenc.pre.norm3.w", 2048), W("aenc.pre.norm3.b", 2048), n1);
+            matmul(T, 2048, 32, n1, W("aenc.pre.proj.w", size_t(32) * 2048), W("aenc.pre.proj.b", 32), xa);
+            layernorm(T, 2048, rows, W("aenc.pre.norm1.w", 2048), W("aenc.pre.norm1.b", 2048), n1);
+            matmul(T, 2048, 6144, n1, W("aenc.pre.qkv.w", size_t(6144) * 2048), W("aenc.pre.qkv.b", 6144), qkv);
+            { const std::string ns = "h3.attn_scores_f32."; auto k = comp_.get("attn_scores_f32", "h3_attn_scores_f32", {{ns + "heads", "8"}, {ns + "hd", "256"}, {ns + "scale", num(1.0 / 16.0)}});
+              KernArgs a; a.i32(T).ptr(qkv).ptr(pattn); launch(*k, &prof, "aenc attention", unsigned((T + 255) / 256), 8, THREADS, a); }
+            { const std::string ns = "h3.attn_pv_pool_f32."; auto k = comp_.get("attn_pv_pool_f32", "h3_attn_pv_pool_f32", {{ns + "heads", "8"}, {ns + "hd", "256"}, {ns + "pool", "8"}});
+              KernArgs a; a.i32(T).ptr(qkv).ptr(pattn).ptr(pool); launch(*k, &prof, "aenc attention", unsigned(T), 1, 32, a); }
+            matmul(T, 32, 32, pool, W("aenc.pre.attn_proj.w", 32 * 32), W("aenc.pre.attn_proj.b", 32), xb);
+            axpy(1.0f, 1.0f, size_t(T) * 32, xb, xa);                                                       // xa = proj + attn
+            layernorm(T, 32, xa, W("aenc.pre.norm2.w", 32), W("aenc.pre.norm2.b", 32), xb);
+            layernorm(T, 32, xb, W("aenc.pre.mlp.norm.w", 32), W("aenc.pre.mlp.norm.b", 32), xc);
+            matmul(T, 32, 64, xc, W("aenc.pre.mlp.w0.w", 64 * 32), W("aenc.pre.mlp.w0.b", 64), a0);
+            matmul(T, 32, 64, xc, W("aenc.pre.mlp.w1.w", 64 * 32), W("aenc.pre.mlp.w1.b", 64), a1);
+            { auto k = comp_.get("geglu_tanh_f32", "h3_geglu_tanh_f32", {}); KernArgs a; a.i32(T * 64).ptr(a0).ptr(a1).ptr(g); launch(*k, &prof, "aenc geglu", unsigned((T * 64 + 255) / 256), 1, THREADS, a); }
+            matmul(T, 64, 32, g, W("aenc.pre.mlp.w2.w", 32 * 64), W("aenc.pre.mlp.w2.b", 32), xb);
+            axpy(1.0f, 1.0f, size_t(T) * 32, xb, xa);                                                       // xa += mlp
+            matmul(T, 32, 32, xa, W("aenc.mean_proj.w", 32 * 32), W("aenc.mean_proj.b", 32), xc);
+            rt().d2h(zrow.data(), xc, size_t(T) * 32 * 4);
+            for (int t = 0; t < T; ++t) for (int c = 0; c < 32; ++c) out[(size_t(ch) * 32 + c) * T + t] = (zrow[size_t(t) * 32 + c] - mean_h[c]) / std_h[c];
+        }
+        rt().sync(); for (void *p : owned) rt().free(p);
+    }
+
     // --- the audio decoder: BigVGAN in f32 SIMT Loom kernels ---
     struct Conv { std::shared_ptr<Kernel> k; int cin, cout, ksize, dil, pad; };
     Conv conv_kernel(int cin, int cout, int ksize, int dil, int pad, bool accumulate, size_t len_bound) {
@@ -844,6 +937,7 @@ private:
     size_t audio_cap_ = 0; void *ah_ = nullptr, *aacc_ = nullptr, *ahj_ = nullptr, *ar_ = nullptr, *ar2_ = nullptr, *atmp_ = nullptr, *ain_ = nullptr;
     void *vx_ = nullptr, *vcos_ = nullptr, *vsin_ = nullptr, *vin16_ = nullptr, *va_q_ = nullptr, *va_s_ = nullptr, *vout16_ = nullptr, *vcls_ = nullptr, *vnorm_table_ = nullptr;
     std::map<std::string, Prepare> prepares_; std::map<std::string, Gemm> gemms_; Prepare final_prep_;
+    Blob aenc_; bool aenc_open_ = false; std::string aenc_dir_;
     std::shared_ptr<Kernel> norm_f32_;
     size_t seq_cap_ = 0;
     void *ones_ = nullptr, *zeros_ = nullptr, *mods_ = nullptr, *final_table_ = nullptr, *x_ = nullptr, *cls_ = nullptr, *cls0_ = nullptr, *tcls_ = nullptr, *cos_ = nullptr, *sin_ = nullptr,
@@ -908,6 +1002,14 @@ extern "C" int h3pipe_decode_video(h3pipe_session *s, const h3pipe_params *param
         if (video_elements != size_t(LATENT_CH) * sh.latent_t * sh.lat_h * sh.lat_w) throw std::invalid_argument("video_latents must hold 24 * latent_t * lat_h * lat_w floats");
         if (frame_bytes != size_t(sh.frames) * params->height * params->width * 3) throw std::invalid_argument("frames must hold frames * height * width * 3 bytes");
         std::lock_guard<std::mutex> lock(s->mutex); s->value.decode_video(*params, latents, frames);
+    })
+}
+extern "C" int h3pipe_encode_audio(h3pipe_session *s, const float *samples, int n_samples, float *latents, size_t latent_elements, int *audio_t, char *error, size_t cap) {
+    GUARD({
+        if (!s || !samples || n_samples < 1 || !latents || !audio_t) throw std::invalid_argument("session, samples (n_samples >= 1), latents and audio_t are required");
+        const int T = (n_samples + 799) / 800;
+        if (latent_elements < size_t(2) * AUDIO_CH * T) throw std::invalid_argument("latents must hold at least 2 * 32 * ceil(n_samples / 800) floats");
+        std::lock_guard<std::mutex> lock(s->mutex); s->value.encode_audio(samples, n_samples, latents, *audio_t);
     })
 }
 extern "C" int h3pipe_decode_audio(h3pipe_session *s, const float *latents, size_t audio_elements, int audio_t, float *samples, size_t sample_elements, char *error, size_t cap) {

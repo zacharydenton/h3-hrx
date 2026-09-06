@@ -1,0 +1,52 @@
+// out[m][n] = x[m][k] . w[n][k] + b[n], f32, one lane per output element (the small heads of the audio encoder).
+amdgpu.target<gfx11-generic> @h3_matmul_f32_gfx11 {subgroup_size = 32}
+
+config.decl @h3.matmul_f32.k : %value: index where [range(%value, 1, 8192)]
+
+config.decl @h3.matmul_f32.n : %value: index where [range(%value, 1, 8192)]
+
+kernel.def target(@h3_matmul_f32_gfx11) export("h3_matmul_f32") @h3_matmul_f32(%m: index) {
+  %c1 = index.constant 1 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %n = config.get @h3.matmul_f32.n : index
+  %rounded = index.add %n, %c255 : index
+  %groups = index.div %rounded, %c256 : index
+  kernel.launch.config workgroups(%groups, %m, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%m: index, %x: buffer, %w: buffer, %b: buffer, %out: buffer) {
+  %k = config.get @h3.matmul_f32.k : index
+  %n = config.get @h3.matmul_f32.n : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  %c0_offset = index.constant 0 : offset
+  %m_b = index.assume %m [range(%m, 1, 32768)] : index
+  %wg = kernel.workgroup.id<x> : index
+  %row0 = kernel.workgroup.id<y> : index
+  %row = index.assume %row0 [lt(%row0, %m_b)] : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %wg, %c256 : index
+  %col = index.add %base, %lane : index
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %w_global = buffer.assume.memory_space<global> %w : buffer
+  %b_global = buffer.assume.memory_space<global> %b : buffer
+  %out_global = buffer.assume.memory_space<global> %out : buffer
+  %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%m_b]x[%k]xf32>
+  %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%n]x[%k]xf32>
+  %b_view = buffer.view %b_global[%c0_offset] : buffer -> view<[%n]xf32>
+  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%m_b]x[%n]xf32>
+  %active = index.cmp ult, %col, %n : index
+  scf.if %active {
+    %cc = index.assume %col [lt(%col, %n)] : index
+    %bias = view.load %b_view[%cc] : view<[%n]xf32> -> f32
+    %acc = scf.for %i = [%c0 to %k step %c1](%a = %bias : f32) -> (f32) {
+      %ii = index.assume %i [lt(%i, %k)] : index
+      %xv = view.load %x_view[%row, %ii] : view<[%m_b]x[%k]xf32> -> f32
+      %wv = view.load %w_view[%cc, %ii] : view<[%n]x[%k]xf32> -> f32
+      %f = scalar.fmaf %xv, %wv, %a : f32
+      scf.yield %f : f32
+    }
+    view.store %acc, %out_view[%row, %cc] : f32, view<[%m_b]x[%n]xf32>
+  }
+  kernel.return
+}

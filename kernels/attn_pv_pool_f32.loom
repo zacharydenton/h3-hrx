@@ -1,0 +1,71 @@
+// The posterior head's attention output pooled to the latent width: out[i][c] = (1/heads) sum_h sum_j p[h][i][j]
+// * mean_{d in pool group c} v[j][h*hd + d]  (mean over heads, then adaptive average pool hd -> hd/pool).
+amdgpu.target<gfx11-generic> @h3_attn_pv_pool_f32_gfx11 {subgroup_size = 32}
+
+config.decl @h3.attn_pv_pool_f32.heads : %value: index where [range(%value, 1, 64)]
+
+config.decl @h3.attn_pv_pool_f32.hd : %value: index where [range(%value, 1, 1024)]
+
+config.decl @h3.attn_pv_pool_f32.pool : %value: index where [range(%value, 1, 64)]
+
+kernel.def target(@h3_attn_pv_pool_f32_gfx11) export("h3_attn_pv_pool_f32") @h3_attn_pv_pool_f32(%t: index) {
+  %c1 = index.constant 1 : index
+  %hd = config.get @h3.attn_pv_pool_f32.hd : index
+  %pool = config.get @h3.attn_pv_pool_f32.pool : index
+  %cols = index.div %hd, %pool : index
+  kernel.launch.config workgroups(%t, %c1, %c1) workgroup_size(%cols, %c1, %c1) : index
+} launch(%t: index, %qkv: buffer, %p: buffer, %out: buffer) {
+  %heads = config.get @h3.attn_pv_pool_f32.heads : index
+  %hd = config.get @h3.attn_pv_pool_f32.hd : index
+  %pool = config.get @h3.attn_pv_pool_f32.pool : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c0_offset = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %t_b = index.assume %t [range(%t, 1, 4096)] : index
+  %i0 = kernel.workgroup.id<x> : index
+  %i = index.assume %i0 [lt(%i0, %t_b)] : index
+  %c = kernel.workitem.id<x> : index
+  %cols = index.div %hd, %pool : index
+  %hh = index.mul %heads, %hd : index
+  %width = index.mul %hh, %c2 : index
+  %width3 = index.add %width, %hh : index
+  %qkv_global = buffer.assume.memory_space<global> %qkv : buffer
+  %p_global = buffer.assume.memory_space<global> %p : buffer
+  %out_global = buffer.assume.memory_space<global> %out : buffer
+  %qkv_view = buffer.view %qkv_global[%c0_offset] : buffer -> view<[%t_b]x[%width3]xf32>
+  %p_view = buffer.view %p_global[%c0_offset] : buffer -> view<[%heads]x[%t_b]x[%t_b]xf32>
+  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%t_b]x[%cols]xf32>
+  %cc = index.assume %c [lt(%c, %cols)] : index
+  %dbase = index.mul %cc, %pool : index
+  %i1 = index.add %i, %c1 : index
+  %acc = scf.for %h = [%c0 to %heads step %c1](%ah = %zero : f32) -> (f32) {
+    %hh0 = index.assume %h [lt(%h, %heads)] : index
+    %vbase0 = index.mul %hh0, %hd : index
+    %vbase1 = index.add %vbase0, %width : index
+    %vbase = index.add %vbase1, %dbase : index
+    %aj = scf.for %j = [%c0 to %i1 step %c1](%a = %ah : f32) -> (f32) {
+      %jj = index.assume %j [lt(%j, %t_b)] : index
+      %pv = view.load %p_view[%hh0, %i, %jj] : view<[%heads]x[%t_b]x[%t_b]xf32> -> f32
+      %vsum = scf.for %d = [%c0 to %pool step %c1](%s = %zero : f32) -> (f32) {
+        %col0 = index.add %vbase, %d : index
+        %col = index.assume %col0 [lt(%col0, %width3)] : index
+        %vv = view.load %qkv_view[%jj, %col] : view<[%t_b]x[%width3]xf32> -> f32
+        %s2 = scalar.addf %s, %vv : f32
+        scf.yield %s2 : f32
+      }
+      %f = scalar.fmaf %pv, %vsum, %a : f32
+      scf.yield %f : f32
+    }
+    scf.yield %aj : f32
+  }
+  %heads_i = index.cast %heads : index to i32
+  %heads_f = scalar.sitofp %heads_i : i32 to f32
+  %pool_i = index.cast %pool : index to i32
+  %pool_f = scalar.sitofp %pool_i : i32 to f32
+  %den = scalar.mulf %heads_f, %pool_f : f32
+  %r = scalar.divf %acc, %den : f32
+  view.store %r, %out_view[%i, %cc] : f32, view<[%t_b]x[%cols]xf32>
+  kernel.return
+}

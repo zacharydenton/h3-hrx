@@ -1,0 +1,90 @@
+// Causal attention probabilities for the audio encoder's posterior head: qkv [t][3*heads*hd] (q | k | v blocks,
+// head-major inside each), p[h][i][j] = softmax_j<=i(q_i . k_j / sqrt(hd)), zero for j > i. One lane per (head, query).
+amdgpu.target<gfx11-generic> @h3_attn_scores_f32_gfx11 {subgroup_size = 32}
+
+config.decl @h3.attn_scores_f32.heads : %value: index where [range(%value, 1, 64)]
+
+config.decl @h3.attn_scores_f32.hd : %value: index where [range(%value, 1, 1024)]
+
+config.decl @h3.attn_scores_f32.scale : f32
+
+kernel.def target(@h3_attn_scores_f32_gfx11) export("h3_attn_scores_f32") @h3_attn_scores_f32(%t: index) {
+  %c1 = index.constant 1 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %heads = config.get @h3.attn_scores_f32.heads : index
+  %rounded = index.add %t, %c255 : index
+  %groups = index.div %rounded, %c256 : index
+  kernel.launch.config workgroups(%groups, %heads, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%t: index, %qkv: buffer, %p: buffer) {
+  %heads = config.get @h3.attn_scores_f32.heads : index
+  %hd = config.get @h3.attn_scores_f32.hd : index
+  %scale = config.get @h3.attn_scores_f32.scale : f32
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c256 = index.constant 256 : index
+  %c0_offset = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %neg = scalar.constant -1000000000.0 : f32
+  %c1f = scalar.constant 1.0 : f32
+  %t_b = index.assume %t [range(%t, 1, 4096)] : index
+  %wg = kernel.workgroup.id<x> : index
+  %h0 = kernel.workgroup.id<y> : index
+  %h = index.assume %h0 [lt(%h0, %heads)] : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %wg, %c256 : index
+  %i0 = index.add %base, %lane : index
+  %hh = index.mul %heads, %hd : index
+  %width = index.mul %hh, %c2 : index
+  %width3 = index.add %width, %hh : index
+  %qkv_global = buffer.assume.memory_space<global> %qkv : buffer
+  %p_global = buffer.assume.memory_space<global> %p : buffer
+  %qkv_view = buffer.view %qkv_global[%c0_offset] : buffer -> view<[%t_b]x[%width3]xf32>
+  %p_view = buffer.view %p_global[%c0_offset] : buffer -> view<[%heads]x[%t_b]x[%t_b]xf32>
+  %active = index.cmp ult, %i0, %t_b : index
+  scf.if %active {
+    %i = index.assume %i0 [lt(%i0, %t_b)] : index
+    %qbase = index.mul %h, %hd : index
+    %kbase = index.add %qbase, %hh : index
+    %i1 = index.add %i, %c1 : index
+    // pass 1: raw scaled scores into p, running max
+    %mx = scf.for %j = [%c0 to %i1 step %c1](%m = %neg : f32) -> (f32) {
+      %jj = index.assume %j [lt(%j, %t_b)] : index
+      %dot = scf.for %d = [%c0 to %hd step %c1](%a = %zero : f32) -> (f32) {
+        %qc0 = index.add %qbase, %d : index
+        %qc = index.assume %qc0 [lt(%qc0, %width3)] : index
+        %kc0 = index.add %kbase, %d : index
+        %kc = index.assume %kc0 [lt(%kc0, %width3)] : index
+        %qv = view.load %qkv_view[%i, %qc] : view<[%t_b]x[%width3]xf32> -> f32
+        %kv = view.load %qkv_view[%jj, %kc] : view<[%t_b]x[%width3]xf32> -> f32
+        %f = scalar.fmaf %qv, %kv, %a : f32
+        scf.yield %f : f32
+      }
+      %s = scalar.mulf %dot, %scale : f32
+      view.store %s, %p_view[%h, %i, %jj] : f32, view<[%heads]x[%t_b]x[%t_b]xf32>
+      %m2 = scalar.maxnumf %m, %s : f32
+      scf.yield %m2 : f32
+    }
+    // pass 2: exp and sum
+    %sum = scf.for %j = [%c0 to %i1 step %c1](%a = %zero : f32) -> (f32) {
+      %jj = index.assume %j [lt(%j, %t_b)] : index
+      %s = view.load %p_view[%h, %i, %jj] : view<[%heads]x[%t_b]x[%t_b]xf32> -> f32
+      %d = scalar.subf %s, %mx : f32
+      %e = scalar.expf<afn> %d : f32
+      view.store %e, %p_view[%h, %i, %jj] : f32, view<[%heads]x[%t_b]x[%t_b]xf32>
+      %a2 = scalar.addf %a, %e : f32
+      scf.yield %a2 : f32
+    }
+    %inv = scalar.divf %c1f, %sum : f32
+    scf.for %j = [%c0 to %t_b step %c1] {
+      %jj = index.assume %j [lt(%j, %t_b)] : index
+      %causal = index.cmp ult, %jj, %i1 : index
+      %e = view.load %p_view[%h, %i, %jj] : view<[%heads]x[%t_b]x[%t_b]xf32> -> f32
+      %pn = scalar.mulf %e, %inv : f32
+      %v = scf.select %causal, %pn, %zero : f32
+      view.store %v, %p_view[%h, %i, %jj] : f32, view<[%heads]x[%t_b]x[%t_b]xf32>
+    }
+  }
+  kernel.return
+}

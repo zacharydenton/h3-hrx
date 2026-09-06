@@ -1,0 +1,52 @@
+// out = gelu_tanh(a) * g over `count` floats (the audio encoder's GeGLU: w2(gelu(w0 x) * w1 x)).
+amdgpu.target<gfx11-generic> @h3_geglu_tanh_f32_gfx11 {subgroup_size = 32}
+
+kernel.def target(@h3_geglu_tanh_f32_gfx11) export("h3_geglu_tanh_f32") @h3_geglu_tanh_f32(%count: index) {
+  %c1 = index.constant 1 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %rounded = index.add %count, %c255 : index
+  %groups = index.div %rounded, %c256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%count: index, %a: buffer, %g: buffer, %out: buffer) {
+  %c256 = index.constant 256 : index
+  %c0_offset = index.constant 0 : offset
+  %half = scalar.constant 0.5 : f32
+  %one = scalar.constant 1.0 : f32
+  %two = scalar.constant 2.0 : f32
+  %k0 = scalar.constant 0.79788456080286544 : f32
+  %k1 = scalar.constant 0.044715 : f32
+  %count_b = index.assume %count [range(%count, 1, 1073741824)] : index
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %wg, %c256 : index
+  %i = index.add %base, %lane : index
+  %a_global = buffer.assume.memory_space<global> %a : buffer
+  %g_global = buffer.assume.memory_space<global> %g : buffer
+  %out_global = buffer.assume.memory_space<global> %out : buffer
+  %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<[%count_b]xf32>
+  %g_view = buffer.view %g_global[%c0_offset] : buffer -> view<[%count_b]xf32>
+  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%count_b]xf32>
+  %active = index.cmp ult, %i, %count_b : index
+  scf.if %active {
+    %ii = index.assume %i [lt(%i, %count_b)] : index
+    %x = view.load %a_view[%ii] : view<[%count_b]xf32> -> f32
+    %gv = view.load %g_view[%ii] : view<[%count_b]xf32> -> f32
+    %x2 = scalar.mulf %x, %x : f32
+    %x3 = scalar.mulf %x2, %x : f32
+    %inner0 = scalar.fmaf %k1, %x3, %x : f32
+    %inner = scalar.mulf %k0, %inner0 : f32
+    // tanh(y) = 1 - 2 / (exp(2y) + 1)
+    %y2 = scalar.mulf %two, %inner : f32
+    %e = scalar.expf<afn> %y2 : f32
+    %e1 = scalar.addf %e, %one : f32
+    %q = scalar.divf %two, %e1 : f32
+    %th = scalar.subf %one, %q : f32
+    %th1 = scalar.addf %one, %th : f32
+    %hx = scalar.mulf %half, %x : f32
+    %gelu = scalar.mulf %hx, %th1 : f32
+    %r = scalar.mulf %gelu, %gv : f32
+    view.store %r, %out_view[%ii] : f32, view<[%count_b]xf32>
+  }
+  kernel.return
+}
