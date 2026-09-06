@@ -373,7 +373,7 @@ TM = "%pair_max" if TILE == 32 else "%scaled"
 K += f"""    // Tile row max across the 16 lanes of this lane's half: an xor butterfly over
     // offsets 1, 2, 4, 8 never crosses the halves, so no even/odd masking is needed.
     %sh1, %ok1 = kernel.subgroup.shuffle<xor> {TM}, %i32_1, %i32_32 : vector<8xf32>, i32, i32
-    %tm1 = vector.maxnumf %scaled, %sh1 : vector<8xf32>
+    %tm1 = vector.maxnumf {TM}, %sh1 : vector<8xf32>
     %sh2, %ok2 = kernel.subgroup.shuffle<xor> %tm1, %i32_2, %i32_32 : vector<8xf32>, i32, i32
     %tm2 = vector.maxnumf %tm1, %sh2 : vector<8xf32>
     %sh4, %ok4 = kernel.subgroup.shuffle<xor> %tm2, %i32_4, %i32_32 : vector<8xf32>, i32, i32

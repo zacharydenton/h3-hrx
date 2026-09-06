@@ -1,6 +1,6 @@
 """Decode saved latents with the ViT decoder blocks in Loom (int4), everything else from
 diffusers' AutoencoderKLMiniMaxH3: post_quant_conv, proj_in, the register and cls tokens,
-the rotary grid, norm_out + proj_out, the unpatchify and the temporal chunk blending.
+the rotary grid, norm_out + proj_out, unpatchify, spatial tiles and temporal chunk blending.
     python3 tools/decode_loom.py build/fox_480p_5s_latents.pt [--out build/loom_decode.mp4] [--clips N] [--compare]"""
 import argparse, math, sys, time
 from pathlib import Path
@@ -11,10 +11,10 @@ from pipeline import write_clip, MODELS
 from h3vae_loom import H3VaeBlocks
 
 
-def decoder_tokens(vae, z):
+def decoder_tokens(vae, z, *, post_quantized=False):
     """diffusers' decoder forward up to the blocks: tokens [1, N, 2048] and the rotary tables."""
     dec = vae.decoder
-    hs = vae.post_quant_conv(z)
+    hs = z if post_quantized else vae.post_quant_conv(z)
     b, c, f, h, w = hs.shape
     hs = hs.permute(0, 2, 3, 4, 1).reshape(b, f * h * w, c)
     hs = dec.proj_in(hs)
@@ -39,7 +39,12 @@ class LoomClipDecoder:
     def __init__(self, vae, layers=36, profile=False, weights=None, bits=4):
         self.vae, self.layers, self.profile, self.sessions, self.weights, self.bits = vae, layers, profile, {}, weights, bits
     def __call__(self, z):
-        hs, cos, sin, num_patches, fhw = decoder_tokens(self.vae, z)
+        return self._forward(z, post_quantized=False)
+    def forward(self, z):
+        """Replace decoder.forward so the VAE retains spatial tiles and temporal blending."""
+        return self._forward(z, post_quantized=True)
+    def _forward(self, z, *, post_quantized):
+        hs, cos, sin, num_patches, fhw = decoder_tokens(self.vae, z, post_quantized=post_quantized)
         n = hs.shape[1]
         if n not in self.sessions:
             self.sessions[n] = H3VaeBlocks(n, layers=self.layers, weights=self.weights, bits=self.bits)
@@ -57,7 +62,6 @@ def main():
     from diffusers import AutoencoderKLMiniMaxH3, AutoencoderKLMiniMaxH3Audio
     fx = torch.load(a.latents); latents, audio = fx["video"].to(dev), fx["audio"].to(dev)
     vae = AutoencoderKLMiniMaxH3.from_pretrained(str(MODELS / "vae"), torch_dtype=torch.float32).to(dev).eval()
-    vae.disable_tiling()
     mean = torch.tensor(vae.config.latents_mean, device=dev).view(1, -1, 1, 1, 1); std = torch.tensor(vae.config.latents_std, device=dev).view(1, -1, 1, 1, 1)
     z = (latents * std + mean).float()
     loom = LoomClipDecoder(vae, profile=a.profile, weights=a.weights, bits=a.bits)
@@ -65,17 +69,17 @@ def main():
         zc = z[:, :, :vae.tokens_chunk_size + vae.token_overlap]
         with torch.no_grad():
             t0 = time.time(); ref = vae._decode_clip(zc); torch.cuda.synchronize(); t_ref = time.time() - t0
-            t0 = time.time(); got = loom(zc); torch.cuda.synchronize(); t_loom = time.time() - t0
+            vae.decoder.forward = loom.forward
+            t0 = time.time(); got = vae._decode_clip(zc); torch.cuda.synchronize(); t_loom = time.time() - t0
         imstd = torch.tensor((0.229, 0.224, 0.225), device=dev).view(1, 3, 1, 1, 1); immean = torch.tensor((0.485, 0.456, 0.406), device=dev).view(1, 3, 1, 1, 1)
         p, q = (ref * imstd + immean).clamp(0, 1), (got * imstd + immean).clamp(0, 1)
         mse = ((p - q) ** 2).mean().item(); print(f"first clip: torch fp32 {t_ref:.1f} s, loom {t_loom:.1f} s, PSNR {10 * math.log10(1 / max(mse, 1e-12)):.2f} dB")
     if a.clips is not None:
         z = z[:, :, : a.clips * vae.tokens_chunk_size]
-    vae._decode_clip = loom                         # the blocks in Loom; diffusers' chunking and blending around them
+    vae.decoder.forward = loom.forward              # preserve spatial tiling and temporal blending
     with torch.no_grad():
         t0 = time.time(); video = vae._decode(z); torch.cuda.synchronize(); print(f"loom decode {time.time() - t0:.1f} s -> {tuple(video.shape)}", flush=True)
-        imstd = torch.tensor((0.229, 0.224, 0.225), device=dev).view(1, 3, 1, 1, 1); immean = torch.tensor((0.485, 0.456, 0.406), device=dev).view(1, 3, 1, 1, 1)
-        video = ((video * imstd + immean).clamp(0, 1) * 2 - 1)   # write_clip expects [-1, 1]
+        # write_clip converts the ImageNet-normalised decoder output to pixels.
         avae = AutoencoderKLMiniMaxH3Audio.from_pretrained(str(MODELS / "audio_vae"), torch_dtype=torch.float32).to(dev).eval()
         amean = torch.tensor(avae.config.latents_mean, device=dev).view(1, -1, 1); astd = torch.tensor(avae.config.latents_std, device=dev).view(1, -1, 1)
         if audio.dim() == 4: audio = audio[0].permute(1, 0, 2)

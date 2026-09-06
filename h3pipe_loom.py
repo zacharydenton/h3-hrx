@@ -111,11 +111,18 @@ class H3Pipe:
         karr = (Keyframe * max(1, len(keyframes or [])))()
         for i, k in enumerate(keyframes or []):
             karr[i].frame_index = int(k["frame_index"])
-            v = np.ascontiguousarray(np.asarray(k["video"], dtype=np.float32)); assert v.ndim == 4 and v.shape[0] == 24 and v.shape[1] == 1, v.shape; keep.append(v); karr[i].video_latent = v.ctypes.data_as(_F32P)
+            v = np.ascontiguousarray(np.asarray(k["video"], dtype=np.float32))
+            expected = (24, 1, s.lat_h, s.lat_w)
+            if v.shape != expected: raise ValueError(f"keyframe video must have shape {expected}, got {v.shape}")
+            keep.append(v); karr[i].video_latent = v.ctypes.data_as(_F32P)
             if k.get("pixels") is not None:
-                px = np.ascontiguousarray(np.asarray(k["pixels"], dtype=np.float32)); keep.append(px); karr[i].pixels = px.ctypes.data_as(_F32P); karr[i].height, karr[i].width = int(px.shape[0]), int(px.shape[1])
+                px = np.ascontiguousarray(np.asarray(k["pixels"], dtype=np.float32))
+                if px.ndim != 3 or px.shape[2] != 3: raise ValueError("keyframe pixels must have shape [H][W][3]")
+                keep.append(px); karr[i].pixels = px.ctypes.data_as(_F32P); karr[i].height, karr[i].width = int(px.shape[0]), int(px.shape[1])
             if k.get("audio") is not None:
-                a = np.ascontiguousarray(np.asarray(k["audio"], dtype=np.float32)); keep.append(a); karr[i].audio_latent = a.ctypes.data_as(_F32P); karr[i].audio_t = int(a.shape[2])
+                a = np.ascontiguousarray(np.asarray(k["audio"], dtype=np.float32))
+                if a.ndim != 3 or a.shape[:2] != (2, 32) or a.shape[2] < 1: raise ValueError("keyframe audio must have shape [2][32][audio_t >= 1]")
+                keep.append(a); karr[i].audio_latent = a.ctypes.data_as(_F32P); karr[i].audio_t = int(a.shape[2])
         if refs or keyframes:
             rc = self._native.h3pipe_denoise_refs(self._handle, ids.ctypes.data_as(_I32P), ids.size, ctypes.byref(p), karr, len(keyframes or []), rarr, len(refs or []),
                                                    None if nv is None else nv.ctypes.data_as(_F32P), None if na is None else na.ctypes.data_as(_F32P),

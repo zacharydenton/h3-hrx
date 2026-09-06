@@ -57,14 +57,16 @@ void *upload_file(const std::string &path, size_t *size_out) {
     in.seekg(0);
     void *device = nullptr;
     HIP_CHECK(hipMalloc(&device, size));
-    std::vector<char> chunk(size_t(256) << 20);
-    for (size_t done = 0; done < size;) {
-        const size_t n = std::min(chunk.size(), size - done);
-        in.read(chunk.data(), std::streamsize(n));
-        if (!in) { (void)hipFree(device); throw std::runtime_error("short read of " + path); }
-        HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)((char *)device + done), chunk.data(), n));
-        done += n;
-    }
+    try {
+        std::vector<char> chunk(std::min(size, size_t(256) << 20));
+        for (size_t done = 0; done < size;) {
+            const size_t n = std::min(chunk.size(), size - done);
+            in.read(chunk.data(), std::streamsize(n));
+            if (!in) throw std::runtime_error("short read of " + path);
+            HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)((char *)device + done), chunk.data(), n));
+            done += n;
+        }
+    } catch (...) { (void)hipFree(device); throw; }
     *size_out = size;
     return device;
 }
@@ -87,6 +89,7 @@ class Session {
 public:
     Session(const std::string &weights_dir, const std::string &kernels_dir, int tokens, int layers)
         : tokens_(tokens), layers_(layers) {
+        struct Rollback { Session *self; ~Rollback() { if (self) self->release(); } } rollback{this};
         if (tokens < 1 || tokens > 65536) throw std::invalid_argument("tokens must be 1..65536");
         if (layers < 1 || layers > 50) throw std::invalid_argument("layers must be 1..50");
         HIP_CHECK(hipInit(0));
@@ -145,8 +148,10 @@ public:
         HIP_CHECK(hipMemset(x_, 0, T * HIDDEN * 4)); HIP_CHECK(hipMemset(fused_, 0, T * QKV * 2));   // headroom rows stay zero
         HIP_CHECK(hipMemset(q_, 0, T * INNER * 2)); HIP_CHECK(hipMemset(k_, 0, T * KV_INNER * 2)); HIP_CHECK(hipMemset(v_, 0, T * KV_INNER * 2));
         HIP_CHECK(hipMemset(cls_, 0, T * 4));
+        rollback.self = nullptr;
     }
-    ~Session() {
+    ~Session() { release(); }
+    void release() noexcept {
         for (void *p : {x_, a_q_, a_s_, fused_, q_, k_, v_, attn_, gu_, mods_, cls_, cos_, sin_, ones_, weights_}) if (p) (void)hipFree(p);
         for (Kernel *k : {&k_prep_norm_, &k_prep_attn_, &k_prep_down_, &k_gemm_qkv_, &k_gemm_gu_, &k_gemm_out_, &k_gemm_down_, &k_rope_, &k_attention_})
             if (k->module) (void)hipModuleUnload(k->module);

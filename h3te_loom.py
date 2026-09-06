@@ -32,8 +32,8 @@ class H3TeBlocks:
         self.tokens, self.layers = tokens, layers
         weights = Path(weights or ROOT / "build/weights_te"); library = Path(library or ROOT / "build/libh3te.so")
         kernels = ROOT / "build/kernels_te" / f"T{tokens}"
-        if not (kernels / "capacity.txt").exists():
-            subprocess.run([sys.executable, str(ROOT / "scripts/build_kernels_te.py"), str(tokens)], check=True, capture_output=True)
+        # Validate sources/configuration and repair missing cached artifacts on every open.
+        subprocess.run([sys.executable, str(ROOT / "scripts/build_kernels_te.py"), str(tokens)], check=True, capture_output=True)
         native = ctypes.CDLL(str(library))
         native.h3te_abi_version.restype = ctypes.c_uint32
         if native.h3te_abi_version() != _ABI:

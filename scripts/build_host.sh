@@ -2,6 +2,8 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mkdir -p build
+/opt/rocm/bin/hipcc -O2 -Wall -Werror -o build/loomrun host/loomrun.cpp
+printf 'built build/loomrun\n'
 /opt/rocm/bin/hipcc -O2 -Wall -Werror -fPIC -shared -o build/libh3.so host/h3.cpp
 printf 'built build/libh3.so\n'
 /opt/rocm/bin/hipcc -O2 -Wall -Werror -fPIC -shared -o build/libh3vae.so host/h3vae.cpp

@@ -956,3 +956,44 @@ already at 83 GB plus 42 GB of zram tipped the global OOM killer, which also too
 
 `tools/pipeline_c.py --ref-image ... --ref-audio ... --first-frame ...` runs the whole thing with the
 Loom encoders and the C tokenizer's presentation; the ref2va 480p clip steps at the t2va rate.
+
+## Code-review corrections (2026-09-06)
+
+The fourteen review findings are corrected: the final head runs only over generated audio
+and video rows; sequence growth invalidates the saved conditioning prefix; Python keyframes
+must match the target latent grid; Qwen3-VL uses interleaved MRoPE axes; and image presentation
+spans, including their boundary tokens, receive video modality tags. The decoder caches its
+full temporal/spatial grid, handles the two-latent/five-frame short clip, and the standalone
+decoder leaves pixel conversion to `write_clip`.
+
+The three HIP block sessions roll back allocations/modules when construction fails, including
+text-weight upload failures. The test runner preserves the ComfyUI process's exit code and
+builds `build/loomrun`. GroupNorm clamps negative variance to zero before adding epsilon.
+The 32-key attention generator includes both half-tiles in the first max reduction; all four
+affected experimental kernels were regenerated. Text-encoder/VAE sessions now validate every
+cached kernel's source, configuration, symbol, target and compiler identity, repairing missing
+artifacts and publishing binaries/stamps atomically under a per-artifact lock.
+
+Validation uses no checkpoints: `scripts/test_host.sh` checks layout/MRoPE/decoder shapes,
+constructor rollback against a bounded fake HIP allocator, binding validation (also under
+`python -O`), cache invalidation/failure recovery and test exit codes. Small GPU tests pass
+for low-variance GroupNorm and the upper-half score maximum that previously broke all four
+32-key attention variants. Host builds and generated-source consistency pass. The local
+T13/T33 text caches and T11345 W8A8 VAE cache were rebuilt without loading weights, with a
+2 GiB compiler address-space limit. Full-model accuracy comparisons were not rerun after
+the OOM; the earlier one-step video discrepancy is not claimed resolved by these checks.
+
+## Decoder grid artifact (2026-09-06)
+
+The C decoder processed each temporal clip over the whole spatial canvas. The released
+VAE uses overlapping 256-pixel tiles, each with its own attention and rotary coordinates;
+whole-canvas decoding produced the visible grid and repeated edges. The Python Loom
+wrapper also bypassed tiling by replacing `_decode_clip`, so the old decoder comparison
+agreed while both paths rendered the wrong geometry.
+
+The C host now decodes spatial tiles, blends the raw upper/left neighbors and crops the
+trailing overlaps before temporal blending. It retains only two rows of decoded tiles.
+The Python wrapper replaces `decoder.forward`, preserving diffusers' tiling and chunking.
+On the saved `py22` latents, the grid disappears and C vs Python tiled decoding measures
+48.95 dB PSNR across all 22 frames at 864x480. `tests/test_decoder_tiles.py` reproduces
+this comparison using decoder weights and small heads, without loading the full models.

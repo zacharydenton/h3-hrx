@@ -25,8 +25,8 @@ class H3VaeBlocks:
         self.tokens, self.layers = tokens, layers
         weights = Path(weights or ROOT / ("build/weights_vae" if bits == 4 else "build/weights_vae_i8")); library = Path(library or ROOT / "build/libh3vae.so")
         kernels = ROOT / ("build/kernels_vae" if bits == 4 else "build/kernels_vae_i8") / f"T{tokens}"
-        if not (kernels / "bits.txt").exists():
-            subprocess.run([sys.executable, str(ROOT / "scripts/build_kernels_vae.py"), str(tokens)], check=True, capture_output=True, env={**os.environ, "H3VAE_BITS": str(bits)})
+        # Validate sources/configuration and repair missing cached artifacts on every open.
+        subprocess.run([sys.executable, str(ROOT / "scripts/build_kernels_vae.py"), str(tokens)], check=True, capture_output=True, env={**os.environ, "H3VAE_BITS": str(bits)})
         native = ctypes.CDLL(str(library))
         native.h3vae_abi_version.restype = ctypes.c_uint32
         if native.h3vae_abi_version() != _ABI:

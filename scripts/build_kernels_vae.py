@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools")); sys.path.insert(0, str(ROOT / "scripts"))
-from kernel_test import compile_kernel
+from kernel_cache import compile_cached
 from build_kernels import gemm_m_group
 
 HIDDEN, HEADS, D, FFN = 2048, 32, 64, 8192
@@ -42,8 +42,7 @@ def build(tokens: int) -> Path:
     ]
     for stem, sym, name, cfg in specs:
         hs = out / f"{name}.hsaco"
-        if not hs.exists():
-            compile_kernel(ROOT / "kernels" / f"{stem}.loom", sym, cfg, hs)
+        compile_cached(ROOT / "kernels" / f"{stem}.loom", sym, cfg, hs)
     (out / "capacity.txt").write_text(f"{capacity}\n"); (out / "gemm_tile.txt").write_text("256\n"); (out / "attention_waves.txt").write_text(f"{waves}\n"); (out / "bits.txt").write_text(f"{BITS}\n")
     return out
 

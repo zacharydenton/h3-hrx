@@ -34,6 +34,7 @@ kernel.def target(@h3_gn_silu_f16_gfx11) export("h3_gn_silu_f16") @h3_gn_silu_f1
   %c2 = index.constant 2 : index
   %c256 = index.constant 256 : index
   %c0_offset = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
   %one = scalar.constant 1.0 : f32
   %frames_b = index.assume %frames [range(%frames, 1, 64)] : index
   %rows0 = index.mul %frames_b, %plane : index
@@ -72,7 +73,7 @@ kernel.def target(@h3_gn_silu_f16_gfx11) export("h3_gn_silu_f16") @h3_gn_silu_f1
     %ex2 = scalar.divf %sq, %n_elems : f32
     %m2 = scalar.mulf %mean, %mean : f32
     %var0 = scalar.subf %ex2, %m2 : f32
-    %var = scalar.maxnumf %var0, %eps : f32
+    %var = scalar.maxnumf %var0, %zero : f32
     %var_eps = scalar.addf %var, %eps : f32
     %rinv = scalar.rsqrtf %var_eps : f32
     %v16 = view.load %x_view[%row, %c] : view<[%rows]x[%channels]xf16> -> f16

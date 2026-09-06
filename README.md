@@ -179,3 +179,15 @@ use in the USA, EU, UK and South Korea; other regions apply to MiniMax for a lic
 The torch side shares `~/code/krea2-loom/.venv` (ROCm torch 2.13, a diffusers dev checkout
 that carries the H3 transformer, VAEs, scheduler and modular pipeline); `scripts/env.sh`
 points at the Loom toolchain.
+
+Run `bash scripts/test_host.sh` for CPU-only regressions without model weights or a GPU
+context. After `bash scripts/build_host.sh`, `python3 tests/test_kernel_regressions.py`
+checks GroupNorm and the experimental 32-key attention kernels on small synthetic inputs
+without loading torch or checkpoints. `scripts/test.sh` includes these checks; its full
+mode also runs the much larger model comparisons. The host build now produces the kernel
+test runner at `build/loomrun`.
+
+`python tests/test_decoder_tiles.py` in the torch venv checks C decoding against Python's
+spatial and temporal blending. It loads only decoder weights and small projection tables,
+without the DiT, text encoder or full floating-point VAE. Pass `--latents video.npy` to
+check saved `[24,T,H,W]` latents.

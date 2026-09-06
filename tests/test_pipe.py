@@ -65,9 +65,9 @@ def decode_video(pipe, a):
     p = H3Pipe.params(height=480, width=864, frames=frames, steps=2); sh = pipe.shape(p)
     z = fx["video"][0, :, :sh.latent_t].float().numpy()
     t0 = time.time(); got = pipe.decode_video(p, z); print(f"  C decode {frames} frames in {time.time() - t0:.1f} s")
-    vae = AutoencoderKLMiniMaxH3.from_pretrained(str(MODELS / "vae"), torch_dtype=torch.float32).to(dev).eval(); vae.disable_tiling()
+    vae = AutoencoderKLMiniMaxH3.from_pretrained(str(MODELS / "vae"), torch_dtype=torch.float32).to(dev).eval()
     mean = torch.tensor(vae.config.latents_mean, device=dev).view(1, -1, 1, 1, 1); std = torch.tensor(vae.config.latents_std, device=dev).view(1, -1, 1, 1, 1)
-    vae._decode_clip = LoomClipDecoder(vae, weights=str(ROOT / "build/weights_vae_i8"), bits=8)
+    vae.decoder.forward = LoomClipDecoder(vae, weights=str(ROOT / "build/weights_vae_i8"), bits=8).forward
     with torch.no_grad():
         t0 = time.time(); video = vae._decode(torch.from_numpy(z)[None].to(dev) * std + mean); torch.cuda.synchronize(); print(f"  Python Loom decode in {time.time() - t0:.1f} s")
     imstd = torch.tensor((0.229, 0.224, 0.225), device=dev).view(1, 3, 1, 1, 1); immean = torch.tensor((0.485, 0.456, 0.406), device=dev).view(1, 3, 1, 1, 1)

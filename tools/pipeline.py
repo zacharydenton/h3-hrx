@@ -119,11 +119,11 @@ def main() -> None:
         with torch.no_grad():
             video = vae.decode((latents * std + mean).to(torch.float16), return_dict=False)[0]     # [1, 3, F, H, W]
     else:                                                                    # the 36 decoder blocks in Loom, diffusers' chunking and head around them
-        vae = AutoencoderKLMiniMaxH3.from_pretrained(str(MODELS / "vae"), torch_dtype=torch.float32).to(dev).eval(); vae.disable_tiling()
+        vae = AutoencoderKLMiniMaxH3.from_pretrained(str(MODELS / "vae"), torch_dtype=torch.float32).to(dev).eval()
         mean = torch.tensor(vae.config.latents_mean, device=dev).view(1, -1, 1, 1, 1); std = torch.tensor(vae.config.latents_std, device=dev).view(1, -1, 1, 1, 1)
         from decode_loom import LoomClipDecoder                             # (decode_loom imports write_clip from here)
         vae_weights = a.vae_weights or str(ROOT / ("build/weights_vae_i8" if a.vae_bits == 8 else "build/weights_vae_gptq"))
-        vae._decode_clip = LoomClipDecoder(vae, profile=a.profile, weights=vae_weights, bits=a.vae_bits)
+        vae.decoder.forward = LoomClipDecoder(vae, profile=a.profile, weights=vae_weights, bits=a.vae_bits).forward
         with torch.no_grad():
             video = vae._decode((latents * std + mean).float())
     torch.cuda.synchronize(); print(f"video decoded in {time.time() - t0:.1f} s ({'torch fp16' if a.torch_decode else f'Loom W{a.vae_bits}A{a.vae_bits}'})", flush=True)

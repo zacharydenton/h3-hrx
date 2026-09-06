@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -77,6 +78,7 @@ class Session {
 public:
     Session(const std::string &weights_dir, const std::string &kernels_dir, int tokens, int layers)
         : tokens_(tokens), layers_(layers) {
+        struct Rollback { Session *self; ~Rollback() { if (self) self->release(); } } rollback{this};
         if (tokens < 16 || tokens > 65536) throw std::invalid_argument("tokens must be 16..65536");
         if (layers < 1 || layers > 50) throw std::invalid_argument("layers must be 1..50");
         HIP_CHECK(hipInit(0));
@@ -147,8 +149,10 @@ public:
         HIP_CHECK(hipMalloc(&cos_, T * ROPE_HALF * 4));
         HIP_CHECK(hipMalloc(&sin_, T * ROPE_HALF * 4));
         for (void *p : {x_, fused_, q_, k_, v_, cls_}) HIP_CHECK(hipMemset(p, 0, p == cls_ ? T * 4 : (p == x_ ? T * HIDDEN * 4 : (p == fused_ ? T * QKV * 2 : T * INNER * 2))));   // headroom rows stay zero
+        rollback.self = nullptr;
     }
-    ~Session() {
+    ~Session() { release(); }
+    void release() noexcept {
         for (void *p : {x_, a_q_, a_s_, fused_, q_, k_, v_, attn_, gu_, mods_, cls_, cos_, sin_, weights_, qi_, ki_, qs_, ks_, kmean_, zmean_, vt_}) if (p) (void)hipFree(p);
         for (Kernel *k : {&k_prep_norm_, &k_prep_attn_, &k_prep_down_, &k_gemm_qkv_, &k_gemm_gu_, &k_gemm_out_, &k_gemm_down_, &k_rope_, &k_attention_, &k_colmean_, &k_prep_q_, &k_prep_k_, &k_transpose_})
             if (k->module) (void)hipModuleUnload(k->module);

@@ -1226,6 +1226,42 @@ public:
         }
     }
 
+    // Decode spatial tiles before the temporal chunk blend, as the released VAE does.
+    void decode_spatial(const float *z, int ft, int h, int w, std::vector<float> &frames) {
+        const int H = h * VAE_PS, W = w * VAE_PS, F = ft * VAE_PT;
+        std::vector<int> ys, yo, xs, xo; split_tiles(H, ys, yo); split_tiles(W, xs, xo);
+        if (ys.size() == 1 && xs.size() == 1) { decode_clip(z, ft, h, w, frames); return; }
+        frames.assign(size_t(3) * F * H * W, 0.0f);
+        std::vector<std::vector<float>> above(xs.size()), row(xs.size());
+        const int TH = std::min(H, 256), TW = std::min(W, 256), lh = TH / VAE_PS, lw = TW / VAE_PS;
+        std::vector<float> latent(size_t(LATENT_CH) * ft * lh * lw);
+        for (size_t iy = 0; iy < ys.size(); ++iy) {
+            for (size_t ix = 0; ix < xs.size(); ++ix) {
+                for (int c = 0; c < LATENT_CH; ++c) for (int t = 0; t < ft; ++t) for (int y = 0; y < lh; ++y)
+                    memcpy(latent.data() + ((size_t(c) * ft + t) * lh + y) * lw,
+                           z + ((size_t(c) * ft + t) * h + ys[iy] / VAE_PS + y) * w + xs[ix] / VAE_PS, size_t(lw) * 4);
+                decode_clip(latent.data(), ft, lh, lw, row[ix]);
+                std::vector<float> tile = row[ix];
+                auto blend = [&](const std::vector<float> &a, int extent, bool vertical) {
+                    for (int c = 0; c < 3; ++c) for (int t = 0; t < F; ++t)
+                        for (int y = 0; y < (vertical ? extent : TH); ++y) for (int x = 0; x < (vertical ? TW : extent); ++x) {
+                            const float wb = float(vertical ? y : x) / extent, wa = 1.0f - wb;
+                            const size_t dst = ((size_t(c) * F + t) * TH + y) * TW + x;
+                            const size_t src = ((size_t(c) * F + t) * TH + (vertical ? TH - extent + y : y)) * TW + (vertical ? x : TW - extent + x);
+                            tile[dst] = wa * a[src] + wb * tile[dst];
+                        }
+                };
+                if (iy) blend(above[ix], yo[iy - 1], true);
+                if (ix) blend(row[ix - 1], xo[ix - 1], false);
+                const int keep_h = TH - (iy + 1 < ys.size() ? yo[iy] : 0), keep_w = TW - (ix + 1 < xs.size() ? xo[ix] : 0);
+                for (int c = 0; c < 3; ++c) for (int t = 0; t < F; ++t) for (int y = 0; y < keep_h; ++y)
+                    memcpy(frames.data() + ((size_t(c) * F + t) * H + ys[iy] + y) * W + xs[ix],
+                           tile.data() + ((size_t(c) * F + t) * TH + y) * TW, size_t(keep_w) * 4);
+            }
+            above.swap(row);
+        }
+    }
+
     // the clip loop of diffusers' _decode: 5-token chunks with a 2-token overlap, 17 kept frames per chunk (3 dropped in front), 5-frame cross-fades
     void decode_video(const h3pipe_params &p, const float *latents, uint8_t *out) {
         h3pipe_shape sh; h3pipe_shape_for(&p, &sh);
@@ -1251,7 +1287,7 @@ public:
             const int start = i * VAE_CHUNK, ft = std::min(VAE_CHUNK + VAE_OVERLAP, Tp - start);
             std::vector<float> z(size_t(LATENT_CH) * ft * H * W);
             for (int c = 0; c < LATENT_CH; ++c) memcpy(z.data() + size_t(c) * ft * H * W, zp.data() + (size_t(c) * Tp + start) * H * W, size_t(ft) * H * W * 4);
-            decode_clip(z.data(), ft, H, W, clip);
+            decode_spatial(z.data(), ft, H, W, clip);
             const size_t clip_frames = size_t(ft) * VAE_TRATIO;
             for (int j = 0; j < 2; ++j) {
                 const size_t f0 = size_t(j) * chunk_frames + pre, f1 = std::min(size_t(j + 1) * chunk_frames, clip_frames);
