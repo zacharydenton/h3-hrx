@@ -345,7 +345,7 @@ public:
         }
         {
             std::string stem = d.causal ? "attention_gqa8c_lds_f16_wmma" : (d.head_dim == 64 ? (waves_ == 8 ? "attention_mha648_lds_f16_wmma" : "attention_mha64_lds_f16_wmma") : (waves_ == 8 ? "attention_mha8_lds_f16_wmma" : "attention_mha_lds_f16_wmma"));
-            if (qk_int) { stem = (tokens >= 20000 && d.attn_i4) ? "attention_i4qkl_mha8_lds_f16_wmma" : (waves_ == 8 ? "attention_i4qk_mha8_lds_f16_wmma" : "attention_i4qk_mha_lds_f16_wmma"); if (!d.attn_i4) stem.replace(stem.find("i4qk"), 4, "i8qk"); }   // the one-workgroup-per-CU form helps int4 past 20k rows (1.09x) and costs int8 3%   // one workgroup per CU past ~20k rows
+            if (qk_int) { stem = (tokens >= 20000 && d.attn_i4) ? "attention_i4qkl_mha8_lds_f16_wmma" : (waves_ == 8 ? "attention_i4qk_mha8_lds_f16_wmma" : "attention_i4qk_mha_lds_f16_wmma"); if (!d.attn_i4) { stem.replace(stem.find("i4qk"), 4, "i8qk"); if (waves_ == 8) stem.replace(stem.find("i8qk"), 4, "i8qkf"); } }   // int8: the eight-wave form carries the next tile's K packet (tools/gen_attention_prefetch.py, 1.1x at 37k rows; the four-wave form loses); the one-workgroup-per-CU form helps int4 past 20k rows and costs int8 3%   // one workgroup per CU past ~20k rows
             // tile skip: H3_ATTN_SKIP_TAU=<tau> selects the skip twin (i4qk -> i4qks) at that tau (tau 4: no measured velocity cost,
             // about 3% on the 768 step against the carried-scale plain kernel); unset or 'off' -> the plain kernel
             double tau = 0.0;

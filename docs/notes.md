@@ -1233,3 +1233,36 @@ shuffle, and P^T can be assembled in registers as the PV rhs with one shuffle, n
 trip. That, and SageAttention's f16 PV accumulator (halving the 64 accumulator registers and
 the rescale, which is what a 32-query-per-wave form needs to halve K/V staging and LDS
 fragment reads per MMA), are the next two attention experiments.
+
+## Attention ledger: five theories, one survivor (2026-09-06, night)
+
+Run under flash-attention's root-cause protocol (`~/code/flash-attention/AI/DEBUG_METHODOLOGY.md`):
+each theory names a falsifier that is cheaper than the build it would justify. All timings are
+`tests/test_attention_i8.py --time-only`, interleaved, eight-wave int8-QK kernel, 16000 / 37723 tokens.
+
+| theory | falsifier | result | status |
+| --- | --- | --- | --- |
+| the per-tile P round trip through LDS is a large share (the transposed S^T = K Q^T form would remove it) | replace P with a loop-invariant fragment | 23.6 -> 19.3 / 21.9 -> 23.7 (+8% at 37k, worse at 16k) | ceiling too low; not built |
+| three of the four row-max butterflies matter | remove them | +1-2% | not worth a kernel |
+| the per-tile workgroup barrier and the latency it exposes (32-key tiles would halve both) | delete the barrier (wrong results, timing only) | 0% at 16k, -8% at 37k | falsified |
+| the eight-deep dependent QK^T MMA chain is latency-bound | split into 2 / 4 independent chains | -4% / -5% | falsified |
+| each tile's global loads are issued at the top of its own iteration, latency exposed (the int4 kernel gained 1.39x from this once, then the form spilled) | carry the next tile's packets in registers | K and V carried (12 regs): spills 72 B, 0.4x. **K only (4 regs): 23.5 -> 25.1 / 21.9 -> 24.0**, with the PV fragment loads interleaved with their MMAs 24.3 | confirmed, shipped |
+
+GEMM pitch, same protocol: comfy_kitchen's int8 GEMM has our exact geometry (256x128, k 64, 4x2
+waves of 64x64) at 27 KB of LDS (72-byte stage rows) and 50 TOPS. Theory: the row pitch.
+Falsifier: 64-, 80- and 96-byte pitches interleaved at 2922x5376x21504: 34.5 / 37.5-39.8 / 37.0
+TOPS. The 80-byte row is already the best of the three; falsified.
+
+`tools/gen_attention_prefetch.py` writes the shipped `attention_i8qkf_mha8_lds_f16_wmma` (K
+packet carried, PV loads interleaved) and, to experiments/, the V-carrying form and the
+four-wave form (0.78x at 2922 rows: the short-sequence kernel is not latency-bound). The host
+uses the prefetch form for int8 from 4096 rows.
+
+Rejected earlier the same night, with numbers: the direct-load (no LDS) form (8.7 / 5.1 TFLOP/s),
+f16-accumulator PV (Loom's descriptor set rejects it). Triton's kernel, disassembled, stages
+through dynamically allocated LDS and uses `v_permlanex16` for its P layout; its 30.8 is a
+scheduling result on the same structure, not a different structure.
+
+End to end with the prefetch kernel: parity unchanged (video rows 0.9988 at block 30, 0.9991 at 49);
+864x480 x 124 frames 32 s per evaluation (33 before); 1344x768 x 124 frames 139.8 s (attention 94.6 s + 3.0 s
+operands, from 101 + 3), 5.5x ComfyUI's 771 s.

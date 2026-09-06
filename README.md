@@ -174,9 +174,10 @@ Measured head to head against ComfyUI's own H3 path (int8 ConvRot checkpoints, b
 pytorch attention, `tools/bench_comfyui_h3.py` in the Strix Halo image): 771 s per step at
 1344x768 and 124 frames against 128 s here with the int4 path in the same session, six times
 faster; 30 steps are 6.4 hours there and about an hour here (`docs/notes.md`, "Head to head
-with ComfyUI"). The int8 path, the one whose clips match ComfyUI's, costs 146 s per
-evaluation at that size with int8 QK^T attention (161 s with f16 attention), 5.3x faster than
-ComfyUI; at 864x480 and 124 frames (5 s of video) 33 s against ComfyUI's 103 s, 3.1x; at
+with ComfyUI"). The int8 path, the one whose clips match ComfyUI's, costs 140 s per
+evaluation at that size with int8 QK^T attention and its next-tile K prefetch (161 s with f16
+attention), 5.5x faster than ComfyUI; at 864x480 and 124 frames (5 s of video) 32 s against
+ComfyUI's 103 s, 3.2x; at
 864x480 and 22 frames 4.0 s against 3.8 s, parity. ComfyUI's slowness at video sizes is one
 thing: its H3 model hands torch's flash attention head-strided views, on which aotriton's kernel
 runs at 5.8 TFLOP/s instead of the 30.8 it reaches on contiguous tensors at the same length
