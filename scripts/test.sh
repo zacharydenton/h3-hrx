@@ -32,6 +32,7 @@ if [ "${1:-}" != "--quick" ]; then
   step "text encoder layers vs transformers" bash -c 'source ~/code/krea2-loom/.venv/bin/activate && env -u LD_LIBRARY_PATH python3 tests/test_te_blocks.py --curve 1,50'
   step "video VAE decoder blocks vs diffusers (W8A8)" bash -c 'source ~/code/krea2-loom/.venv/bin/activate && env -u LD_LIBRARY_PATH python3 tests/test_vae_blocks.py --curve 36 --bits 8'
   step "C pipeline (libh3pipe) vs the Python stages" bash -c 'source ~/code/krea2-loom/.venv/bin/activate && env -u LD_LIBRARY_PATH python3 tests/test_pipe.py --step --decode --audio'
+  step "C host vs ComfyUI's own run (int8 rows + f16 attention)" bash -c 'source ~/code/krea2-loom/.venv/bin/activate && env -u LD_LIBRARY_PATH python3 tests/test_comfy_parity.py'
 fi
 printf '\n'; [ "$status" = 0 ] && printf 'all checks passed\n' || printf 'SOME CHECKS FAILED\n'
 exit $status

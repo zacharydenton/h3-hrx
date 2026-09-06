@@ -1025,3 +1025,69 @@ HRX agree exactly. C/Python tiled parity is 48.95 dB at 864x480 over 22 frames a
 at 384x320 over 39 frames. A separate regression checks different post-quant weights across
 three successive sessions and five-frame clips. CPU fault injection checks lazy loading,
 failed uploads, failed constructors, resize retries and module cleanup without a GPU.
+
+## ComfyUI's sampler, and why int4 ghosts conditioned clips (2026-09-06)
+
+The keyframe and reference clips came out with doubled, streaked legs while text-only clips
+looked fine. Three things were settled in order, each against ComfyUI itself.
+
+**Sampler.** The stock H3 workflows (`user/default/workflows/MiniMax-H3-*.json` in the Strix
+Halo image) all sample with `res_multistep` on the `simple` schedule, 20 evaluations, cfg 1
+(`BasicGuider`), the model's shifts 12/3; the pipeline used plain Euler at 30. `simple` with 20
+steps is the same grid as diffusers' `linspace(1, 0, 21)` through the shift, so `steps` stays
+"sigma grid points" (21 = ComfyUI's 20 evaluations). `h3pipe_params.sampler = 1` ports
+`comfy/k_diffusion/sampling.py` `res_multistep` (eta 0): the pack advances on the video sigma
+grid, second-order in t = -log sigma with the previous denoised; the audio's sampler variable
+is ComfyUI's carried `y = (sigma_v / sigma_a) x_a` with the model output transformed as
+`comfy/ldm/minimax/model.py` does (`(1 - scale) x_a + (1 + (scale - 1) sigma_a) out_a`,
+scale = shift_v / shift_a) and `y / scale` at the end. From ComfyUI's own noise the video
+latent agrees to rel err 0.001 after one evaluation and 0.01 after five, so the port is right;
+the sampler was not the ghosting (the res_multistep clips ghosted the same way).
+
+**Decoder.** The C decoder was cleared by decoding the clean text-only latents (matches the
+torch VAE) and by torch-decoding the ghosted keyframe latents (still ghosted): the defect is
+in the latents.
+
+**Precision.** `tools/comfy_clip.py --dump-steps --dump-blocks` runs a whole ComfyUI clip in
+the image and saves its noise, the video latent after every evaluation, the refined text and
+the residual stream after chosen blocks at the first evaluation; `tools/compare_comfy.py`
+runs the C host from that noise and compares. Text-only, 864x480, 22 frames, first evaluation,
+cosine of the residual stream rows against ComfyUI (text / audio / video rows):
+
+| blocks | attention QK^T | block 0 | block 10 | block 20 | block 30 | block 40 | block 49 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| int4 GPTQ (W4A4) | int4 | .997 / .999 / .992 | .999 / .998 / .998 | 1.00 / .999 / .989 | .997 / .991 / .908 | .989 / .934 / .834 | .974 / .960 / .943 |
+| int8 rows (W8A8) | f16 | 1.000 / 1.000 / 1.000 | 1.000 / 1.000 / 1.000 | 1.000 / 1.000 / 1.000 | 1.000 / 1.000 / .999 | 1.000 / .999 / .994 | .999 / .999 / .999 |
+
+The refined text rows match at 0.9998 in both. With int8 rows and f16 attention the host
+*is* ComfyUI's network to three or four digits through 49 blocks; the int4 configuration is
+right through block 10 and then loses the video rows in the deep blocks (the massive-activation
+regime, |x| 800 to 7000), and the loss is the same size whether int4 sits in the GEMMs or in
+the attention operands (int8 rows with int4 QK^T, and int4 rows with f16 attention, both end
+their 20-step trajectory at cosine 0.86 to 0.87 against ComfyUI; both together 0.90). The
+first evaluation's velocity is 19 to 37% off ComfyUI's in int4 and the trajectory drifts from
+there. Text-only clips absorb that as different but coherent content; a keyframe pins frame 0
+(frame 0 matches ComfyUI at 0.993 in every configuration) and the drift shows up as the
+moving frames disagreeing with the anchor: the ghosting. The 22-frame clips at 864x480 with
+int8 rows and f16 attention (`build/fl2va_i8.mp4`, `ref2va_i8.mp4`, `t2va_i8.mp4`) are clean and
+the keyframe one is indistinguishable in kind from ComfyUI's (`build/comfy_fl2va.mp4`).
+
+Even at parity precision the 20-step trajectory ends at cosine 0.90: the last four evaluations
+jump sigma 0.8 -> 0.39 -> 0 and amplify 1% differences into different fine detail. That is
+inherent to the schedule, not a defect; the int8 clip is clean.
+
+`tools/export_weights.py --bits 8` writes the checkpoint's int8 rows and scales verbatim
+(`build/weights_i8`, 19.3 GB); the host reads the width from the manifest. `h3pipe_config.attn_qk_bits`
+(16 or 4) picks the attention; `tools/pipeline_c.py --precision int8|int4` sets both (int8 is
+the default now). Per step at 864x480 x 22 frames, 20 evaluations: int4 2.8 s, int8 + f16 5.7 s,
+ComfyUI 5.2 s (`tools/comfy_clip.py`, pytorch attention, in the same session order). At 1344x768
+x 124 frames (37723 rows) int8 + f16 is 161 s per evaluation (160.3 / 161.2 / 161.5), against
+128 s for int4 in the earlier same-session head to head and 771 s for ComfyUI: 4.8x. The int8
+GEMMs cost little there because attention is the wall, and the f16 attention kernel at eight
+waves is close to the int4-QK one at that size. The int4 path keeps its 2x per step at small
+sizes as a preview/fast mode; clips meant to be looked at use int8.
+
+Two harness traps found on the way: ComfyUI's pack stores the audio noise as [32, 2, A]
+(transpose to [2, 32, A]; a reshape scrambles the audio rows and they, not the video, then
+diverge from block 5), and hooking a block's input by reading `args[0]` after the call sees
+the output, because the blocks update the hidden state in place.

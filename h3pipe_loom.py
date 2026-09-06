@@ -8,14 +8,14 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent
-_ABI, _ERR = 4, 4096
+_ABI, _ERR = 6, 4096
 _F32P, _U8P, _I32P = ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_int32)
 PROGRESS = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_double)
 
 
 class Config(ctypes.Structure):
     _fields_ = [("glue_dir", ctypes.c_char_p), ("blocks_dir", ctypes.c_char_p), ("te_dir", ctypes.c_char_p), ("vae_dir", ctypes.c_char_p),
-                ("kernel_sources", ctypes.c_char_p), ("cache_dir", ctypes.c_char_p), ("loom_compile", ctypes.c_char_p), ("vae_bits", ctypes.c_int), ("aenc_dir", ctypes.c_char_p), ("vision_dir", ctypes.c_char_p), ("venc_dir", ctypes.c_char_p)]
+                ("kernel_sources", ctypes.c_char_p), ("cache_dir", ctypes.c_char_p), ("loom_compile", ctypes.c_char_p), ("vae_bits", ctypes.c_int), ("aenc_dir", ctypes.c_char_p), ("vision_dir", ctypes.c_char_p), ("venc_dir", ctypes.c_char_p), ("attn_qk_bits", ctypes.c_int)]
 
 
 class Ref(ctypes.Structure):
@@ -28,7 +28,7 @@ class Keyframe(ctypes.Structure):
 
 class Params(ctypes.Structure):
     _fields_ = [("height", ctypes.c_int), ("width", ctypes.c_int), ("frames", ctypes.c_int), ("steps", ctypes.c_int), ("seed", ctypes.c_uint64),
-                ("video_shift", ctypes.c_float), ("audio_shift", ctypes.c_float), ("cache_threshold", ctypes.c_float)]
+                ("video_shift", ctypes.c_float), ("audio_shift", ctypes.c_float), ("sampler", ctypes.c_int), ("cache_threshold", ctypes.c_float)]
 
 
 class Shape(ctypes.Structure):
@@ -45,7 +45,8 @@ def default_loom_compile() -> str:
 
 
 class H3Pipe:
-    def __init__(self, glue=None, blocks=None, te=None, vae=None, vae_bits=8, cache=None, library=None, aenc=None, vision=None, venc=None):
+    def __init__(self, glue=None, blocks=None, te=None, vae=None, vae_bits=8, cache=None, library=None, aenc=None, vision=None, venc=None, attn="i4"):
+        """blocks: build/weights_i8 (int8 rows, ComfyUI parity) or build/weights_gptq (int4, the fast path); attn: "f16" or "i4" QK^T. Both int4 choices ghost conditioned clips (docs/notes.md)."""
         native = ctypes.CDLL(str(library or os.environ.get("H3PIPE_LIB") or ROOT / "build/libh3pipe.so"))   # H3PIPE_LIB=build/libh3pipe_hrx.so: the libhrx build
         native.h3pipe_abi_version.restype = ctypes.c_uint32
         if native.h3pipe_abi_version() != _ABI: raise H3PipeError("ABI mismatch; rebuild with scripts/build_host.sh")
@@ -63,7 +64,7 @@ class H3Pipe:
         self._native = native
         cfg = Config(os.fsencode(glue or ROOT / "build/weights_glue"), os.fsencode(blocks or ROOT / "build/weights_gptq"), os.fsencode(te or ROOT / "build/weights_te"),
                      os.fsencode(vae or ROOT / ("build/weights_vae_i8" if vae_bits == 8 else "build/weights_vae_gptq")), os.fsencode(ROOT / "kernels"),
-                     os.fsencode(cache or ROOT / "build/kernel_cache"), os.fsencode(default_loom_compile()), vae_bits, os.fsencode(aenc or ROOT / "build/weights_aenc"), os.fsencode(vision or ROOT / "build/weights_vision"), os.fsencode(venc or ROOT / "build/weights_venc"))
+                     os.fsencode(cache or ROOT / "build/kernel_cache"), os.fsencode(default_loom_compile()), vae_bits, os.fsencode(aenc or ROOT / "build/weights_aenc"), os.fsencode(vision or ROOT / "build/weights_vision"), os.fsencode(venc or ROOT / "build/weights_venc"), {"i4": 4, "f16": 16}[attn])
         handle = ctypes.c_void_p(); err = ctypes.create_string_buffer(_ERR)
         if native.h3pipe_create(ctypes.byref(cfg), ctypes.byref(handle), err, _ERR): raise H3PipeError(err.value.decode())
         self._handle = handle
@@ -76,8 +77,9 @@ class H3Pipe:
         except Exception: pass
 
     @staticmethod
-    def params(height=480, width=864, frames=124, steps=50, seed=0, video_shift=0.0, audio_shift=0.0, cache_threshold=0.0) -> Params:
-        return Params(height, width, frames, steps, seed, video_shift, audio_shift, cache_threshold)
+    def params(height=480, width=864, frames=124, steps=21, seed=0, video_shift=0.0, audio_shift=0.0, cache_threshold=0.0, sampler="res_multistep") -> Params:
+        """steps = sigma grid points (steps - 1 evaluations); the defaults are the stock ComfyUI workflows' res_multistep / simple / 20 evaluations."""
+        return Params(height, width, frames, steps, seed, video_shift, audio_shift, {"euler": 0, "res_multistep": 1}[sampler], cache_threshold)
 
     def shape(self, p: Params) -> Shape:
         s = Shape(); self._native.h3pipe_shape_for(ctypes.byref(p), ctypes.byref(s)); return s

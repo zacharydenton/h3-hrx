@@ -149,9 +149,18 @@ plus `tools/gptq_export.py --out ...`. Run:
 
 ```sh
 python3 tools/pipeline_c.py "<Picture 1> is the fox. A red fox ... with the sound of <Audio 1>" \
-  --ref-image fox.png --ref-audio fox.wav --blocks build/weights_gptq_ref2va --glue build/weights_glue_ref2va
+  --ref-image fox.png --ref-audio fox.wav        # ref2va: picks build/weights_i8_ref2va + weights_glue_ref2va when exported
 python3 tools/pipeline_c.py "A red fox ..." --first-frame fox.png      # fl2va with the default weights
 ```
+
+The defaults are the stock ComfyUI workflows' settings: `res_multistep` on the `simple`
+schedule, 20 evaluations (`--steps 21` grid points), no CFG, shifts 12/3, and
+`--precision int8` (the checkpoint's int8 rows, `tools/export_weights.py --bits 8`, with f16
+attention). `--precision int4` is the 2x-per-step path (GPTQ int4 blocks, int4 QK^T attention):
+fine for text-only previews, but it ghosts keyframe and reference clips, because its deep-block
+error drifts the moving frames away from the pinned anchor (`docs/notes.md`, "ComfyUI's
+sampler, and why int4 ghosts conditioned clips"). At parity precision the host reproduces
+ComfyUI's residual stream to 0.999 through all 50 blocks (`tests/test_comfy_parity.py`).
 
 Details and every gate: `docs/plan-refs.md`, `docs/notes.md` ("Reference conditioning").
 
@@ -161,9 +170,11 @@ At 480p and 4 s (about 10k rows) a step is about 12 s at the rates krea2-loom re
 this part; at 768p and 5 s (about 37k rows) a step is 110-114 s (124 frames), attention about 75% of it.
 Measured head to head against ComfyUI's own H3 path (int8 ConvRot checkpoints, bf16 compute,
 pytorch attention, `tools/bench_comfyui_h3.py` in the Strix Halo image): 771 s per step at
-1344x768 and 124 frames against 128 s here in the same session, six times faster; 30 steps
-are 6.4 hours there and about an hour here (`docs/notes.md`, "Head to head with ComfyUI").
-Attention, not the int4 GEMMs, is the wall at video lengths.
+1344x768 and 124 frames against 128 s here with the int4 path in the same session, six times
+faster; 30 steps are 6.4 hours there and about an hour here (`docs/notes.md`, "Head to head
+with ComfyUI"). The int8 + f16 path, the one whose clips match ComfyUI's, costs 161 s per
+step at that size, 4.8x faster than ComfyUI; at 864x480 and 22 frames it is 5.7 s per step against ComfyUI's 5.2 s and
+int4's 2.8 s. Attention, not the GEMMs, is the wall at video lengths.
 
 ## Weights and license
 

@@ -11,7 +11,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define H3PIPE_ABI_VERSION 4u
+#define H3PIPE_ABI_VERSION 6u
 enum { H3PIPE_OK = 0, H3PIPE_ERROR = 1, H3PIPE_CANCELLED = 2, H3PIPE_INVALID_ARGUMENT = 64 };
 typedef struct h3pipe_session h3pipe_session;
 
@@ -27,6 +27,7 @@ typedef struct {
     const char *aenc_dir;        // tools/export_audio_encoder.py: the audio VAE's encoder (reference audio); NULL -> h3pipe_encode_audio unavailable
     const char *vision_dir;      // tools/export_vision.py: Qwen3-VL's vision tower (reference images in the prompt); NULL -> unavailable
     const char *venc_dir;        // tools/export_vae_encoder.py: the video VAE's encoder (reference images/videos, keyframes); NULL -> unavailable
+    int attn_qk_bits;            // the DiT attention's QK^T: 16 (f16, ComfyUI parity) or 4 (int4 operands, the fast path); 0 -> 4. blocks_dir's width (int4 or int8 rows) is read from its manifest
 } h3pipe_config;
 
 typedef struct {
@@ -35,6 +36,7 @@ typedef struct {
     int steps;                   // sigma grid points (steps - 1 model evaluations), as diffusers
     uint64_t seed;
     float video_shift, audio_shift;   // 0 -> the model's defaults (12, 3)
+    int sampler;                      // 0 = Euler per stream schedule (diffusers); 1 = ComfyUI's res_multistep on the video sigma grid, the audio carried as (sigma_v / sigma_a) x_a (the stock workflows: res_multistep, simple, 20 evaluations = steps 21)
     float cache_threshold;            // first-block step cache: skip blocks 1..49 while the accumulated relative change of block 0's output stays below this (0 = off; 0.05-0.15 typical)
 } h3pipe_params;
 

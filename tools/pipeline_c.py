@@ -1,7 +1,7 @@
 """Text -> video + audio through libh3pipe.so alone: the tokenizer here, everything else in the C
 library (every kernel in Loom). Writes <out>.mp4 (+ .wav) through ffmpeg.
     python3 tools/pipeline_c.py "a red fox ..." [--frames 124 --steps 50 --height 480 --width 864 --seed 0 --out build/clip_c.mp4]"""
-import argparse, math, subprocess, sys, time, wave
+import argparse, os, math, subprocess, sys, time, wave
 from pathlib import Path
 import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
@@ -12,16 +12,21 @@ FPS, RATE = 24, 32000
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("prompt"); ap.add_argument("--height", type=int, default=480); ap.add_argument("--width", type=int, default=864)
-    ap.add_argument("--frames", type=int, default=124); ap.add_argument("--steps", type=int, default=50); ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--frames", type=int, default=124); ap.add_argument("--steps", type=int, default=21, help="sigma grid points; 21 = the ComfyUI workflows' 20 evaluations"); ap.add_argument("--sampler", choices=["euler", "res_multistep"], default="res_multistep", help="res_multistep is the ComfyUI workflows' sampler"); ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cache-threshold", type=float, default=0.0, help="first-block step cache threshold (0 = off)"); ap.add_argument("--vae-bits", type=int, default=8); ap.add_argument("--out", default=str(ROOT / "build/clip_c.mp4")); ap.add_argument("--latents-out", default=None); ap.add_argument("--no-decode", action="store_true", help="stop after denoising (timing runs)")
     ap.add_argument("--ref-image", action="append", default=[], help="reference image (png/jpg) for ref2va: presented as <Picture i> and encoded by the VAE encoder; repeatable")
     ap.add_argument("--ref-audio", action="append", default=[], help="reference wav (32 kHz stereo/mono) for ref2va: <Audio j>; repeatable")
     ap.add_argument("--first-frame", default=None, help="keyframe image for fl2va (resized to the canvas)")
-    ap.add_argument("--blocks", default=None); ap.add_argument("--glue", default=None)
+    ap.add_argument("--precision", choices=["int8", "int4"], default="int8", help="int8: int8 block rows + f16 attention (ComfyUI parity; conditioned clips clean); int4: int4 GPTQ blocks + int4 QK^T attention (2x faster per step, ghosts keyframe/reference clips)")
+    ap.add_argument("--blocks", default=None, help="override the block weights directory"); ap.add_argument("--attn", choices=["f16", "i4"], default=None, help="override the attention QK^T precision"); ap.add_argument("--glue", default=None)
     a = ap.parse_args()
     from h3tok_ids import encode_presentation
-    t0 = time.time(); pipe = H3Pipe(vae_bits=a.vae_bits, blocks=a.blocks, glue=a.glue); print(f"session in {time.time() - t0:.1f} s", flush=True)
-    p = H3Pipe.params(height=a.height, width=a.width, frames=a.frames, steps=a.steps, seed=a.seed, cache_threshold=a.cache_threshold); sh = pipe.shape(p)
+        # the ref2va checkpoint for reference runs when its exports exist (H3_CKPT=<ref2va> tools/export_weights.py --bits 8 --out build/weights_i8_ref2va, tools/export_glue.py)
+    suffix = "_ref2va" if (a.ref_image or a.ref_audio) and (ROOT / f"build/weights_{'i8' if a.precision == 'int8' else 'gptq'}_ref2va/manifest.txt").exists() and (ROOT / "build/weights_glue_ref2va/manifest.txt").exists() else ""
+    blocks = a.blocks or str(ROOT / (("build/weights_i8" if a.precision == "int8" else "build/weights_gptq") + suffix)); attn = a.attn or ("f16" if a.precision == "int8" else "i4")
+    glue = a.glue or (str(ROOT / "build/weights_glue_ref2va") if suffix else None)
+    t0 = time.time(); pipe = H3Pipe(vae_bits=a.vae_bits, blocks=blocks, glue=glue, attn=attn); print(f"session in {time.time() - t0:.1f} s ({os.path.basename(blocks)}, {attn} attention{', ref2va glue' if glue else ''})", flush=True)
+    p = H3Pipe.params(height=a.height, width=a.width, frames=a.frames, steps=a.steps, seed=a.seed, cache_threshold=a.cache_threshold, sampler=a.sampler); sh = pipe.shape(p)
     print(f"{sh.frames} frames at {a.width}x{a.height}: {sh.latent_t}x{sh.lat_h}x{sh.lat_w} latents, {sh.audio_t} audio latents", flush=True)
     # references (ref2va) and the keyframe (fl2va): images resized as ComfyUI's nodes do, encoded by the Loom encoders
     refs, kfs, image_tokens = [], [], []

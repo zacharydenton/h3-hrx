@@ -384,6 +384,11 @@ public:
     void forward(Profile *prof, void *x, const void *cls, const void *cos, const void *sin, const std::function<LayerCond(int)> &cond, int first = 0, int last = -1) {
         const unsigned T = unsigned(tokens_);
         if (last < 0) last = layers_;
+        static const char *dump_blocks = std::getenv("H3_DUMP_BLOCKS");   // H3_DUMP_BLOCKS=<dir>: x before the first block (h_in) and after every block (blk_NN), [tokens][hidden] f32, first call only
+        static int dump_calls = 0; const bool dumping = dump_blocks && dump_calls == 0 && layers_ == 50 && d_.classes > 1;   // the DiT, not the 50-layer text encoder if (dumping) ++dump_calls;
+        auto dump_x = [&](const std::string &name) { if (!dumping) return; std::vector<float> hbuf(size_t(T) * d_.hidden); rt().sync(); rt().d2h(hbuf.data(), x, hbuf.size() * 4);
+            if (FILE *f = fopen((std::string(dump_blocks) + "/" + name + ".f32").c_str(), "wb")) { fwrite(hbuf.data(), 4, hbuf.size(), f); fclose(f); } };
+        dump_x("h_in");
         for (int i = first; i < last; ++i) {
             const Block &b = blocks_[i]; const LayerCond lc = cond(i);
             prep_norm_.run(prof, "prepare norm", T, x, b.norm1, lc.table_msa, cls, a_q_, a_s_);
@@ -407,6 +412,7 @@ public:
             gemm_gu_.run(prof, "gemm ff + swiglu", T, a_q_, b.gu_q, b.gu_s, a_s_, gu_, nullptr, nullptr, b.gu_b);
             prep_down_.run(prof, "prepare down input", T, gu_, nullptr, nullptr, nullptr, a_q_, a_s_);
             gemm_down_.run(prof, "gemm down + residual", T, a_q_, b.down_q, b.down_s, a_s_, x, lc.gate_mlp, cls, b.down_b);
+            dump_x(fmt("blk_%02d", i));
         }
     }
 
@@ -512,6 +518,7 @@ public:
         comp_.exe = cfg.loom_compile; comp_.sources = cfg.kernel_sources; comp_.cache = cfg.cache_dir;
         vae_dir_ = cfg.vae_dir ? cfg.vae_dir : ""; vae_bits_ = cfg.vae_bits ? cfg.vae_bits : 8;
         aenc_dir_ = cfg.aenc_dir ? cfg.aenc_dir : ""; vision_dir_ = cfg.vision_dir ? cfg.vision_dir : ""; venc_dir_ = cfg.venc_dir ? cfg.venc_dir : "";
+        attn_qk_bits_ = cfg.attn_qk_bits ? cfg.attn_qk_bits : 4; if (attn_qk_bits_ != 4 && attn_qk_bits_ != 16) throw std::invalid_argument("attn_qk_bits must be 4 or 16");
         glue_.open(cfg.glue_dir);
         embed_ = glue_.span("te.embed");
         blocks_dir_ = cfg.blocks_dir;
@@ -718,13 +725,17 @@ public:
           for (size_t r = 0; r < S; ++r) for (int ax = 0; ax < 3; ++ax) for (int j = 0; j < 16; ++j) { const float ang = float(lay.pos[3 * r + ax]) * inv_freq_[j]; c[r * ROPE_HALF + ax * 16 + j] = std::cos(ang); s[r * ROPE_HALF + ax * 16 + j] = std::sin(ang); }
           rt().h2d(cos_, c.data(), c.size() * 4); rt().h2d(sin_, s.data(), s.size() * 4); }
         if (!dit_ || dit_->tokens() != S) {
-            const char *qk = std::getenv("H3_ATTN_QK"); StackDims dd{HID, HEADS, HEADS, HEAD_DIM, FFN, ROPE_DIM, CLASSES, 4, 1e-5f, false, true, false}; dd.attn_i4 = !(qk && std::string(qk) == "f16");   // int4 QK^T by default
+            const char *qk = std::getenv("H3_ATTN_QK"); StackDims dd{HID, HEADS, HEADS, HEAD_DIM, FFN, ROPE_DIM, CLASSES, 4, 1e-5f, false, true, false}; dd.attn_i4 = qk ? !(std::string(qk) == "f16") : attn_qk_bits_ == 4;   // H3_ATTN_QK=f16|i4 overrides the config
+            dd.bits = blocks_.span("blocks.0.qkv.q").bytes == size_t(dd.qkv()) * dd.hidden ? 8 : 4;   // the export's width: int8 rows verbatim (export_weights.py --bits 8) or packed int4
             dit_.reset(); dit_ = std::make_unique<Stack>(comp_, dd, S, 50, blocks_, "blocks.%d.", true, nullptr); }
         if (!final_prep_.k) { final_prep_.build(comp_, "norm", 8, HID, 1e-5f, 2); }
         const size_t generated_rows = Na + Nv;   // the final head has only the video/audio timestep classes
         Gemm &final_gemm = gemms_[fmt("final_%zu", generated_rows)]; if (!final_gemm.k) final_gemm.build(comp_, "plain", 8, true, true, HID, FINAL_N, generated_rows);
         // latents as rows: video [Nv][96] (row = (t*(H/2) + hh)*(W/2) + ww, column = c*4 + dy*2 + dx), audio [2*audio_t][32] (row = c*audio_t + t)
         std::vector<float> vrows(Nv * VIDEO_PATCH), arows(Na * AUDIO_CH);
+        const bool res = p.sampler == 1;   // ComfyUI's res_multistep over the pack on the video sigma grid; arows is what the network sees, yrows the carried audio variable
+        const double shift_v = p.video_shift > 0 ? p.video_shift : 12.0, shift_a = p.audio_shift > 0 ? p.audio_shift : 3.0, ascale = shift_v / shift_a;
+        std::vector<float> yrows, den_v, den_a, old_v, old_a;
         const int T = sh.latent_t, H = sh.lat_h, W = sh.lat_w, A = sh.audio_t;
         Rng rng(p.seed);
         if (noise_video) for (size_t i = 0; i < vrows.size(); ++i) vrows[i] = 0; // filled below from the tensor layout
@@ -737,6 +748,11 @@ public:
         if (noise_video) tensor_to_rows(noise_video); else { std::vector<float> lat(size_t(LATENT_CH) * T * H * W); for (float &v : lat) v = rng.normal(); tensor_to_rows(lat.data()); }
         if (noise_audio) for (int c = 0; c < 2; ++c) for (int t = 0; t < A; ++t) for (int k = 0; k < AUDIO_CH; ++k) arows[(size_t(c) * A + t) * AUDIO_CH + k] = noise_audio[(size_t(c) * AUDIO_CH + k) * A + t];
         else for (float &v : arows) v = rng.normal();
+        if (res) yrows = arows;   // carry = sigma_a / sigma_v = 1 at sigma_v = 1
+        const char *dump_dir = std::getenv("H3_DUMP_DIR");   // per-step video latents [24][T][H][W] f32: x_00 = noise, x_k = the state after evaluation k
+        auto dump = [&](size_t k) { if (!dump_dir) return; std::vector<float> lat(size_t(LATENT_CH) * T * H * W); rows_to_tensor(lat.data());
+            if (FILE *f = fopen(fmt("%s/x_%02zu.f32", dump_dir, k).c_str(), "wb")) { fwrite(lat.data(), 4, lat.size(), f); fclose(f); } };
+        dump(0);
         Schedule sv(p.steps, p.video_shift > 0 ? p.video_shift : 12.0), sa(p.steps, p.audio_shift > 0 ? p.audio_shift : 3.0);
         cache_acc_ = 0.0; have_cache_ = false; cache_skipped_ = 0;
         if (sv.timesteps.size() != sa.timesteps.size()) throw std::runtime_error("the two schedules differ in length");
@@ -748,6 +764,7 @@ public:
             temb(std::max(sv.timesteps[step], VISUAL_COND_AUG), tcv); temb(std::max(sa.timesteps[step], 1.0f), tca); upload_mods(tv, ta, tcv, tca);
             // audio rows -> x[L, L+Na), video rows -> x[L+Na, S), each through prepare(256) + the padded-K int8 GEMM
             std::fill(in16.begin(), in16.end(), 0);
+            if (res) { const float carry = sa.sigmas[step] / sv.sigmas[step]; for (size_t i = 0; i < arows.size(); ++i) arows[i] = yrows[i] * carry; }
             for (size_t r = 0; r < Na; ++r) for (int k = 0; k < AUDIO_CH; ++k) in16[r * KPAD + k] = f32_to_f16(arows[r * AUDIO_CH + k]);
             rt().h2d(in16_, in16.data(), Na * KPAD * 2);
             embed_linear("audio in", LR, Na, KPAD, "h3.audio_in");
@@ -808,16 +825,37 @@ public:
             final_prep_.run(&prof, "final norm", unsigned(generated_rows), (float *)x_ + LR * HID, glue_.at("h3.final.norm", size_t(HID) * 4), final_table_, (int32_t *)tcls_ + LR, a_q_, a_s_);
             final_gemm.run(&prof, "final out", unsigned(generated_rows), a_q_, glue_.at("h3.final.out.q", size_t(FINAL_N) * HID), glue_.at("h3.final.out.s", size_t(FINAL_N) * 4), a_s_, out16_, nullptr, nullptr, glue_.at("h3.final.out.b", size_t(FINAL_N) * 4));
             rt().sync(); rt().d2h(out16.data(), out16_, generated_rows * FINAL_N * 2);
-            // Euler step per schedule: x0 = x + sigma * v, x' = r x + (1 - r) x0
-            const float sg_v = sv.sigmas[step], r_v = sv.sigmas[step + 1] / sg_v, sg_a = sa.sigmas[step], r_a = sa.sigmas[step + 1] / sg_a;
-            for (size_t r = 0; r < Nv; ++r) for (int k = 0; k < VIDEO_PATCH; ++k) { float &x = vrows[r * VIDEO_PATCH + k]; const float v = f16_to_f32(out16[(Na + r) * FINAL_N + k]); x = r_v * x + (1.0f - r_v) * (x + sg_v * v); }
-            for (size_t r = 0; r < Na; ++r) for (int k = 0; k < AUDIO_CH; ++k) { float &x = arows[r * AUDIO_CH + k]; const float v = f16_to_f32(out16[r * FINAL_N + VIDEO_PATCH + k]); x = r_a * x + (1.0f - r_a) * (x + sg_a * v); }
+            const float sg_v = sv.sigmas[step], sg_next = sv.sigmas[step + 1], r_v = sg_next / sg_v, sg_a = sa.sigmas[step], r_a = sa.sigmas[step + 1] / sg_a;
+            if (!res) {
+                // Euler step per schedule: x0 = x + sigma * v, x' = r x + (1 - r) x0
+                for (size_t r = 0; r < Nv; ++r) for (int k = 0; k < VIDEO_PATCH; ++k) { float &x = vrows[r * VIDEO_PATCH + k]; const float v = f16_to_f32(out16[(Na + r) * FINAL_N + k]); x = r_v * x + (1.0f - r_v) * (x + sg_v * v); }
+                for (size_t r = 0; r < Na; ++r) for (int k = 0; k < AUDIO_CH; ++k) { float &x = arows[r * AUDIO_CH + k]; const float v = f16_to_f32(out16[r * FINAL_N + VIDEO_PATCH + k]); x = r_a * x + (1.0f - r_a) * (x + sg_a * v); }
+            } else {
+                // ComfyUI (comfy/k_diffusion/sampling.py res_multistep, eta 0): denoised D = X - sigma_v * OUT over the pack. The video's OUT is
+                // -v. The audio's carried variable y = (sigma_v / sigma_a) x_a sees OUT_a = (1 - scale) x_a + (1 + (scale - 1) sigma_a) (-v_a),
+                // scale = shift_v / shift_a (comfy/ldm/minimax/model.py forward); the network itself sees x_a and t_a = 1 - sigma_a.
+                den_v.resize(vrows.size()); den_a.resize(arows.size());
+                for (size_t i = 0; i < vrows.size(); ++i) { const size_t r = i / VIDEO_PATCH, k = i % VIDEO_PATCH; den_v[i] = vrows[i] + sg_v * f16_to_f32(out16[(Na + r) * FINAL_N + k]); }
+                for (size_t i = 0; i < arows.size(); ++i) { const size_t r = i / AUDIO_CH, k = i % AUDIO_CH; const float v = f16_to_f32(out16[r * FINAL_N + VIDEO_PATCH + k]);
+                    const double out = (1.0 - ascale) * arows[i] - (1.0 + (ascale - 1.0) * sg_a) * v; den_a[i] = float(yrows[i] - sg_v * out); }
+                auto advance = [&](std::vector<float> &x, const std::vector<float> &d, const std::vector<float> &od) {
+                    if (sg_next == 0.0f || od.empty()) { for (size_t i = 0; i < x.size(); ++i) x[i] = r_v * x[i] + (1.0f - r_v) * d[i]; }   // Euler: x + (x - D) / sigma * (sigma_next - sigma)
+                    else {   // second-order multistep (arXiv 2308.02157) in t = -log sigma with the previous denoised
+                        const double t = -std::log(double(sg_v)), t_next = -std::log(double(sg_next)), t_prev = -std::log(double(sv.sigmas[step - 1]));
+                        const double h = t_next - t, c2 = (t_prev - t) / h, phi1 = std::expm1(-h) / (-h), phi2 = (phi1 - 1.0) / (-h);
+                        const double b1 = phi1 - phi2 / c2, b2 = phi2 / c2, decay = std::exp(-h);
+                        for (size_t i = 0; i < x.size(); ++i) x[i] = float(decay * x[i] + h * (b1 * d[i] + b2 * od[i]));
+                    }
+                };
+                advance(vrows, den_v, old_v); advance(yrows, den_a, old_a); old_v.swap(den_v); old_a.swap(den_a);
+            }
+            dump(step + 1);
             if (prof.on) { double tot = 0; for (auto &kv : prof.us) tot += kv.second; fprintf(stderr, "  step %zu stages (%.1f s):", step + 1, tot * 1e-6); for (auto &kv : prof.us) if (kv.second > 0.01 * tot) fprintf(stderr, "  %s %.2fs", kv.first.c_str(), kv.second * 1e-6); fprintf(stderr, "\n"); prof.us.clear(); }
             if (progress && progress(user, int(step + 1), int(sv.timesteps.size()), std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count())) throw Cancelled();
         }
         if (p.cache_threshold > 0.0f && std::getenv("H3_CACHE_TRACE")) fprintf(stderr, "  step cache: %d of %zu evaluations skipped\n", cache_skipped_, sv.timesteps.size());
         rows_to_tensor(video_out);
-        for (int c = 0; c < 2; ++c) for (int t = 0; t < A; ++t) for (int k = 0; k < AUDIO_CH; ++k) audio_out[(size_t(c) * AUDIO_CH + k) * A + t] = arows[(size_t(c) * A + t) * AUDIO_CH + k];
+        for (int c = 0; c < 2; ++c) for (int t = 0; t < A; ++t) for (int k = 0; k < AUDIO_CH; ++k) audio_out[(size_t(c) * AUDIO_CH + k) * A + t] = res ? float(yrows[(size_t(c) * A + t) * AUDIO_CH + k] / ascale) : arows[(size_t(c) * A + t) * AUDIO_CH + k];   // the carried variable ends at scale * x_a
     }
     struct Cancelled {};
 
@@ -1372,7 +1410,7 @@ private:
     std::map<std::string, Prepare> prepares_; std::map<std::string, Gemm> gemms_; Prepare final_prep_;
     Blob aenc_; bool aenc_open_ = false; std::string aenc_dir_;
     Blob vision_; bool vision_open_ = false; std::string vision_dir_; std::string te_span_sig_; void *ds_buf_ = nullptr;
-    Blob venc_; bool venc_open_ = false; std::string venc_dir_;
+    Blob venc_; bool venc_open_ = false; std::string venc_dir_; int attn_qk_bits_ = 4;
     std::shared_ptr<Kernel> norm_f32_;
     size_t seq_cap_ = 0;
     void *ones_ = nullptr, *zeros_ = nullptr, *mods_ = nullptr, *final_table_ = nullptr, *x_ = nullptr, *cls_ = nullptr, *cls0_ = nullptr, *tcls_ = nullptr, *cos_ = nullptr, *sin_ = nullptr,

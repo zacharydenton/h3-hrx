@@ -1,4 +1,4 @@
-"""Export the ComfyUI int8 ConvRot checkpoint as the int4 operands the Loom runtime loads.
+"""Export the ComfyUI int8 ConvRot checkpoint as the int4 (default) or int8 (--bits 8) operands the Loom runtime loads.
 
 The checkpoint's block linears are already rotated along K (group-256 Hadamard) and
 quantised to int8 per output row. Each row is requantised to symmetric int4 (absmax / 7,
@@ -53,6 +53,7 @@ def main() -> None:
     ap.add_argument("--out", default=str(ROOT / "build/weights"))
     ap.add_argument("--source", default=str(R.CKPT))
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--bits", type=int, choices=(4, 8), default=4, help="8: the checkpoint's int8 rows and scales verbatim (tools/quant_study.py: velocity cosine 0.9997 vs 0.98-0.99 for int4)")
     a = ap.parse_args()
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -62,7 +63,8 @@ def main() -> None:
     for i in range(a.layers):
         p = f"blocks.{i}"
         for tag, name in (("qkv", f"{p}.attn.qkv_proj"), ("out", f"{p}.attn.out_proj"), ("gu", f"{p}.mlp.fc1"), ("down", f"{p}.mlp.fc2")):
-            q, s = requantize(ckpt, name, a.device)
+            if a.bits == 8: q, s = ckpt.raw(name + ".weight").to(torch.int8).cpu(), ckpt.raw(name + ".weight_scale").float().view(-1).cpu()
+            else: q, s = requantize(ckpt, name, a.device)
             if tag == "gu":
                 q, s = interleave_gate_up(q), interleave_gate_up(s.view(-1, 1)).view(-1)
             add(f"{p}.{tag}.q", q); add(f"{p}.{tag}.s", s)
@@ -79,7 +81,7 @@ def main() -> None:
             f.write(b); offset += len(b)
     (out / "manifest.txt").write_text("\n".join(manifest) + "\n")
     (out / "config.json").write_text(json.dumps(dict(layers=a.layers, hidden=R.HIDDEN, heads=R.HEADS, head_dim=R.HEAD_DIM,
-                                                    inner=R.INNER, ffn=R.FFN, group=R.HADAMARD_GROUP, rope_dim=R.ROPE_DIM), indent=1))
+                                                    inner=R.INNER, ffn=R.FFN, group=R.HADAMARD_GROUP, rope_dim=R.ROPE_DIM, bits=a.bits), indent=1))
     print(f"wrote {out}/weights.bin: {offset / 1e9:.2f} GB, {len(manifest)} tensors, {time.time() - t0:.0f} s")
 
 
