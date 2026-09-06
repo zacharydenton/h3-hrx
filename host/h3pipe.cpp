@@ -4,7 +4,7 @@
 // decoder; the embedders and the final layer are the same int8 GEMMs with padded K / N.
 //
 // Build: ./scripts/build_host.sh  (host-only code against the HIP runtime API)
-#include <hip/hip_runtime.h>
+#include "rt.h"
 
 #include <spawn.h>
 #include <sys/stat.h>
@@ -48,8 +48,6 @@ constexpr double FRAME_RESCALE = 5.0 / 3.0, SPATIAL_SCALE = 32.0;
 constexpr int FRAME_PER_TOKEN[5] = {1, 4, 4, 4, 4};
 constexpr int THREADS = 256;
 
-#define HIP_CHECK(call) do { hipError_t e_ = (call); if (e_ != hipSuccess) \
-    throw std::runtime_error(std::string(#call) + ": " + hipGetErrorString(e_)); } while (0)
 
 // --- small host helpers --------------------------------------------------------------------
 uint16_t f32_to_f16(float f) {
@@ -108,7 +106,7 @@ struct Blob {
         if (!f) throw std::runtime_error("cannot read " + path);
         size = size_t(f.tellg());
         for (auto &e : spans) if (e.second.offset + e.second.bytes > size) throw std::runtime_error("manifest span '" + e.first + "' runs past " + path);
-        HIP_CHECK(hipMalloc(&dev, size));
+        dev = rt().alloc(size);
         std::vector<char> chunk(size_t(256) << 20);
         // upload every span except the skipped ones (uploading the whole file keeps it simple; skipped spans stay uninitialised)
         for (auto &e : spans) {
@@ -118,7 +116,7 @@ struct Blob {
                 const size_t n = std::min(chunk.size(), e.second.bytes - done);
                 f.read(chunk.data(), std::streamsize(n));
                 if (!f) throw std::runtime_error("short read of " + path);
-                HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)((char *)dev + e.second.offset + done), chunk.data(), n));
+                rt().h2d(((char *)dev + e.second.offset + done), chunk.data(), n);
                 done += n;
             }
         }
@@ -139,17 +137,14 @@ struct Blob {
         std::vector<float> v(count); std::ifstream f(path, std::ios::binary); f.seekg(std::streamoff(s.offset)); f.read((char *)v.data(), std::streamsize(s.bytes));
         if (!f) throw std::runtime_error("short read of " + name); return v;
     }
-    ~Blob() { if (dev) (void)hipFree(dev); }
+    ~Blob() { if (dev) rt().free(dev); }
 };
 
 // --- kernels: compile through loom-compile into the cache, load, launch ---------------------
 struct Kernel {
-    hipModule_t module = nullptr; hipFunction_t function = nullptr;
-    void load(const std::string &path, const std::string &symbol) {
-        HIP_CHECK(hipModuleLoad(&module, path.c_str()));
-        HIP_CHECK(hipModuleGetFunction(&function, module, symbol.c_str()));
-    }
-    ~Kernel() { if (module) (void)hipModuleUnload(module); }
+    RtKernel *k = nullptr;
+    void load(const std::string &path, const std::string &symbol) { k = rt().load(path, symbol); }
+    ~Kernel() { if (k) rt().unload(k); }
 };
 using Cfg = std::vector<std::pair<std::string, std::string>>;
 
@@ -190,23 +185,16 @@ struct Compiler {
     }
 };
 
-struct KernArgs {
-    alignas(16) unsigned char bytes[192]; size_t size = 0;
-    KernArgs &i32(int v) { size = (size + 3) & ~size_t(3); memcpy(bytes + size, &v, 4); size += 4; return *this; }
-    KernArgs &ptr(const void *p) { size = (size + 7) & ~size_t(7); memcpy(bytes + size, &p, 8); size += 8; return *this; }
-};
-
 struct Profile { bool on = false; std::map<std::string, double> us; };
 
 void launch(Kernel &k, Profile *prof, const char *stage, unsigned gx, unsigned gy, unsigned bx, KernArgs &args) {
     std::chrono::steady_clock::time_point t0;
-    if (prof && prof->on) { HIP_CHECK(hipDeviceSynchronize()); t0 = std::chrono::steady_clock::now(); }
-    void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, args.bytes, HIP_LAUNCH_PARAM_BUFFER_SIZE, &args.size, HIP_LAUNCH_PARAM_END};
+    if (prof && prof->on) { rt().sync(); t0 = std::chrono::steady_clock::now(); }
     static const bool trace = std::getenv("H3_TRACE") && *std::getenv("H3_TRACE");   // H3_TRACE=1: print and synchronize every launch (fault localisation)
-    if (trace) fprintf(stderr, "launch %-12s grid %u x %u block %u args %zu\n", stage, gx, gy, bx, args.size);
-    HIP_CHECK(hipModuleLaunchKernel(k.function, gx, gy, 1, bx, 1, 1, 0, nullptr, nullptr, config));
-    if (trace) HIP_CHECK(hipDeviceSynchronize());
-    if (prof && prof->on) { HIP_CHECK(hipDeviceSynchronize()); prof->us[stage] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(); }
+    if (trace) fprintf(stderr, "launch %-12s grid %u x %u block %u args %d+%d\n", stage, gx, gy, bx, args.nscalars, args.nptrs);
+    rt().launch(k.k, gx, gy, bx, args);
+    if (trace) rt().sync();
+    if (prof && prof->on) { rt().sync(); prof->us[stage] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(); }
 }
 
 int lanes_for(int width) {
@@ -329,24 +317,24 @@ public:
             attention_ = c.get(stem, "h3_" + stem, acfg);
         }
         const size_t T = capacity_;
-        HIP_CHECK(hipMalloc(&a_q_, T * size_t(std::max(d.ffn, std::max(d.hidden, d.inner()))) / per));
-        HIP_CHECK(hipMalloc(&a_s_, T * 4));
-        HIP_CHECK(hipMalloc(&fused_, T * size_t(d.qkv()) * 2));
-        HIP_CHECK(hipMalloc(&q_, T * size_t(d.inner()) * 2));
-        HIP_CHECK(hipMalloc(&k_, T * size_t(d.kv_inner()) * 2));
-        HIP_CHECK(hipMalloc(&v_, T * size_t(d.kv_inner()) * 2));
-        HIP_CHECK(hipMalloc(&attn_, T * size_t(d.inner()) * 2));
-        HIP_CHECK(hipMalloc(&gu_, T * size_t(d.ffn) * 2));
-        for (auto p : {fused_, q_, k_, v_, attn_}) HIP_CHECK(hipMemset(p, 0, T * size_t(p == fused_ ? d.qkv() : (p == q_ || p == attn_ ? d.inner() : d.kv_inner())) * 2));
+        a_q_ = rt().alloc(T * size_t(std::max(d.ffn, std::max(d.hidden, d.inner()))) / per);
+        a_s_ = rt().alloc(T * 4);
+        fused_ = rt().alloc(T * size_t(d.qkv()) * 2);
+        q_ = rt().alloc(T * size_t(d.inner()) * 2);
+        k_ = rt().alloc(T * size_t(d.kv_inner()) * 2);
+        v_ = rt().alloc(T * size_t(d.kv_inner()) * 2);
+        attn_ = rt().alloc(T * size_t(d.inner()) * 2);
+        gu_ = rt().alloc(T * size_t(d.ffn) * 2);
+        for (auto p : {fused_, q_, k_, v_, attn_}) rt().memset(p, 0, T * size_t(p == fused_ ? d.qkv() : (p == q_ || p == attn_ ? d.inner() : d.kv_inner())) * 2);
         if (d.attn_i4) {
-            HIP_CHECK(hipMalloc(&qi_, T * size_t(d.heads) * 64)); HIP_CHECK(hipMalloc(&ki_, T * size_t(d.heads) * 64)); HIP_CHECK(hipMalloc(&qs_, T * size_t(d.heads) * 4)); HIP_CHECK(hipMalloc(&ks_, T * size_t(d.heads) * 4));
-            HIP_CHECK(hipMalloc(&kmean_, size_t(d.inner()) * 4)); HIP_CHECK(hipMalloc(&zmean_, size_t(d.inner()) * 4)); HIP_CHECK(hipMemset(zmean_, 0, size_t(d.inner()) * 4));
-            HIP_CHECK(hipMalloc(&vt_, size_t(d.inner()) * T * 2)); HIP_CHECK(hipMemset(vt_, 0, size_t(d.inner()) * T * 2));
-            for (auto p : {qi_, ki_}) HIP_CHECK(hipMemset(p, 0, T * size_t(d.heads) * 64));
-            for (auto p : {qs_, ks_}) HIP_CHECK(hipMemset(p, 0, T * size_t(d.heads) * 4));
+            qi_ = rt().alloc(T * size_t(d.heads) * 64); ki_ = rt().alloc(T * size_t(d.heads) * 64); qs_ = rt().alloc(T * size_t(d.heads) * 4); ks_ = rt().alloc(T * size_t(d.heads) * 4);
+            kmean_ = rt().alloc(size_t(d.inner()) * 4); zmean_ = rt().alloc(size_t(d.inner()) * 4); rt().memset(zmean_, 0, size_t(d.inner()) * 4);
+            vt_ = rt().alloc(size_t(d.inner()) * T * 2); rt().memset(vt_, 0, size_t(d.inner()) * T * 2);
+            for (auto p : {qi_, ki_}) rt().memset(p, 0, T * size_t(d.heads) * 64);
+            for (auto p : {qs_, ks_}) rt().memset(p, 0, T * size_t(d.heads) * 4);
         }
     }
-    ~Stack() { for (void *p : {a_q_, a_s_, fused_, q_, k_, v_, attn_, gu_, qi_, ki_, qs_, ks_, kmean_, zmean_, vt_}) if (p) (void)hipFree(p); }
+    ~Stack() { for (void *p : {a_q_, a_s_, fused_, q_, k_, v_, attn_, gu_, qi_, ki_, qs_, ks_, kmean_, zmean_, vt_}) if (p) rt().free(p); }
     size_t capacity() const { return capacity_; }
     size_t tokens() const { return tokens_; }
     const std::vector<struct Block_> *dummy = nullptr;
@@ -369,10 +357,10 @@ public:
                 { KernArgs a; a.i32(int(T)).ptr(q_).ptr(zmean_).ptr(qi_).ptr(qs_); launch(*prep_q_, prof, "attention operands", T, 1, THREADS, a); }
                 { KernArgs a; a.i32(int(T)).ptr(k_).ptr(smooth ? kmean_ : zmean_).ptr(ki_).ptr(ks_); launch(*prep_k_, prof, "attention operands", T, 1, THREADS, a); }
                 { KernArgs a; a.i32(int(T)).ptr(v_).ptr(vt_); launch(*transpose_, prof, "attention operands", (T + 31) / 32, unsigned(d_.inner() / 32), THREADS, a); }
-                KernArgs a; a.i32(int(T)).i32(d_.heads).ptr(qi_).ptr(qs_).ptr(ki_).ptr(ks_).ptr(vt_).ptr(attn_);
+                KernArgs a; a.i32(int(T)).ptr(qi_).ptr(qs_).ptr(ki_).ptr(ks_).ptr(vt_).ptr(attn_);
                 const unsigned qb = 16 * unsigned(waves_); launch(*attention_, prof, "attention", (T + qb - 1) / qb, unsigned(d_.heads), 32 * unsigned(waves_), a);
             } else {
-              KernArgs a; a.i32(int(T)).i32(d_.causal ? d_.kv_heads : d_.heads).ptr(q_).ptr(k_).ptr(v_).ptr(attn_);
+              KernArgs a; a.i32(int(T)).ptr(q_).ptr(k_).ptr(v_).ptr(attn_);
               if (d_.causal) launch(*attention_, prof, "attention", (T + 15) / 16, unsigned(d_.kv_heads), THREADS, a);
               else { const unsigned qb = 16 * unsigned(waves_); launch(*attention_, prof, "attention", (T + qb - 1) / qb, unsigned(d_.heads), 32 * unsigned(waves_), a); } }
             prep_attn_.run(prof, "prepare out input", T, attn_, nullptr, nullptr, nullptr, a_q_, a_s_);
@@ -436,7 +424,7 @@ class Pipe {
 public:
     explicit Pipe(const h3pipe_config &cfg) {
         if (!cfg.glue_dir || !cfg.blocks_dir || !cfg.te_dir || !cfg.kernel_sources || !cfg.cache_dir || !cfg.loom_compile) throw std::invalid_argument("every directory and the loom-compile path are required");
-        HIP_CHECK(hipInit(0));
+        rt();
         comp_.exe = cfg.loom_compile; comp_.sources = cfg.kernel_sources; comp_.cache = cfg.cache_dir;
         vae_dir_ = cfg.vae_dir ? cfg.vae_dir : ""; vae_bits_ = cfg.vae_bits ? cfg.vae_bits : 8;
         glue_.open(cfg.glue_dir, [](const std::string &n) { return n == "te.embed"; });
@@ -448,29 +436,29 @@ public:
         inv_freq_ = glue_.host_f32("h3.rope_inv_freq", 16);
         for (int i = 0; i < 50; ++i) { adaln_w_.push_back(glue_.host_f32(fmt("h3.blocks.%d.adaln.w", i), size_t(3 * 6 * HID) * 8)); adaln_b_.push_back(glue_.host_f32(fmt("h3.blocks.%d.adaln.b", i), size_t(3 * 6 * HID))); }
         final_w_ = glue_.host_f32("h3.final.adaln.w", size_t(2 * HID) * 8); final_b_ = glue_.host_f32("h3.final.adaln.b", size_t(2 * HID));
-        HIP_CHECK(hipMalloc(&ones_, size_t(HID) * 4)); { std::vector<float> o(HID, 1.0f); HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)ones_, o.data(), o.size() * 4)); }
-        HIP_CHECK(hipMalloc(&zeros_, size_t(2 * TE_FFN) * 4)); HIP_CHECK(hipMemset(zeros_, 0, size_t(2 * TE_FFN) * 4));
-        HIP_CHECK(hipMalloc(&mods_, size_t(50) * MODS_ROWS * HID * 4));
-        HIP_CHECK(hipMalloc(&final_table_, size_t(4) * HID * 4));
+        ones_ = rt().alloc(size_t(HID) * 4); { std::vector<float> o(HID, 1.0f); rt().h2d(ones_, o.data(), o.size() * 4); }
+        zeros_ = rt().alloc(size_t(2 * TE_FFN) * 4); rt().memset(zeros_, 0, size_t(2 * TE_FFN) * 4);
+        mods_ = rt().alloc(size_t(50) * MODS_ROWS * HID * 4);
+        final_table_ = rt().alloc(size_t(4) * HID * 4);
     }
-    ~Pipe() { for (void *p : {ones_, zeros_, mods_, final_table_, x_, cls_, cls0_, tcls_, cos_, sin_, in16_, a_q_, a_s_, out16_, text_copy_, ref_cos_, ref_sin_, te_x_, te_cos_, te_sin_, te_cls_, vx_, vcos_, vsin_, vin16_, va_q_, va_s_, vout16_, vcls_, vnorm_table_, ah_, aacc_, ahj_, ar_, ar2_, atmp_, ain_, xb0_, prev_b0_, cache_resid_, partials_}) if (p) (void)hipFree(p); }
+    ~Pipe() { for (void *p : {ones_, zeros_, mods_, final_table_, x_, cls_, cls0_, tcls_, cos_, sin_, in16_, a_q_, a_s_, out16_, text_copy_, ref_cos_, ref_sin_, te_x_, te_cos_, te_sin_, te_cls_, vx_, vcos_, vsin_, vin16_, va_q_, va_s_, vout16_, vcls_, vnorm_table_, ah_, aacc_, ahj_, ar_, ar2_, atmp_, ain_, xb0_, prev_b0_, cache_resid_, partials_}) if (p) rt().free(p); }
 
     Profile prof{std::getenv("H3_PROFILE") != nullptr && *std::getenv("H3_PROFILE") != 0};   // H3_PROFILE=1: synchronized per-stage times printed after every step
 
     // --- the prompt: embedding lookup on the host, the encoder, condition_proj, the refiner ---
     void ensure_seq(size_t seq) {
         if (seq <= seq_cap_) return;
-        for (void *p : {x_, cls_, cls0_, tcls_, cos_, sin_, in16_, a_q_, a_s_, out16_}) if (p) (void)hipFree(p);
+        for (void *p : {x_, cls_, cls0_, tcls_, cos_, sin_, in16_, a_q_, a_s_, out16_}) if (p) rt().free(p);
         seq_cap_ = (seq + 255) / 256 * 256 + 32;
         const size_t T = seq_cap_;
-        HIP_CHECK(hipMalloc(&x_, T * HID * 4)); HIP_CHECK(hipMemset(x_, 0, T * HID * 4));
-        HIP_CHECK(hipMalloc(&cls_, T * 4)); HIP_CHECK(hipMemset(cls_, 0, T * 4));
-        HIP_CHECK(hipMalloc(&cls0_, T * 4)); HIP_CHECK(hipMemset(cls0_, 0, T * 4));       // the single-class GEMMs (embedders, condition proj) index their gate table with this
-        HIP_CHECK(hipMalloc(&tcls_, T * 4)); HIP_CHECK(hipMemset(tcls_, 0, T * 4));
-        HIP_CHECK(hipMalloc(&cos_, T * ROPE_HALF * 4)); HIP_CHECK(hipMalloc(&sin_, T * ROPE_HALF * 4));
-        HIP_CHECK(hipMalloc(&in16_, T * TEXT_DIM * 2)); HIP_CHECK(hipMemset(in16_, 0, T * TEXT_DIM * 2));
-        HIP_CHECK(hipMalloc(&a_q_, T * size_t(std::max(TEXT_DIM, HID)))); HIP_CHECK(hipMalloc(&a_s_, T * 4));   // the final norm writes HID-wide rows, the embedders TEXT_DIM-wide
-        HIP_CHECK(hipMalloc(&out16_, T * FINAL_N * 2));
+        x_ = rt().alloc(T * HID * 4); rt().memset(x_, 0, T * HID * 4);
+        cls_ = rt().alloc(T * 4); rt().memset(cls_, 0, T * 4);
+        cls0_ = rt().alloc(T * 4); rt().memset(cls0_, 0, T * 4);       // the single-class GEMMs (embedders, condition proj) index their gate table with this
+        tcls_ = rt().alloc(T * 4); rt().memset(tcls_, 0, T * 4);
+        cos_ = rt().alloc(T * ROPE_HALF * 4); sin_ = rt().alloc(T * ROPE_HALF * 4);
+        in16_ = rt().alloc(T * TEXT_DIM * 2); rt().memset(in16_, 0, T * TEXT_DIM * 2);
+        a_q_ = rt().alloc(T * size_t(std::max(TEXT_DIM, HID))); a_s_ = rt().alloc(T * 4);   // the final norm writes HID-wide rows, the embedders TEXT_DIM-wide
+        out16_ = rt().alloc(T * FINAL_N * 2);
     }
 
     // x rows [row0, row0 + rows) = W · in + b through the int8 family: in f16 [rows][k] on in16_, rows zeroed first
@@ -479,7 +467,7 @@ public:
         Gemm &g = gemms_[fmt("resid_%d_%zu", k, rows)]; if (!g.k) g.build(comp_, "resid", 8, true, true, k, HID, rows, 1);
         prep.run(&prof, stage, unsigned(rows), in16_, nullptr, nullptr, nullptr, a_q_, a_s_);
         float *xr = (float *)x_ + row0 * HID;
-        HIP_CHECK(hipMemset(xr, 0, rows * HID * 4));
+        rt().memset(xr, 0, rows * HID * 4);
         g.run(&prof, stage, unsigned(rows), a_q_, glue_.at(wname + ".q", size_t(HID) * k), glue_.at(wname + ".s", size_t(HID) * 4), a_s_, xr, ones_, cls0_, glue_.at(wname + ".b", size_t(HID) * 4));
     }
 
@@ -494,29 +482,29 @@ public:
         if (!te_ || te_->tokens() != size_t(n)) {
             if (!te_blob_.dev) te_blob_.open(te_dir_);
             te_.reset(); te_ = std::make_unique<Stack>(comp_, StackDims{TE_HID, TE_HEADS, TE_KV, HEAD_DIM, TE_FFN, 128, 1, 8, 1e-6f, false, true, true}, size_t(n), 50, te_blob_, "blocks.%d.", true, nullptr);
-            for (void *p : {te_x_, te_cos_, te_sin_, te_cls_}) if (p) (void)hipFree(p);
+            for (void *p : {te_x_, te_cos_, te_sin_, te_cls_}) if (p) rt().free(p);
             const size_t T = te_->capacity();
-            HIP_CHECK(hipMalloc(&te_x_, T * TE_HID * 4)); HIP_CHECK(hipMemset(te_x_, 0, T * TE_HID * 4));
-            HIP_CHECK(hipMalloc(&te_cos_, T * TE_ROPE_HALF * 4)); HIP_CHECK(hipMalloc(&te_sin_, T * TE_ROPE_HALF * 4));
-            HIP_CHECK(hipMalloc(&te_cls_, T * 4)); HIP_CHECK(hipMemset(te_cls_, 0, T * 4));
+            te_x_ = rt().alloc(T * TE_HID * 4); rt().memset(te_x_, 0, T * TE_HID * 4);
+            te_cos_ = rt().alloc(T * TE_ROPE_HALF * 4); te_sin_ = rt().alloc(T * TE_ROPE_HALF * 4);
+            te_cls_ = rt().alloc(T * 4); rt().memset(te_cls_, 0, T * 4);
             std::vector<float> c(size_t(n) * TE_ROPE_HALF), s(size_t(n) * TE_ROPE_HALF);
             for (int t = 0; t < n; ++t) for (int j = 0; j < TE_ROPE_HALF; ++j) { const double inv = std::pow(5000000.0, -double(2 * j) / HEAD_DIM), ang = t * inv; c[size_t(t) * TE_ROPE_HALF + j] = float(std::cos(ang)); s[size_t(t) * TE_ROPE_HALF + j] = float(std::sin(ang)); }
-            HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)te_cos_, c.data(), c.size() * 4)); HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)te_sin_, s.data(), s.size() * 4));
+            rt().h2d(te_cos_, c.data(), c.size() * 4); rt().h2d(te_sin_, s.data(), s.size() * 4);
         }
-        HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)te_x_, emb.data(), emb.size() * 4));
+        rt().h2d(te_x_, emb.data(), emb.size() * 4);
         te_->forward(&prof, te_x_, te_cls_, te_cos_, te_sin_, [&](int) { return LayerCond{(const float *)zeros_, (const float *)ones_, (const float *)zeros_, (const float *)ones_}; });
         // hidden -> f16 -> condition_proj into x rows [0, n)
-        std::vector<float> hid(size_t(n) * TE_HID); HIP_CHECK(hipDeviceSynchronize()); HIP_CHECK(hipMemcpyDtoH(hid.data(), (hipDeviceptr_t)te_x_, hid.size() * 4));
+        std::vector<float> hid(size_t(n) * TE_HID); rt().sync(); rt().d2h(hid.data(), te_x_, hid.size() * 4);
         std::vector<uint16_t> h16(hid.size()); for (size_t i = 0; i < hid.size(); ++i) h16[i] = f32_to_f16(hid[i]);
-        HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)in16_, h16.data(), h16.size() * 2));
+        rt().h2d(in16_, h16.data(), h16.size() * 2);
         embed_linear("condition proj", 0, size_t(n), TEXT_DIM, "h3.cond");
         // the token refiner: two H3-shaped blocks without rope (identity tables), then its final norm
         if (!refiner_ || refiner_->tokens() != size_t(n)) {
             refiner_.reset(); refiner_ = std::make_unique<Stack>(comp_, StackDims{HID, HEADS, HEADS, HEAD_DIM, FFN, ROPE_DIM, 1, 8, 1e-5f, false, true, false}, size_t(n), 2, glue_, "h3.refiner.%d.", true, nullptr);
             std::vector<float> c(size_t(n) * ROPE_HALF, 1.0f), s(size_t(n) * ROPE_HALF, 0.0f);
-            for (void *q : {ref_cos_, ref_sin_}) if (q) (void)hipFree(q);
-            HIP_CHECK(hipMalloc(&ref_cos_, c.size() * 4)); HIP_CHECK(hipMalloc(&ref_sin_, s.size() * 4));
-            HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)ref_cos_, c.data(), c.size() * 4)); HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)ref_sin_, s.data(), s.size() * 4));
+            for (void *q : {ref_cos_, ref_sin_}) if (q) rt().free(q);
+            ref_cos_ = rt().alloc(c.size() * 4); ref_sin_ = rt().alloc(s.size() * 4);
+            rt().h2d(ref_cos_, c.data(), c.size() * 4); rt().h2d(ref_sin_, s.data(), s.size() * 4);
             const std::string ns = "h3.norm_mod_f32.";
             norm_f32_ = comp_.get("norm_mod_f32", "h3_norm_mod_f32", {{ns + "width", std::to_string(HID)}, {ns + "lanes", std::to_string(lanes_for(HID))}, {ns + "eps", num(1e-5)}, {ns + "classes", "1"}});
         }
@@ -527,7 +515,7 @@ public:
     void get_text_in(const int32_t *ids, int n, float *out) {
         ensure_seq(size_t(n));
         text_in(ids, n);
-        HIP_CHECK(hipDeviceSynchronize()); HIP_CHECK(hipMemcpyDtoH(out, (hipDeviceptr_t)x_, size_t(n) * HID * 4));
+        rt().sync(); rt().d2h(out, x_, size_t(n) * HID * 4);
     }
 
     // --- conditioning per step ---
@@ -556,14 +544,14 @@ public:
                 }
             }
         }
-        HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)mods_, table.data(), table.size() * 4));
+        rt().h2d(mods_, table.data(), table.size() * 4);
         // the final layer's (scale, shift) per timestep class: rows 2c = scale, 2c + 1 = shift; the projection gives (shift | scale)
         std::vector<float> ft(size_t(4) * HID);
         for (int m = 0; m < 2; ++m) {
             const float *te = m == 0 ? tv : ta;
             for (int r = 0; r < 2 * HID; ++r) { float acc = final_b_[r]; for (int j = 0; j < 8; ++j) acc += final_w_[size_t(r) * 8 + j] * te[j]; (r < HID ? ft[size_t(2 * m + 1) * HID + r] : ft[size_t(2 * m) * HID + r - HID]) = acc; }
         }
-        HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)final_table_, ft.data(), ft.size() * 4));
+        rt().h2d(final_table_, ft.data(), ft.size() * 4);
     }
     LayerCond cond(int i) const {
         const float *mod = (const float *)mods_ + size_t(i) * MODS_ROWS * HID;
@@ -580,10 +568,10 @@ public:
         ensure_seq(S);
         text_in(ids, n);
         // the packed layout's tables
-        HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)cls_, lay.adaln_rows.data(), S * 4)); HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)tcls_, lay.tclass.data(), S * 4));
+        rt().h2d(cls_, lay.adaln_rows.data(), S * 4); rt().h2d(tcls_, lay.tclass.data(), S * 4);
         { std::vector<float> c(S * ROPE_HALF), s(S * ROPE_HALF);
           for (size_t r = 0; r < S; ++r) for (int ax = 0; ax < 3; ++ax) for (int j = 0; j < 16; ++j) { const float ang = float(lay.pos[3 * r + ax]) * inv_freq_[j]; c[r * ROPE_HALF + ax * 16 + j] = std::cos(ang); s[r * ROPE_HALF + ax * 16 + j] = std::sin(ang); }
-          HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)cos_, c.data(), c.size() * 4)); HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)sin_, s.data(), s.size() * 4)); }
+          rt().h2d(cos_, c.data(), c.size() * 4); rt().h2d(sin_, s.data(), s.size() * 4); }
         if (!dit_ || dit_->tokens() != S) {
             const char *qk = std::getenv("H3_ATTN_QK"); StackDims dd{HID, HEADS, HEADS, HEAD_DIM, FFN, ROPE_DIM, CLASSES, 4, 1e-5f, false, true, false}; dd.attn_i4 = !(qk && std::string(qk) == "f16");   // int4 QK^T by default
             dit_.reset(); dit_ = std::make_unique<Stack>(comp_, dd, S, 50, blocks_, "blocks.%d.", true, nullptr); }
@@ -613,44 +601,44 @@ public:
             // audio rows -> x[L, L+Na), video rows -> x[L+Na, S), each through prepare(256) + the padded-K int8 GEMM
             std::fill(in16.begin(), in16.end(), 0);
             for (size_t r = 0; r < Na; ++r) for (int k = 0; k < AUDIO_CH; ++k) in16[r * KPAD + k] = f32_to_f16(arows[r * AUDIO_CH + k]);
-            HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)in16_, in16.data(), Na * KPAD * 2));
+            rt().h2d(in16_, in16.data(), Na * KPAD * 2);
             embed_linear("audio in", L, Na, KPAD, "h3.audio_in");
             std::fill(in16.begin(), in16.end(), 0);
             for (size_t r = 0; r < Nv; ++r) for (int k = 0; k < VIDEO_PATCH; ++k) in16[r * KPAD + k] = f32_to_f16(vrows[r * VIDEO_PATCH + k]);
-            HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)in16_, in16.data(), Nv * KPAD * 2));
+            rt().h2d(in16_, in16.data(), Nv * KPAD * 2);
             embed_linear("video in", L + Na, Nv, KPAD, "h3.video_in");
             // the text rows are refreshed from a copy each step (the blocks update x in place)
-            if (step == 0) { if (!text_copy_) HIP_CHECK(hipMalloc(&text_copy_, seq_cap_ * HID * 4)); HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)text_copy_, (hipDeviceptr_t)x_, L * HID * 4)); }
-            else HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)x_, (hipDeviceptr_t)text_copy_, L * HID * 4));
+            if (step == 0) { if (!text_copy_) text_copy_ = rt().alloc(seq_cap_ * HID * 4); rt().d2d(text_copy_, x_, L * HID * 4); }
+            else rt().d2d(x_, text_copy_, L * HID * 4);
             if (p.cache_threshold > 0.0f) {                                          // first-block cache (TeaCache / FBCache style)
                 const size_t n = S * size_t(HID), groups = (n + 2047) / 2048;
                 if (cache_cap_ < n) {
-                    for (void *q : {xb0_, prev_b0_, cache_resid_, partials_}) if (q) (void)hipFree(q);
-                    HIP_CHECK(hipMalloc(&xb0_, n * 4)); HIP_CHECK(hipMalloc(&prev_b0_, n * 4)); HIP_CHECK(hipMalloc(&cache_resid_, n * 4)); HIP_CHECK(hipMalloc(&partials_, groups * 8)); cache_cap_ = n;
+                    for (void *q : {xb0_, prev_b0_, cache_resid_, partials_}) if (q) rt().free(q);
+                    xb0_ = rt().alloc(n * 4); prev_b0_ = rt().alloc(n * 4); cache_resid_ = rt().alloc(n * 4); partials_ = rt().alloc(groups * 8); cache_cap_ = n;
                     absdiff_ = comp_.get("absdiff_sum_f32", "h3_absdiff_sum_f32", {});
                 }
                 dit_->forward(&prof, x_, cls_, cos_, sin_, [&](int i) { return cond(i); }, 0, 1);
                 bool skip = false;
                 if (step > 0) {
                     KernArgs a; a.i32(int(n)).ptr(x_).ptr(prev_b0_).ptr(partials_); launch(*absdiff_, &prof, "cache metric", unsigned(groups), 1, THREADS, a);
-                    std::vector<float> ps(groups * 2); HIP_CHECK(hipDeviceSynchronize()); HIP_CHECK(hipMemcpyDtoH(ps.data(), (hipDeviceptr_t)partials_, ps.size() * 4));
+                    std::vector<float> ps(groups * 2); rt().sync(); rt().d2h(ps.data(), partials_, ps.size() * 4);
                     double d = 0, m = 0; for (size_t i = 0; i < groups; ++i) { d += ps[2 * i]; m += ps[2 * i + 1]; }
                     const double rel = d / std::max(m, 1e-30); cache_acc_ += rel;
                     skip = cache_acc_ < p.cache_threshold && have_cache_;
                     if (std::getenv("H3_CACHE_TRACE")) fprintf(stderr, "  step %zu: block-0 change %.4f, accumulated %.4f -> %s\n", step + 1, rel, cache_acc_, skip ? "cached" : "full");
                 }
-                HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)prev_b0_, (hipDeviceptr_t)x_, n * 4));
+                rt().d2d(prev_b0_, x_, n * 4);
                 if (skip) { axpy(1.0f, 1.0f, n, cache_resid_, x_); ++cache_skipped_; }
                 else {
-                    HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)xb0_, (hipDeviceptr_t)x_, n * 4));
+                    rt().d2d(xb0_, x_, n * 4);
                     dit_->forward(&prof, x_, cls_, cos_, sin_, [&](int i) { return cond(i); }, 1, 50);
-                    HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)cache_resid_, (hipDeviceptr_t)x_, n * 4)); axpy(-1.0f, 1.0f, n, xb0_, cache_resid_);   // residual of blocks 1..49
+                    rt().d2d(cache_resid_, x_, n * 4); axpy(-1.0f, 1.0f, n, xb0_, cache_resid_);   // residual of blocks 1..49
                     have_cache_ = true; cache_acc_ = 0.0;
                 }
             } else dit_->forward(&prof, x_, cls_, cos_, sin_, [&](int i) { return cond(i); });
             final_prep_.run(&prof, "final norm", unsigned(S), x_, glue_.at("h3.final.norm", size_t(HID) * 4), final_table_, tcls_, a_q_, a_s_);
             final_gemm.run(&prof, "final out", unsigned(S), a_q_, glue_.at("h3.final.out.q", size_t(FINAL_N) * HID), glue_.at("h3.final.out.s", size_t(FINAL_N) * 4), a_s_, out16_, nullptr, nullptr, glue_.at("h3.final.out.b", size_t(FINAL_N) * 4));
-            HIP_CHECK(hipDeviceSynchronize()); HIP_CHECK(hipMemcpyDtoH(out16.data(), (hipDeviceptr_t)out16_, S * FINAL_N * 2));
+            rt().sync(); rt().d2h(out16.data(), out16_, S * FINAL_N * 2);
             // Euler step per schedule: x0 = x + sigma * v, x' = r x + (1 - r) x0
             const float sg_v = sv.sigmas[step], r_v = sv.sigmas[step + 1] / sg_v, sg_a = sa.sigmas[step], r_a = sa.sigmas[step + 1] / sg_a;
             for (size_t r = 0; r < Nv; ++r) for (int k = 0; k < VIDEO_PATCH; ++k) { float &x = vrows[r * VIDEO_PATCH + k]; const float v = f16_to_f32(out16[(L + Na + r) * FINAL_N + k]); x = r_v * x + (1.0f - r_v) * (x + sg_v * v); }
@@ -693,15 +681,15 @@ public:
         const int T = audio_t; const size_t L_out = size_t(T) * 800;
         const size_t cap = std::max<size_t>(size_t(2048) * T, size_t(8) * L_out) + 4096;    // the widest [C][len] plane of the stack
         if (audio_cap_ < cap) {
-            for (void *q : {ah_, aacc_, ahj_, ar_, ar2_, atmp_, ain_}) if (q) (void)hipFree(q);
-            HIP_CHECK(hipMalloc(&ah_, cap * 4)); HIP_CHECK(hipMalloc(&aacc_, cap * 4)); HIP_CHECK(hipMalloc(&ahj_, cap * 4)); HIP_CHECK(hipMalloc(&ar_, cap * 4)); HIP_CHECK(hipMalloc(&ar2_, cap * 4));
-            HIP_CHECK(hipMalloc(&atmp_, cap * 8)); HIP_CHECK(hipMalloc(&ain_, size_t(32) * T * 4 + 4096)); audio_cap_ = cap;
+            for (void *q : {ah_, aacc_, ahj_, ar_, ar2_, atmp_, ain_}) if (q) rt().free(q);
+            ah_ = rt().alloc(cap * 4); aacc_ = rt().alloc(cap * 4); ahj_ = rt().alloc(cap * 4); ar_ = rt().alloc(cap * 4); ar2_ = rt().alloc(cap * 4);
+            atmp_ = rt().alloc(cap * 8); ain_ = rt().alloc(size_t(32) * T * 4 + 4096); audio_cap_ = cap;
         }
         std::vector<float> lmean = glue_.host_f32("audio.latents_mean", 32), lstd = glue_.host_f32("audio.latents_std", 32);
         std::vector<float> in(size_t(32) * T), out(L_out);
         for (int ch = 0; ch < 2; ++ch) {
             for (int c = 0; c < 32; ++c) for (int t = 0; t < T; ++t) in[size_t(c) * T + t] = latents[(size_t(ch) * 32 + c) * T + t] * lstd[c] + lmean[c];
-            HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)ain_, in.data(), in.size() * 4));
+            rt().h2d(ain_, in.data(), in.size() * 4);
             // dec_in_proj (32 -> 2048, k 1), conv_pre (2048 -> 1024, k 7)
             conv_run(conv_kernel(32, 2048, 1, 1, 0, false, round256(T)), "audio dec_in_proj", T, ain_, glue_.at("audio.dec_in_proj.w", size_t(2048) * 32 * 4), glue_.at("audio.dec_in_proj.b", 2048 * 4), ar_);
             conv_run(conv_kernel(2048, 1024, 7, 1, 3, false, round256(T)), "audio conv_pre", T, ar_, glue_.at("audio.conv_pre.w", size_t(1024) * 2048 * 7 * 4), glue_.at("audio.conv_pre.b", 1024 * 4), ah_);
@@ -713,10 +701,10 @@ public:
                   KernArgs a; a.i32(int(len)).i32(int(olen)).ptr(ah_).ptr(glue_.at(fmt("audio.ups.%d.w", i), size_t(C) * Cout * k * 4)).ptr(glue_.at(fmt("audio.ups.%d.b", i), size_t(Cout) * 4)).ptr(ar_);
                   launch(*kt, &prof, "audio upsample", unsigned((olen + 255) / 256), unsigned(Cout), THREADS, a); }
                 len = olen; C = Cout; const size_t plane = size_t(C) * len;
-                HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)ah_, (hipDeviceptr_t)ar_, plane * 4)); HIP_CHECK(hipMemset(aacc_, 0, plane * 4));
+                rt().d2d(ah_, ar_, plane * 4); rt().memset(aacc_, 0, plane * 4);
                 for (int j = 0; j < 3; ++j) {                                   // the three AMP blocks, averaged
                     const int r = i * 3 + j, kk = RESK[j];
-                    HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)ahj_, (hipDeviceptr_t)ah_, plane * 4));
+                    rt().d2d(ahj_, ah_, plane * 4);
                     for (int d = 0; d < 3; ++d) {
                         const std::string act1 = fmt("audio.res.%d.act.%d.", r, 2 * d), act2 = fmt("audio.res.%d.act.%d.", r, 2 * d + 1);
                         snake(C, len, ahj_, glue_.at(act1 + "alpha", size_t(C) * 4), glue_.at(act1 + "beta", size_t(C) * 4), atmp_, ar_);
@@ -731,7 +719,7 @@ public:
             snake(C, len, ah_, glue_.at("audio.post.alpha", size_t(C) * 4), glue_.at("audio.post.beta", size_t(C) * 4), atmp_, ar_);
             conv_run(conv_kernel(C, 1, 7, 1, 3, false, round256(len)), "audio conv_post", len, ar_, glue_.at("audio.conv_post.w", size_t(C) * 7 * 4), zeros_, ar2_);
             if (len != L_out) throw std::runtime_error("audio length " + std::to_string(len) + " != " + std::to_string(L_out));
-            HIP_CHECK(hipDeviceSynchronize()); HIP_CHECK(hipMemcpyDtoH(out.data(), (hipDeviceptr_t)ar2_, L_out * 4));
+            rt().sync(); rt().d2h(out.data(), ar2_, L_out * 4);
             for (size_t i = 0; i < L_out; ++i) samples[size_t(ch) * L_out + i] = std::min(std::max(out[i], -1.0f), 1.0f);
         }
     }
@@ -743,13 +731,13 @@ public:
         if (!vae_blob_.dev) { if (vae_dir_.empty()) throw std::invalid_argument("vae_dir is required for video decoding"); vae_blob_.open(vae_dir_); }
         if (!vae_ || vae_->tokens() != NT) {
             vae_.reset(); vae_ = std::make_unique<Stack>(comp_, StackDims{VAE_HID, VAE_HEADS, VAE_HEADS, VAE_D, VAE_FFN, 48, 1, vae_bits_, 1e-5f, true, false, false}, NT, 36, vae_blob_, "blocks.%d.", false, (const float *)ones_);
-            for (void *q : {vx_, vcos_, vsin_, vin16_, va_q_, va_s_, vout16_, vcls_}) if (q) (void)hipFree(q);
+            for (void *q : {vx_, vcos_, vsin_, vin16_, va_q_, va_s_, vout16_, vcls_}) if (q) rt().free(q);
             const size_t T = vae_->capacity();
-            HIP_CHECK(hipMalloc(&vx_, T * VAE_HID * 4)); HIP_CHECK(hipMemset(vx_, 0, T * VAE_HID * 4));
-            HIP_CHECK(hipMalloc(&vcos_, T * VAE_ROPE_HALF * 4)); HIP_CHECK(hipMalloc(&vsin_, T * VAE_ROPE_HALF * 4));
-            HIP_CHECK(hipMalloc(&vin16_, T * KPAD * 2)); HIP_CHECK(hipMemset(vin16_, 0, T * KPAD * 2));
-            HIP_CHECK(hipMalloc(&va_q_, T * VAE_HID)); HIP_CHECK(hipMalloc(&va_s_, T * 4));
-            HIP_CHECK(hipMalloc(&vout16_, T * VAE_OUT * 2)); HIP_CHECK(hipMalloc(&vcls_, T * 4)); HIP_CHECK(hipMemset(vcls_, 0, T * 4));
+            vx_ = rt().alloc(T * VAE_HID * 4); rt().memset(vx_, 0, T * VAE_HID * 4);
+            vcos_ = rt().alloc(T * VAE_ROPE_HALF * 4); vsin_ = rt().alloc(T * VAE_ROPE_HALF * 4);
+            vin16_ = rt().alloc(T * KPAD * 2); rt().memset(vin16_, 0, T * KPAD * 2);
+            va_q_ = rt().alloc(T * VAE_HID); va_s_ = rt().alloc(T * 4);
+            vout16_ = rt().alloc(T * VAE_OUT * 2); vcls_ = rt().alloc(T * 4); rt().memset(vcls_, 0, T * 4);
             // the rotary tables: coordinates 2 * ((i + 0.5) / size) - 1 per axis, angles 2 pi * pos * inv_freq (8 frequencies per axis), zero for the register / cls rows
             std::vector<float> c(T * VAE_ROPE_HALF, 1.0f), s(T * VAE_ROPE_HALF, 0.0f);
             const int sizes[3] = {ft, h, w};
@@ -758,25 +746,25 @@ public:
                 for (int ax = 0; ax < 3; ++ax) for (int j = 0; j < 8; ++j) {
                     const double pos = 2.0 * ((idx[ax] + 0.5) / sizes[ax]) - 1.0, inv = std::pow(100.0, -double(j) * 6.0 / 48.0), ang = 2.0 * M_PI * pos * inv;
                     c[r * VAE_ROPE_HALF + ax * 8 + j] = float(std::cos(ang)); s[r * VAE_ROPE_HALF + ax * 8 + j] = float(std::sin(ang)); } }
-            HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)vcos_, c.data(), c.size() * 4)); HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)vsin_, s.data(), s.size() * 4));
+            rt().h2d(vcos_, c.data(), c.size() * 4); rt().h2d(vsin_, s.data(), s.size() * 4);
             vproj_in_prep_.build(comp_, "plain", 8, KPAD); vproj_in_.build(comp_, "resid", 8, true, true, KPAD, VAE_HID, N, 1);
             vnorm_out_.build(comp_, "lnorm", 8, VAE_HID, 1e-5f, 1); vproj_out_.build(comp_, "plain", 8, true, true, VAE_HID, VAE_OUT, NT);
-            if (!vnorm_table_) { HIP_CHECK(hipMalloc(&vnorm_table_, size_t(2) * VAE_HID * 4)); HIP_CHECK(hipMemset(vnorm_table_, 0, size_t(VAE_HID) * 4));
-                HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)((float *)vnorm_table_ + VAE_HID), (hipDeviceptr_t)glue_.at("vae.norm_out.b", size_t(VAE_HID) * 4), size_t(VAE_HID) * 4)); }
+            if (!vnorm_table_) { vnorm_table_ = rt().alloc(size_t(2) * VAE_HID * 4); rt().memset(vnorm_table_, 0, size_t(VAE_HID) * 4);
+                rt().d2d(((float *)vnorm_table_ + VAE_HID), glue_.at("vae.norm_out.b", size_t(VAE_HID) * 4), size_t(VAE_HID) * 4); }
         }
         // post_quant_conv (a 24x24 matrix per voxel) on the host, then the tokens padded to K = 256 in f16
         static std::vector<float> pq_w, pq_b; if (pq_w.empty()) { pq_w = glue_.host_f32("vae.post_quant_conv.w", 24 * 24); pq_b = glue_.host_f32("vae.post_quant_conv.b", 24); }
         std::vector<uint16_t> in16(N * KPAD, 0);
         for (size_t v = 0; v < N; ++v) for (int o = 0; o < LATENT_CH; ++o) { float acc = pq_b[o]; for (int i = 0; i < LATENT_CH; ++i) acc += pq_w[o * 24 + i] * z[size_t(i) * N + v]; in16[v * KPAD + o] = f32_to_f16(acc); }
-        HIP_CHECK(hipMemcpyHtoD((hipDeviceptr_t)vin16_, in16.data(), in16.size() * 2));
+        rt().h2d(vin16_, in16.data(), in16.size() * 2);
         vproj_in_prep_.run(&prof, "vae proj_in", unsigned(N), vin16_, nullptr, nullptr, nullptr, va_q_, va_s_);
-        HIP_CHECK(hipMemset(vx_, 0, NT * VAE_HID * 4));
+        rt().memset(vx_, 0, NT * VAE_HID * 4);
         vproj_in_.run(&prof, "vae proj_in", unsigned(N), va_q_, glue_.at("vae.proj_in.q", size_t(VAE_HID) * KPAD), glue_.at("vae.proj_in.s", size_t(VAE_HID) * 4), va_s_, vx_, ones_, vcls_, glue_.at("vae.proj_in.b", size_t(VAE_HID) * 4));
-        HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)((float *)vx_ + N * VAE_HID), (hipDeviceptr_t)glue_.at("vae.register_tokens", size_t(VAE_REG) * VAE_HID * 4), size_t(VAE_REG) * VAE_HID * 4));   // then a zero cls row
+        rt().d2d(((float *)vx_ + N * VAE_HID), glue_.at("vae.register_tokens", size_t(VAE_REG) * VAE_HID * 4), size_t(VAE_REG) * VAE_HID * 4);   // then a zero cls row
         vae_->forward(&prof, vx_, vcls_, vcos_, vsin_, [&](int i) { const Stack::Block &b = vae_->block(i); return LayerCond{(const float *)zeros_, (const float *)b.scale1, (const float *)zeros_, (const float *)b.scale2}; });
         vnorm_out_.run(&prof, "vae norm_out", unsigned(NT), vx_, glue_.at("vae.norm_out.w", size_t(VAE_HID) * 4), vnorm_table_, vcls_, va_q_, va_s_);
         vproj_out_.run(&prof, "vae proj_out", unsigned(NT), va_q_, glue_.at("vae.proj_out.q", size_t(VAE_OUT) * VAE_HID), glue_.at("vae.proj_out.s", size_t(VAE_OUT) * 4), va_s_, vout16_, nullptr, nullptr, glue_.at("vae.proj_out.b", size_t(VAE_OUT) * 4));
-        std::vector<uint16_t> out16(N * VAE_OUT); HIP_CHECK(hipDeviceSynchronize()); HIP_CHECK(hipMemcpyDtoH(out16.data(), (hipDeviceptr_t)vout16_, out16.size() * 2));
+        std::vector<uint16_t> out16(N * VAE_OUT); rt().sync(); rt().d2h(out16.data(), vout16_, out16.size() * 2);
         // unpatchify: token (t, y, x) holds [3][4][16][16] -> frames [3][ft*4][h*16][w*16]
         const size_t FH = size_t(h) * VAE_PS, FW = size_t(w) * VAE_PS, FT = size_t(ft) * VAE_PT;
         frames.assign(size_t(3) * FT * FH * FW, 0.0f);

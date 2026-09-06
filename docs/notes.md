@@ -872,3 +872,23 @@ And a container launched from a shell wrapper loses its output if the wrapper di
 bench runs detached (`podman run -d --name h3bench`, `podman logs`). Another session's GPU job
 (`build/down-component-repeat.py`) overlapped the second attempt; the numbers above are from a
 run with nothing else on the GPU (rocm-smi 0% before, checked).
+
+## libhrx: the pipeline without HIP (2026-09-06)
+
+`host/rt.h` is the runtime the pipeline talks to (alloc, free, memset, three copies, sync, kernel
+load, launch); `host/rt_hip.cpp` implements it over the HIP runtime API and `host/rt_hrx.cpp` over
+hrx-system's libhrx (IREE's AMDGPU HAL; it dlopens the HSA runtime, so the floor is HSA plus the
+kernel driver, not HIP). `scripts/build_host.sh` builds `libh3pipe.so` (hipcc) and
+`libh3pipe_hrx.so` plus `h3pipe_hrx` (plain g++, links only libhrx). `H3PIPE_LIB=build/libh3pipe_hrx.so`
+selects it from Python; libhrx needs the ROCm 7.14 runtime on `LD_LIBRARY_PATH` (`~/.local/rocm-hrx`
+on halo: Arch's hsa-rocr lacks `HSA_AMD_AGENT_INFO_PM4_EMULATION`), and torch must not be imported
+in that process. Facts the port needed: Loom's kernarg layout is the launch signature (the by-value
+scalar as a 4-byte slot, or 8 bytes where the kernel keeps the index 64-bit, then 8-byte buffer
+pointers; `hrx_executable_export_info` reports the constant byte length and binding count, and the
+hrx launch packs and checks against them); device-local hrx buffers expose no device pointer, so the
+hrx runtime hands out synthetic addresses that map back to (buffer, offset); the attention launches
+had passed a second scalar (the head count) the kernels never declared, hidden by the old 4-byte
+packing, now removed. Validation: the 22-frame fox clip through both libraries gives bit-identical
+video and audio latents, wav and mp4. Steps 4.3 s (HIP) and 4.7 s (hrx) at 22 frames; the hrx
+session upload is about 30 s slower because each weight chunk's copy synchronizes (fixable with
+async copies).

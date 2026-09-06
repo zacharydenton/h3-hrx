@@ -38,7 +38,7 @@ def default_loom_compile() -> str:
 
 class H3Pipe:
     def __init__(self, glue=None, blocks=None, te=None, vae=None, vae_bits=8, cache=None, library=None):
-        native = ctypes.CDLL(str(library or ROOT / "build/libh3pipe.so"))
+        native = ctypes.CDLL(str(library or os.environ.get("H3PIPE_LIB") or ROOT / "build/libh3pipe.so"))   # H3PIPE_LIB=build/libh3pipe_hrx.so: the libhrx build
         native.h3pipe_abi_version.restype = ctypes.c_uint32
         if native.h3pipe_abi_version() != _ABI: raise H3PipeError("ABI mismatch; rebuild with scripts/build_host.sh")
         native.h3pipe_create.argtypes = [ctypes.POINTER(Config), ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_size_t]
