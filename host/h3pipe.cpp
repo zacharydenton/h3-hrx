@@ -290,7 +290,7 @@ struct Gemm {
 
 // --- the generic transformer stack -----------------------------------------------------------
 struct StackDims {
-    int hidden, heads, kv_heads, head_dim, ffn, rope_dim, classes, bits; float eps; bool bias, gate_first, causal; bool attn_i4 = false;   // attn_i4: QK^T in int4 (prepare_qk_i4 operands)
+    int hidden, heads, kv_heads, head_dim, ffn, rope_dim, classes, bits; float eps; bool bias, gate_first, causal; bool attn_i4 = false; int attn_qk_bits = 16;   // attn_i4: QK^T in int4 (prepare_qk_i4 operands); attn_qk_bits 8: int8 operands (prepare_qk_i8, attention_i8qk_*), 4 = attn_i4
     int inner() const { return heads * head_dim; }
     int kv_inner() const { return kv_heads * head_dim; }
     int qkv() const { return inner() + 2 * kv_inner(); }
@@ -332,22 +332,23 @@ public:
             const std::string ns = "h3." + stem + ".";
             rope_ = c.get(stem, "h3_" + stem, {{ns + "row_stride", std::to_string(d.qkv())}, {ns + "heads", std::to_string(d.heads)}, {ns + "kv_heads", std::to_string(d.kv_heads)}, {ns + "k_offset", std::to_string(d.inner())}, {ns + "eps", num(d.eps)}});
         }
-        if (d.attn_i4) {
-            if (d.causal || d.head_dim != 128) throw std::runtime_error("int4 QK^T attention: MHA with head 128 only");
-            const std::string pq = "h3.prepare_qk_i4.";
+        const bool qk_int = d.attn_i4 || d.attn_qk_bits == 8; const std::string pqk = d.attn_i4 ? "prepare_qk_i4" : "prepare_qk_i8";
+        if (qk_int) {
+            if (d.causal || d.head_dim != 128) throw std::runtime_error("integer QK^T attention: MHA with head 128 only");
+            const std::string pq = "h3." + pqk + ".";
             colmean_ = c.get("colmean_f32", "h3_colmean_f32", {{"h3.colmean_f32.width", std::to_string(d.inner())}});
-            prep_q_ = c.get("prepare_qk_i4", "h3_prepare_qk_i4", {{pq + "row_stride", std::to_string(d.inner())}, {pq + "head_offset", "0"}, {pq + "heads", std::to_string(d.heads)}, {pq + "extra_scale", num(1.0 / std::sqrt(double(d.head_dim)) / 128.0)}});
-            prep_k_ = c.get("prepare_qk_i4", "h3_prepare_qk_i4", {{pq + "row_stride", std::to_string(d.inner())}, {pq + "head_offset", "0"}, {pq + "heads", std::to_string(d.heads)}, {pq + "extra_scale", "1"}});
+            prep_q_ = c.get(pqk, "h3_" + pqk, {{pq + "row_stride", std::to_string(d.inner())}, {pq + "head_offset", "0"}, {pq + "heads", std::to_string(d.heads)}, {pq + "extra_scale", num(1.0 / std::sqrt(double(d.head_dim)) / 128.0)}});
+            prep_k_ = c.get(pqk, "h3_" + pqk, {{pq + "row_stride", std::to_string(d.inner())}, {pq + "head_offset", "0"}, {pq + "heads", std::to_string(d.heads)}, {pq + "extra_scale", "1"}});
             transpose_ = c.get("transpose_f16", "h3_transpose_f16", {{"h3.transpose_f16.width", std::to_string(d.inner())}, {"h3.transpose_f16.row_capacity", std::to_string(capacity_)}});
         }
         {
             std::string stem = d.causal ? "attention_gqa8c_lds_f16_wmma" : (d.head_dim == 64 ? (waves_ == 8 ? "attention_mha648_lds_f16_wmma" : "attention_mha64_lds_f16_wmma") : (waves_ == 8 ? "attention_mha8_lds_f16_wmma" : "attention_mha_lds_f16_wmma"));
-            if (d.attn_i4) stem = tokens >= 20000 ? "attention_i4qkl_mha8_lds_f16_wmma" : (waves_ == 8 ? "attention_i4qk_mha8_lds_f16_wmma" : "attention_i4qk_mha_lds_f16_wmma");   // one workgroup per CU past ~20k rows
+            if (qk_int) { stem = tokens >= 20000 ? "attention_i4qkl_mha8_lds_f16_wmma" : (waves_ == 8 ? "attention_i4qk_mha8_lds_f16_wmma" : "attention_i4qk_mha_lds_f16_wmma"); if (!d.attn_i4) stem.replace(stem.find("i4qk"), 4, "i8qk"); }   // one workgroup per CU past ~20k rows
             // tile skip: H3_ATTN_SKIP_TAU=<tau> selects the skip twin (i4qk -> i4qks) at that tau (tau 4: no measured velocity cost,
             // about 3% on the 768 step against the carried-scale plain kernel); unset or 'off' -> the plain kernel
             double tau = 0.0;
             if (const char *v = std::getenv("H3_ATTN_SKIP_TAU")) { std::string sv(v); for (auto &ch : sv) ch = char(tolower(ch)); tau = (sv == "off" || sv == "none" || sv == "0" || sv == "1e30" || sv.empty()) ? 0.0 : std::atof(v); }
-            const bool skip = d.attn_i4 && tau > 0.0;
+            const bool skip = d.attn_i4 && tau > 0.0;   // the skip twins exist for int4 only
             if (skip) { const size_t at = stem.find("i4qk"); stem.replace(at, 4, "i4qks"); }
             const std::string ns = "h3." + stem + ".";
             Cfg acfg = {{ns + "q_stride", std::to_string(d.inner())}, {ns + "kv_stride", std::to_string(d.kv_inner())}, {ns + "tokens", std::to_string(tokens)}, {ns + "token_capacity", std::to_string(capacity_)}, {ns + "scale", num(1.0 / std::sqrt(double(d.head_dim)))}, {ns + "out_stride", std::to_string(d.inner())}};
@@ -364,11 +365,11 @@ public:
         attn_ = memory_.alloc(T * size_t(d.inner()) * 2);
         gu_ = memory_.alloc(T * size_t(d.ffn) * 2);
         for (auto p : {fused_, q_, k_, v_, attn_}) rt().memset(p, 0, T * size_t(p == fused_ ? d.qkv() : (p == q_ || p == attn_ ? d.inner() : d.kv_inner())) * 2);
-        if (d.attn_i4) {
-            qi_ = memory_.alloc(T * size_t(d.heads) * 64); ki_ = memory_.alloc(T * size_t(d.heads) * 64); qs_ = memory_.alloc(T * size_t(d.heads) * 4); ks_ = memory_.alloc(T * size_t(d.heads) * 4);
+        if (d.attn_i4 || d.attn_qk_bits == 8) {
+            const size_t code_bytes = d.attn_i4 ? 64 : 128; qi_ = memory_.alloc(T * size_t(d.heads) * code_bytes); ki_ = memory_.alloc(T * size_t(d.heads) * code_bytes); qs_ = memory_.alloc(T * size_t(d.heads) * 4); ks_ = memory_.alloc(T * size_t(d.heads) * 4);
             kmean_ = memory_.alloc(size_t(d.inner()) * 4); zmean_ = memory_.alloc(size_t(d.inner()) * 4); rt().memset(zmean_, 0, size_t(d.inner()) * 4);
             vt_ = memory_.alloc(size_t(d.inner()) * T * 2); rt().memset(vt_, 0, size_t(d.inner()) * T * 2);
-            for (auto p : {qi_, ki_}) rt().memset(p, 0, T * size_t(d.heads) * 64);
+            for (auto p : {qi_, ki_}) rt().memset(p, 0, T * size_t(d.heads) * code_bytes);
             for (auto p : {qs_, ks_}) rt().memset(p, 0, T * size_t(d.heads) * 4);
         }
     }
@@ -394,7 +395,7 @@ public:
             prep_norm_.run(prof, "prepare norm", T, x, b.norm1, lc.table_msa, cls, a_q_, a_s_);
             gemm_qkv_.run(prof, "gemm qkv", T, a_q_, b.qkv_q, b.qkv_s, a_s_, fused_, nullptr, nullptr, b.qkv_b);
             { KernArgs a; a.i32(int(T)).ptr(fused_).ptr(b.qnorm).ptr(b.knorm).ptr(cos).ptr(sin).ptr(q_).ptr(k_).ptr(v_); launch(*rope_, prof, "qk norm + rope", T, 1, THREADS, a); }
-            if (d_.attn_i4) {
+            if (d_.attn_i4 || d_.attn_qk_bits == 8) {
                 static const bool smooth = std::getenv("H3_KSMOOTH") && std::string(std::getenv("H3_KSMOOTH")) == "1";   // K mean smoothing: off by default (measured worse)
                 if (smooth) { KernArgs a; a.i32(int(T)).ptr(k_).ptr(kmean_); launch(*colmean_, prof, "attention operands", unsigned(d_.inner() / 256), 1, THREADS, a); }
                 { KernArgs a; a.i32(int(T)).ptr(q_).ptr(zmean_).ptr(qi_).ptr(qs_); launch(*prep_q_, prof, "attention operands", T, 1, THREADS, a); }
@@ -518,7 +519,7 @@ public:
         comp_.exe = cfg.loom_compile; comp_.sources = cfg.kernel_sources; comp_.cache = cfg.cache_dir;
         vae_dir_ = cfg.vae_dir ? cfg.vae_dir : ""; vae_bits_ = cfg.vae_bits ? cfg.vae_bits : 8;
         aenc_dir_ = cfg.aenc_dir ? cfg.aenc_dir : ""; vision_dir_ = cfg.vision_dir ? cfg.vision_dir : ""; venc_dir_ = cfg.venc_dir ? cfg.venc_dir : "";
-        attn_qk_bits_ = cfg.attn_qk_bits ? cfg.attn_qk_bits : 4; if (attn_qk_bits_ != 4 && attn_qk_bits_ != 16) throw std::invalid_argument("attn_qk_bits must be 4 or 16");
+        attn_qk_bits_ = cfg.attn_qk_bits ? cfg.attn_qk_bits : 4; if (attn_qk_bits_ != 4 && attn_qk_bits_ != 8 && attn_qk_bits_ != 16) throw std::invalid_argument("attn_qk_bits must be 4, 8 or 16");
         glue_.open(cfg.glue_dir);
         embed_ = glue_.span("te.embed");
         blocks_dir_ = cfg.blocks_dir;
@@ -725,7 +726,7 @@ public:
           for (size_t r = 0; r < S; ++r) for (int ax = 0; ax < 3; ++ax) for (int j = 0; j < 16; ++j) { const float ang = float(lay.pos[3 * r + ax]) * inv_freq_[j]; c[r * ROPE_HALF + ax * 16 + j] = std::cos(ang); s[r * ROPE_HALF + ax * 16 + j] = std::sin(ang); }
           rt().h2d(cos_, c.data(), c.size() * 4); rt().h2d(sin_, s.data(), s.size() * 4); }
         if (!dit_ || dit_->tokens() != S) {
-            const char *qk = std::getenv("H3_ATTN_QK"); StackDims dd{HID, HEADS, HEADS, HEAD_DIM, FFN, ROPE_DIM, CLASSES, 4, 1e-5f, false, true, false}; dd.attn_i4 = qk ? !(std::string(qk) == "f16") : attn_qk_bits_ == 4;   // H3_ATTN_QK=f16|i4 overrides the config
+            const char *qk = std::getenv("H3_ATTN_QK"); StackDims dd{HID, HEADS, HEADS, HEAD_DIM, FFN, ROPE_DIM, CLASSES, 4, 1e-5f, false, true, false}; const int qkb = qk ? (std::string(qk) == "f16" ? 16 : (std::string(qk) == "i8" ? 8 : 4)) : attn_qk_bits_; dd.attn_i4 = qkb == 4; dd.attn_qk_bits = qkb;   // H3_ATTN_QK=f16|i8|i4 overrides the config
             dd.bits = blocks_.span("blocks.0.qkv.q").bytes == size_t(dd.qkv()) * dd.hidden ? 8 : 4;   // the export's width: int8 rows verbatim (export_weights.py --bits 8) or packed int4
             dit_.reset(); dit_ = std::make_unique<Stack>(comp_, dd, S, 50, blocks_, "blocks.%d.", true, nullptr); }
         if (!final_prep_.k) { final_prep_.build(comp_, "norm", 8, HID, 1e-5f, 2); }

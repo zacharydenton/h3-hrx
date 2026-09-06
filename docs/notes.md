@@ -1101,3 +1101,36 @@ int8 + f16 and 31 s int4 here, 103 s in ComfyUI (`tools/bench_comfyui_h3.py`, 10
 15.5 min at int4, 51 min in ComfyUI. Attention is about 60% of the int8 evaluation at this size
 (340 TFLOP per evaluation at ~15 TFLOP/s against 590 TOPS of int8 GEMM at ~38), so the
 attention levers apply here too.
+
+## int8 QK^T attention (2026-09-06)
+
+`tools/gen_attention_i8qk.py` derives int8-operand twins of the three shipped int4-QK kernels
+(4-wave, 8-wave, and the one-workgroup-per-CU form past 20k rows): the same schedule with
+`payload_registers 4`, 32 i32 words per head, K tiles 16 x 36 words (2304 B, double-buffered),
+every LDS offset past the K tiles grown accordingly. `kernels/prepare_qk_i8.loom` makes the
+operands (per token and head, K mean-smoothed, the head rotated by the Hadamard, absmax/127,
+4 codes per word low byte first; bit-exact against `tests/test_prepare_qk_i8.py`). The first
+cut paired query chunk c with key words 2c: the generated int4 kernels read K through the
+double-buffer views (`%k_tile_b`, `%k_tile_o`), which the offset-doubling regex did not match.
+A one-hot-V probe (probabilities read straight off the output) and one-hot query codes found
+it in two runs: query channel 16c correlated with key channel 8c. `tests/test_attention_i8.py`:
+cosine 0.99999996 against the replica at 100 / 1000 / 4000 tokens, both wave forms.
+
+Parity: against ComfyUI's residual stream (int8 rows), int8 QK^T is indistinguishable from f16
+attention (video rows 1.0000 through block 20, 0.9988 at 30, 0.9929 at 40, 0.9991 at 49; the
+20-evaluation keyframe trajectory 0.876 final, the same as f16's 0.90 class). It is the
+default for `--precision int8` now.
+
+| size | f16 attention | int8 QK^T | int4 QK^T | ComfyUI |
+| --- | ---: | ---: | ---: | ---: |
+| 864x480 x 22 f, per evaluation | 3.85 s | 4.0 s | 2.3 s (int4 blocks) | 5.2 s |
+| 864x480 x 124 f | 36 s | 33 s | 31 s (int4 blocks) | 103 s |
+| 1344x768 x 124 f | 161 s (attention 120) | 146 s (attention 101 + 3 operands) | 128 s (int4 blocks) | 771 s |
+
+The modest gain is the expected one: the int8 kernel issues the same MMAs as the f16 one
+(int8 WMMA runs at the f16 rate on gfx1151) and only halves the QK operand traffic. The int4
+kernel's 2x MMA rate is what bought its 85 s, and int4 is out for quality. Attention at 768p
+runs at 17.5 TFLOP/s of the 54 peak: the MMAs alone would take 33 s, so about 70 s of the
+101 is schedule (staging, barriers, softmax bookkeeping, occupancy), shared by all three
+kernels. That schedule, not operand width, is the remaining large lever at parity precision;
+the other is the int8 GEMMs at 38 of 54 TOPS (about 40 s of a 768p evaluation).

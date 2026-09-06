@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
     const std::string glue = root + "/build/weights_glue", blocks = root + "/build/weights_gptq", te = root + "/build/weights_te", vae = root + "/build/weights_vae_i8";
     const char *loom = getenv("LOOM_COMPILE");
     const std::string sources = root + "/kernels", cache = root + "/build/kernel_cache";
-    h3pipe_config cfg = {glue.c_str(), blocks.c_str(), te.c_str(), vae.c_str(), sources.c_str(), cache.c_str(), loom ? loom : "loom-compile", 8, nullptr, nullptr, nullptr, std::string(arg(argc, argv, "--attn", "i4")) == "f16" ? 16 : 4};
+    h3pipe_config cfg = {glue.c_str(), blocks.c_str(), te.c_str(), vae.c_str(), sources.c_str(), cache.c_str(), loom ? loom : "loom-compile", 8, nullptr, nullptr, nullptr, std::string(arg(argc, argv, "--attn", "i4")) == "f16" ? 16 : (std::string(arg(argc, argv, "--attn", "i4")) == "i8" ? 8 : 4)};
     h3pipe_params p = {atoi(arg(argc, argv, "--height", "480")), atoi(arg(argc, argv, "--width", "864")), atoi(arg(argc, argv, "--frames", "124")), atoi(arg(argc, argv, "--steps", "31")), (uint64_t)atoll(arg(argc, argv, "--seed", "0")), 0.0f, 0.0f, std::string(arg(argc, argv, "--sampler", "res_multistep")) == "euler" ? 0 : 1, (float)atof(arg(argc, argv, "--cache", "0"))};
     char err[4096]; h3pipe_session *s = nullptr;
     if (h3pipe_create(&cfg, &s, err, sizeof err)) { fprintf(stderr, "create: %s\n", err); return 1; }

@@ -46,7 +46,7 @@ def default_loom_compile() -> str:
 
 class H3Pipe:
     def __init__(self, glue=None, blocks=None, te=None, vae=None, vae_bits=8, cache=None, library=None, aenc=None, vision=None, venc=None, attn="i4"):
-        """blocks: build/weights_i8 (int8 rows, ComfyUI parity) or build/weights_gptq (int4, the fast path); attn: "f16" or "i4" QK^T. Both int4 choices ghost conditioned clips (docs/notes.md)."""
+        """blocks: build/weights_i8 (int8 rows, ComfyUI parity) or build/weights_gptq (int4, the fast path); attn: "f16", "i8" or "i4" QK^T. Both int4 choices ghost conditioned clips (docs/notes.md)."""
         native = ctypes.CDLL(str(library or os.environ.get("H3PIPE_LIB") or ROOT / "build/libh3pipe.so"))   # H3PIPE_LIB=build/libh3pipe_hrx.so: the libhrx build
         native.h3pipe_abi_version.restype = ctypes.c_uint32
         if native.h3pipe_abi_version() != _ABI: raise H3PipeError("ABI mismatch; rebuild with scripts/build_host.sh")
@@ -64,7 +64,7 @@ class H3Pipe:
         self._native = native
         cfg = Config(os.fsencode(glue or ROOT / "build/weights_glue"), os.fsencode(blocks or ROOT / "build/weights_gptq"), os.fsencode(te or ROOT / "build/weights_te"),
                      os.fsencode(vae or ROOT / ("build/weights_vae_i8" if vae_bits == 8 else "build/weights_vae_gptq")), os.fsencode(ROOT / "kernels"),
-                     os.fsencode(cache or ROOT / "build/kernel_cache"), os.fsencode(default_loom_compile()), vae_bits, os.fsencode(aenc or ROOT / "build/weights_aenc"), os.fsencode(vision or ROOT / "build/weights_vision"), os.fsencode(venc or ROOT / "build/weights_venc"), {"i4": 4, "f16": 16}[attn])
+                     os.fsencode(cache or ROOT / "build/kernel_cache"), os.fsencode(default_loom_compile()), vae_bits, os.fsencode(aenc or ROOT / "build/weights_aenc"), os.fsencode(vision or ROOT / "build/weights_vision"), os.fsencode(venc or ROOT / "build/weights_venc"), {"i4": 4, "i8": 8, "f16": 16}[attn])
         handle = ctypes.c_void_p(); err = ctypes.create_string_buffer(_ERR)
         if native.h3pipe_create(ctypes.byref(cfg), ctypes.byref(handle), err, _ERR): raise H3PipeError(err.value.decode())
         self._handle = handle

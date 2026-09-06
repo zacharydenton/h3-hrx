@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "tools"))
 ap = argparse.ArgumentParser()
 ap.add_argument("--case", choices=["t2va", "fl2va"], default="t2va"); ap.add_argument("--mode", choices=["trajectory", "blocks"], default="trajectory")
-ap.add_argument("--truth", required=True, help="tools/comfy_clip.py --out directory"); ap.add_argument("--blocks", default=None); ap.add_argument("--attn", choices=["i4", "f16"], default="i4")
+ap.add_argument("--truth", required=True, help="tools/comfy_clip.py --out directory"); ap.add_argument("--blocks", default=None); ap.add_argument("--attn", choices=["i4", "i8", "f16"], default="i4")
 ap.add_argument("--prompt", default="A red fox trotting through a snowy forest at dawn, cinematic"); ap.add_argument("--first-frame", default=str(ROOT / "build/refs/fox_clean.png"))
 ap.add_argument("--width", type=int, default=864); ap.add_argument("--height", type=int, default=480); ap.add_argument("--frames", type=int, default=22); ap.add_argument("--seed", type=int, default=7)
 ap.add_argument("--dump", default=None, help="directory for the per-step / per-block dumps (default: <truth>/mine_<blocks>_<attn>)")

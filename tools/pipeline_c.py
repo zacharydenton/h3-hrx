@@ -18,12 +18,12 @@ def main():
     ap.add_argument("--ref-audio", action="append", default=[], help="reference wav (32 kHz stereo/mono) for ref2va: <Audio j>; repeatable")
     ap.add_argument("--first-frame", default=None, help="keyframe image for fl2va (resized to the canvas)")
     ap.add_argument("--precision", choices=["int8", "int4"], default="int8", help="int8: int8 block rows + f16 attention (ComfyUI parity; conditioned clips clean); int4: int4 GPTQ blocks + int4 QK^T attention (2x faster per step, ghosts keyframe/reference clips)")
-    ap.add_argument("--blocks", default=None, help="override the block weights directory"); ap.add_argument("--attn", choices=["f16", "i4"], default=None, help="override the attention QK^T precision"); ap.add_argument("--glue", default=None)
+    ap.add_argument("--blocks", default=None, help="override the block weights directory"); ap.add_argument("--attn", choices=["f16", "i8", "i4"], default=None, help="override the attention QK^T precision"); ap.add_argument("--glue", default=None)
     a = ap.parse_args()
     from h3tok_ids import encode_presentation
         # the ref2va checkpoint for reference runs when its exports exist (H3_CKPT=<ref2va> tools/export_weights.py --bits 8 --out build/weights_i8_ref2va, tools/export_glue.py)
     suffix = "_ref2va" if (a.ref_image or a.ref_audio) and (ROOT / f"build/weights_{'i8' if a.precision == 'int8' else 'gptq'}_ref2va/manifest.txt").exists() and (ROOT / "build/weights_glue_ref2va/manifest.txt").exists() else ""
-    blocks = a.blocks or str(ROOT / (("build/weights_i8" if a.precision == "int8" else "build/weights_gptq") + suffix)); attn = a.attn or ("f16" if a.precision == "int8" else "i4")
+    blocks = a.blocks or str(ROOT / (("build/weights_i8" if a.precision == "int8" else "build/weights_gptq") + suffix)); attn = a.attn or ("i8" if a.precision == "int8" else "i4")
     glue = a.glue or (str(ROOT / "build/weights_glue_ref2va") if suffix else None)
     t0 = time.time(); pipe = H3Pipe(vae_bits=a.vae_bits, blocks=blocks, glue=glue, attn=attn); print(f"session in {time.time() - t0:.1f} s ({os.path.basename(blocks)}, {attn} attention{', ref2va glue' if glue else ''})", flush=True)
     p = H3Pipe.params(height=a.height, width=a.width, frames=a.frames, steps=a.steps, seed=a.seed, cache_threshold=a.cache_threshold, sampler=a.sampler); sh = pipe.shape(p)

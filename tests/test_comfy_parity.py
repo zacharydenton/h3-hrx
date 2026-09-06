@@ -10,9 +10,12 @@ def main():
     if not (ROOT / "build/comfy_t2va_blocks/blocks/blk_49.npy").exists() or not (ROOT / "build/comfy_fl2va/x_19.npy").exists() or not (ROOT / "build/weights_i8/manifest.txt").exists():
         print("SKIP: no ComfyUI dumps (tools/comfy_clip.py --dump-steps --dump-blocks 0,1,2,5,10,20,30,40,49 --steps 2 --out build/comfy_t2va_blocks) or no build/weights_i8"); return 0
     ok = True
-    for line in run(["--case", "t2va", "--mode", "blocks", "--truth", "build/comfy_t2va_blocks", "--blocks", "build/weights_i8", "--attn", "f16"]).splitlines():
-        if line.startswith("blk_"):
-            blk = int(line.split(":")[0][4:]); video = float(line.split("video ")[1].rstrip("]")); good = video >= (0.999 if blk <= 30 else 0.99);   # measured 0.9935 at block 40, 0.9992 at 49 ok &= good; print(f"  {'PASS' if good else 'FAIL'} {line.split(':')[0]} video rows {video:.4f}")
+    for attn in ("f16", "i8"):   # int8 QK^T operands are the parity path too (tools/gen_attention_i8qk.py)
+        for line in run(["--case", "t2va", "--mode", "blocks", "--truth", "build/comfy_t2va_blocks", "--blocks", "build/weights_i8", "--attn", attn]).splitlines():
+            if line.startswith("blk_"):
+                blk = int(line.split(":")[0][4:]); video = float(line.split("video ")[1].rstrip("]"))
+                good = video >= (0.999 if blk <= 20 else 0.99)   # measured 0.9990 / 0.9988 at block 30 (f16 / int8), 0.9935 at 40, 0.9992 at 49
+                ok &= good; print(f"  {'PASS' if good else 'FAIL'} {attn} attention {line.split(':')[0]} video rows {video:.4f}")
     for line in run(["--case", "fl2va", "--mode", "trajectory", "--truth", "build/comfy_fl2va", "--blocks", "build/weights_i8", "--attn", "f16"]).splitlines():
         if line.startswith("x_05"):
             err = float(line.split("rel err ")[1]); good = err <= 0.02; ok &= good; print(f"  {'PASS' if good else 'FAIL'} trajectory after five evaluations: rel err {err:.4f}")

@@ -155,8 +155,8 @@ python3 tools/pipeline_c.py "A red fox ..." --first-frame fox.png      # fl2va w
 
 The defaults are the stock ComfyUI workflows' settings: `res_multistep` on the `simple`
 schedule, 30 evaluations (`--steps 31` grid points; ComfyUI's workflows use 20), no CFG, shifts 12/3, and
-`--precision int8` (the checkpoint's int8 rows, `tools/export_weights.py --bits 8`, with f16
-attention). `--precision int4` is the 2x-per-step path (GPTQ int4 blocks, int4 QK^T attention):
+`--precision int8` (the checkpoint's int8 rows, `tools/export_weights.py --bits 8`, with int8
+QK^T attention, `tools/gen_attention_i8qk.py`; `--attn f16` is the same quality, slightly slower). `--precision int4` is the 2x-per-step path (GPTQ int4 blocks, int4 QK^T attention):
 fine for text-only previews, but it ghosts keyframe and reference clips, because its deep-block
 error drifts the moving frames away from the pinned anchor (`docs/notes.md`, "ComfyUI's
 sampler, and why int4 ghosts conditioned clips"). At parity precision the host reproduces
@@ -172,9 +172,11 @@ Measured head to head against ComfyUI's own H3 path (int8 ConvRot checkpoints, b
 pytorch attention, `tools/bench_comfyui_h3.py` in the Strix Halo image): 771 s per step at
 1344x768 and 124 frames against 128 s here with the int4 path in the same session, six times
 faster; 30 steps are 6.4 hours there and about an hour here (`docs/notes.md`, "Head to head
-with ComfyUI"). The int8 + f16 path, the one whose clips match ComfyUI's, costs 161 s per
-step at that size, 4.8x faster than ComfyUI; at 864x480 and 22 frames it is 5.7 s per step against ComfyUI's 5.2 s and
-int4's 2.8 s. Attention, not the GEMMs, is the wall at video lengths.
+with ComfyUI"). The int8 path, the one whose clips match ComfyUI's, costs 146 s per
+evaluation at that size with int8 QK^T attention (161 s with f16 attention), 5.3x faster than
+ComfyUI; at 864x480 and 124 frames (5 s of video) 33 s against ComfyUI's 103 s, 3.1x; at
+864x480 and 22 frames 4.0 s against 5.2 s. Attention is 70% of a 768p evaluation and runs at
+17 TFLOP/s against the part's 54 peak; the remaining large lever is that kernel's schedule.
 
 ## Weights and license
 

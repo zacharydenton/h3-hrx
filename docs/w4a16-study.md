@@ -24,6 +24,8 @@ Video-velocity relative L2 error against that baseline:
 | W8A8 | 2.64% | 1.40% |
 | GPTQ W4A4, per-row weights | 12.86% | 27.70% |
 | GPTQ W4A16, same per-row weights | 5.56% | 23.00% |
+| W4A16, round-to-nearest weights, group 128 | 13.02% | 20.00% |
+| W4A16, round-to-nearest weights, group 32 | 11.51% | 14.24% |
 
 The fixture has 2097 tokens, random text conditioning, and video sigma 0.9. The real
 prompt is the saved fox T2VA case at 864x480, 22 frames, 2922 tokens, sigma 1. Its input
@@ -47,6 +49,10 @@ all of that configuration's loss to weights. The larger remaining error on the r
 case also shows that activation precision alone is insufficient. More representative
 weight calibration is worth testing; these two inputs cannot isolate whether prompt,
 timestep, layout, or another distribution difference accounts for the remaining gap.
+Group-32 W4A16 generalizes better to this real input than the per-row GPTQ export, even
+though GPTQ does better on its own calibration fixture. The best tested real-prompt
+four-bit configuration still has substantially more velocity error than W8A8. No full
+reference-conditioned render or native W4A16 throughput test was run.
 
 Reproduce with the project's Torch environment:
 

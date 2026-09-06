@@ -27,7 +27,7 @@ typedef struct {
     const char *aenc_dir;        // tools/export_audio_encoder.py: the audio VAE's encoder (reference audio); NULL -> h3pipe_encode_audio unavailable
     const char *vision_dir;      // tools/export_vision.py: Qwen3-VL's vision tower (reference images in the prompt); NULL -> unavailable
     const char *venc_dir;        // tools/export_vae_encoder.py: the video VAE's encoder (reference images/videos, keyframes); NULL -> unavailable
-    int attn_qk_bits;            // the DiT attention's QK^T: 16 (f16, ComfyUI parity) or 4 (int4 operands, the fast path); 0 -> 4. blocks_dir's width (int4 or int8 rows) is read from its manifest
+    int attn_qk_bits;            // the DiT attention's QK^T: 16 (f16), 8 (int8 operands: parity quality, less operand traffic) or 4 (int4, ghosts conditioned clips); 0 -> 4. blocks_dir's width (int4 or int8 rows) is read from its manifest
 } h3pipe_config;
 
 typedef struct {
