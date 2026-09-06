@@ -28,6 +28,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <tuple>
 
 #include "h3pipe.h"
 
@@ -400,7 +401,7 @@ struct Layout {
         return v;
     }
     static double video_span(int n) { double s = 0; for (int k = 0; k < n; ++k) s += FRAME_RESCALE * FRAME_PER_TOKEN[k % 5]; return s; }
-    Layout(int text_len_, int latent_t_, int lat_h_, int lat_w_, int audio_t_, const std::vector<h3pipe_ref> &refs = {}) : text_len(text_len_), latent_t(latent_t_), lat_h(lat_h_), lat_w(lat_w_), audio_t(audio_t_) {
+    Layout(int text_len_, int latent_t_, int lat_h_, int lat_w_, int audio_t_, const std::vector<h3pipe_ref> &refs = {}, const std::vector<h3pipe_keyframe> &kfs = {}) : text_len(text_len_), latent_t(latent_t_), lat_h(lat_h_), lat_w(lat_w_), audio_t(audio_t_) {
         const double area = std::sqrt(double(lat_h) * lat_w);
         const std::vector<double> ah = axis(lat_h, area), aw = axis(lat_w, area);
         audio_rows = size_t(audio_t) * 2; video_rows = size_t(latent_t) * ah.size() * aw.size();
@@ -408,6 +409,7 @@ struct Layout {
             if (rf.kind == 1) ref_rows += size_t(rf.audio_t) * 2;
             else { const int hh = rf.lat_h / 2, ww = rf.lat_w / 2; ref_rows += size_t(rf.kind == 0 ? 1 : rf.latent_t) * hh * ww; if (rf.kind == 2 && rf.audio_latent && rf.audio_t > 0) ref_rows += size_t(rf.audio_t) * 2; }
         }
+        for (const h3pipe_keyframe &kf : kfs) { ref_rows += ah.size() * aw.size(); if (kf.audio_latent && kf.audio_t > 0) ref_rows += size_t(kf.audio_t) * 2; }
         seq_len = text_len + ref_rows + audio_rows + video_rows;
         pos.assign(seq_len * 3, 0.0); adaln_rows.assign(seq_len, 0); tclass.assign(seq_len, 0);
         size_t r = 0;
@@ -418,6 +420,15 @@ struct Layout {
         auto video_grid = [&](double origin, int vt, const std::vector<double> &gh, const std::vector<double> &gw, int cls) {
             double acc = origin;
             for (int k = 0; k < vt; ++k) { for (double hv : gh) for (double wv : gw) { pos[3 * r] = acc; pos[3 * r + 1] = hv; pos[3 * r + 2] = wv; adaln_rows[r] = cls * MODALITIES + 0; tclass[r] = cls; ++r; } acc += FRAME_RESCALE * FRAME_PER_TOKEN[k % 5]; } };
+        // keyframes: cond rows on the target grid at cond_t = cursor + FRAME_RESCALE * frame_index, where cursor already skips the references
+        { double after_refs = cursor;
+          for (const h3pipe_ref &rf : refs) after_refs += rf.kind == 0 ? 1.0 : (rf.kind == 1 ? double(rf.audio_t) : std::max(rf.audio_latent && rf.audio_t > 0 ? double(rf.audio_t) : 0.0, video_span(rf.latent_t)));
+          for (size_t ki = 0; ki < kfs.size(); ++ki) {
+              const h3pipe_keyframe &kf = kfs[ki]; const double cond_t = after_refs + FRAME_RESCALE * kf.frame_index;
+              ref_segs.push_back({3, r, ah.size() * aw.size(), 1, lat_h, lat_w, 0, false, int(ki)});
+              for (double hv : ah) for (double wv : aw) { pos[3 * r] = cond_t; pos[3 * r + 1] = hv; pos[3 * r + 2] = wv; adaln_rows[r] = 2 * MODALITIES + 0; tclass[r] = 2; ++r; }
+              if (kf.audio_latent && kf.audio_t > 0) { ref_segs.push_back({3, r, size_t(kf.audio_t) * 2, 0, 0, 0, kf.audio_t, true, int(ki)}); audio_grid(cond_t, kf.audio_t, aw.front(), aw.back(), 3); }
+          } }
         for (size_t ri = 0; ri < refs.size(); ++ri) {
             const h3pipe_ref &rf = refs[ri];
             if (rf.kind == 0 || rf.kind == 2) {
@@ -621,22 +632,26 @@ public:
     }
 
     // --- denoising ---
-    void denoise(const int32_t *ids, int n, const h3pipe_params &p, const float *noise_video, const float *noise_audio, float *video_out, float *audio_out, h3pipe_progress progress, void *user, const std::vector<h3pipe_ref> &refs = {}) {
+    void denoise(const int32_t *ids, int n, const h3pipe_params &p, const float *noise_video, const float *noise_audio, float *video_out, float *audio_out, h3pipe_progress progress, void *user, const std::vector<h3pipe_ref> &refs = {}, const std::vector<h3pipe_keyframe> &kfs = {}) {
         if (p.height % 32 || p.width % 32 || p.height < 64 || p.width < 64) throw std::invalid_argument("height and width must be multiples of 32");
         if (p.steps < 2 || p.steps > 1000) throw std::invalid_argument("steps must be 2..1000");
         h3pipe_shape sh; h3pipe_shape_for(&p, &sh);
-        Layout lay(n, sh.latent_t, sh.lat_h, sh.lat_w, sh.audio_t, refs);
+        Layout lay(n, sh.latent_t, sh.lat_h, sh.lat_w, sh.audio_t, refs, kfs);
         const size_t L = size_t(n), Rr = lay.ref_rows, LR = L + Rr, Na = lay.audio_rows, Nv = lay.video_rows, S = lay.seq_len;
         ensure_seq(S);
         // image references presented to the text encoder: the vision tower per image, in the order of the placeholder runs
         std::vector<VisionSpan> spans; std::vector<std::vector<float>> vmerged, vdeep;
         { std::vector<std::pair<size_t, size_t>> runs; for (int i = 0; i < n; ++i) if (ids[i] < 0) { if (runs.empty() || runs.back().first + runs.back().second != size_t(i)) runs.push_back({size_t(i), 0}); ++runs.back().second; }
           size_t ri = 0;
-          for (const h3pipe_ref &rf : refs) if (rf.kind == 0 && rf.pixels) {
-              if (ri >= runs.size()) throw std::invalid_argument("more image references than placeholder runs in the ids");
-              const int mh = rf.height / 32, mw = rf.width / 32;
+          std::vector<std::tuple<const float *, int, int>> pics;   // keyframes first, then image references, as the presentation orders them
+          for (const h3pipe_keyframe &kf : kfs) if (kf.pixels) pics.emplace_back(kf.pixels, kf.height, kf.width);
+          for (const h3pipe_ref &rf : refs) if (rf.kind == 0 && rf.pixels) pics.emplace_back(rf.pixels, rf.height, rf.width);
+          for (const auto &pc : pics) {
+              const float *px = std::get<0>(pc); const int ph = std::get<1>(pc), pw = std::get<2>(pc);
+              if (ri >= runs.size()) throw std::invalid_argument("more images than placeholder runs in the ids");
+              const int mh = ph / 32, mw = pw / 32;
               if (runs[ri].second != size_t(mh) * mw) throw std::invalid_argument(fmt("placeholder run %zu has %zu ids, the image needs %d", ri, runs[ri].second, mh * mw));
-              vmerged.emplace_back(); vdeep.emplace_back(); vision_embed(rf.pixels, rf.height, rf.width, vmerged.back(), vdeep.back());
+              vmerged.emplace_back(); vdeep.emplace_back(); vision_embed(px, ph, pw, vmerged.back(), vdeep.back());
               spans.push_back({runs[ri].first, runs[ri].second, mh, mw, nullptr, nullptr}); ++ri;
           }
           if (ri != runs.size()) throw std::invalid_argument("placeholder runs in the ids without an image reference with pixels");
@@ -689,7 +704,9 @@ public:
                 // reference rows (constant across steps, re-set every step like the text): the packed latents through the
                 // patch projections; visual ones mixed with seeded noise at 0.999 as ComfyUI's condition augmentation
                 for (const RefSeg &sg : lay.ref_segs) {
-                    const h3pipe_ref &rf = refs[size_t(sg.ref)];
+                    h3pipe_ref rf{};
+                    if (sg.kind == 3) { const h3pipe_keyframe &kf = kfs[size_t(sg.ref)]; rf.kind = 0; rf.video_latent = kf.video_latent; rf.latent_t = 1; rf.lat_h = sh.lat_h; rf.lat_w = sh.lat_w; rf.audio_latent = kf.audio_latent; rf.audio_t = kf.audio_t; }
+                    else rf = refs[size_t(sg.ref)];
                     std::fill(in16.begin(), in16.end(), 0);
                     if (sg.audio) {
                         for (int c = 0; c < 2; ++c) for (int t = 0; t < sg.audio_t; ++t) for (int k = 0; k < AUDIO_CH; ++k) in16[(size_t(c) * sg.audio_t + t) * KPAD + k] = f32_to_f16(rf.audio_latent[(size_t(c) * AUDIO_CH + k) * sg.audio_t + t]);
@@ -1293,20 +1310,21 @@ extern "C" int h3pipe_text_in(h3pipe_session *s, const int32_t *ids, int n, floa
     })
 }
 
-extern "C" int h3pipe_denoise_refs(h3pipe_session *s, const int32_t *ids, int n, const h3pipe_params *params, const h3pipe_ref *refs, int n_refs, const float *noise_video, const float *noise_audio,
+extern "C" int h3pipe_denoise_refs(h3pipe_session *s, const int32_t *ids, int n, const h3pipe_params *params, const h3pipe_keyframe *keyframes, int n_keyframes, const h3pipe_ref *refs, int n_refs, const float *noise_video, const float *noise_audio,
                                    float *video, size_t video_elements, float *audio, size_t audio_elements, h3pipe_progress progress, void *user, char *error, size_t cap) {
     GUARD({
-        if (!s || !ids || !params || !video || !audio || n < 1 || (n_refs > 0 && !refs)) throw std::invalid_argument("session, ids, params, refs and outputs are required");
+        if (!s || !ids || !params || !video || !audio || n < 1 || (n_refs > 0 && !refs) || (n_keyframes > 0 && !keyframes)) throw std::invalid_argument("session, ids, params, keyframes, refs and outputs are required");
         h3pipe_shape sh; h3pipe_shape_for(params, &sh);
         if (video_elements != size_t(LATENT_CH) * sh.latent_t * sh.lat_h * sh.lat_w) throw std::invalid_argument("video_latents must hold 24 * latent_t * lat_h * lat_w floats");
         if (audio_elements != size_t(2) * AUDIO_CH * sh.audio_t) throw std::invalid_argument("audio_latents must hold 2 * 32 * audio_t floats");
-        std::vector<h3pipe_ref> rv(refs, refs + n_refs);
+        std::vector<h3pipe_ref> rv(refs, refs + n_refs); std::vector<h3pipe_keyframe> kv(keyframes, keyframes + n_keyframes);
+        for (const h3pipe_keyframe &kf : kv) { if (!kf.video_latent || kf.frame_index < 0 || kf.frame_index >= sh.frames) throw std::invalid_argument("keyframes need a video latent and a frame index inside the clip"); if (kf.audio_latent && kf.audio_t < 1) throw std::invalid_argument("keyframe audio needs audio_t >= 1"); }
         for (const h3pipe_ref &rf : rv) {
             if (rf.kind < 0 || rf.kind > 2) throw std::invalid_argument("ref kind must be 0 (image), 1 (audio) or 2 (video)");
             if (rf.kind != 1 && (!rf.video_latent || rf.lat_h < 2 || rf.lat_w < 2 || rf.lat_h % 2 || rf.lat_w % 2 || (rf.kind == 2 && rf.latent_t < 1))) throw std::invalid_argument("image/video refs need a video latent with even lat_h, lat_w");
             if (rf.kind == 1 && (!rf.audio_latent || rf.audio_t < 1)) throw std::invalid_argument("audio refs need an audio latent with audio_t >= 1");
         }
-        std::lock_guard<std::mutex> lock(s->mutex); s->value.denoise(ids, n, *params, noise_video, noise_audio, video, audio, progress, user, rv);
+        std::lock_guard<std::mutex> lock(s->mutex); s->value.denoise(ids, n, *params, noise_video, noise_audio, video, audio, progress, user, rv, kv);
     })
 }
 extern "C" int h3pipe_denoise(h3pipe_session *s, const int32_t *ids, int n, const h3pipe_params *params, const float *noise_video, const float *noise_audio,

@@ -14,7 +14,7 @@ ap.add_argument("--out", type=Path, default=Path("build/ref_truth")); ap.add_arg
 ap.add_argument("--image", default="build/refs/fox_frame.png"); ap.add_argument("--frames-dir", default="build/refs")
 ap.add_argument("--width", type=int, default=864); ap.add_argument("--height", type=int, default=480); ap.add_argument("--length", type=int, default=22)
 ap.add_argument("--prompt", default="<Picture 1> is the fox. A red fox trotting through a snowy forest at dawn, cinematic, with the sound of <Audio 1>")
-ap.add_argument("--seed", type=int, default=0); ap.add_argument("--skip-dit", action="store_true"); ap.add_argument("--skip-encoders", action="store_true", help="only the DiT one-step cases (the encoder outputs already saved)")
+ap.add_argument("--seed", type=int, default=0); ap.add_argument("--skip-dit", action="store_true"); ap.add_argument("--fl2va", action="store_true", help="also a first-frame keyframe case (needs --model-fl2va for its checkpoint)"); ap.add_argument("--only", default="", help="comma list of cases to run (both,audio,fl2va)"); ap.add_argument("--skip-encoders", action="store_true", help="only the DiT one-step cases (the encoder outputs already saved)")
 a = ap.parse_args()
 sys.path.insert(0, str(a.comfy)); sys.argv = [sys.argv[0]]
 import comfy.options; comfy.options.enable_args_parsing()
@@ -96,11 +96,24 @@ with torch.inference_mode():
             if "latent" in r: save(f"{tag}_ref_latent", r["latent"][0])
             if r.get("audio_latent") is not None: save(f"{tag}_ref_audio_latent", r["audio_latent"][0])
         cases[tag] = (positive, latent)
+    if a.fl2va:   # first-frame keyframe with the fl2va checkpoint (our default weights): the frame resized to the canvas
+        out = H3.MiniMaxH3ImageToVideo.execute(clip, vae, a.prompt.replace("<Picture 1> is the fox. ", "").replace(", with the sound of <Audio 1>", ""), a.width, a.height, a.length, first_frame=img)
+        positive, latent = out.args[0], out.args[1]
+        canvas = H3._resize(img[:1], a.width, a.height, "disabled"); save("fl2va_image_resized", canvas[0])
+        pres = clip.tokenize(a.prompt.replace("<Picture 1> is the fox. ", "").replace(", with the sound of <Audio 1>", ""), images=[canvas])
+        save("fl2va_pres_ids", np.array([(e[0] if isinstance(e[0], int) else -1) for e in pres["qwen3vl_32b"][0]], dtype=np.int64))
+        for kf in positive[0][1].get("minimax_keyframes", []): save("fl2va_keyframe_latent", kf["latent"][0]); print("keyframe index", kf["resolved_frame_index"])
+        cases["fl2va"] = (positive, latent)
     clip = None; vae = None; audio_vae = None
     comfy.model_management.unload_all_models(); comfy.model_management.soft_empty_cache()
-    model = comfy.sd.load_diffusion_model(str(a.models / "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"))
-    sigmas = comfy.samplers.calculate_sigmas(model.get_model_object("model_sampling"), "simple", 1); save("sigmas", sigmas)
-    for tag, (positive, latent) in cases.items():
+    only = [x for x in a.only.split(",") if x]
+    by_model = {"ref2va": [t for t in ("both", "audio") if t in cases and (not only or t in only)], "fl2va": [t for t in ("fl2va",) if t in cases and (not only or t in only)]}
+    for model_tag, tags in by_model.items():
+      if not tags: continue
+      model = comfy.sd.load_diffusion_model(str(a.models / f"diffusion_models/minimax_h3_{model_tag}_pruned_int8_convrot.safetensors"))
+      sigmas = comfy.samplers.calculate_sigmas(model.get_model_object("model_sampling"), "simple", 1); save("sigmas", sigmas)
+      for tag in tags:
+        positive, latent = cases[tag]
         noise = comfy.sample.prepare_noise(latent["samples"], a.seed)
         v, au = noise.unbind(); save(f"{tag}_noise_video", v[0]); save(f"{tag}_noise_audio", au[0])
         got = {}
@@ -108,4 +121,5 @@ with torch.inference_mode():
         comfy.sample.sample(model, noise, 1, 1.0, "euler", "simple", positive, positive, latent["samples"], seed=a.seed, callback=cb, disable_pbar=True)
         dv, da = got["x0"].unbind(); save(f"{tag}_denoised_video", dv[0]); save(f"{tag}_denoised_audio", da[0])
         xv, xa = got["x"].unbind(); save(f"{tag}_x_video", xv[0]); save(f"{tag}_x_audio", xa[0])
+      model = None; comfy.model_management.unload_all_models(); comfy.model_management.soft_empty_cache()
     print("done", flush=True)

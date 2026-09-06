@@ -54,6 +54,17 @@ typedef struct {
                                               // height and width multiples of 32; the ids carry (height/32)*(width/32) placeholders (-1) for it
 } h3pipe_ref;
 
+// A keyframe (fl2va): frame_index 0 for the first frame or frames - 1 (after snapping) for the last; video_latent
+// [24][1][lat_h][lat_w] on the generation's latent grid (h3pipe_encode_video of the frame resized to the canvas); pixels
+// the same resized frame f32 [height][width][3] for the text encoder's presentation ("<Picture i>: " + a vision span of
+// (height/32)*(width/32) placeholders, keyframes before references); audio_latent optional ([2][32][audio_t], never denoised).
+typedef struct {
+    int frame_index;
+    const float *video_latent;
+    const float *pixels; int height, width;
+    const float *audio_latent; int audio_t;
+} h3pipe_keyframe;
+
 // Called after every denoising step; return nonzero to cancel.
 typedef int (*h3pipe_progress)(void *user, int step, int steps, double seconds);
 
@@ -69,9 +80,9 @@ int h3pipe_denoise(h3pipe_session *s, const int32_t *ids, int n_ids, const h3pip
                    float *video_latents, size_t video_elements, float *audio_latents, size_t audio_elements,
                    h3pipe_progress progress, void *user, char *error, size_t error_capacity);
 
-// As h3pipe_denoise with reference blocks packed between the text and the target streams (the ids must carry the
+// As h3pipe_denoise with keyframe rows and reference blocks packed between the text and the target streams (the ids must carry the
 // matching presentation: "<Picture i>: " + vision span, "<Audio j>: ", "<Video k>: " blocks, then the prompt).
-int h3pipe_denoise_refs(h3pipe_session *s, const int32_t *ids, int n_ids, const h3pipe_params *params, const h3pipe_ref *refs, int n_refs,
+int h3pipe_denoise_refs(h3pipe_session *s, const int32_t *ids, int n_ids, const h3pipe_params *params, const h3pipe_keyframe *keyframes, int n_keyframes, const h3pipe_ref *refs, int n_refs,
                         const float *noise_video, const float *noise_audio,
                         float *video_latents, size_t video_elements, float *audio_latents, size_t audio_elements,
                         h3pipe_progress progress, void *user, char *error, size_t error_capacity);

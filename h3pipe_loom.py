@@ -22,6 +22,10 @@ class Ref(ctypes.Structure):
     _fields_ = [("kind", ctypes.c_int), ("video_latent", _F32P), ("latent_t", ctypes.c_int), ("lat_h", ctypes.c_int), ("lat_w", ctypes.c_int), ("audio_latent", _F32P), ("audio_t", ctypes.c_int), ("pixels", _F32P), ("height", ctypes.c_int), ("width", ctypes.c_int)]
 
 
+class Keyframe(ctypes.Structure):
+    _fields_ = [("frame_index", ctypes.c_int), ("video_latent", _F32P), ("pixels", _F32P), ("height", ctypes.c_int), ("width", ctypes.c_int), ("audio_latent", _F32P), ("audio_t", ctypes.c_int)]
+
+
 class Params(ctypes.Structure):
     _fields_ = [("height", ctypes.c_int), ("width", ctypes.c_int), ("frames", ctypes.c_int), ("steps", ctypes.c_int), ("seed", ctypes.c_uint64),
                 ("video_shift", ctypes.c_float), ("audio_shift", ctypes.c_float), ("cache_threshold", ctypes.c_float)]
@@ -52,7 +56,7 @@ class H3Pipe:
         native.h3pipe_denoise.argtypes = [ctypes.c_void_p, _I32P, ctypes.c_int, ctypes.POINTER(Params), _F32P, _F32P, _F32P, ctypes.c_size_t, _F32P, ctypes.c_size_t, PROGRESS, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
         native.h3pipe_decode_video.argtypes = [ctypes.c_void_p, ctypes.POINTER(Params), _F32P, ctypes.c_size_t, _U8P, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
         native.h3pipe_decode_audio.argtypes = [ctypes.c_void_p, _F32P, ctypes.c_size_t, ctypes.c_int, _F32P, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
-        native.h3pipe_denoise_refs.argtypes = [ctypes.c_void_p, _I32P, ctypes.c_int, ctypes.POINTER(Params), ctypes.POINTER(Ref), ctypes.c_int, _F32P, _F32P, _F32P, ctypes.c_size_t, _F32P, ctypes.c_size_t, PROGRESS, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+        native.h3pipe_denoise_refs.argtypes = [ctypes.c_void_p, _I32P, ctypes.c_int, ctypes.POINTER(Params), ctypes.POINTER(Keyframe), ctypes.c_int, ctypes.POINTER(Ref), ctypes.c_int, _F32P, _F32P, _F32P, ctypes.c_size_t, _F32P, ctypes.c_size_t, PROGRESS, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
         native.h3pipe_encode_video.argtypes = [ctypes.c_void_p, _F32P, ctypes.c_int, ctypes.c_int, ctypes.c_int, _F32P, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_size_t]
         native.h3pipe_vision_embed.argtypes = [ctypes.c_void_p, _F32P, ctypes.c_int, ctypes.c_int, _F32P, ctypes.c_size_t, _F32P, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_size_t]
         native.h3pipe_encode_audio.argtypes = [ctypes.c_void_p, _F32P, ctypes.c_int, _F32P, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_size_t]
@@ -83,7 +87,7 @@ class H3Pipe:
         if self._native.h3pipe_text_in(self._handle, ids.ctypes.data_as(_I32P), ids.size, out.ctypes.data_as(_F32P), out.size, err, _ERR): raise H3PipeError(err.value.decode())
         return out
 
-    def denoise(self, ids, p: Params, noise_video=None, noise_audio=None, progress=None, refs=None):
+    def denoise(self, ids, p: Params, noise_video=None, noise_audio=None, progress=None, refs=None, keyframes=None):
         """-> (video latents [24][T][H][W], audio latents [2][32][audio_t]) in model space. refs: list of dicts in presentation
         order, {"kind": "image"|"audio"|"video", "video": [24][T][h][w] latents, "audio": [2][32][audio_t] latents} (ref2va)."""
         ids = np.ascontiguousarray(np.asarray(ids, dtype=np.int32)); s = self.shape(p)
@@ -104,8 +108,16 @@ class H3Pipe:
             if kind != 0 and r.get("audio") is not None:
                 a = np.ascontiguousarray(np.asarray(r["audio"], dtype=np.float32)); assert a.ndim == 3 and a.shape[:2] == (2, 32), a.shape; keep.append(a)
                 rarr[i].audio_latent = a.ctypes.data_as(_F32P); rarr[i].audio_t = int(a.shape[2])
-        if refs:
-            rc = self._native.h3pipe_denoise_refs(self._handle, ids.ctypes.data_as(_I32P), ids.size, ctypes.byref(p), rarr, len(refs),
+        karr = (Keyframe * max(1, len(keyframes or [])))()
+        for i, k in enumerate(keyframes or []):
+            karr[i].frame_index = int(k["frame_index"])
+            v = np.ascontiguousarray(np.asarray(k["video"], dtype=np.float32)); assert v.ndim == 4 and v.shape[0] == 24 and v.shape[1] == 1, v.shape; keep.append(v); karr[i].video_latent = v.ctypes.data_as(_F32P)
+            if k.get("pixels") is not None:
+                px = np.ascontiguousarray(np.asarray(k["pixels"], dtype=np.float32)); keep.append(px); karr[i].pixels = px.ctypes.data_as(_F32P); karr[i].height, karr[i].width = int(px.shape[0]), int(px.shape[1])
+            if k.get("audio") is not None:
+                a = np.ascontiguousarray(np.asarray(k["audio"], dtype=np.float32)); keep.append(a); karr[i].audio_latent = a.ctypes.data_as(_F32P); karr[i].audio_t = int(a.shape[2])
+        if refs or keyframes:
+            rc = self._native.h3pipe_denoise_refs(self._handle, ids.ctypes.data_as(_I32P), ids.size, ctypes.byref(p), karr, len(keyframes or []), rarr, len(refs or []),
                                                    None if nv is None else nv.ctypes.data_as(_F32P), None if na is None else na.ctypes.data_as(_F32P),
                                                    video.ctypes.data_as(_F32P), video.size, audio.ctypes.data_as(_F32P), audio.size, cb, None, err, _ERR)
         else:
