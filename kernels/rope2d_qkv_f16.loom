@@ -1,0 +1,97 @@
+// The vision tower's attention operands: from the qkv GEMM's f32 rows [tokens][3 * heads * hd] (q | k | v, head-major)
+// to f16 q, k, v [tokens][heads * hd_pad] with the head dimension zero-padded to hd_pad and the 2-D rotary embedding
+// (rotate-half pairs (j, j + hd/2) over the full head, host cos/sin [tokens][hd/2]) applied to q and k.
+amdgpu.target<gfx11-generic> @h3_rope2d_qkv_f16_gfx11 {subgroup_size = 32}
+
+config.decl @h3.rope2d_qkv_f16.heads : %value: index where [range(%value, 1, 64)]
+
+config.decl @h3.rope2d_qkv_f16.hd : %value: index where [range(%value, 2, 256), mul(%value, 2)]
+
+config.decl @h3.rope2d_qkv_f16.hd_pad : %value: index where [range(%value, 32, 256), mul(%value, 32)]
+
+kernel.def target(@h3_rope2d_qkv_f16_gfx11) export("h3_rope2d_qkv_f16") @h3_rope2d_qkv_f16(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %heads = config.get @h3.rope2d_qkv_f16.heads : index
+  %hd_pad = config.get @h3.rope2d_qkv_f16.hd_pad : index
+  kernel.launch.config workgroups(%tokens, %heads, %c1) workgroup_size(%hd_pad, %c1, %c1) : index
+} launch(%tokens: index, %qkv: buffer, %cos: buffer, %sin: buffer, %q: buffer, %k: buffer, %v: buffer) {
+  %heads = config.get @h3.rope2d_qkv_f16.heads : index
+  %hd = config.get @h3.rope2d_qkv_f16.hd : index
+  %hd_pad = config.get @h3.rope2d_qkv_f16.hd_pad : index
+  %c0_offset = index.constant 0 : offset
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %zero = scalar.constant 0.0 : f32
+  %tokens_b = index.assume %tokens [range(%tokens, 1, 65536)] : index
+  %t0 = kernel.workgroup.id<x> : index
+  %t = index.assume %t0 [lt(%t0, %tokens_b)] : index
+  %h0 = kernel.workgroup.id<y> : index
+  %h = index.assume %h0 [lt(%h0, %heads)] : index
+  %d = kernel.workitem.id<x> : index
+  %inner = index.mul %heads, %hd : index
+  %width = index.mul %inner, %c3 : index
+  %half = index.div %hd, %c2 : index
+  %out_w = index.mul %heads, %hd_pad : index
+  %qkv_global = buffer.assume.memory_space<global> %qkv : buffer
+  %cos_global = buffer.assume.memory_space<global> %cos : buffer
+  %sin_global = buffer.assume.memory_space<global> %sin : buffer
+  %q_global = buffer.assume.memory_space<global> %q : buffer
+  %k_global = buffer.assume.memory_space<global> %k : buffer
+  %v_global = buffer.assume.memory_space<global> %v : buffer
+  %qkv_view = buffer.view %qkv_global[%c0_offset] : buffer -> view<[%tokens_b]x[%width]xf32>
+  %cos_view = buffer.view %cos_global[%c0_offset] : buffer -> view<[%tokens_b]x[%half]xf32>
+  %sin_view = buffer.view %sin_global[%c0_offset] : buffer -> view<[%tokens_b]x[%half]xf32>
+  %q_view = buffer.view %q_global[%c0_offset] : buffer -> view<[%tokens_b]x[%out_w]xf16>
+  %k_view = buffer.view %k_global[%c0_offset] : buffer -> view<[%tokens_b]x[%out_w]xf16>
+  %v_view = buffer.view %v_global[%c0_offset] : buffer -> view<[%tokens_b]x[%out_w]xf16>
+  %ocol0 = index.mul %h, %hd_pad : index
+  %ocol1 = index.add %ocol0, %d : index
+  %ocol = index.assume %ocol1 [lt(%ocol1, %out_w)] : index
+  %in_head = index.cmp ult, %d, %hd : index
+  %zero16 = scalar.fptrunc %zero : f32 to f16
+  scf.if %in_head {
+    %dd = index.assume %d [lt(%d, %hd)] : index
+    %hbase = index.mul %h, %hd : index
+    %qc0 = index.add %hbase, %dd : index
+    %qc = index.assume %qc0 [lt(%qc0, %width)] : index
+    %kc0 = index.add %qc0, %inner : index
+    %kc = index.assume %kc0 [lt(%kc0, %width)] : index
+    %vc0 = index.add %kc0, %inner : index
+    %vc = index.assume %vc0 [lt(%vc0, %width)] : index
+    %lo = index.cmp ult, %dd, %half : index
+    %j0 = index.rem %dd, %half : index
+    %j = index.assume %j0 [lt(%j0, %half)] : index
+    %partner_lo = index.add %dd, %half : index
+    %partner_hi = index.sub %dd, %half : index
+    %partner0 = scf.select %lo, %partner_lo, %partner_hi : index
+    %partner = index.assume %partner0 [lt(%partner0, %hd)] : index
+    %pq0 = index.add %hbase, %partner : index
+    %pq = index.assume %pq0 [lt(%pq0, %width)] : index
+    %pk0 = index.add %pq0, %inner : index
+    %pk = index.assume %pk0 [lt(%pk0, %width)] : index
+    %cv = view.load %cos_view[%t, %j] : view<[%tokens_b]x[%half]xf32> -> f32
+    %sv = view.load %sin_view[%t, %j] : view<[%tokens_b]x[%half]xf32> -> f32
+    %sneg = scalar.negf %sv : f32
+    %ssign = scf.select %lo, %sneg, %sv : f32
+    %qx = view.load %qkv_view[%t, %qc] : view<[%tokens_b]x[%width]xf32> -> f32
+    %qp = view.load %qkv_view[%t, %pq] : view<[%tokens_b]x[%width]xf32> -> f32
+    %kx = view.load %qkv_view[%t, %kc] : view<[%tokens_b]x[%width]xf32> -> f32
+    %kp = view.load %qkv_view[%t, %pk] : view<[%tokens_b]x[%width]xf32> -> f32
+    %vx = view.load %qkv_view[%t, %vc] : view<[%tokens_b]x[%width]xf32> -> f32
+    %qr0 = scalar.mulf %qx, %cv : f32
+    %qr = scalar.fmaf %qp, %ssign, %qr0 : f32
+    %kr0 = scalar.mulf %kx, %cv : f32
+    %kr = scalar.fmaf %kp, %ssign, %kr0 : f32
+    %q16 = scalar.fptrunc %qr : f32 to f16
+    %k16 = scalar.fptrunc %kr : f32 to f16
+    %v16 = scalar.fptrunc %vx : f32 to f16
+    view.store %q16, %q_view[%t, %ocol] : f16, view<[%tokens_b]x[%out_w]xf16>
+    view.store %k16, %k_view[%t, %ocol] : f16, view<[%tokens_b]x[%out_w]xf16>
+    view.store %v16, %v_view[%t, %ocol] : f16, view<[%tokens_b]x[%out_w]xf16>
+  } else {
+    view.store %zero16, %q_view[%t, %ocol] : f16, view<[%tokens_b]x[%out_w]xf16>
+    view.store %zero16, %k_view[%t, %ocol] : f16, view<[%tokens_b]x[%out_w]xf16>
+    view.store %zero16, %v_view[%t, %ocol] : f16, view<[%tokens_b]x[%out_w]xf16>
+  }
+  kernel.return
+}

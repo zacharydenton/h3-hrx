@@ -8,18 +8,18 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent
-_ABI, _ERR = 3, 4096
+_ABI, _ERR = 4, 4096
 _F32P, _U8P, _I32P = ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_int32)
 PROGRESS = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_double)
 
 
 class Config(ctypes.Structure):
     _fields_ = [("glue_dir", ctypes.c_char_p), ("blocks_dir", ctypes.c_char_p), ("te_dir", ctypes.c_char_p), ("vae_dir", ctypes.c_char_p),
-                ("kernel_sources", ctypes.c_char_p), ("cache_dir", ctypes.c_char_p), ("loom_compile", ctypes.c_char_p), ("vae_bits", ctypes.c_int), ("aenc_dir", ctypes.c_char_p)]
+                ("kernel_sources", ctypes.c_char_p), ("cache_dir", ctypes.c_char_p), ("loom_compile", ctypes.c_char_p), ("vae_bits", ctypes.c_int), ("aenc_dir", ctypes.c_char_p), ("vision_dir", ctypes.c_char_p)]
 
 
 class Ref(ctypes.Structure):
-    _fields_ = [("kind", ctypes.c_int), ("video_latent", _F32P), ("latent_t", ctypes.c_int), ("lat_h", ctypes.c_int), ("lat_w", ctypes.c_int), ("audio_latent", _F32P), ("audio_t", ctypes.c_int)]
+    _fields_ = [("kind", ctypes.c_int), ("video_latent", _F32P), ("latent_t", ctypes.c_int), ("lat_h", ctypes.c_int), ("lat_w", ctypes.c_int), ("audio_latent", _F32P), ("audio_t", ctypes.c_int), ("pixels", _F32P), ("height", ctypes.c_int), ("width", ctypes.c_int)]
 
 
 class Params(ctypes.Structure):
@@ -41,7 +41,7 @@ def default_loom_compile() -> str:
 
 
 class H3Pipe:
-    def __init__(self, glue=None, blocks=None, te=None, vae=None, vae_bits=8, cache=None, library=None, aenc=None):
+    def __init__(self, glue=None, blocks=None, te=None, vae=None, vae_bits=8, cache=None, library=None, aenc=None, vision=None):
         native = ctypes.CDLL(str(library or os.environ.get("H3PIPE_LIB") or ROOT / "build/libh3pipe.so"))   # H3PIPE_LIB=build/libh3pipe_hrx.so: the libhrx build
         native.h3pipe_abi_version.restype = ctypes.c_uint32
         if native.h3pipe_abi_version() != _ABI: raise H3PipeError("ABI mismatch; rebuild with scripts/build_host.sh")
@@ -53,11 +53,12 @@ class H3Pipe:
         native.h3pipe_decode_video.argtypes = [ctypes.c_void_p, ctypes.POINTER(Params), _F32P, ctypes.c_size_t, _U8P, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
         native.h3pipe_decode_audio.argtypes = [ctypes.c_void_p, _F32P, ctypes.c_size_t, ctypes.c_int, _F32P, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
         native.h3pipe_denoise_refs.argtypes = [ctypes.c_void_p, _I32P, ctypes.c_int, ctypes.POINTER(Params), ctypes.POINTER(Ref), ctypes.c_int, _F32P, _F32P, _F32P, ctypes.c_size_t, _F32P, ctypes.c_size_t, PROGRESS, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+        native.h3pipe_vision_embed.argtypes = [ctypes.c_void_p, _F32P, ctypes.c_int, ctypes.c_int, _F32P, ctypes.c_size_t, _F32P, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_size_t]
         native.h3pipe_encode_audio.argtypes = [ctypes.c_void_p, _F32P, ctypes.c_int, _F32P, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_size_t]
         self._native = native
         cfg = Config(os.fsencode(glue or ROOT / "build/weights_glue"), os.fsencode(blocks or ROOT / "build/weights_gptq"), os.fsencode(te or ROOT / "build/weights_te"),
                      os.fsencode(vae or ROOT / ("build/weights_vae_i8" if vae_bits == 8 else "build/weights_vae_gptq")), os.fsencode(ROOT / "kernels"),
-                     os.fsencode(cache or ROOT / "build/kernel_cache"), os.fsencode(default_loom_compile()), vae_bits, os.fsencode(aenc or ROOT / "build/weights_aenc"))
+                     os.fsencode(cache or ROOT / "build/kernel_cache"), os.fsencode(default_loom_compile()), vae_bits, os.fsencode(aenc or ROOT / "build/weights_aenc"), os.fsencode(vision or ROOT / "build/weights_vision"))
         handle = ctypes.c_void_p(); err = ctypes.create_string_buffer(_ERR)
         if native.h3pipe_create(ctypes.byref(cfg), ctypes.byref(handle), err, _ERR): raise H3PipeError(err.value.decode())
         self._handle = handle
@@ -96,6 +97,9 @@ class H3Pipe:
             if kind != 1:
                 v = np.ascontiguousarray(np.asarray(r["video"], dtype=np.float32)); assert v.ndim == 4 and v.shape[0] == 24, v.shape; keep.append(v)
                 rarr[i].video_latent = v.ctypes.data_as(_F32P); rarr[i].latent_t, rarr[i].lat_h, rarr[i].lat_w = int(v.shape[1]), int(v.shape[2]), int(v.shape[3])
+            if kind == 0 and r.get("pixels") is not None:
+                px = np.ascontiguousarray(np.asarray(r["pixels"], dtype=np.float32)); assert px.ndim == 3 and px.shape[2] == 3, px.shape; keep.append(px)
+                rarr[i].pixels = px.ctypes.data_as(_F32P); rarr[i].height, rarr[i].width = int(px.shape[0]), int(px.shape[1])
             if kind != 0 and r.get("audio") is not None:
                 a = np.ascontiguousarray(np.asarray(r["audio"], dtype=np.float32)); assert a.ndim == 3 and a.shape[:2] == (2, 32), a.shape; keep.append(a)
                 rarr[i].audio_latent = a.ctypes.data_as(_F32P); rarr[i].audio_t = int(a.shape[2])
@@ -114,6 +118,13 @@ class H3Pipe:
         s = self.shape(p); v = np.ascontiguousarray(np.asarray(video, dtype=np.float32)); frames = np.zeros((s.frames, p.height, p.width, 3), np.uint8); err = ctypes.create_string_buffer(_ERR)
         if self._native.h3pipe_decode_video(self._handle, ctypes.byref(p), v.ctypes.data_as(_F32P), v.size, frames.ctypes.data_as(_U8P), frames.size, err, _ERR): raise H3PipeError(err.value.decode())
         return frames
+
+    def vision_embed(self, pixels):
+        """pixels [H][W][3] in [0, 1] (H, W multiples of 32) -> (merged [tokens][5120], deepstack [3][tokens][5120]) from the vision tower."""
+        x = np.ascontiguousarray(np.asarray(pixels, dtype=np.float32)); H, W = int(x.shape[0]), int(x.shape[1]); m = (H // 32) * (W // 32)
+        merged = np.zeros((m, 5120), np.float32); ds = np.zeros((3, m, 5120), np.float32); t = ctypes.c_int(0); err = ctypes.create_string_buffer(_ERR)
+        if self._native.h3pipe_vision_embed(self._handle, x.ctypes.data_as(_F32P), H, W, merged.ctypes.data_as(_F32P), merged.size, ds.ctypes.data_as(_F32P), ds.size, ctypes.byref(t), err, _ERR): raise H3PipeError(err.value.decode())
+        return merged, ds
 
     def encode_audio(self, samples) -> np.ndarray:
         """Stereo float samples [2][n] at 32 kHz -> model-space audio latents [2][32][ceil(n / 800)] (the audio VAE's encoder in Loom)."""

@@ -458,7 +458,7 @@ public:
         rt();
         comp_.exe = cfg.loom_compile; comp_.sources = cfg.kernel_sources; comp_.cache = cfg.cache_dir;
         vae_dir_ = cfg.vae_dir ? cfg.vae_dir : ""; vae_bits_ = cfg.vae_bits ? cfg.vae_bits : 8;
-        aenc_dir_ = cfg.aenc_dir ? cfg.aenc_dir : "";
+        aenc_dir_ = cfg.aenc_dir ? cfg.aenc_dir : ""; vision_dir_ = cfg.vision_dir ? cfg.vision_dir : "";
         glue_.open(cfg.glue_dir, [](const std::string &n) { return n == "te.embed"; });
         embed_ = glue_.span("te.embed");
         blocks_.open(cfg.blocks_dir);
@@ -503,15 +503,20 @@ public:
         g.run(&prof, stage, unsigned(rows), a_q_, glue_.at(wname + ".q", size_t(HID) * k), glue_.at(wname + ".s", size_t(HID) * 4), a_s_, xr, ones_, cls0_, glue_.at(wname + ".b", size_t(HID) * 4));
     }
 
-    void text_in(const int32_t *ids, int n) {
-        // embedding rows from the file (bf16) -> f32
+    struct VisionSpan { size_t start, count; int merged_h, merged_w; const float *merged, *deepstack; };   // an image's rows in the presentation
+    void text_in(const int32_t *ids, int n, const std::vector<VisionSpan> &spans = {}) {
+        // embedding rows from the file (bf16) -> f32; vision spans take the merged vision embeds
         std::vector<float> emb(size_t(n) * TEXT_DIM);
+        for (const VisionSpan &sp : spans) memcpy(emb.data() + sp.start * TEXT_DIM, sp.merged, sp.count * TEXT_DIM * 4);
         { std::ifstream f(glue_.path, std::ios::binary); std::vector<uint16_t> row(TEXT_DIM);
-          for (int i = 0; i < n; ++i) { if (ids[i] < 0 || size_t(ids[i]) * TEXT_DIM * 2 >= embed_.bytes) throw std::invalid_argument("token id out of range: " + std::to_string(ids[i]));
+          for (int i = 0; i < n; ++i) { if (ids[i] < 0) { bool in_span = false; for (const VisionSpan &sp : spans) in_span |= size_t(i) >= sp.start && size_t(i) < sp.start + sp.count; if (in_span) continue; }
+              if (ids[i] < 0 || size_t(ids[i]) * TEXT_DIM * 2 >= embed_.bytes) throw std::invalid_argument("token id out of range: " + std::to_string(ids[i]));
               f.seekg(std::streamoff(embed_.offset + size_t(ids[i]) * TEXT_DIM * 2)); f.read((char *)row.data(), TEXT_DIM * 2); if (!f) throw std::runtime_error("short read of the embedding table");
               for (int j = 0; j < TEXT_DIM; ++j) emb[size_t(i) * TEXT_DIM + j] = bf16_to_f32(row[j]); } }
         // the encoder's 50 layers
-        if (!te_ || te_->tokens() != size_t(n)) {
+        std::string span_sig; for (const VisionSpan &sp : spans) span_sig += fmt("%zu:%zu:%d:%d;", sp.start, sp.count, sp.merged_h, sp.merged_w);
+        if (!te_ || te_->tokens() != size_t(n) || te_span_sig_ != span_sig) {
+            te_span_sig_ = span_sig;
             if (!te_blob_.dev) te_blob_.open(te_dir_);
             te_.reset(); te_ = std::make_unique<Stack>(comp_, StackDims{TE_HID, TE_HEADS, TE_KV, HEAD_DIM, TE_FFN, 128, 1, 8, 1e-6f, false, true, true}, size_t(n), 50, te_blob_, "blocks.%d.", true, nullptr);
             for (void *p : {te_x_, te_cos_, te_sin_, te_cls_}) if (p) rt().free(p);
@@ -520,11 +525,36 @@ public:
             te_cos_ = rt().alloc(T * TE_ROPE_HALF * 4); te_sin_ = rt().alloc(T * TE_ROPE_HALF * 4);
             te_cls_ = rt().alloc(T * 4); rt().memset(te_cls_, 0, T * 4);
             std::vector<float> c(size_t(n) * TE_ROPE_HALF), s(size_t(n) * TE_ROPE_HALF);
-            for (int t = 0; t < n; ++t) for (int j = 0; j < TE_ROPE_HALF; ++j) { const double inv = std::pow(5000000.0, -double(2 * j) / HEAD_DIM), ang = t * inv; c[size_t(t) * TE_ROPE_HALF + j] = float(std::cos(ang)); s[size_t(t) * TE_ROPE_HALF + j] = float(std::sin(ang)); }
+            std::vector<double> pos(size_t(n) * 3);   // (t, h, w) per token: text runs sequentially, each image span its grid (qwen2vl_mrope_position_ids)
+            { size_t cursor = 0; double offset = 0; std::vector<VisionSpan> ordered = spans; std::sort(ordered.begin(), ordered.end(), [](const VisionSpan &x, const VisionSpan &y) { return x.start < y.start; });
+              for (const VisionSpan &sp : ordered) {
+                  for (size_t i = cursor; i < sp.start; ++i) for (int ax = 0; ax < 3; ++ax) pos[i * 3 + ax] = double(i) + offset;
+                  for (size_t k = 0; k < sp.count; ++k) { pos[(sp.start + k) * 3] = double(sp.start) + offset; pos[(sp.start + k) * 3 + 1] = double(sp.start) + offset + double(k / size_t(sp.merged_w)); pos[(sp.start + k) * 3 + 2] = double(sp.start) + offset + double(k % size_t(sp.merged_w)); }
+                  const double len_max = std::max(sp.merged_h, sp.merged_w);
+                  offset += len_max - double(sp.count); cursor = sp.start + sp.count;
+              }
+              for (size_t i = cursor; i < size_t(n); ++i) for (int ax = 0; ax < 3; ++ax) pos[i * 3 + ax] = double(i) + offset; }
+            for (int t = 0; t < n; ++t) for (int j = 0; j < TE_ROPE_HALF; ++j) {
+                const int ax = j < 24 ? 0 : (j < 44 ? 1 : 2);   // interleaved mrope sections [24, 20, 20]: pair j takes the t / h / w position
+                const double inv = std::pow(5000000.0, -double(2 * j) / HEAD_DIM), ang = pos[size_t(t) * 3 + ax] * inv;
+                c[size_t(t) * TE_ROPE_HALF + j] = float(std::cos(ang)); s[size_t(t) * TE_ROPE_HALF + j] = float(std::sin(ang)); }
             rt().h2d(te_cos_, c.data(), c.size() * 4); rt().h2d(te_sin_, s.data(), s.size() * 4);
         }
         rt().h2d(te_x_, emb.data(), emb.size() * 4);
-        te_->forward(&prof, te_x_, te_cls_, te_cos_, te_sin_, [&](int) { return LayerCond{(const float *)zeros_, (const float *)ones_, (const float *)zeros_, (const float *)ones_}; });
+        auto te_cond = [&](int) { return LayerCond{(const float *)zeros_, (const float *)ones_, (const float *)zeros_, (const float *)ones_}; };
+        if (spans.empty()) te_->forward(&prof, te_x_, te_cls_, te_cos_, te_sin_, te_cond);
+        else {   // DeepStack: the vision tower's features from blocks 8, 16, 24 added at the image rows after the first three layers
+            if (!ds_buf_) ds_buf_ = rt().alloc(size_t(4096) * TEXT_DIM * 4);
+            for (int layer = 0; layer < 3; ++layer) {
+                te_->forward(&prof, te_x_, te_cls_, te_cos_, te_sin_, te_cond, layer, layer + 1);
+                for (const VisionSpan &sp : spans) {
+                    if (sp.count > 4096) throw std::invalid_argument("vision span too long");
+                    rt().h2d(ds_buf_, sp.deepstack + size_t(layer) * sp.count * TEXT_DIM, sp.count * TEXT_DIM * 4);
+                    axpy(1.0f, 1.0f, sp.count * TEXT_DIM, ds_buf_, (float *)te_x_ + sp.start * TEXT_DIM);
+                }
+            }
+            te_->forward(&prof, te_x_, te_cls_, te_cos_, te_sin_, te_cond, 3, 50);
+        }
         // hidden -> f16 -> condition_proj into x rows [0, n)
         std::vector<float> hid(size_t(n) * TE_HID); rt().sync(); rt().d2h(hid.data(), te_x_, hid.size() * 4);
         std::vector<uint16_t> h16(hid.size()); for (size_t i = 0; i < hid.size(); ++i) h16[i] = f32_to_f16(hid[i]);
@@ -598,7 +628,20 @@ public:
         Layout lay(n, sh.latent_t, sh.lat_h, sh.lat_w, sh.audio_t, refs);
         const size_t L = size_t(n), Rr = lay.ref_rows, LR = L + Rr, Na = lay.audio_rows, Nv = lay.video_rows, S = lay.seq_len;
         ensure_seq(S);
-        text_in(ids, n);
+        // image references presented to the text encoder: the vision tower per image, in the order of the placeholder runs
+        std::vector<VisionSpan> spans; std::vector<std::vector<float>> vmerged, vdeep;
+        { std::vector<std::pair<size_t, size_t>> runs; for (int i = 0; i < n; ++i) if (ids[i] < 0) { if (runs.empty() || runs.back().first + runs.back().second != size_t(i)) runs.push_back({size_t(i), 0}); ++runs.back().second; }
+          size_t ri = 0;
+          for (const h3pipe_ref &rf : refs) if (rf.kind == 0 && rf.pixels) {
+              if (ri >= runs.size()) throw std::invalid_argument("more image references than placeholder runs in the ids");
+              const int mh = rf.height / 32, mw = rf.width / 32;
+              if (runs[ri].second != size_t(mh) * mw) throw std::invalid_argument(fmt("placeholder run %zu has %zu ids, the image needs %d", ri, runs[ri].second, mh * mw));
+              vmerged.emplace_back(); vdeep.emplace_back(); vision_embed(rf.pixels, rf.height, rf.width, vmerged.back(), vdeep.back());
+              spans.push_back({runs[ri].first, runs[ri].second, mh, mw, nullptr, nullptr}); ++ri;
+          }
+          if (ri != runs.size()) throw std::invalid_argument("placeholder runs in the ids without an image reference with pixels");
+          for (size_t i = 0; i < spans.size(); ++i) { spans[i].merged = vmerged[i].data(); spans[i].deepstack = vdeep[i].data(); } }
+        text_in(ids, n, spans);
         // the packed layout's tables
         rt().h2d(cls_, lay.adaln_rows.data(), S * 4); rt().h2d(tcls_, lay.tclass.data(), S * 4);
         { std::vector<float> c(S * ROPE_HALF), s(S * ROPE_HALF);
@@ -703,6 +746,91 @@ public:
         for (int c = 0; c < 2; ++c) for (int t = 0; t < A; ++t) for (int k = 0; k < AUDIO_CH; ++k) audio_out[(size_t(c) * AUDIO_CH + k) * A + t] = arows[(size_t(c) * A + t) * AUDIO_CH + k];
     }
     struct Cancelled {};
+
+    // --- the vision tower: Qwen3-VL's ViT (27 blocks, hidden 1152, 16 heads of 72 padded to 128) in f16-weight WMMA GEMMs on
+    // an f16 residual stream, the H3 f16 attention per image, the patch merger and the DeepStack mergers ---
+    static constexpr int VHID = 1152, VHEADS = 16, VHD = 72, VHDP = 128, VMLP = 4352, VOUT = 5120, VBLOCKS = 27;
+    std::shared_ptr<Kernel> f16gemm(const char *kind, int k, int n) {
+        const std::string stem = std::string("matmul_") + kind + "_f16_wmma", ns = "h3." + stem + ".";
+        return comp_.get(stem, "h3_" + stem, {{ns + "k_size", std::to_string(k)}, {ns + "n_size", std::to_string(n)}});
+    }
+    void gemm16(const char *kind, const char *stage, size_t m, int k, int n, const void *a, const void *w, const void *bias, void *c, const void *lambda = nullptr) {
+        auto kern = f16gemm(kind, k, n); KernArgs args; args.i32(int(m)).ptr(a).ptr(w).ptr(bias).ptr(c); if (lambda) args.ptr(lambda);
+        launch(*kern, &prof, stage, unsigned(n / 64), unsigned((m + 63) / 64), 256, args);
+    }
+    void layernorm16(size_t rows, int width, const void *x16, const void *w, const void *b, void *out32) {
+        const std::string ns = "h3.layernorm_f16_f32.";
+        auto k = comp_.get("layernorm_f16_f32", "h3_layernorm_f16_f32", {{ns + "width", std::to_string(width)}, {ns + "eps", num(1e-6)}});
+        KernArgs a; a.i32(int(rows)).ptr(x16).ptr(w).ptr(b).ptr(out32); launch(*k, &prof, "vision layernorm", unsigned(rows), 1, 32, a);
+    }
+    // pixels [H][W][3] in [0, 1] -> merged [n/4][5120], deepstack [3][n/4][5120]; n = (H/16) * (W/16) patches in 2x2 merge order
+    void vision_embed(const float *pixels, int H, int W, std::vector<float> &merged, std::vector<float> &deepstack) {
+        if (!vision_open_) { if (vision_dir_.empty()) throw std::runtime_error("no vision tower weights: h3pipe_config.vision_dir is NULL"); vision_.open(vision_dir_); vision_open_ = true; }
+        if (H % 32 || W % 32 || H < 32 || W < 32) throw std::invalid_argument("vision images need height and width multiples of 32");
+        const int gh = H / 16, gw = W / 16, n = gh * gw, m = n / 4; const size_t cap = (size_t(n) + 16 + 31) / 32 * 32;
+        auto V = [&](const std::string &nm, size_t bytes) { return vision_.at(nm, bytes); };
+        std::vector<void *> owned; auto buf = [&](size_t bytes) { void *p = rt().alloc(bytes); owned.push_back(p); return p; };
+        // patches in merge order, content (c, t, py, px) with the image in both temporal slots, Qwen's (x - 0.5) / 0.5
+        std::vector<float> patches(size_t(n) * 1536);
+        for (int bh = 0; bh < gh / 2; ++bh) for (int bw = 0; bw < gw / 2; ++bw) for (int ih = 0; ih < 2; ++ih) for (int iw = 0; iw < 2; ++iw) {
+            const size_t pi = ((size_t(bh) * (gw / 2) + bw) * 2 + ih) * 2 + iw; float *dst = patches.data() + pi * 1536;
+            for (int c = 0; c < 3; ++c) for (int t = 0; t < 2; ++t) for (int py = 0; py < 16; ++py) for (int px = 0; px < 16; ++px) {
+                const int y = (bh * 2 + ih) * 16 + py, x = (bw * 2 + iw) * 16 + px;
+                dst[((c * 2 + t) * 16 + py) * 16 + px] = (pixels[(size_t(y) * W + x) * 3 + c] - 0.5f) / 0.5f; } }
+        void *pa = buf(patches.size() * 4); rt().h2d(pa, patches.data(), patches.size() * 4);
+        void *x32 = buf(size_t(n) * VHID * 4); gemm16("bias", "vision patch", n, 1536, VHID, pa, V("vis.patch.w", size_t(VHID) * 1536 * 2), V("vis.patch.b", VHID * 4), x32);
+        // the learned 48x48 position table, bilinearly resampled to the grid then permuted into merge order (fast_pos_embed_interpolate)
+        std::vector<float> pos(vision_.host_f32("vis.pos", size_t(2304) * VHID)), x0(size_t(n) * VHID); rt().d2h(x0.data(), x32, x0.size() * 4);
+        const int G = 48;
+        for (int hy = 0; hy < gh; ++hy) for (int wx = 0; wx < gw; ++wx) {
+            const float fh = gh == 1 ? 0.0f : float(hy) * (G - 1) / float(gh - 1), fw = gw == 1 ? 0.0f : float(wx) * (G - 1) / float(gw - 1);
+            const int h0 = int(fh), w0 = int(fw), h1 = std::min(h0 + 1, G - 1), w1 = std::min(w0 + 1, G - 1); const float dh = fh - h0, dw = fw - w0;
+            const size_t pi = ((size_t(hy / 2) * (gw / 2) + wx / 2) * 2 + hy % 2) * 2 + wx % 2; float *row = x0.data() + pi * VHID;
+            const float *r00 = pos.data() + (size_t(h0) * G + w0) * VHID, *r01 = pos.data() + (size_t(h0) * G + w1) * VHID, *r10 = pos.data() + (size_t(h1) * G + w0) * VHID, *r11 = pos.data() + (size_t(h1) * G + w1) * VHID;
+            for (int c = 0; c < VHID; ++c) row[c] += (1 - dh) * (1 - dw) * r00[c] + (1 - dh) * dw * r01[c] + dh * (1 - dw) * r10[c] + dh * dw * r11[c]; }
+        std::vector<uint16_t> x16h(x0.size()); for (size_t i = 0; i < x0.size(); ++i) x16h[i] = f32_to_f16(x0[i]);
+        void *x16 = buf(x16h.size() * 2); rt().h2d(x16, x16h.data(), x16h.size() * 2);
+        // 2-D rope tables: pair j < 36 -> h with inv_freq[j], j >= 36 -> w with inv_freq[j - 36]; theta 10000 over dim 36
+        std::vector<float> cosv(size_t(n) * 36), sinv(size_t(n) * 36);
+        for (int hy = 0; hy < gh; ++hy) for (int wx = 0; wx < gw; ++wx) { const size_t pi = ((size_t(hy / 2) * (gw / 2) + wx / 2) * 2 + hy % 2) * 2 + wx % 2;
+            for (int j = 0; j < 36; ++j) { const double inv = std::pow(10000.0, -double(2 * (j % 18)) / 36.0), ang = double(j < 18 ? hy : wx) * inv; cosv[pi * 36 + j] = float(std::cos(ang)); sinv[pi * 36 + j] = float(std::sin(ang)); } }
+        void *cosb = buf(cosv.size() * 4), *sinb = buf(sinv.size() * 4); rt().h2d(cosb, cosv.data(), cosv.size() * 4); rt().h2d(sinb, sinv.data(), sinv.size() * 4);
+        void *ln = buf(size_t(n) * VHID * 4), *qkv = buf(size_t(n) * 3 * VHEADS * VHD * 4), *q16 = buf(cap * VHEADS * VHDP * 2), *k16 = buf(cap * VHEADS * VHDP * 2), *v16 = buf(cap * VHEADS * VHDP * 2);
+        void *att16 = buf(cap * VHEADS * VHDP * 2), *att32 = buf(size_t(n) * VHEADS * VHDP * 4), *hid = buf(size_t(n) * VMLP * 4), *ln4 = buf(size_t(m) * 4608 * 4), *mid = buf(size_t(m) * 4608 * 4), *out5 = buf(size_t(m) * VOUT * 4);
+        std::vector<float> ones(4608, 1.0f); void *lam = buf(ones.size() * 4); rt().h2d(lam, ones.data(), ones.size() * 4);
+        rt().memset(k16, 0, cap * VHEADS * VHDP * 2); rt().memset(v16, 0, cap * VHEADS * VHDP * 2); rt().memset(q16, 0, cap * VHEADS * VHDP * 2);
+        const std::string ans = "h3.attention_mha_lds_f16_wmma.";
+        auto attn = comp_.get("attention_mha_lds_f16_wmma", "h3_attention_mha_lds_f16_wmma", {{ans + "q_stride", std::to_string(VHEADS * VHDP)}, {ans + "kv_stride", std::to_string(VHEADS * VHDP)}, {ans + "tokens", std::to_string(n)}, {ans + "token_capacity", std::to_string(cap)}, {ans + "scale", num(1.0 / std::sqrt(double(VHD)))}, {ans + "out_stride", std::to_string(VHEADS * VHDP)}});
+        const std::string rns = "h3.rope2d_qkv_f16.";
+        auto rope = comp_.get("rope2d_qkv_f16", "h3_rope2d_qkv_f16", {{rns + "heads", std::to_string(VHEADS)}, {rns + "hd", std::to_string(VHD)}, {rns + "hd_pad", std::to_string(VHDP)}});
+        auto cast = comp_.get("cast_f16_f32", "h3_cast_f16_f32", {});
+        merged.assign(size_t(m) * VOUT, 0.0f); deepstack.assign(size_t(3) * m * VOUT, 0.0f);
+        static const int DS[3] = {8, 16, 24};
+        for (int i = 0; i < VBLOCKS; ++i) {
+            const std::string b = fmt("vis.b%d.", i);
+            layernorm16(n, VHID, x16, V(b + "norm1.w", VHID * 4), V(b + "norm1.b", VHID * 4), ln);
+            gemm16("bias", "vision qkv", n, VHID, 3 * VHEADS * VHD, ln, V(b + "qkv.w", size_t(3 * VHEADS * VHDP) * VHID * 2), V(b + "qkv.b", size_t(3 * VHEADS * VHDP) * 4), qkv);
+            { KernArgs a; a.i32(n).ptr(qkv).ptr(cosb).ptr(sinb).ptr(q16).ptr(k16).ptr(v16); launch(*rope, &prof, "vision rope", unsigned(n), unsigned(VHEADS), unsigned(VHDP), a); }
+            { KernArgs a; a.i32(n).ptr(q16).ptr(k16).ptr(v16).ptr(att16); launch(*attn, &prof, "vision attention", unsigned((n + 63) / 64), unsigned(VHEADS), 128, a); }
+            { KernArgs a; a.i32(n * VHEADS * VHDP).ptr(att16).ptr(att32); launch(*cast, &prof, "vision cast", unsigned((size_t(n) * VHEADS * VHDP + 255) / 256), 1, 256, a); }
+            gemm16("resid", "vision proj", n, VHEADS * VHDP, VHID, att32, V(b + "proj.w", size_t(VHID) * VHEADS * VHDP * 2), V(b + "proj.b", VHID * 4), x16, lam);
+            layernorm16(n, VHID, x16, V(b + "norm2.w", VHID * 4), V(b + "norm2.b", VHID * 4), ln);
+            gemm16("gelu", "vision fc1", n, VHID, VMLP, ln, V(b + "fc1.w", size_t(VMLP) * VHID * 2), V(b + "fc1.b", VMLP * 4), hid);
+            gemm16("resid", "vision fc2", n, VMLP, VHID, hid, V(b + "fc2.w", size_t(VHID) * VMLP * 2), V(b + "fc2.b", VHID * 4), x16, lam);
+            for (int j = 0; j < 3; ++j) if (i == DS[j]) {
+                const std::string d = fmt("vis.ds%d.", j);
+                layernorm16(m, 4608, x16, V(d + "norm.w", 4608 * 4), V(d + "norm.b", 4608 * 4), ln4);
+                gemm16("gelu_erf", "vision deepstack", m, 4608, 4608, ln4, V(d + "fc1.w", size_t(4608) * 4608 * 2), V(d + "fc1.b", 4608 * 4), mid);
+                gemm16("bias", "vision deepstack", m, 4608, VOUT, mid, V(d + "fc2.w", size_t(VOUT) * 4608 * 2), V(d + "fc2.b", VOUT * 4), out5);
+                rt().d2h(deepstack.data() + size_t(j) * m * VOUT, out5, size_t(m) * VOUT * 4);
+            }
+        }
+        layernorm16(n, VHID, x16, V("vis.merger.norm.w", VHID * 4), V("vis.merger.norm.b", VHID * 4), ln);   // [n][1152] -> viewed [m][4608]
+        gemm16("gelu_erf", "vision merger", m, 4608, 4608, ln, V("vis.merger.fc1.w", size_t(4608) * 4608 * 2), V("vis.merger.fc1.b", 4608 * 4), mid);
+        gemm16("bias", "vision merger", m, 4608, VOUT, mid, V("vis.merger.fc2.w", size_t(VOUT) * 4608 * 2), V("vis.merger.fc2.b", VOUT * 4), out5);
+        rt().d2h(merged.data(), out5, merged.size() * 4);
+        rt().sync(); for (void *p : owned) rt().free(p);
+    }
 
     // --- the audio encoder: the audio VAE's DAC conv stack and posterior head, f32 SIMT Loom kernels (reference audio) ---
     static size_t pow2_bound(size_t n) { size_t b = 256; while (b < n) b *= 2; return b; }
@@ -989,6 +1117,7 @@ private:
     void *vx_ = nullptr, *vcos_ = nullptr, *vsin_ = nullptr, *vin16_ = nullptr, *va_q_ = nullptr, *va_s_ = nullptr, *vout16_ = nullptr, *vcls_ = nullptr, *vnorm_table_ = nullptr;
     std::map<std::string, Prepare> prepares_; std::map<std::string, Gemm> gemms_; Prepare final_prep_;
     Blob aenc_; bool aenc_open_ = false; std::string aenc_dir_;
+    Blob vision_; bool vision_open_ = false; std::string vision_dir_; std::string te_span_sig_; void *ds_buf_ = nullptr;
     std::shared_ptr<Kernel> norm_f32_;
     size_t seq_cap_ = 0;
     void *ones_ = nullptr, *zeros_ = nullptr, *mods_ = nullptr, *final_table_ = nullptr, *x_ = nullptr, *cls_ = nullptr, *cls0_ = nullptr, *tcls_ = nullptr, *cos_ = nullptr, *sin_ = nullptr,
@@ -1069,6 +1198,16 @@ extern "C" int h3pipe_decode_video(h3pipe_session *s, const h3pipe_params *param
         if (video_elements != size_t(LATENT_CH) * sh.latent_t * sh.lat_h * sh.lat_w) throw std::invalid_argument("video_latents must hold 24 * latent_t * lat_h * lat_w floats");
         if (frame_bytes != size_t(sh.frames) * params->height * params->width * 3) throw std::invalid_argument("frames must hold frames * height * width * 3 bytes");
         std::lock_guard<std::mutex> lock(s->mutex); s->value.decode_video(*params, latents, frames);
+    })
+}
+extern "C" int h3pipe_vision_embed(h3pipe_session *s, const float *pixels, int height, int width, float *merged, size_t merged_elements, float *deepstack, size_t deepstack_elements, int *tokens, char *error, size_t cap) {
+    GUARD({
+        if (!s || !pixels || !merged || !deepstack || !tokens) throw std::invalid_argument("session, pixels, merged, deepstack and tokens are required");
+        if (height % 32 || width % 32 || height < 32 || width < 32) throw std::invalid_argument("height and width must be multiples of 32");
+        const size_t m = size_t(height / 32) * size_t(width / 32);
+        if (merged_elements < m * 5120 || deepstack_elements < 3 * m * 5120) throw std::invalid_argument("merged needs tokens * 5120 floats, deepstack 3 * tokens * 5120");
+        std::lock_guard<std::mutex> lock(s->mutex); std::vector<float> mg; std::vector<float> ds; s->value.vision_embed(pixels, height, width, mg, ds);
+        memcpy(merged, mg.data(), mg.size() * 4); memcpy(deepstack, ds.data(), ds.size() * 4); *tokens = int(m);
     })
 }
 extern "C" int h3pipe_encode_audio(h3pipe_session *s, const float *samples, int n_samples, float *latents, size_t latent_elements, int *audio_t, char *error, size_t cap) {

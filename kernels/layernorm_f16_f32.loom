@@ -1,0 +1,75 @@
+// LayerNorm over f16 rows [rows][width] (the vision tower's f16 residual stream) to f32 rows for the f16-weight GEMMs.
+amdgpu.target<gfx11-generic> @h3_layernorm_f16_f32_gfx11 {subgroup_size = 32}
+
+config.decl @h3.layernorm_f16_f32.width : %value: index where [range(%value, 32, 8192), mul(%value, 32)]
+
+config.decl @h3.layernorm_f16_f32.eps : f32
+
+kernel.def target(@h3_layernorm_f16_f32_gfx11) export("h3_layernorm_f16_f32") @h3_layernorm_f16_f32(%rows: index) {
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%c32, %c1, %c1) : index
+} launch(%rows: index, %x: buffer, %w: buffer, %b: buffer, %out: buffer) {
+  %width = config.get @h3.layernorm_f16_f32.width : index
+  %eps = config.get @h3.layernorm_f16_f32.eps : f32
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  %c0_offset = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %rows_b = index.assume %rows [range(%rows, 1, 65536)] : index
+  %row0 = kernel.workgroup.id<x> : index
+  %row = index.assume %row0 [lt(%row0, %rows_b)] : index
+  %lane = kernel.workitem.id<x> : index
+  %per_lane = index.div %width, %c32 : index
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %w_global = buffer.assume.memory_space<global> %w : buffer
+  %b_global = buffer.assume.memory_space<global> %b : buffer
+  %out_global = buffer.assume.memory_space<global> %out : buffer
+  %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%rows_b]x[%width]xf16>
+  %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%width]xf32>
+  %b_view = buffer.view %b_global[%c0_offset] : buffer -> view<[%width]xf32>
+  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%width]xf32>
+  %width_i = index.cast %width : index to i32
+  %width_f = scalar.sitofp %width_i : i32 to f32
+  %sum = scf.for %j = [%c0 to %per_lane step %c1](%acc = %zero : f32) -> (f32) {
+    %col0 = index.mul %j, %c32 : index
+    %col1 = index.add %col0, %lane : index
+    %col = index.assume %col1 [lt(%col1, %width)] : index
+    %v16 = view.load %x_view[%row, %col] : view<[%rows_b]x[%width]xf16> -> f16
+    %v = scalar.extf %v16 : f16 to f32
+    %s = scalar.addf %acc, %v : f32
+    scf.yield %s : f32
+  }
+  %total = kernel.subgroup.reduce<addf> %sum : f32
+  %mean = scalar.divf %total, %width_f : f32
+  %ss = scf.for %j = [%c0 to %per_lane step %c1](%acc = %zero : f32) -> (f32) {
+    %col0 = index.mul %j, %c32 : index
+    %col1 = index.add %col0, %lane : index
+    %col = index.assume %col1 [lt(%col1, %width)] : index
+    %v16 = view.load %x_view[%row, %col] : view<[%rows_b]x[%width]xf16> -> f16
+    %v = scalar.extf %v16 : f16 to f32
+    %d = scalar.subf %v, %mean : f32
+    %s = scalar.fmaf %d, %d, %acc : f32
+    scf.yield %s : f32
+  }
+  %ss_total = kernel.subgroup.reduce<addf> %ss : f32
+  %var = scalar.divf %ss_total, %width_f : f32
+  %var_eps = scalar.addf %var, %eps : f32
+  %rinv = scalar.rsqrtf %var_eps : f32
+  %out_row = buffer.view %out_global[%c0_offset] : buffer -> view<[%rows_b]x[%width]xf32>
+  scf.for %j = [%c0 to %per_lane step %c1] {
+    %col0 = index.mul %j, %c32 : index
+    %col1 = index.add %col0, %lane : index
+    %col = index.assume %col1 [lt(%col1, %width)] : index
+    %v16 = view.load %x_view[%row, %col] : view<[%rows_b]x[%width]xf16> -> f16
+    %v = scalar.extf %v16 : f16 to f32
+    %wv = view.load %w_view[%col] : view<[%width]xf32> -> f32
+    %bv = view.load %b_view[%col] : view<[%width]xf32> -> f32
+    %d = scalar.subf %v, %mean : f32
+    %nrm = scalar.mulf %d, %rinv : f32
+    %r = scalar.fmaf %nrm, %wv, %bv : f32
+    view.store %r, %out_row[%row, %col] : f32, view<[%rows_b]x[%width]xf32>
+  }
+  kernel.return
+}

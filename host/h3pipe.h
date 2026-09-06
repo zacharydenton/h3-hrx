@@ -11,7 +11,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define H3PIPE_ABI_VERSION 3u
+#define H3PIPE_ABI_VERSION 4u
 enum { H3PIPE_OK = 0, H3PIPE_ERROR = 1, H3PIPE_CANCELLED = 2, H3PIPE_INVALID_ARGUMENT = 64 };
 typedef struct h3pipe_session h3pipe_session;
 
@@ -25,6 +25,7 @@ typedef struct {
     const char *loom_compile;    // path to the loom-compile binary
     int vae_bits;                // 8 or 4, matching vae_dir
     const char *aenc_dir;        // tools/export_audio_encoder.py: the audio VAE's encoder (reference audio); NULL -> h3pipe_encode_audio unavailable
+    const char *vision_dir;      // tools/export_vision.py: Qwen3-VL's vision tower (reference images in the prompt); NULL -> unavailable
 } h3pipe_config;
 
 typedef struct {
@@ -48,6 +49,8 @@ typedef struct {
     int kind;
     const float *video_latent; int latent_t, lat_h, lat_w;
     const float *audio_latent; int audio_t;
+    const float *pixels; int height, width;   // images: the reference image as presented to the text encoder, f32 [height][width][3] in [0, 1],
+                                              // height and width multiples of 32; the ids carry (height/32)*(width/32) placeholders (-1) for it
 } h3pipe_ref;
 
 // Called after every denoising step; return nonzero to cancel.
@@ -83,6 +86,11 @@ int h3pipe_decode_video(h3pipe_session *s, const h3pipe_params *params, const fl
 // Model-space audio latents [2][32][audio_t] -> stereo float samples [2][audio_t * 800] at 32 kHz.
 int h3pipe_decode_audio(h3pipe_session *s, const float *audio_latents, size_t audio_elements, int audio_t,
                         float *samples, size_t sample_elements, char *error, size_t error_capacity);
+// The vision tower on one image: pixels f32 [height][width][3] in [0, 1] (height and width multiples of 32, as the
+// reference sizing produces) -> the merged vision embeds [tokens][5120] and the three DeepStack embeds [3][tokens][5120]
+// with tokens = (height / 32) * (width / 32); the element counts must be at least those sizes; *tokens is written.
+int h3pipe_vision_embed(h3pipe_session *s, const float *pixels, int height, int width, float *merged, size_t merged_elements, float *deepstack, size_t deepstack_elements, int *tokens, char *error, size_t error_capacity);
+
 // Stereo float samples [2][n_samples] at 32 kHz (right-padded to a multiple of 800 inside) -> model-space audio latents
 // [2][32][audio_t] with audio_t = ceil(n_samples / 800) written to *audio_t; latent_elements must be at least 2*32*audio_t.
 int h3pipe_encode_audio(h3pipe_session *s, const float *samples, int n_samples, float *latents, size_t latent_elements, int *audio_t, char *error, size_t error_capacity);
