@@ -1,5 +1,5 @@
 """Qwen3-VL-32B's vision tower (visual.* in the H3 text-encoder checkpoint, bf16) into build/weights_vision/{weights.bin,
-manifest.txt} for libh3pipe: f16 weights [n][k] with the head dimension padded 72 -> 128 (qkv rows, proj columns) and the MLP
+manifest.txt} for libh3pipe: f16 weights [n][k] with the head dimension padded 72 -> 128 in the proj columns (the rope kernel pads q/k/v) and the MLP
 hidden 4304 -> 4352, f32 biases and norms, the 48x48 position table f32. numpy only.
     python3 tools/export_vision.py"""
 import argparse, json, struct, time
@@ -30,9 +30,7 @@ with open(a.src, "rb") as fh:
         add("vis.pos", get("visual.pos_embed.weight"), np.float32)
         for i in range(27):
             p = f"visual.blocks.{i}"; norm(f"vis.b{i}.norm1", p + ".norm1"); norm(f"vis.b{i}.norm2", p + ".norm2")
-            w = get(p + ".attn.qkv.weight").reshape(3, HEADS, HD, HID); b = get(p + ".attn.qkv.bias").reshape(3, HEADS, HD)
-            wp = np.zeros((3, HEADS, HDP, HID), np.float32); wp[:, :, :HD] = w; bp = np.zeros((3, HEADS, HDP), np.float32); bp[:, :, :HD] = b
-            add(f"vis.b{i}.qkv.w", wp.reshape(3 * HEADS * HDP, HID), np.float16); add(f"vis.b{i}.qkv.b", bp.reshape(-1), np.float32)
+            add(f"vis.b{i}.qkv.w", get(p + ".attn.qkv.weight"), np.float16); add(f"vis.b{i}.qkv.b", get(p + ".attn.qkv.bias"), np.float32)   # unpadded [3456][1152]: the rope kernel pads the heads
             w = get(p + ".attn.proj.weight").reshape(HID, HEADS, HD); wp = np.zeros((HID, HEADS, HDP), np.float32); wp[:, :, :HD] = w
             add(f"vis.b{i}.proj.w", wp.reshape(HID, HEADS * HDP), np.float16); add(f"vis.b{i}.proj.b", get(p + ".attn.proj.bias"), np.float32)
             lin(f"vis.b{i}.fc1", p + ".mlp.linear_fc1", npad=MLPP); lin(f"vis.b{i}.fc2", p + ".mlp.linear_fc2", kpad=MLPP)

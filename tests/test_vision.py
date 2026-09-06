@@ -8,8 +8,9 @@ from h3pipe_loom import H3Pipe
 T = ROOT / "build/ref_truth"; L = lambda n: np.load(T / f"{n}.npy")
 img = L("image_resized").astype(np.float32)                      # [H][W][3] in [0,1]
 H, W = img.shape[:2]; gh, gw = H // 16, W // 16
-# the patch flatten as process_qwen2vl_images: (x - 0.5) / 0.5, merge order, content (c, t, py, px)
-x = ((img - 0.5) / 0.5).transpose(2, 0, 1)[None].repeat(2, 0)    # [2][3][H][W]
+# the patch flatten as process_qwen2vl_images: CLIP mean/std, merge order, content (c, t, py, px)
+mean = np.array([0.48145466, 0.4578275, 0.40821073], np.float32); std = np.array([0.26862954, 0.26130258, 0.27577711], np.float32)
+x = ((img - mean) / std).transpose(2, 0, 1)[None].repeat(2, 0)    # [2][3][H][W], CLIP normalisation (process_qwen2vl_images)
 p = x.reshape(2, 3, gh // 2, 2, 16, gw // 2, 2, 16).transpose(2, 5, 3, 6, 1, 0, 4, 7).reshape(gh * gw, 1536)
 pref = L("vision_patches"); print("patches vs comfy: max|diff|", float(np.abs(p - pref).max()))
 pipe = H3Pipe()

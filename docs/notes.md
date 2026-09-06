@@ -892,3 +892,42 @@ packing, now removed. Validation: the 22-frame fox clip through both libraries g
 video and audio latents, wav and mp4. Steps 4.3 s (HIP) and 4.7 s (hrx) at 22 frames; the hrx
 session upload is about 30 s slower because each weight chunk's copy synchronizes (fixable with
 async copies).
+
+## Reference conditioning: fl2va, ref2va, audio, every kernel in Loom (2026-09-06)
+
+The plan is docs/plan-refs.md; the ground truth is ComfyUI's own path run in the Strix Halo image
+(`tools/ref_truth_comfy.py` -> `build/ref_truth/*.npy`: encoder outputs, presentation ids and tags,
+text states, the vision tower's merged and DeepStack embeds, and one-step denoised outputs for
+image+audio references, an audio reference alone, and a first-frame keyframe).
+
+What was built, in order:
+
+- **Audio VAE encoder** (`tools/export_audio_encoder.py`, kernels `conv1d_s_f32`, `snake_f32`,
+  `layernorm_f32`, `matmul_f32`, `attn_scores_f32`, `attn_pv_pool_f32`, `geglu_tanh_f32`,
+  `transpose_f32`; `Pipe::encode_audio`, `h3pipe_encode_audio`). DAC conv stack (strides 2,4,4,5,5)
+  plus the posterior head (causal attention over 2048 with a head mean and an 8-wide channel pool to
+  32, GeGLU). Gate: `tests/test_audio_encoder.py`, cosine 1.0000000, relative error 8e-6.
+- **Presentation** (`tools/h3tok_ids.py` on the C tokenizer): `<Picture i>: ` + vision start,
+  placeholders, vision end; `<Audio j>: `; video blocks; identical ids to ComfyUI's.
+- **Packed layout with references and keyframes** (`Layout`, `RefSeg`): text | keyframe cond rows |
+  reference blocks | audio | video, the cursor advancing by each block's span, cond timestep classes
+  (t = max(t_v, 0.999), max(t_a, 1)) as two more AdaLN classes, reference rows through the same
+  patch projections (visual ones at 0.999 z + 0.001 seeded noise), re-set every step with the text.
+  ABI: `h3pipe_ref`, `h3pipe_keyframe`, `h3pipe_denoise_refs`.
+- **Vision tower** (`tools/export_vision.py`, kernels: dinov3-loom's f16 WMMA GEMMs with bias,
+  residual, GELU-tanh and GELU-erf epilogues, `rope2d_qkv_f16` (heads 72 -> 128 with the 2-D rope),
+  `cast_f16_f32`, `layernorm_f16_f32`, the H3 f16 attention; `Pipe::vision_embed`,
+  `h3pipe_vision_embed`) and its text-encoder side: merged embeds at the placeholder rows, mrope
+  (t, h, w) positions with the interleaved [24, 20, 20] sections, DeepStack adds after layers 0-2.
+- **Video VAE encoder** (`tools/gen_conv3d.py`: scrfd-loom's implicit-GEMM derivation with 27 causal
+  taps, reflect padding in both forms, strides, a 2-D mode; `conv3d_f16_wmma(_add)`, `gn_stats_f16`,
+  `gn_silu_f16`; `tools/export_vae_encoder.py`; `Pipe::encode_video` with ComfyUI's 256-px tile split,
+  latent blends and 17-frame chunks; `h3pipe_encode_video`).
+- **ref2va weights**: `H3_CKPT=... tools/export_glue.py` (H3_GLUE_OUT) and `tools/gptq_export.py --out`
+  on the ref2va checkpoint (the GPTQ calibration reuses the fl2va fixture).
+
+Prover lessons from the conv: a hoisted name ending in "1" is stripped by the widen pass; the flat
+address proof multiplies config *ranges*, so a `rows_bound` config carries the concrete product; a
+subtraction the prover cannot bound must sit inside the branch that proves it (reflect's y0 - 1).
+
+Gates (tests/test_vision.py, tests/test_vae_encoder.py, tests/test_ref2va.py --case audio|both|fl2va):

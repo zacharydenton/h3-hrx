@@ -104,10 +104,15 @@ with torch.inference_mode():
         save("fl2va_pres_ids", np.array([(e[0] if isinstance(e[0], int) else -1) for e in pres["qwen3vl_32b"][0]], dtype=np.int64))
         for kf in positive[0][1].get("minimax_keyframes", []): save("fl2va_keyframe_latent", kf["latent"][0]); print("keyframe index", kf["resolved_frame_index"])
         cases["fl2va"] = (positive, latent)
+    if "t2va" in a.only.split(","):   # no references: the baseline agreement of the pipeline with ComfyUI (fl2va checkpoint)
+        prompt = a.prompt.replace("<Picture 1> is the fox. ", "").replace(", with the sound of <Audio 1>", "")
+        positive = clip.encode_from_tokens_scheduled(clip.tokenize(prompt)); latent, _ = H3._empty_av_latent(a.width, a.height, a.length)
+        save("t2va_pres_ids", np.array([(e[0] if isinstance(e[0], int) else -1) for e in clip.tokenize(prompt)["qwen3vl_32b"][0]], dtype=np.int64)); save("t2va_text_states", positive[0][0][0])
+        cases["t2va"] = (positive, latent)
     clip = None; vae = None; audio_vae = None
     comfy.model_management.unload_all_models(); comfy.model_management.soft_empty_cache()
     only = [x for x in a.only.split(",") if x]
-    by_model = {"ref2va": [t for t in ("both", "audio") if t in cases and (not only or t in only)], "fl2va": [t for t in ("fl2va",) if t in cases and (not only or t in only)]}
+    by_model = {"ref2va": [t for t in ("both", "audio") if t in cases and (not only or t in only)], "fl2va": [t for t in ("fl2va", "t2va") if t in cases and (not only or t in only)]}
     for model_tag, tags in by_model.items():
       if not tags: continue
       model = comfy.sd.load_diffusion_model(str(a.models / f"diffusion_models/minimax_h3_{model_tag}_pruned_int8_convrot.safetensors"))

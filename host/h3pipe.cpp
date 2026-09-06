@@ -915,13 +915,19 @@ public:
         const int gh = H / 16, gw = W / 16, n = gh * gw, m = n / 4; const size_t cap = (size_t(n) + 16 + 31) / 32 * 32;
         auto V = [&](const std::string &nm, size_t bytes) { return vision_.at(nm, bytes); };
         std::vector<void *> owned; auto buf = [&](size_t bytes) { void *p = rt().alloc(bytes); owned.push_back(p); return p; };
-        // patches in merge order, content (c, t, py, px) with the image in both temporal slots, Qwen's (x - 0.5) / 0.5
+        // patches in merge order, content (c, t, py, px) with the image in both temporal slots, CLIP's mean/std (process_qwen2vl_images)
+        static const float pmean[3] = {0.48145466f, 0.4578275f, 0.40821073f}, pstd[3] = {0.26862954f, 0.26130258f, 0.27577711f};
         std::vector<float> patches(size_t(n) * 1536);
         for (int bh = 0; bh < gh / 2; ++bh) for (int bw = 0; bw < gw / 2; ++bw) for (int ih = 0; ih < 2; ++ih) for (int iw = 0; iw < 2; ++iw) {
             const size_t pi = ((size_t(bh) * (gw / 2) + bw) * 2 + ih) * 2 + iw; float *dst = patches.data() + pi * 1536;
             for (int c = 0; c < 3; ++c) for (int t = 0; t < 2; ++t) for (int py = 0; py < 16; ++py) for (int px = 0; px < 16; ++px) {
                 const int y = (bh * 2 + ih) * 16 + py, x = (bw * 2 + iw) * 16 + px;
-                dst[((c * 2 + t) * 16 + py) * 16 + px] = (pixels[(size_t(y) * W + x) * 3 + c] - 0.5f) / 0.5f; } }
+                dst[((c * 2 + t) * 16 + py) * 16 + px] = (pixels[(size_t(y) * W + x) * 3 + c] - pmean[c]) / pstd[c]; } }
+        static const bool vdebug = std::getenv("H3_VISION_DEBUG") && *std::getenv("H3_VISION_DEBUG");
+        auto probe = [&](const char *what, const void *ptr, size_t count, bool half) { if (!vdebug) return; rt().sync(); std::vector<float> v(count);
+            if (half) { std::vector<uint16_t> h(count); rt().d2h(h.data(), ptr, count * 2); for (size_t i = 0; i < count; ++i) v[i] = f16_to_f32(h[i]); } else rt().d2h(v.data(), ptr, count * 4);
+            size_t bad = 0; double mx = 0; for (float f : v) { if (!std::isfinite(f)) ++bad; else mx = std::max(mx, double(std::fabs(f))); }
+            fprintf(stderr, "  vision %-18s non-finite %zu / %zu  max|x| %.3g\n", what, bad, count, mx); };
         void *pa = buf(patches.size() * 4); rt().h2d(pa, patches.data(), patches.size() * 4);
         void *x32 = buf(size_t(n) * VHID * 4); gemm16("bias", "vision patch", n, 1536, VHID, pa, V("vis.patch.w", size_t(VHID) * 1536 * 2), V("vis.patch.b", VHID * 4), x32);
         // the learned 48x48 position table, bilinearly resampled to the grid then permuted into merge order (fast_pos_embed_interpolate)
@@ -933,6 +939,7 @@ public:
             const size_t pi = ((size_t(hy / 2) * (gw / 2) + wx / 2) * 2 + hy % 2) * 2 + wx % 2; float *row = x0.data() + pi * VHID;
             const float *r00 = pos.data() + (size_t(h0) * G + w0) * VHID, *r01 = pos.data() + (size_t(h0) * G + w1) * VHID, *r10 = pos.data() + (size_t(h1) * G + w0) * VHID, *r11 = pos.data() + (size_t(h1) * G + w1) * VHID;
             for (int c = 0; c < VHID; ++c) row[c] += (1 - dh) * (1 - dw) * r00[c] + (1 - dh) * dw * r01[c] + dh * (1 - dw) * r10[c] + dh * dw * r11[c]; }
+        probe("patch gemm", x32, x0.size(), false);
         std::vector<uint16_t> x16h(x0.size()); for (size_t i = 0; i < x0.size(); ++i) x16h[i] = f32_to_f16(x0[i]);
         void *x16 = buf(x16h.size() * 2); rt().h2d(x16, x16h.data(), x16h.size() * 2);
         // 2-D rope tables: pair j < 36 -> h with inv_freq[j], j >= 36 -> w with inv_freq[j - 36]; theta 10000 over dim 36
@@ -941,27 +948,29 @@ public:
             for (int j = 0; j < 36; ++j) { const double inv = std::pow(10000.0, -double(2 * (j % 18)) / 36.0), ang = double(j < 18 ? hy : wx) * inv; cosv[pi * 36 + j] = float(std::cos(ang)); sinv[pi * 36 + j] = float(std::sin(ang)); } }
         void *cosb = buf(cosv.size() * 4), *sinb = buf(sinv.size() * 4); rt().h2d(cosb, cosv.data(), cosv.size() * 4); rt().h2d(sinb, sinv.data(), sinv.size() * 4);
         void *ln = buf(size_t(n) * VHID * 4), *qkv = buf(size_t(n) * 3 * VHEADS * VHD * 4), *q16 = buf(cap * VHEADS * VHDP * 2), *k16 = buf(cap * VHEADS * VHDP * 2), *v16 = buf(cap * VHEADS * VHDP * 2);
-        void *att16 = buf(cap * VHEADS * VHDP * 2), *att32 = buf(size_t(n) * VHEADS * VHDP * 4), *hid = buf(size_t(n) * VMLP * 4), *ln4 = buf(size_t(m) * 4608 * 4), *mid = buf(size_t(m) * 4608 * 4), *out5 = buf(size_t(m) * VOUT * 4);
+        void *att16 = buf(cap * VHEADS * VHDP * 2), *hid = buf(size_t(n) * VMLP * 4), *ln4 = buf(size_t(m) * 4608 * 4), *mid = buf(size_t(m) * 4608 * 4), *out5 = buf(size_t(m) * VOUT * 4);
         std::vector<float> ones(4608, 1.0f); void *lam = buf(ones.size() * 4); rt().h2d(lam, ones.data(), ones.size() * 4);
         rt().memset(k16, 0, cap * VHEADS * VHDP * 2); rt().memset(v16, 0, cap * VHEADS * VHDP * 2); rt().memset(q16, 0, cap * VHEADS * VHDP * 2);
         const std::string ans = "h3.attention_mha_lds_f16_wmma.";
         auto attn = comp_.get("attention_mha_lds_f16_wmma", "h3_attention_mha_lds_f16_wmma", {{ans + "q_stride", std::to_string(VHEADS * VHDP)}, {ans + "kv_stride", std::to_string(VHEADS * VHDP)}, {ans + "tokens", std::to_string(n)}, {ans + "token_capacity", std::to_string(cap)}, {ans + "scale", num(1.0 / std::sqrt(double(VHD)))}, {ans + "out_stride", std::to_string(VHEADS * VHDP)}});
         const std::string rns = "h3.rope2d_qkv_f16.";
         auto rope = comp_.get("rope2d_qkv_f16", "h3_rope2d_qkv_f16", {{rns + "heads", std::to_string(VHEADS)}, {rns + "hd", std::to_string(VHD)}, {rns + "hd_pad", std::to_string(VHDP)}});
-        auto cast = comp_.get("cast_f16_f32", "h3_cast_f16_f32", {});
+        auto cast = comp_.get("cast_f32_f16", "h3_cast_f32_f16", {});
+        void *hid16 = buf(size_t(n) * VMLP * 2);
         merged.assign(size_t(m) * VOUT, 0.0f); deepstack.assign(size_t(3) * m * VOUT, 0.0f);
         static const int DS[3] = {8, 16, 24};
         for (int i = 0; i < VBLOCKS; ++i) {
             const std::string b = fmt("vis.b%d.", i);
             layernorm16(n, VHID, x16, V(b + "norm1.w", VHID * 4), V(b + "norm1.b", VHID * 4), ln);
-            gemm16("bias", "vision qkv", n, VHID, 3 * VHEADS * VHD, ln, V(b + "qkv.w", size_t(3 * VHEADS * VHDP) * VHID * 2), V(b + "qkv.b", size_t(3 * VHEADS * VHDP) * 4), qkv);
+            gemm16("bias", "vision qkv", n, VHID, 3 * VHEADS * VHD, ln, V(b + "qkv.w", size_t(3 * VHEADS * VHD) * VHID * 2), V(b + "qkv.b", size_t(3 * VHEADS * VHD) * 4), qkv);
             { KernArgs a; a.i32(n).ptr(qkv).ptr(cosb).ptr(sinb).ptr(q16).ptr(k16).ptr(v16); launch(*rope, &prof, "vision rope", unsigned(n), unsigned(VHEADS), unsigned(VHDP), a); }
             { KernArgs a; a.i32(n).ptr(q16).ptr(k16).ptr(v16).ptr(att16); launch(*attn, &prof, "vision attention", unsigned((n + 63) / 64), unsigned(VHEADS), 128, a); }
-            { KernArgs a; a.i32(n * VHEADS * VHDP).ptr(att16).ptr(att32); launch(*cast, &prof, "vision cast", unsigned((size_t(n) * VHEADS * VHDP + 255) / 256), 1, 256, a); }
-            gemm16("resid", "vision proj", n, VHEADS * VHDP, VHID, att32, V(b + "proj.w", size_t(VHID) * VHEADS * VHDP * 2), V(b + "proj.b", VHID * 4), x16, lam);
+            gemm16("resid", "vision proj", n, VHEADS * VHDP, VHID, att16, V(b + "proj.w", size_t(VHID) * VHEADS * VHDP * 2), V(b + "proj.b", VHID * 4), x16, lam);   // the residual GEMM takes A as f16
             layernorm16(n, VHID, x16, V(b + "norm2.w", VHID * 4), V(b + "norm2.b", VHID * 4), ln);
             gemm16("gelu", "vision fc1", n, VHID, VMLP, ln, V(b + "fc1.w", size_t(VMLP) * VHID * 2), V(b + "fc1.b", VMLP * 4), hid);
-            gemm16("resid", "vision fc2", n, VMLP, VHID, hid, V(b + "fc2.w", size_t(VHID) * VMLP * 2), V(b + "fc2.b", VHID * 4), x16, lam);
+            { KernArgs a; a.i32(n * VMLP).ptr(hid).ptr(hid16); launch(*cast, &prof, "vision cast", unsigned((size_t(n) * VMLP + 255) / 256), 1, 256, a); }
+            gemm16("resid", "vision fc2", n, VMLP, VHID, hid16, V(b + "fc2.w", size_t(VHID) * VMLP * 2), V(b + "fc2.b", VHID * 4), x16, lam);
+            if (i < 2 || i == VBLOCKS - 1) { probe(fmt("b%d ln1", i).c_str(), ln, size_t(n) * VHID, false); probe(fmt("b%d qkv", i).c_str(), qkv, size_t(n) * 3 * VHEADS * VHD, false); probe(fmt("b%d attn", i).c_str(), att16, size_t(n) * VHEADS * VHDP, true); probe(fmt("b%d fc1", i).c_str(), hid, size_t(n) * VMLP, false); probe(fmt("b%d x", i).c_str(), x16, size_t(n) * VHID, true); }
             for (int j = 0; j < 3; ++j) if (i == DS[j]) {
                 const std::string d = fmt("vis.ds%d.", j);
                 layernorm16(m, 4608, x16, V(d + "norm.w", 4608 * 4), V(d + "norm.b", 4608 * 4), ln4);
