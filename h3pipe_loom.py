@@ -46,7 +46,7 @@ def default_loom_compile() -> str:
 
 class H3Pipe:
     def __init__(self, glue=None, blocks=None, te=None, vae=None, vae_bits=8, cache=None, library=None, aenc=None, vision=None, venc=None, attn="i4"):
-        """blocks: build/weights_i8 (int8 rows, ComfyUI parity) or build/weights_gptq (int4, the fast path); attn: "f16", "i8" or "i4" QK^T. Both int4 choices ghost conditioned clips (docs/notes.md)."""
+        """blocks: build/weights_i8 (int8 rows, ComfyUI parity), build/weights_f16 (the pruned bf16 checkpoint's rows in f16) or build/weights_gptq (int4, the fast path); attn: "f16", "i8" or "i4" QK^T. Both int4 choices ghost conditioned clips (docs/notes.md)."""
         native = ctypes.CDLL(str(library or os.environ.get("H3PIPE_LIB") or ROOT / "build/libh3pipe.so"))   # H3PIPE_LIB=build/libh3pipe_hrx.so: the libhrx build
         native.h3pipe_abi_version.restype = ctypes.c_uint32
         if native.h3pipe_abi_version() != _ABI: raise H3PipeError("ABI mismatch; rebuild with scripts/build_host.sh")

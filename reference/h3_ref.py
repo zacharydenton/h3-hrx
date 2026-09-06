@@ -157,6 +157,10 @@ class Checkpoint:
         if w.dtype == torch.int8:
             s = self.raw(name + ".weight_scale").float().view(-1, 1)
             w = w.float() * s
+        elif name.startswith("blocks.") and w.shape[-1] % HADAMARD_GROUP == 0:
+            # a bf16 (pruned_bf16) checkpoint: unrotated rows. Rotate along K as the ConvRot export did, so the same
+            # rotated-activation path (QuantLinear) applies unchanged; the rotation is orthogonal, the product is identical
+            w = rotate_groups(w.float(), hadamard(HADAMARD_GROUP))
         return w.to(self.device, self.dtype)
 
 

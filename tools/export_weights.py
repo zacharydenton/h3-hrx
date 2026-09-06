@@ -53,7 +53,7 @@ def main() -> None:
     ap.add_argument("--out", default=str(ROOT / "build/weights"))
     ap.add_argument("--source", default=str(R.CKPT))
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--bits", type=int, choices=(4, 8), default=4, help="8: the checkpoint's int8 rows and scales verbatim (tools/quant_study.py: velocity cosine 0.9997 vs 0.98-0.99 for int4)")
+    ap.add_argument("--bits", type=int, choices=(4, 8, 16), default=4, help="8: the checkpoint's int8 rows and scales verbatim (tools/quant_study.py: velocity cosine 0.9997 vs 0.98-0.99 for int4)")
     a = ap.parse_args()
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -63,11 +63,14 @@ def main() -> None:
     for i in range(a.layers):
         p = f"blocks.{i}"
         for tag, name in (("qkv", f"{p}.attn.qkv_proj"), ("out", f"{p}.attn.out_proj"), ("gu", f"{p}.mlp.fc1"), ("down", f"{p}.mlp.fc2")):
-            if a.bits == 8: q, s = ckpt.raw(name + ".weight").to(torch.int8).cpu(), ckpt.raw(name + ".weight_scale").float().view(-1).cpu()
+            if a.bits == 16:   # f16 rows rotated along K: a bf16 (pruned_bf16) checkpoint is rotated here, int8 rows come back dequantised and already rotated
+                q, s = ckpt.linear(name).to(a.device).to(torch.float16).cpu(), None
+            elif a.bits == 8: q, s = ckpt.raw(name + ".weight").to(torch.int8).cpu(), ckpt.raw(name + ".weight_scale").float().view(-1).cpu()
             else: q, s = requantize(ckpt, name, a.device)
             if tag == "gu":
-                q, s = interleave_gate_up(q), interleave_gate_up(s.view(-1, 1)).view(-1)
-            add(f"{p}.{tag}.q", q); add(f"{p}.{tag}.s", s)
+                q, s = interleave_gate_up(q), (interleave_gate_up(s.view(-1, 1)).view(-1) if s is not None else None)
+            add(f"{p}.{tag}.q", q)
+            if s is not None: add(f"{p}.{tag}.s", s)
         for vec in ("norm1", "norm2"):
             add(f"{p}.{vec}", ckpt.raw(f"{p}.{vec}.weight").float())
         add(f"{p}.qnorm", ckpt.raw(f"{p}.attn.q_norm.weight").float())

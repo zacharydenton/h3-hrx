@@ -1134,3 +1134,46 @@ runs at 17.5 TFLOP/s of the 54 peak: the MMAs alone would take 33 s, so about 70
 101 is schedule (staging, barriers, softmax bookkeeping, occupancy), shared by all three
 kernels. That schedule, not operand width, is the remaining large lever at parity precision;
 the other is the int8 GEMMs at 38 of 54 TOPS (about 40 s of a 768p evaluation).
+
+## The pruned bf16 checkpoint, and f16 block kernels (2026-09-06)
+
+`Comfy-Org/MiniMax-H3` `diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors` (40.2 GB,
+`curl -C -`; `hf download` does not resume on Xet repos) run through ComfyUI itself
+(`tools/comfy_clip.py --model ...`, bf16 compute) against ComfyUI on the int8 ConvRot checkpoint,
+same noise, text-only 864x480 x 22 frames, first evaluation, residual-stream cosine (video rows):
+1.0000 through block 10, 0.9999 at 20, 0.9992 at 30, 0.9946 at 40, 0.9992 at 49; the
+20-evaluation keyframe clip's final latent 0.9983, the frames indistinguishable. That is the
+same distance this pipeline's int8 path keeps from int8 ComfyUI (0.9988 / 0.9929 / 0.9991), so
+the int8 ConvRot checkpoint is, for every purpose here, the bf16 model. And int8 WMMA runs at
+the f16 rate on gfx1151 with half the bytes, so bf16 weights cannot be faster either.
+
+The f16 block kernels were drafted anyway (`tools/gen_gemm_f16.py`): `gemm_f16_256`,
+`_256b`, `_resid_256`, `_resid_256b`, `_swiglu_256`, `_swiglu_256b_gs` from the int8 texts
+(vector<16xf16> fragments, f32 accumulation, no scales, 144-byte stage rows, 55296 B of LDS),
+and `prepare_norm_f16` / `prepare_plain_f16` (the rotated rows in f16, the 1/16 in the
+value). All eight compile; the prepare kernels match the reference (`tests/test_prepare_f16.py`);
+`tests/test_gemm_f16.py` is the GEMM gate. Every f16 GEMM spills one 8-VGPR packet (the
+fourth A packet): 128 accumulator VGPRs plus 48 of f16 packets plus 64 of fragments, against
+184 for int8. A 32-wide k stage (half the packets, 30 KB of LDS, two workgroups per CU) is
+the shape an f16 GEMM wants on this part; not built, since the bf16 checkpoint has no
+quality or speed case. The host does not load f16 rows yet (`export_weights.py --bits 16`
+and the bits-16 stack are the remaining pieces if it ever matters).
+
+**bf16 end to end (2026-09-06, later).** `tools/export_weights.py --bits 16 --source <pruned_bf16>` writes the
+rows rotated along K in f16 (38.5 GB, 73 s); the host reads the width from the manifest (bits 16: no `.s`,
+`prepare_*_f16`, `gemm_f16_*`, f16 activations, no scales), `tools/pipeline_c.py --precision bf16` picks
+it with f16 attention. Against ComfyUI's own bf16 run (`build/comfy_t2va_bf16_blocks`): video rows 1.0000
+through block 20, 0.9995 at 30, 0.9968 at 40, 0.9996 at 49 (the int8 path against int8 ComfyUI: 0.9988 /
+0.9929 / 0.9991); the keyframe trajectory 0.9999 after five evaluations, 0.872 final (the same schedule
+sensitivity as every other configuration); `build/fl2va_bf16.mp4` clean. Cost, per evaluation:
+
+| size | int8 rows + int8 QK^T | bf16 rows + f16 attention | ComfyUI (int8) |
+| --- | ---: | ---: | ---: |
+| 864x480 x 22 f | 4.0 s | 5.6 s | 5.2 s |
+| 864x480 x 124 f | 33 s | 45.5 s | 103 s |
+| 1344x768 x 124 f | 146 s (attention 104) | 188 s (attention 125, GEMMs 60) | 771 s |
+
+The f16 GEMMs run at 28-30 TFLOP/s against the int8 kernels' 38 TOPS (the one-packet spill and the
+55 KB stage), so bf16 costs about 1.4x at 480p and 1.3x at 768p for a quality difference that is not
+measurable against the bf16 model. It stays as an option; int8 stays the default. Its GEMMs' 32-wide
+k-stage form is the lever if it is ever wanted.

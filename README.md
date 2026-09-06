@@ -156,7 +156,9 @@ python3 tools/pipeline_c.py "A red fox ..." --first-frame fox.png      # fl2va w
 The defaults are the stock ComfyUI workflows' settings: `res_multistep` on the `simple`
 schedule, 30 evaluations (`--steps 31` grid points; ComfyUI's workflows use 20), no CFG, shifts 12/3, and
 `--precision int8` (the checkpoint's int8 rows, `tools/export_weights.py --bits 8`, with int8
-QK^T attention, `tools/gen_attention_i8qk.py`; `--attn f16` is the same quality, slightly slower). `--precision int4` is the 2x-per-step path (GPTQ int4 blocks, int4 QK^T attention):
+QK^T attention, `tools/gen_attention_i8qk.py`; `--attn f16` is the same quality, slightly slower). `--precision bf16` runs the pruned bf16 checkpoint's rows in f16 (`tools/export_weights.py --bits 16
+--source .../minimax_h3_fl2va_pruned_bf16.safetensors`, f16 attention, `tools/gen_gemm_f16.py` kernels):
+no weight quantisation in the blocks, at about the int8 speed. `--precision int4` is the 2x-per-step path (GPTQ int4 blocks, int4 QK^T attention):
 fine for text-only previews, but it ghosts keyframe and reference clips, because its deep-block
 error drifts the moving frames away from the pinned anchor (`docs/notes.md`, "ComfyUI's
 sampler, and why int4 ghosts conditioned clips"). At parity precision the host reproduces

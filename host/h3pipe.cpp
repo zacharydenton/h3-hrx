@@ -249,10 +249,10 @@ unsigned gemm_grid_y(size_t tokens) { const unsigned g = m_group_for(tokens); re
 
 // A prepare kernel (norm / lnorm / plain) for one width, ready to launch.
 struct Prepare {
-    std::shared_ptr<Kernel> k; int lanes = 0; std::string form;
-    void build(Compiler &c, const std::string &form_, int bits, int width, float eps = 1e-5f, int classes = 1) {
-        form = form_;
-        std::string stem = "prepare_" + form + "_i" + std::to_string(bits);
+    std::shared_ptr<Kernel> k; int lanes = 0; std::string form; int bits = 8;
+    void build(Compiler &c, const std::string &form_, int bits_, int width, float eps = 1e-5f, int classes = 1) {
+        form = form_; bits = bits_;
+        std::string stem = "prepare_" + form + (bits == 16 ? "_f16" : "_i" + std::to_string(bits));
         if (form == "plain" && size_t(width) * 4 > 65536) stem = "prepare_plain16_i" + std::to_string(bits);   // f16 LDS for rows past 64 KB of f32
         lanes = lanes_for(width);
         const std::string ns = "h3." + stem + ".";
@@ -264,24 +264,24 @@ struct Prepare {
     void run(Profile *p, const char *stage, unsigned tokens, const void *x, const void *weight, const void *table, const void *cls, void *a_q, void *a_s) {
         KernArgs a; a.i32(int(tokens)).ptr(x);
         if (form != "plain") a.ptr(weight).ptr(table).ptr(cls);
-        a.ptr(a_q).ptr(a_s);
+        a.ptr(a_q); if (bits != 16) a.ptr(a_s);   // the f16 forms write rows, no token scale
         launch(*k, p, stage, tokens, 1, unsigned(lanes), a);
     }
 };
 
 // A GEMM of the int4/int8 family for one (K, N, m_group).
 struct Gemm {
-    std::shared_ptr<Kernel> k; int n = 0; bool resid = false, bias = false;
-    void build(Compiler &c, const std::string &mode, int bits, bool bias_, bool gate_first, int k_size, int n_size, size_t tokens, int classes = 1) {
-        resid = mode == "resid"; bias = bias_; n = n_size;
-        std::string stem = "gemm_i" + std::to_string(bits) + (mode == "plain" ? "" : "_" + mode) + "_256" + (bias ? "b" : "") + (mode == "swiglu" && !gate_first ? "_gs" : "");
+    std::shared_ptr<Kernel> k; int n = 0; bool resid = false, bias = false; int bits = 8;
+    void build(Compiler &c, const std::string &mode, int bits_, bool bias_, bool gate_first, int k_size, int n_size, size_t tokens, int classes = 1) {
+        resid = mode == "resid"; bias = bias_; n = n_size; bits = bits_;
+        std::string stem = (bits == 16 ? std::string("gemm_f16") : "gemm_i" + std::to_string(bits)) + (mode == "plain" ? "" : "_" + mode) + "_256" + (bias ? "b" : "") + (mode == "swiglu" && !gate_first ? "_gs" : "");
         const std::string ns = "h3." + stem + ".";
         Cfg cfg = {{ns + "k_size", std::to_string(k_size)}, {ns + "n_size", std::to_string(n_size)}, {ns + "m_group", std::to_string(m_group_for(tokens))}};
         if (resid) cfg.push_back({ns + "classes", std::to_string(classes)});
         k = c.get(stem, "h3_" + stem, cfg);
     }
     void run(Profile *p, const char *stage, unsigned tokens, const void *a_q, const void *w_q, const void *w_s, const void *a_s, void *out, const void *gate = nullptr, const void *cls = nullptr, const void *b = nullptr) {
-        KernArgs a; a.i32(int(tokens)).ptr(a_q).ptr(w_q).ptr(w_s).ptr(a_s).ptr(out);
+        KernArgs a; a.i32(int(tokens)).ptr(a_q).ptr(w_q); if (bits != 16) a.ptr(w_s).ptr(a_s); a.ptr(out);   // f16 operands carry no scales
         if (resid) a.ptr(gate).ptr(cls);
         if (bias) a.ptr(b);
         launch(*k, p, stage, unsigned(n / 128), gemm_grid_y(tokens), THREADS, a);
@@ -302,17 +302,19 @@ class Stack {
 public:
     Stack(Compiler &c, const StackDims &d, size_t tokens, int layers, const Blob &w, const std::string &prefix_fmt, bool qk_weights, const float *ones_head)
         : d_(d), tokens_(tokens), layers_(layers) {
-        const int bits = d.bits, per = bits == 4 ? 2 : 1;
+        const int bits = d.bits; const bool f16w = bits == 16;
+        auto wbytes = [&](size_t n, size_t k) { return bits == 4 ? n * k / 2 : bits == 8 ? n * k : n * k * 2; };
+        auto scale = [&](const std::string &name, size_t n) -> char * { return f16w ? nullptr : w.at(name, n * 4); };
         waves_ = d.causal ? 8 : (tokens >= 4096 ? 8 : 4);
         capacity_ = std::max<size_t>((tokens + 16 + 31) / 32 * 32, (tokens + 16 * waves_ - 1) / (16 * waves_) * (16 * waves_));
         capacity_ = std::max<size_t>(capacity_, (tokens + 255) / 256 * 256);
         for (int i = 0; i < layers; ++i) {
             const std::string p = fmt(prefix_fmt.c_str(), i);
             Block b;
-            b.qkv_q = w.at(p + "qkv.q", size_t(d.qkv()) * d.hidden / per);   b.qkv_s = w.at(p + "qkv.s", size_t(d.qkv()) * 4);
-            b.out_q = w.at(p + "out.q", size_t(d.hidden) * d.inner() / per); b.out_s = w.at(p + "out.s", size_t(d.hidden) * 4);
-            b.gu_q = w.at(p + "gu.q", size_t(2 * d.ffn) * d.hidden / per);   b.gu_s = w.at(p + "gu.s", size_t(2 * d.ffn) * 4);
-            b.down_q = w.at(p + "down.q", size_t(d.hidden) * d.ffn / per);   b.down_s = w.at(p + "down.s", size_t(d.hidden) * 4);
+            b.qkv_q = w.at(p + "qkv.q", wbytes(d.qkv(), d.hidden));   b.qkv_s = scale(p + "qkv.s", d.qkv());
+            b.out_q = w.at(p + "out.q", wbytes(d.hidden, d.inner())); b.out_s = scale(p + "out.s", d.hidden);
+            b.gu_q = w.at(p + "gu.q", wbytes(2 * d.ffn, d.hidden));   b.gu_s = scale(p + "gu.s", 2 * d.ffn);
+            b.down_q = w.at(p + "down.q", wbytes(d.hidden, d.ffn));   b.down_s = scale(p + "down.s", d.hidden);
             if (d.bias) { b.qkv_b = w.at(p + "qkv.b", size_t(d.qkv()) * 4); b.out_b = w.at(p + "out.b", size_t(d.hidden) * 4); b.gu_b = w.at(p + "gu.b", size_t(2 * d.ffn) * 4); b.down_b = w.at(p + "down.b", size_t(d.hidden) * 4); }
             b.norm1 = w.at(p + "norm1", size_t(d.hidden) * 4); b.norm2 = w.at(p + "norm2", size_t(d.hidden) * 4);
             if (qk_weights) { b.qnorm = w.at(p + "qnorm", size_t(d.head_dim) * 4); b.knorm = w.at(p + "knorm", size_t(d.head_dim) * 4); }
@@ -356,7 +358,7 @@ public:
             attention_ = c.get(stem, "h3_" + stem, acfg);
         }
         const size_t T = capacity_;
-        a_q_ = memory_.alloc(T * size_t(std::max(d.ffn, std::max(d.hidden, d.inner()))) / per);
+        a_q_ = memory_.alloc(T * size_t(std::max(d.ffn, std::max(d.hidden, d.inner()))) * (bits == 4 ? 1 : bits == 8 ? 1 : 2) / (bits == 4 ? 2 : 1));
         a_s_ = memory_.alloc(T * 4);
         fused_ = memory_.alloc(T * size_t(d.qkv()) * 2);
         q_ = memory_.alloc(T * size_t(d.inner()) * 2);
@@ -727,7 +729,7 @@ public:
           rt().h2d(cos_, c.data(), c.size() * 4); rt().h2d(sin_, s.data(), s.size() * 4); }
         if (!dit_ || dit_->tokens() != S) {
             const char *qk = std::getenv("H3_ATTN_QK"); StackDims dd{HID, HEADS, HEADS, HEAD_DIM, FFN, ROPE_DIM, CLASSES, 4, 1e-5f, false, true, false}; const int qkb = qk ? (std::string(qk) == "f16" ? 16 : (std::string(qk) == "i8" ? 8 : 4)) : attn_qk_bits_; dd.attn_i4 = qkb == 4; dd.attn_qk_bits = qkb;   // H3_ATTN_QK=f16|i8|i4 overrides the config
-            dd.bits = blocks_.span("blocks.0.qkv.q").bytes == size_t(dd.qkv()) * dd.hidden ? 8 : 4;   // the export's width: int8 rows verbatim (export_weights.py --bits 8) or packed int4
+            { const size_t qb = blocks_.span("blocks.0.qkv.q").bytes, nk = size_t(dd.qkv()) * dd.hidden; dd.bits = qb == nk ? 8 : qb == 2 * nk ? 16 : 4; }   // the export's width: int8 rows verbatim, f16 rows (--bits 16), or packed int4
             dit_.reset(); dit_ = std::make_unique<Stack>(comp_, dd, S, 50, blocks_, "blocks.%d.", true, nullptr); }
         if (!final_prep_.k) { final_prep_.build(comp_, "norm", 8, HID, 1e-5f, 2); }
         const size_t generated_rows = Na + Nv;   // the final head has only the video/audio timestep classes
