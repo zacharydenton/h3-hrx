@@ -187,14 +187,14 @@ def pack_tail(bits: int) -> str:
     if bits == 4:
         out += "".join(f"    %q_s{j} = scalar.shli %q_e{j}, %sh{4*j} : i32\n" for j in range(1, 8))
         out += "    %q_o1 = scalar.ori %q_e0, %q_s1 : i32\n" + "".join(f"    %q_o{j} = scalar.ori %q_o{j-1}, %q_s{j} : i32\n" for j in range(2, 8))
-        out += "    view.store %q_o7, %qw_view[%row, %q_w] : i32, view<[%tokens_b]x[%word_width]xi32>\n"
+        out += "    %q_wo = index.assume %q_w [lt(%q_w, %out_words)] : index\n    view.store %q_o7, %qw_view[%row, %q_wo] : i32, view<[%tokens_b]x[%out_words]xi32>\n"
     else:
         out += "".join(f"    %q_s{j} = scalar.shli %q_e{j}, %sh{8*(j%4)} : i32\n" for j in (1, 2, 3, 5, 6, 7))
         out += "    %q_lo1 = scalar.ori %q_e0, %q_s1 : i32\n    %q_lo2 = scalar.ori %q_lo1, %q_s2 : i32\n    %q_lo = scalar.ori %q_lo2, %q_s3 : i32\n"
         out += "    %q_hi1 = scalar.ori %q_e4, %q_s5 : i32\n    %q_hi2 = scalar.ori %q_hi1, %q_s6 : i32\n    %q_hi = scalar.ori %q_hi2, %q_s7 : i32\n"
         out += "    %q_words = vector.from_elements %q_lo, %q_hi : vector<2xi32>\n"
         out += "    %q_w2 = index.mul %q_chunk, %c2 : index\n    %q_w2b = index.assume %q_w2 [le(%q_w2, %word_last), mul(%q_w2, 2)] : index\n"
-        out += "    vector.store %q_words, %qw_view[%row, %q_w2b] : vector<2xi32>, view<[%tokens_b]x[%word_width]xi32>\n"
+        out += "    %q_w2o = index.assume %q_w2b [le(%q_w2b, %out_wlast), mul(%q_w2b, 2)] : index\n    vector.store %q_words, %qw_view[%row, %q_w2o] : vector<2xi32>, view<[%tokens_b]x[%out_words]xi32>\n"
     return out
 
 
@@ -226,6 +226,8 @@ amdgpu.target<gfx11-generic> @{sym}_gfx11 {{subgroup_size = 32}}
 config.decl @{ns}.width : %value: index where [range(%value, 256, 32768), mul(%value, 256)]
 
 config.decl @{ns}.lanes : %value: index where [range(%value, 32, 1024), mul(%value, 32)]
+
+config.decl @{ns}.out_stride : %value: index where [range(%value, 256, 65536), mul(%value, 64)]
 {eps_cfg}{extra_cfg}
 kernel.def target(@{sym}_gfx11) export("{sym}") @{sym}(%tokens: index) {{
   %c1 = index.constant 1 : index
@@ -276,12 +278,16 @@ kernel.def target(@{sym}_gfx11) export("{sym}") @{sym}(%tokens: index) {{
   %lane = kernel.workitem.id<x> : index
   %half_width = index.div %width, %c2 : index
   %word_width = index.div %width, %c{8 if bits == 4 else 4} : index
+  // the quantised rows' pitch: the GEMM's padded k_stride (>= width)
+  %out_stride = config.get @{ns}.out_stride : index
+  %out_words = index.div %out_stride, %c{8 if bits == 4 else 4} : index
   %word_last = index.sub %word_width, %c2 : index
+  %out_wlast = index.sub %out_words, %c2 : index
   %width_last = index.sub %width, %c8 : index
 {gate_last}  %quads = index.div %width, %c4 : index
 {f["views"]}  %q_global = buffer.assume.memory_space<global> %q : buffer
   %qs_global = buffer.assume.memory_space<global> %q_scale : buffer
-  %qw_view = buffer.view %q_global[%c0_offset] : buffer -> view<[%tokens_b]x[%word_width]xi32>
+  %qw_view = buffer.view %q_global[%c0_offset] : buffer -> view<[%tokens_b]x[%out_words]xi32>
   %qs_view = buffer.view %qs_global[%c0_offset] : buffer -> view<[%tokens_b]xf32>
   %row_bytes0 = index.mul %width, %c{lds_bytes} : index
   %row_bytes = index.cast %row_bytes0 : index to offset

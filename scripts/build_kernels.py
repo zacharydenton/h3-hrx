@@ -75,7 +75,10 @@ def build(tokens: int) -> Path:
                   ("prepare_qk_i4", "h3_prepare_qk_i4", "prepare_q_i4", {pq + "row_stride": INNER, pq + "head_offset": 0, pq + "heads": HEADS, pq + "extra_scale": D ** -0.5 / 128.0}),
                   ("prepare_qk_i4", "h3_prepare_qk_i4", "prepare_k_i4", {pq + "row_stride": INNER, pq + "head_offset": 0, pq + "heads": HEADS, pq + "extra_scale": 1.0}),
                   ("transpose_f16", "h3_transpose_f16", "transpose_v", {"h3.transpose_f16.width": INNER, "h3.transpose_f16.row_capacity": capacity})]   # V^T once per block: the int4 kernel stages V by channel rows
-    for stem, sym, name, cfg in specs:
+    for stem, sym, name, cfg in specs:   # pitch configs default to K / width here; the host pads them (gemm_pitch in host/h3pipe.cpp)
+        ns = "h3." + stem + "."
+        if stem.startswith("gemm_i") and ns + "k_size" in cfg: cfg.setdefault(ns + "k_stride", cfg[ns + "k_size"])
+        if stem.startswith("prepare_") and stem[-3:] in ("_i4", "_i8") and ns + "width" in cfg: cfg.setdefault(ns + "out_stride", cfg[ns + "width"])
         hs = out / f"{name}.hsaco"
         src = ROOT / "kernels" / f"{stem}.loom"
         src_stamp = hashlib.sha1(src.read_bytes()).hexdigest()[:12] + " " + " ".join(f"{k}={v}" for k, v in cfg.items()); stamp_file = hs.with_suffix(".src.txt")

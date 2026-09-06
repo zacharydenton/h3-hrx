@@ -23,11 +23,17 @@ PACKETS = (TM + TN) * 4 // 256
 A_PACKETS = TM * 4 // 256
 
 
-def generate(mode: str, bias: bool = False, gate_first: bool = True, bits: int = 4) -> str:
+def generate(mode: str, bias: bool = False, gate_first: bool = True, bits: int = 4, plain_loads: bool = True, suffix: str = "", lds_ahead: bool = False) -> str:
     """bias: a per-column f32 bias added to every output before the epilogue's own arithmetic
     (the VAE decoder's linears have biases); gate_first: which interleaved half the SwiGLU
-    applies silu to (ComfyUI's fc1: gate first; diffusers' SwiGLU: linear first, gate second)."""
-    STEM = {"plain": "gemm_i4_256", "resid": "gemm_i4_resid_256", "swiglu": "gemm_i4_swiglu_256"}[mode].replace("i4", f"i{bits}") + ("b" if bias else "") + ("" if gate_first else "_gs")
+    applies silu to (ComfyUI's fc1: gate first; diffusers' SwiGLU: linear first, gate second).
+    plain_loads: the staging loads are unconditional (rows past M are clamped to row 0, k past K to the
+    first quad); rows past M are never published and the last step's prefetch is never staged, so
+    the predicated zero-fill only cost the loads their independence (each `scf.if` load waited on the
+    one before it: `s_waitcnt vmcnt(0)` between all six).
+    lds_ahead: the fragment loads of sub-step s+1 are issued before sub-step s's sixteen WMMAs, so the
+    LDS latency is covered by a whole sub-step instead of the two or three WMMAs the source order gave it."""
+    STEM = {"plain": "gemm_i4_256", "resid": "gemm_i4_resid_256", "swiglu": "gemm_i4_swiglu_256"}[mode].replace("i4", f"i{bits}{suffix}") + ("b" if bias else "") + ("" if gate_first else "_gs")
     KSTEP, SUBS, KQ, FRAG, PREGS = (128, 8, 8, "vector<2xi32>", 2) if bits == 4 else (64, 4, 4, "vector<4xi32>", 4)   # k per step, sub-steps, k per i32 quad, fragment payload
     SYM, NS = "h3_" + STEM, "h3." + STEM
     extra_args = {"plain": "", "resid": ", %gate: buffer, %cls: buffer", "swiglu": ""}[mode] + (", %bias: buffer" if bias else "")
@@ -47,6 +53,8 @@ def generate(mode: str, bias: bool = False, gate_first: bool = True, bits: int =
     config.decl @{NS}.k_size : %value: index where [range(%value, {KSTEP}, 65536), mul(%value, {KSTEP})]
 
     config.decl @{NS}.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+
+    config.decl @{NS}.k_stride : %value: index where [range(%value, {KSTEP}, 65536), mul(%value, {KSTEP})]
 {extra_cfg}
     kernel.def target(@{SYM}_gfx11) export("{SYM}") @{SYM}(%m_size: index) {{
       %c1 = index.constant 1 : index
@@ -69,6 +77,10 @@ def generate(mode: str, bias: bool = False, gate_first: bool = True, bits: int =
       %k_size0 = config.get @{NS}.k_size : index
       %n_size0 = config.get @{NS}.n_size : index
       %k_size = index.assume %k_size0 [range(%k_size0, {KSTEP}, 65536), mul(%k_size0, {KSTEP})] : index
+      // the operand rows' pitch (k elements); K itself when it is not a multiple of 1024, else K + 64,
+      // so that the 384 rows a step touches do not alias in the cache (K = 7168: 36.7 -> 41.2 TOPS, K = 21504: 33.4 -> 41.4)
+      %k_stride0 = config.get @{NS}.k_stride : index
+      %k_stride = index.assume %k_stride0 [range(%k_stride0, {KSTEP}, 65536), mul(%k_stride0, {KSTEP})] : index
       %n_size = index.assume %n_size0 [range(%n_size0, 128, 65536), mul(%n_size0, 128)] : index
 
       %c0 = index.constant 0 : index
@@ -143,7 +155,7 @@ def generate(mode: str, bias: bool = False, gate_first: bool = True, bits: int =
       %wave_col = index.mul %wave_n, %c64 : index
       %base_m = index.mul %tile_m_id, %c256 : index
       %base_n = index.mul %tile_n_id, %c128 : index
-      %k_quads = index.div %k_size, %c{KQ} : index
+      %k_quads = index.div %k_stride, %c{KQ} : index
 
       %a_global = buffer.assume.memory_space<global> %a : buffer
       %w_global = buffer.assume.memory_space<global> %w : buffer
@@ -206,6 +218,8 @@ def generate(mode: str, bias: bool = False, gate_first: bool = True, bits: int =
     for i in range(A_PACKETS):
         K += f"  %gok{i} = index.add %c0, %c0 : index\n" if False else ""
     for i in range(A_PACKETS):
+        if plain_loads:
+            K += f"  %ga{i} = vector.load %a_view[%a_row{i}, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> {V4}\n"; continue
         K += f"  %ga{i} = scf.if %a_ok{i} -> ({V4}) {{\n    %v = vector.load %a_view[%a_row{i}, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> {V4}\n    scf.yield %v : {V4}\n  }} else {{\n    scf.yield %zero_i32x4 : {V4}\n  }}\n"
     for i in range(PACKETS - A_PACKETS):
         K += f"  %gw{i} = vector.load %w_view[%w_row{i}, %kq_first] : view<[%n_size]x[%k_quads]xi32> -> {V4}\n"
@@ -231,18 +245,30 @@ def generate(mode: str, bias: bool = False, gate_first: bool = True, bits: int =
         %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), mul(%kq_safe, 4)] : index
     """
     for i in range(A_PACKETS):
+        if plain_loads:
+            K += f"    %na{i} = vector.load %a_view[%a_row{i}, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> {V4}\n"; continue
         K += f"    %load_a{i} = scalar.andi %in_k, %a_ok{i} : i1\n"
         K += f"    %na{i} = scf.if %load_a{i} -> ({V4}) {{\n      %v = vector.load %a_view[%a_row{i}, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> {V4}\n      scf.yield %v : {V4}\n    }} else {{\n      scf.yield %zero_i32x4 : {V4}\n    }}\n"
     for i in range(PACKETS - A_PACKETS):
+        if plain_loads:
+            K += f"    %nw{i} = vector.load %w_view[%w_row{i}, %kq_next] : view<[%n_size]x[%k_quads]xi32> -> {V4}\n"; continue
         K += f"    %nw{i} = scf.if %in_k -> ({V4}) {{\n      %v = vector.load %w_view[%w_row{i}, %kq_next] : view<[%n_size]x[%k_quads]xi32> -> {V4}\n      scf.yield %v : {V4}\n    }} else {{\n      scf.yield %zero_i32x4 : {V4}\n    }}\n"
     K += f"\n    // {SUBS} 16-wide sub-steps over the staged 64 bytes: 4 A + 4 W runs, 16 WMMAs each.\n"
     prev = {x: f"%r{x}" for x in ACC}
     step = 2 if bits == 4 else 4     # i32 quads per sub-step
-    for s in range(SUBS):
+    def frag_loads(s):
+        t = ""
         for i in range(FM):
-            K += f"    %da{i}_{s} = vector.load %a_stage[%fa{i}, %c{step*s}] : view<{TM}x20xi32> -> {FRAG}\n"
+            t += f"    %da{i}_{s} = vector.load %a_stage[%fa{i}, %c{step*s}] : view<{TM}x20xi32> -> {FRAG}\n"
         for j in range(FN):
-            K += f"    %db{j}_{s} = vector.load %w_stage[%fb{j}, %c{step*s}] : view<{TN}x20xi32> -> {FRAG}\n"
+            t += f"    %db{j}_{s} = vector.load %w_stage[%fb{j}, %c{step*s}] : view<{TN}x20xi32> -> {FRAG}\n"
+        return t
+    if lds_ahead: K += frag_loads(0)
+    for s in range(SUBS):
+        if lds_ahead:
+            if s + 1 < SUBS: K += frag_loads(s + 1)
+        else:
+            K += frag_loads(s)
         for i in range(FM):
             K += f"    %la{i}_{s} = vector.fragment<lhs> %da{i}_{s} shape [%m, %k] using {{schema = %i4_schema : encoding<schema>}} : {FRAG}\n"
         for j in range(FN):
@@ -430,3 +456,12 @@ if __name__ == "__main__":
     for mode, stem in (("plain", "gemm_i8_256"), ("resid", "gemm_i8_resid_256"), ("swiglu", "gemm_i8_swiglu_256")):
         (ROOT / "kernels" / f"{stem}.loom").write_text(generate(mode, bits=8))
         print("wrote", stem)
+    # experiment: unconditional staging loads (the `u` family), timed against the shipped kernels
+    for mode, stem in (("plain", "gemm_i8u_256b"), ("resid", "gemm_i8u_resid_256b"), ("swiglu", "gemm_i8u_swiglu_256b_gs")):
+        (ROOT / "experiments" / f"{stem}.loom").write_text(generate(mode, bias=True, gate_first=(mode != "swiglu"), bits=8, plain_loads=True, suffix="u"))
+        print("wrote", stem)
+    for mode, stem in (("plain", "gemm_i8u_256"), ("resid", "gemm_i8u_resid_256"), ("swiglu", "gemm_i8u_swiglu_256")):
+        (ROOT / "experiments" / f"{stem}.loom").write_text(generate(mode, bits=8, plain_loads=True, suffix="u"))
+        print("wrote", stem)
+    # experiment: `v` = `u` plus fragment loads one sub-step ahead
+    (ROOT / "experiments" / "gemm_i8v_256.loom").write_text(generate("plain", bits=8, plain_loads=True, suffix="v", lds_ahead=True)); print("wrote gemm_i8v_256")

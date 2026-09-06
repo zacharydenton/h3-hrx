@@ -169,6 +169,29 @@ struct Blob {
         } catch (...) { memory.free(p); throw; }
         return p;
     }
+    // rows of row_bytes uploaded at a pitch of pitch_bytes; the padding is never read (the GEMMs read k_size of the k_stride pitch)
+    char *at_padded(const std::string &name, size_t rows, size_t row_bytes, size_t pitch_bytes) const {
+        if (pitch_bytes == row_bytes) return at(name, rows * row_bytes);
+        const std::string key = name + "@" + std::to_string(pitch_bytes);
+        const Span &s = span(name);
+        if (s.bytes != rows * row_bytes) throw std::runtime_error("tensor " + name + " has " + std::to_string(s.bytes) + " bytes, expected " + std::to_string(rows * row_bytes));
+        auto it = tensors.find(key); if (it != tensors.end()) return it->second;
+        std::ifstream f(path, std::ios::binary); f.seekg(std::streamoff(s.offset));
+        const size_t rows_per_chunk = std::max<size_t>(1, (size_t(16) << 20) / pitch_bytes);
+        std::vector<char> in(rows_per_chunk * row_bytes), out(rows_per_chunk * pitch_bytes, 0);
+        char *p = (char *)memory.alloc(rows * pitch_bytes);
+        try {
+            for (size_t done = 0; done < rows;) {
+                const size_t n = std::min(rows_per_chunk, rows - done);
+                f.read(in.data(), std::streamsize(n * row_bytes));
+                if (!f) throw std::runtime_error("short read of " + name);
+                for (size_t r = 0; r < n; ++r) memcpy(out.data() + r * pitch_bytes, in.data() + r * row_bytes, row_bytes);
+                rt().h2d(p + done * pitch_bytes, out.data(), n * pitch_bytes); done += n;
+            }
+            tensors.emplace(key, p);
+        } catch (...) { memory.free(p); throw; }
+        return p;
+    }
     std::vector<float> host_f32(const std::string &name, size_t count) const {
         const Span &s = span(name);
         if (s.bytes != count * 4) throw std::runtime_error("tensor " + name + " has " + std::to_string(s.bytes) + " bytes, expected " + std::to_string(count * 4));
@@ -245,12 +268,19 @@ unsigned m_group_for(size_t tokens) {          // the raster group rule shared w
     for (unsigned g : {3u, 2u}) { const size_t pad = (tiles + g - 1) / g * g; if (pad < best_pad) { best = g; best_pad = pad; } }
     return best;
 }
+// GEMM operand row pitch in k elements: K itself unless the row's byte pitch is a multiple of 1024, when the 384 rows a k step touches alias in
+// the cache (int8 out projection K = 7168: 36.7 -> 41.2 TOPS, down projection K = 21504: 33.4 -> 41.4 with the pad); the pad is
+// one k step (64 int8, 128 int4) so the kernels' step constraints hold. f16 GEMMs take no pitch.
+size_t gemm_pitch(size_t k, int bits) {
+    const bool aliases = bits == 8 ? k % 1024 == 0 : bits == 4 ? k % 2048 == 0 : false;   // the byte pitch (int4 rows are k/2 bytes) a multiple of 1024
+    return aliases ? k + (bits == 4 ? 128 : 64) : k;
+}
 unsigned gemm_grid_y(size_t tokens) { const unsigned g = m_group_for(tokens); return unsigned(((tokens + 255) / 256 + g - 1) / g * g); }
 
 // A prepare kernel (norm / lnorm / plain) for one width, ready to launch.
 struct Prepare {
     std::shared_ptr<Kernel> k; int lanes = 0; std::string form; int bits = 8;
-    void build(Compiler &c, const std::string &form_, int bits_, int width, float eps = 1e-5f, int classes = 1) {
+    void build(Compiler &c, const std::string &form_, int bits_, int width, float eps = 1e-5f, int classes = 1, int out_stride = 0) {
         form = form_; bits = bits_;
         std::string stem = "prepare_" + form + (bits == 16 ? "_f16" : "_i" + std::to_string(bits));
         if (form == "plain" && size_t(width) * 4 > 65536) stem = "prepare_plain16_i" + std::to_string(bits);   // f16 LDS for rows past 64 KB of f32
@@ -258,6 +288,7 @@ struct Prepare {
         const std::string ns = "h3." + stem + ".";
         Cfg cfg = {{ns + "width", std::to_string(width)}, {ns + "lanes", std::to_string(lanes)}};
         if (form != "plain") { cfg.push_back({ns + "eps", num(eps)}); cfg.push_back({ns + "classes", std::to_string(classes)}); }
+        if (bits != 16) cfg.push_back({ns + "out_stride", std::to_string(out_stride ? out_stride : width)});   // the quantised rows' pitch = the GEMM's k_stride
         k = c.get(stem, "h3_" + stem, cfg);
     }
     // norm forms: (x f32, weight, table, cls) -> a_q, a_s; plain: (h f16) -> a_q, a_s
@@ -272,12 +303,13 @@ struct Prepare {
 // A GEMM of the int4/int8 family for one (K, N, m_group).
 struct Gemm {
     std::shared_ptr<Kernel> k; int n = 0; bool resid = false, bias = false; int bits = 8;
-    void build(Compiler &c, const std::string &mode, int bits_, bool bias_, bool gate_first, int k_size, int n_size, size_t tokens, int classes = 1) {
+    void build(Compiler &c, const std::string &mode, int bits_, bool bias_, bool gate_first, int k_size, int n_size, size_t tokens, int classes = 1, int k_stride = 0) {
         resid = mode == "resid"; bias = bias_; n = n_size; bits = bits_;
         std::string stem = (bits == 16 ? std::string("gemm_f16") : "gemm_i" + std::to_string(bits)) + (mode == "plain" ? "" : "_" + mode) + "_256" + (bias ? "b" : "") + (mode == "swiglu" && !gate_first ? "_gs" : "");
         const std::string ns = "h3." + stem + ".";
         Cfg cfg = {{ns + "k_size", std::to_string(k_size)}, {ns + "n_size", std::to_string(n_size)}, {ns + "m_group", std::to_string(m_group_for(tokens))}};
         if (resid) cfg.push_back({ns + "classes", std::to_string(classes)});
+        if (bits != 16) cfg.push_back({ns + "k_stride", std::to_string(k_stride ? k_stride : k_size)});   // operand row pitch (see gemm_pitch)
         k = c.get(stem, "h3_" + stem, cfg);
     }
     void run(Profile *p, const char *stage, unsigned tokens, const void *a_q, const void *w_q, const void *w_s, const void *a_s, void *out, const void *gate = nullptr, const void *cls = nullptr, const void *b = nullptr) {
@@ -305,16 +337,18 @@ public:
         const int bits = d.bits; const bool f16w = bits == 16;
         auto wbytes = [&](size_t n, size_t k) { return bits == 4 ? n * k / 2 : bits == 8 ? n * k : n * k * 2; };
         auto scale = [&](const std::string &name, size_t n) -> char * { return f16w ? nullptr : w.at(name, n * 4); };
+        auto pitch = [&](size_t k) { return gemm_pitch(k, bits); };
+        auto wpad = [&](const std::string &name, size_t n, size_t k) { return w.at_padded(name, n, wbytes(1, k), wbytes(1, pitch(k))); };
         waves_ = d.causal ? 8 : (tokens >= 4096 ? 8 : 4);
         capacity_ = std::max<size_t>((tokens + 16 + 31) / 32 * 32, (tokens + 16 * waves_ - 1) / (16 * waves_) * (16 * waves_));
         capacity_ = std::max<size_t>(capacity_, (tokens + 255) / 256 * 256);
         for (int i = 0; i < layers; ++i) {
             const std::string p = fmt(prefix_fmt.c_str(), i);
             Block b;
-            b.qkv_q = w.at(p + "qkv.q", wbytes(d.qkv(), d.hidden));   b.qkv_s = scale(p + "qkv.s", d.qkv());
-            b.out_q = w.at(p + "out.q", wbytes(d.hidden, d.inner())); b.out_s = scale(p + "out.s", d.hidden);
-            b.gu_q = w.at(p + "gu.q", wbytes(2 * d.ffn, d.hidden));   b.gu_s = scale(p + "gu.s", 2 * d.ffn);
-            b.down_q = w.at(p + "down.q", wbytes(d.hidden, d.ffn));   b.down_s = scale(p + "down.s", d.hidden);
+            b.qkv_q = wpad(p + "qkv.q", d.qkv(), d.hidden);   b.qkv_s = scale(p + "qkv.s", d.qkv());
+            b.out_q = wpad(p + "out.q", d.hidden, d.inner()); b.out_s = scale(p + "out.s", d.hidden);
+            b.gu_q = wpad(p + "gu.q", 2 * d.ffn, d.hidden);   b.gu_s = scale(p + "gu.s", 2 * d.ffn);
+            b.down_q = wpad(p + "down.q", d.hidden, d.ffn);   b.down_s = scale(p + "down.s", d.hidden);
             if (d.bias) { b.qkv_b = w.at(p + "qkv.b", size_t(d.qkv()) * 4); b.out_b = w.at(p + "out.b", size_t(d.hidden) * 4); b.gu_b = w.at(p + "gu.b", size_t(2 * d.ffn) * 4); b.down_b = w.at(p + "down.b", size_t(d.hidden) * 4); }
             b.norm1 = w.at(p + "norm1", size_t(d.hidden) * 4); b.norm2 = w.at(p + "norm2", size_t(d.hidden) * 4);
             if (qk_weights) { b.qnorm = w.at(p + "qnorm", size_t(d.head_dim) * 4); b.knorm = w.at(p + "knorm", size_t(d.head_dim) * 4); }
@@ -322,30 +356,46 @@ public:
             if (w.spans.count(p + "scale1")) { b.scale1 = w.at(p + "scale1", size_t(d.hidden) * 4); b.scale2 = w.at(p + "scale2", size_t(d.hidden) * 4); }
             blocks_.push_back(b);
         }
-        prep_norm_.build(c, "norm", bits, d.hidden, d.eps, d.classes);
-        prep_attn_.build(c, "plain", bits, d.inner());
-        prep_down_.build(c, "plain", bits, d.ffn);
-        gemm_qkv_.build(c, "plain", bits, d.bias, true, d.hidden, d.qkv(), tokens);
-        gemm_gu_.build(c, "swiglu", bits, d.bias, d.gate_first, d.hidden, 2 * d.ffn, tokens);
-        gemm_out_.build(c, "resid", bits, d.bias, true, d.inner(), d.hidden, tokens, d.classes);
-        gemm_down_.build(c, "resid", bits, d.bias, true, d.ffn, d.hidden, tokens, d.classes);
+        prep_norm_.build(c, "norm", bits, d.hidden, d.eps, d.classes, int(pitch(d.hidden)));
+        prep_attn_.build(c, "plain", bits, d.inner(), 1e-5f, 1, int(pitch(d.inner())));
+        prep_down_.build(c, "plain", bits, d.ffn, 1e-5f, 1, int(pitch(d.ffn)));
+        gemm_qkv_.build(c, "plain", bits, d.bias, true, d.hidden, d.qkv(), tokens, 1, int(pitch(d.hidden)));
+        gemm_gu_.build(c, "swiglu", bits, d.bias, d.gate_first, d.hidden, 2 * d.ffn, tokens, 1, int(pitch(d.hidden)));
+        gemm_out_.build(c, "resid", bits, d.bias, true, d.inner(), d.hidden, tokens, d.classes, int(pitch(d.inner())));
+        gemm_down_.build(c, "resid", bits, d.bias, true, d.ffn, d.hidden, tokens, d.classes, int(pitch(d.ffn)));
         {
             const std::string stem = d.head_dim == 64 ? "rope64_qknorm_f16" : (d.rope_dim == 128 ? "rope128_qknorm_f16" : "rope_qknorm_f16");
             const std::string ns = "h3." + stem + ".";
             rope_ = c.get(stem, "h3_" + stem, {{ns + "row_stride", std::to_string(d.qkv())}, {ns + "heads", std::to_string(d.heads)}, {ns + "kv_heads", std::to_string(d.kv_heads)}, {ns + "k_offset", std::to_string(d.inner())}, {ns + "eps", num(d.eps)}});
         }
-        const bool qk_int = d.attn_i4 || d.attn_qk_bits == 8; const std::string pqk = d.attn_i4 ? "prepare_qk_i4" : "prepare_qk_i8";
+        const bool qk_int = d.attn_i4 || d.attn_qk_bits == 8;
+        const bool qk_head_major = !d.attn_i4 && d.attn_qk_bits == 8 && waves_ == 8;
+        const std::string pqk = d.attn_i4 ? "prepare_qk_i4" : (qk_head_major ? "prepare_qk_i8hm" : "prepare_qk_i8");
         if (qk_int) {
             if (d.causal || d.head_dim != 128) throw std::runtime_error("integer QK^T attention: MHA with head 128 only");
             const std::string pq = "h3." + pqk + ".";
             colmean_ = c.get("colmean_f32", "h3_colmean_f32", {{"h3.colmean_f32.width", std::to_string(d.inner())}});
-            prep_q_ = c.get(pqk, "h3_" + pqk, {{pq + "row_stride", std::to_string(d.inner())}, {pq + "head_offset", "0"}, {pq + "heads", std::to_string(d.heads)}, {pq + "extra_scale", num(1.0 / std::sqrt(double(d.head_dim)) / 128.0)}});
-            prep_k_ = c.get(pqk, "h3_" + pqk, {{pq + "row_stride", std::to_string(d.inner())}, {pq + "head_offset", "0"}, {pq + "heads", std::to_string(d.heads)}, {pq + "extra_scale", "1"}});
+            Cfg prep_cfg{{pq + "row_stride", std::to_string(d.inner())}, {pq + "head_offset", "0"}, {pq + "heads", std::to_string(d.heads)}};
+            if (qk_head_major) prep_cfg.emplace_back(pq + "token_capacity", std::to_string(capacity_));
+            prep_cfg.emplace_back(pq + "extra_scale", num(1.0 / std::sqrt(double(d.head_dim)) / 128.0));
+            prep_q_ = c.get(pqk, "h3_" + pqk, prep_cfg);
+            prep_cfg.back().second = "1";
+            prep_k_ = c.get(pqk, "h3_" + pqk, prep_cfg);
             transpose_ = c.get("transpose_f16", "h3_transpose_f16", {{"h3.transpose_f16.width", std::to_string(d.inner())}, {"h3.transpose_f16.row_capacity", std::to_string(capacity_)}});
         }
         {
             std::string stem = d.causal ? "attention_gqa8c_lds_f16_wmma" : (d.head_dim == 64 ? (waves_ == 8 ? "attention_mha648_lds_f16_wmma" : "attention_mha64_lds_f16_wmma") : (waves_ == 8 ? "attention_mha8_lds_f16_wmma" : "attention_mha_lds_f16_wmma"));
-            if (qk_int) { stem = (tokens >= 20000 && d.attn_i4) ? "attention_i4qkl_mha8_lds_f16_wmma" : (waves_ == 8 ? "attention_i4qk_mha8_lds_f16_wmma" : "attention_i4qk_mha_lds_f16_wmma"); if (!d.attn_i4) { stem.replace(stem.find("i4qk"), 4, "i8qk"); if (waves_ == 8) stem.replace(stem.find("i8qk"), 4, "i8qkf"); } }   // int8: the eight-wave form carries the next tile's K packet (tools/gen_attention_prefetch.py, 1.1x at 37k rows; the four-wave form loses); the one-workgroup-per-CU form helps int4 past 20k rows and costs int8 3%   // one workgroup per CU past ~20k rows
+            if (qk_int) {
+                if (qk_head_major) {
+                    // Head-major Q/K/scales keep each head's streaming operands contiguous.
+                    stem = "attention_i8qkhm_mha8_lds_f16_wmma";
+                } else if (d.attn_i4) {
+                    stem = tokens >= 20000 ? "attention_i4qkl_mha8_lds_f16_wmma" :
+                           (waves_ == 8 ? "attention_i4qk_mha8_lds_f16_wmma" : "attention_i4qk_mha_lds_f16_wmma");
+                } else {
+                    stem = "attention_i8qk_mha_lds_f16_wmma";
+                }
+            }
             // tile skip: H3_ATTN_SKIP_TAU=<tau> selects the skip twin (i4qk -> i4qks) at that tau (tau 4: no measured velocity cost,
             // about 3% on the 768 step against the carried-scale plain kernel); unset or 'off' -> the plain kernel
             double tau = 0.0;
@@ -358,7 +408,7 @@ public:
             attention_ = c.get(stem, "h3_" + stem, acfg);
         }
         const size_t T = capacity_;
-        a_q_ = memory_.alloc(T * size_t(std::max(d.ffn, std::max(d.hidden, d.inner()))) * (bits == 4 ? 1 : bits == 8 ? 1 : 2) / (bits == 4 ? 2 : 1));
+        a_q_ = memory_.alloc(T * std::max(pitch(d.ffn), std::max(pitch(d.hidden), pitch(d.inner()))) * (bits == 4 ? 1 : bits == 8 ? 1 : 2) / (bits == 4 ? 2 : 1));
         a_s_ = memory_.alloc(T * 4);
         fused_ = memory_.alloc(T * size_t(d.qkv()) * 2);
         q_ = memory_.alloc(T * size_t(d.inner()) * 2);

@@ -13,6 +13,8 @@ config.decl @h3.gemm_i4_256.k_size : %value: index where [range(%value, 128, 655
 
 config.decl @h3.gemm_i4_256.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
 
+config.decl @h3.gemm_i4_256.k_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+
 config.decl @h3.gemm_i4_256.m_group : %value: index where [range(%value, 1, 4)]
 
 kernel.def target(@h3_gemm_i4_256_gfx11) export("h3_gemm_i4_256") @h3_gemm_i4_256(%m_size: index) {
@@ -36,6 +38,10 @@ kernel.def target(@h3_gemm_i4_256_gfx11) export("h3_gemm_i4_256") @h3_gemm_i4_25
   %k_size0 = config.get @h3.gemm_i4_256.k_size : index
   %n_size0 = config.get @h3.gemm_i4_256.n_size : index
   %k_size = index.assume %k_size0 [range(%k_size0, 128, 65536), mul(%k_size0, 128)] : index
+  // the operand rows' pitch (k elements); K itself when it is not a multiple of 1024, else K + 64,
+  // so that the 384 rows a step touches do not alias in the cache (K = 7168: 36.7 -> 41.2 TOPS, K = 21504: 33.4 -> 41.4)
+  %k_stride0 = config.get @h3.gemm_i4_256.k_stride : index
+  %k_stride = index.assume %k_stride0 [range(%k_stride0, 128, 65536), mul(%k_stride0, 128)] : index
   %n_size = index.assume %n_size0 [range(%n_size0, 128, 65536), mul(%n_size0, 128)] : index
 
   %c0 = index.constant 0 : index
@@ -110,7 +116,7 @@ kernel.def target(@h3_gemm_i4_256_gfx11) export("h3_gemm_i4_256") @h3_gemm_i4_25
   %wave_col = index.mul %wave_n, %c64 : index
   %base_m = index.mul %tile_m_id, %c256 : index
   %base_n = index.mul %tile_n_id, %c128 : index
-  %k_quads = index.div %k_size, %c8 : index
+  %k_quads = index.div %k_stride, %c8 : index
 
   %a_global = buffer.assume.memory_space<global> %a : buffer
   %w_global = buffer.assume.memory_space<global> %w : buffer
@@ -175,30 +181,10 @@ kernel.def target(@h3_gemm_i4_256_gfx11) export("h3_gemm_i4_256") @h3_gemm_i4_25
 
   // Gather of the first k step into registers.
   %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), mul(%st_quad, 4)] : index
-  %ga0 = scf.if %a_ok0 -> (vector<4xi32>) {
-    %v = vector.load %a_view[%a_row0, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
-    scf.yield %v : vector<4xi32>
-  } else {
-    scf.yield %zero_i32x4 : vector<4xi32>
-  }
-  %ga1 = scf.if %a_ok1 -> (vector<4xi32>) {
-    %v = vector.load %a_view[%a_row1, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
-    scf.yield %v : vector<4xi32>
-  } else {
-    scf.yield %zero_i32x4 : vector<4xi32>
-  }
-  %ga2 = scf.if %a_ok2 -> (vector<4xi32>) {
-    %v = vector.load %a_view[%a_row2, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
-    scf.yield %v : vector<4xi32>
-  } else {
-    scf.yield %zero_i32x4 : vector<4xi32>
-  }
-  %ga3 = scf.if %a_ok3 -> (vector<4xi32>) {
-    %v = vector.load %a_view[%a_row3, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
-    scf.yield %v : vector<4xi32>
-  } else {
-    scf.yield %zero_i32x4 : vector<4xi32>
-  }
+  %ga0 = vector.load %a_view[%a_row0, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+  %ga1 = vector.load %a_view[%a_row1, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+  %ga2 = vector.load %a_view[%a_row2, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+  %ga3 = vector.load %a_view[%a_row3, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
   %gw0 = vector.load %w_view[%w_row0, %kq_first] : view<[%n_size]x[%k_quads]xi32> -> vector<4xi32>
   %gw1 = vector.load %w_view[%w_row1, %kq_first] : view<[%n_size]x[%k_quads]xi32> -> vector<4xi32>
 
@@ -219,46 +205,12 @@ kernel.def target(@h3_gemm_i4_256_gfx11) export("h3_gemm_i4_256") @h3_gemm_i4_25
     %kq_slot = index.add %kq_next0, %st_quad : index
     %kq_safe = scf.select %in_k, %kq_slot, %st_quad : index
     %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), mul(%kq_safe, 4)] : index
-    %load_a0 = scalar.andi %in_k, %a_ok0 : i1
-    %na0 = scf.if %load_a0 -> (vector<4xi32>) {
-      %v = vector.load %a_view[%a_row0, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
-      scf.yield %v : vector<4xi32>
-    } else {
-      scf.yield %zero_i32x4 : vector<4xi32>
-    }
-    %load_a1 = scalar.andi %in_k, %a_ok1 : i1
-    %na1 = scf.if %load_a1 -> (vector<4xi32>) {
-      %v = vector.load %a_view[%a_row1, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
-      scf.yield %v : vector<4xi32>
-    } else {
-      scf.yield %zero_i32x4 : vector<4xi32>
-    }
-    %load_a2 = scalar.andi %in_k, %a_ok2 : i1
-    %na2 = scf.if %load_a2 -> (vector<4xi32>) {
-      %v = vector.load %a_view[%a_row2, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
-      scf.yield %v : vector<4xi32>
-    } else {
-      scf.yield %zero_i32x4 : vector<4xi32>
-    }
-    %load_a3 = scalar.andi %in_k, %a_ok3 : i1
-    %na3 = scf.if %load_a3 -> (vector<4xi32>) {
-      %v = vector.load %a_view[%a_row3, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
-      scf.yield %v : vector<4xi32>
-    } else {
-      scf.yield %zero_i32x4 : vector<4xi32>
-    }
-    %nw0 = scf.if %in_k -> (vector<4xi32>) {
-      %v = vector.load %w_view[%w_row0, %kq_next] : view<[%n_size]x[%k_quads]xi32> -> vector<4xi32>
-      scf.yield %v : vector<4xi32>
-    } else {
-      scf.yield %zero_i32x4 : vector<4xi32>
-    }
-    %nw1 = scf.if %in_k -> (vector<4xi32>) {
-      %v = vector.load %w_view[%w_row1, %kq_next] : view<[%n_size]x[%k_quads]xi32> -> vector<4xi32>
-      scf.yield %v : vector<4xi32>
-    } else {
-      scf.yield %zero_i32x4 : vector<4xi32>
-    }
+    %na0 = vector.load %a_view[%a_row0, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+    %na1 = vector.load %a_view[%a_row1, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+    %na2 = vector.load %a_view[%a_row2, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+    %na3 = vector.load %a_view[%a_row3, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+    %nw0 = vector.load %w_view[%w_row0, %kq_next] : view<[%n_size]x[%k_quads]xi32> -> vector<4xi32>
+    %nw1 = vector.load %w_view[%w_row1, %kq_next] : view<[%n_size]x[%k_quads]xi32> -> vector<4xi32>
 
     // 8 16-wide sub-steps over the staged 64 bytes: 4 A + 4 W runs, 16 WMMAs each.
     %da0_0 = vector.load %a_stage[%fa0, %c0] : view<256x20xi32> -> vector<2xi32>

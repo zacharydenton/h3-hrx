@@ -40,7 +40,10 @@ def build(tokens: int) -> Path:
         ("rope64_qknorm_f16", "h3_rope64_qknorm_f16", "rope_qknorm", {"h3.rope64_qknorm_f16.row_stride": 3 * INNER, "h3.rope64_qknorm_f16.heads": HEADS, "h3.rope64_qknorm_f16.kv_heads": HEADS, "h3.rope64_qknorm_f16.k_offset": INNER, "h3.rope64_qknorm_f16.eps": 1e-5}),
         (attn_stem, "h3_" + attn_stem, "attention", {f"{attn}.q_stride": INNER, f"{attn}.kv_stride": INNER, f"{attn}.tokens": tokens, f"{attn}.token_capacity": capacity, f"{attn}.scale": D ** -0.5, f"{attn}.out_stride": INNER}),
     ]
-    for stem, sym, name, cfg in specs:
+    for stem, sym, name, cfg in specs:   # pitch configs default to K / width here; the host pads them (gemm_pitch in host/h3pipe.cpp)
+        ns = "h3." + stem + "."
+        if stem.startswith("gemm_i") and ns + "k_size" in cfg: cfg.setdefault(ns + "k_stride", cfg[ns + "k_size"])
+        if stem.startswith("prepare_") and stem[-3:] in ("_i4", "_i8") and ns + "width" in cfg: cfg.setdefault(ns + "out_stride", cfg[ns + "width"])
         hs = out / f"{name}.hsaco"
         compile_cached(ROOT / "kernels" / f"{stem}.loom", sym, cfg, hs)
     (out / "capacity.txt").write_text(f"{capacity}\n"); (out / "gemm_tile.txt").write_text("256\n"); (out / "attention_waves.txt").write_text(f"{waves}\n"); (out / "bits.txt").write_text(f"{BITS}\n")

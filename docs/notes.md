@@ -1266,3 +1266,81 @@ scheduling result on the same structure, not a different structure.
 End to end with the prefetch kernel: parity unchanged (video rows 0.9988 at block 30, 0.9991 at 49);
 864x480 x 124 frames 32 s per evaluation (33 before); 1344x768 x 124 frames 139.8 s (attention 94.6 s + 3.0 s
 operands, from 101 + 3), 5.5x ComfyUI's 771 s.
+
+## Day 1: head-major INT8 attention exceeds 30 TFLOP/s in Loom
+
+The new C-host INT8 path reaches 35.903 TFLOP/s-equivalent at 16,000 tokens and
+34.616 at 37,723 (56 heads, D=128), using only Loom-compiled GPU kernels. The
+matching operand preparation writes Q/K/scales by head; a 32-key transposed
+attention tile and bounded WMMA scheduling complete the change. The 37,723-token
+previous default measured 22.850 in the same session. Full-output boundary and
+sharp-softmax tests pass. See [the study](attention-int8-loom.md) and its recorded
+benchmark evidence for the metric, accuracy limits, and reproduction commands.
+
+## The int8 GEMM: two levers that hold, five that do not, and where the rest of the gap sits
+
+Protocol as above: a theory earns a kernel only after a cheap falsifier; every number is an
+A/B/A at 2922x5120x10240 (`tools/bench_gemm_i8.py`, timing only) or the gemm gate. The
+shipped kernel measured 38.8-40.2 TOPS on an idle box (54 measured peak; comfy_kitchen 50).
+
+| theory | falsifier | result | status |
+| --- | --- | --- | --- |
+| the six prefetch loads are predicated (`scf.if` with a zero else) and Loom waits `s_waitcnt vmcnt(0)` before each, serialising them | unconditional loads from clamped addresses (rows past M are never published; the last step's prefetch is never staged) | 40.0-42.8 vs 38.8-40.2, and 228 -> 192 VGPRs | **shipped** (`plain_loads`, all int4/int8 GEMMs) |
+| fragment loads issued one sub-step ahead would cover LDS latency | emit sub-step s+1's loads before sub-step s's WMMAs | Loom re-sinks them next to their use: the ISA is the same, 39-40 | falsified (a scheduler question, not a source one) |
+| 72-byte stage rows (comfy_kitchen's) avoid bank conflicts | pitch 18 dwords, 16-byte loads | Loom emits misaligned `ds_load_b128`: 25 TOPS | not the form |
+| same with two 8-byte pieces per fragment (comfy's `ds_load_2addr_b64`) | pitch 18, `vector<2xi32>` loads and stores | 40.3-40.8 vs 40.3-40.9 | falsified |
+| the raster group | m_group 1 / 2 / 4 / 6 / 12 at 12 m-tiles; 4 / 8 at 32 | 36.4 / 41.2 / 41.7 / 39.9 / 38.4; 42.7 / 41.4 | 4 stays |
+| the epilogue is a large share | K = 2560 / 5120 / 20480 | 42.5 / 41.7 / 32.8 | the opposite: long K loses |
+| rows whose pitch is a multiple of 1024 alias in the cache | K vs K + 64 at the same N: 20480 / 20544, 8192 / 8256, 5120 / 5184 | 31.1 / 41.2, 37.3 / 42.1, 38.7 / 41.8 | **confirmed** |
+| the H3 shapes suffer it | out projection 7168 / 7232, down projection 21504 / 21568, qkv and ff 5376 / 5440 | 36.7 / 41.2, 33.4 / 41.4, 41.8 / 42.0 | **shipped** (`k_stride`) |
+| the loop without any global loads (the compute + LDS ceiling) | packets replaced by constants | 45.9-46.5 | memory costs ~10%; the loop itself sits at 85% of peak |
+
+What shipped: `tools/gen_gemm.py` emits unconditional staging loads and a `k_stride` config
+(the operand rows' pitch); `tools/gen_prepare.py` gives the quantisers an `out_stride`; the host's
+`gemm_pitch` pads K by one k step whenever the row's byte pitch is a multiple of 1024 (int8: 7168 -> 7232, 21504 -> 21568; int4 rows are K/2 bytes, so H3's int4 shapes need no pad and gain nothing from one: 72.6 vs 72.4 at K = 7168),
+the stack's prepare kernels write rows at that pitch, and the blob uploads the block weights at it
+(`Blob::at_padded`, 16 MB chunks). Gates: `tests/test_gemm.py` with `GEMM_KPAD=64` (int8) / `128`
+(int4) checks garbage in the padding is never read; `tests/test_prepare.py` with `PREP_OUT_PAD=64`.
+
+What did not move and why it matters: comfy_kitchen's k loop is *heavier* than ours (627
+instructions per 64-wide step against 395: 144 `v_mov` and 83 `v_dual_mov`, the same 6 predicated
+global loads, the same two barriers, 32 `ds_load_2addr_b64` against our 32 `ds_load_b128`) and
+still reaches 50, above our no-memory ceiling of 46. Its LDS reads are issued fifteen at a time
+with one `lgkmcnt(0)` before sixteen WMMAs; Loom interleaves ours one per WMMA with
+`lgkmcnt(3..0)` waits two or three WMMAs after the load, and re-sinks any source-level
+reordering. The remaining 15% is the operand-read schedule inside the WMMA chain, which is a
+compiler scheduling decision (or a locked `low.invoke` fragment), not a kernel-source lever.
+
+## The transposed attention form, and CK-tile as the existence proof
+
+`tools/gen_attention_transposed.py` derives `attention_i8qkt_mha8_lds_f16_wmma` from the shipped
+prefetch kernel: S^T = K Q^T (K as the lhs fragment, Q as the rhs, held in registers), softmax in
+lane with one xor-16 exchange, P^T repacked to the PV rhs in registers by the new Loom
+strategy (`v_permlanex16` + `v_cvt_f16_f32` x2 + `v_pack_b32_f16` + `v_perm_b32` per register,
+added to the Loom fork with a `permlanex16` cross-lane recipe for xor-16 shuffles), O^T += V^T P^T.
+`prepare_qk_i8t` writes the K scales transposed and parity-split per 16-key block
+(`[heads][capacity]`, index blk*16 + (t&1)*8 + ((t&15)>>1)) so a lane's eight keys are one
+8-float load. Correct at 100 / 1000 / 4000 tokens (`tests/test_attention_i8t.py`,
+`tests/test_prepare_qk_i8t.py`), deterministic, no DPP moves left (10 `v_permlanex16`, 8
+`v_perm`), 989 loop instructions against 1475. It loses anyway: 19.2 / 20.5 TFLOP/s at 16000 /
+37723 against 25.2 / 24.4, with 248 VGPRs and a 36-byte spill of an accumulator round trip
+(`scratch_store` then `scratch_load` of the same registers before the first PV WMMA, with
+`s_waitcnt vmcnt(0)` that also drains the K prefetch). Masking only the last key tile (a uniform
+branch) times identically, so the per-element mask is not the cost; dropping the zero
+`vector<16xf16>` V placeholder the K-only prefetch form still carries changes nothing either
+(`attention_i8qkfz_mha8`: 25.4 / 24.4 against 25.1 / 24.2; Loom had already folded it). The
+head-major kernel above supersedes this form; it stays as the base the pipelined generator reads.
+
+CK-tile's fp16 forward (`tile_example_fmha_fwd`, built for gfx1151 from the flash-attention
+submodule with a `--filter` for the d128 batch kernels): b=1, h=56, d=128, fp16, no mask:
+38.70 TFLOP/s at 37723 tokens (1054 ms), tile 128x64x32, 8 warps, Q in registers, K/V through
+LDS, occupancy hint 6. That is the measured ceiling on this part for an fp16 flash form.
+
+Measured the same evening, for the record: the CPU-bound CK build (68 clang processes) pulls
+the GPU numbers down by 40% through the shared APU power budget (the shipped attention kernel
+read 15.3 TFLOP/s instead of 25.2); never time with a compile running.
+
+End to end with both the GEMM levers and the head-major attention above in one build (parity gate
+unchanged: video rows 0.9988 at block 30, 0.9991 at 49; trajectory rel err 0.0102 after five
+evaluations): 864x480 x 124 frames 26.7 s per evaluation (32 before), 1344x768 x 124 frames
+101-103 s (140 before), no decode, official t2v prompt.

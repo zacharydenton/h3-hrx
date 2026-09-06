@@ -11,6 +11,8 @@ config.decl @h3.prepare_norm_i8.width : %value: index where [range(%value, 256, 
 
 config.decl @h3.prepare_norm_i8.lanes : %value: index where [range(%value, 32, 1024), mul(%value, 32)]
 
+config.decl @h3.prepare_norm_i8.out_stride : %value: index where [range(%value, 256, 65536), mul(%value, 64)]
+
 config.decl @h3.prepare_norm_i8.eps : f32
 
 config.decl @h3.prepare_norm_i8.classes : %value: index where [range(%value, 1, 64)]
@@ -66,7 +68,11 @@ kernel.def target(@h3_prepare_norm_i8_gfx11) export("h3_prepare_norm_i8") @h3_pr
   %lane = kernel.workitem.id<x> : index
   %half_width = index.div %width, %c2 : index
   %word_width = index.div %width, %c4 : index
+  // the quantised rows' pitch: the GEMM's padded k_stride (>= width)
+  %out_stride = config.get @h3.prepare_norm_i8.out_stride : index
+  %out_words = index.div %out_stride, %c4 : index
   %word_last = index.sub %word_width, %c2 : index
+  %out_wlast = index.sub %out_words, %c2 : index
   %width_last = index.sub %width, %c8 : index
   %quads = index.div %width, %c4 : index
   %width_per_lane = index.div %width, %lanes : index
@@ -93,7 +99,7 @@ kernel.def target(@h3_prepare_norm_i8_gfx11) export("h3_prepare_norm_i8") @h3_pr
   %shift_row = index.assume %shift_row0 [range(%shift_row0, 1, 127), lt(%shift_row0, %table_rows)] : index
   %q_global = buffer.assume.memory_space<global> %q : buffer
   %qs_global = buffer.assume.memory_space<global> %q_scale : buffer
-  %qw_view = buffer.view %q_global[%c0_offset] : buffer -> view<[%tokens_b]x[%word_width]xi32>
+  %qw_view = buffer.view %q_global[%c0_offset] : buffer -> view<[%tokens_b]x[%out_words]xi32>
   %qs_view = buffer.view %qs_global[%c0_offset] : buffer -> view<[%tokens_b]xf32>
   %row_bytes0 = index.mul %width, %c4 : index
   %row_bytes = index.cast %row_bytes0 : index to offset
@@ -329,7 +335,8 @@ kernel.def target(@h3_prepare_norm_i8_gfx11) export("h3_prepare_norm_i8") @h3_pr
     %q_words = vector.from_elements %q_lo, %q_hi : vector<2xi32>
     %q_w2 = index.mul %q_chunk, %c2 : index
     %q_w2b = index.assume %q_w2 [le(%q_w2, %word_last), mul(%q_w2, 2)] : index
-    vector.store %q_words, %qw_view[%row, %q_w2b] : vector<2xi32>, view<[%tokens_b]x[%word_width]xi32>
+    %q_w2o = index.assume %q_w2b [le(%q_w2b, %out_wlast), mul(%q_w2b, 2)] : index
+    vector.store %q_words, %qw_view[%row, %q_w2o] : vector<2xi32>, view<[%tokens_b]x[%out_words]xi32>
   }
   // the token scale, by one lane, after the last loop (a divergent region before a
   // loop is rejected by the branch lowering)

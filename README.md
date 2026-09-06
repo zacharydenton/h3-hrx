@@ -119,7 +119,13 @@ won or lost, is in `docs/notes.md`.
 
 **GEMM tile.** The four GEMMs run on a 256x128 workgroup tile of 64x64 wave tiles (half the
 LDS operand reads per multiply of the 128x128 tile), 15-17% faster per stage at 2097 rows;
-`H3_GEMM_TILE=128` builds the smaller tile for comparison.
+`H3_GEMM_TILE=128` builds the smaller tile for comparison. The staging loads are unconditional
+(rows past M clamped, never published: +3 TOPS, 228 -> 192 VGPRs), and the operand rows are
+laid out at a padded pitch whenever K is a multiple of 1024 (`gemm_pitch`: 7168 -> 7232,
+21504 -> 21568), because rows at such a pitch alias in the cache: the out and down projections
+went from 36.7 and 33.4 to 41.2 and 41.4 TOPS. The int8 GEMMs now run at 41-43 TOPS against a
+measured 54 peak; the loop without any global loads reaches 46, so what remains is Loom's
+LDS-read schedule inside the WMMA chain (`docs/notes.md`, "The int8 GEMM").
 
 ## Plan
 
@@ -174,16 +180,16 @@ Measured head to head against ComfyUI's own H3 path (int8 ConvRot checkpoints, b
 pytorch attention, `tools/bench_comfyui_h3.py` in the Strix Halo image): 771 s per step at
 1344x768 and 124 frames against 128 s here with the int4 path in the same session, six times
 faster; 30 steps are 6.4 hours there and about an hour here (`docs/notes.md`, "Head to head
-with ComfyUI"). The int8 path, the one whose clips match ComfyUI's, costs 140 s per
-evaluation at that size with int8 QK^T attention and its next-tile K prefetch (161 s with f16
-attention), 5.5x faster than ComfyUI; at 864x480 and 124 frames (5 s of video) 32 s against
-ComfyUI's 103 s, 3.2x; at
+with ComfyUI"). The int8 path, the one whose clips match ComfyUI's, costs 101-103 s per
+evaluation at that size with the head-major int8 QK^T attention and the padded-pitch GEMMs
+(140 s before them, 161 s with f16 attention), 7.5x faster than ComfyUI; at 864x480 and
+124 frames (5 s of video) 26.7 s against ComfyUI's 103 s, 3.9x; at
 864x480 and 22 frames 4.0 s against 3.8 s, parity. ComfyUI's slowness at video sizes is one
 thing: its H3 model hands torch's flash attention head-strided views, on which aotriton's kernel
 runs at 5.8 TFLOP/s instead of the 30.8 it reaches on contiguous tensors at the same length
 (`docs/notes.md`, "Why ComfyUI is slow"). Its int8 GEMMs (comfy_kitchen) run at 50 TOPS against
-this pipeline's 38, and that 30.8 TFLOP/s attention is the same silicon: the headroom for the
-Loom kernels is about 1.3x on the GEMMs and 1.8x on attention.
+this pipeline's 41-43 after the pitch and load fixes, and that 30.8 TFLOP/s attention is the same silicon: the headroom for the
+Loom kernels is about 1.2x on the GEMMs and 1.8x on attention.
 
 ## Weights and license
 

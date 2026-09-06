@@ -11,6 +11,8 @@ config.decl @h3.prepare_plain_i4.width : %value: index where [range(%value, 256,
 
 config.decl @h3.prepare_plain_i4.lanes : %value: index where [range(%value, 32, 1024), mul(%value, 32)]
 
+config.decl @h3.prepare_plain_i4.out_stride : %value: index where [range(%value, 256, 65536), mul(%value, 64)]
+
 kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_prepare_plain_i4(%tokens: index) {
   %c1 = index.constant 1 : index
   %lanes = config.get @h3.prepare_plain_i4.lanes : index
@@ -60,7 +62,11 @@ kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_
   %lane = kernel.workitem.id<x> : index
   %half_width = index.div %width, %c2 : index
   %word_width = index.div %width, %c8 : index
+  // the quantised rows' pitch: the GEMM's padded k_stride (>= width)
+  %out_stride = config.get @h3.prepare_plain_i4.out_stride : index
+  %out_words = index.div %out_stride, %c8 : index
   %word_last = index.sub %word_width, %c2 : index
+  %out_wlast = index.sub %out_words, %c2 : index
   %width_last = index.sub %width, %c8 : index
   %quads = index.div %width, %c4 : index
   %width_per_lane = index.div %width, %lanes : index
@@ -71,7 +77,7 @@ kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_
   %h_view = buffer.view %h_global[%c0_offset] : buffer -> view<[%tokens_b]x[%width]xf16>
   %q_global = buffer.assume.memory_space<global> %q : buffer
   %qs_global = buffer.assume.memory_space<global> %q_scale : buffer
-  %qw_view = buffer.view %q_global[%c0_offset] : buffer -> view<[%tokens_b]x[%word_width]xi32>
+  %qw_view = buffer.view %q_global[%c0_offset] : buffer -> view<[%tokens_b]x[%out_words]xi32>
   %qs_view = buffer.view %qs_global[%c0_offset] : buffer -> view<[%tokens_b]xf32>
   %row_bytes0 = index.mul %width, %c4 : index
   %row_bytes = index.cast %row_bytes0 : index to offset
@@ -282,7 +288,8 @@ kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_
     %q_o5 = scalar.ori %q_o4, %q_s5 : i32
     %q_o6 = scalar.ori %q_o5, %q_s6 : i32
     %q_o7 = scalar.ori %q_o6, %q_s7 : i32
-    view.store %q_o7, %qw_view[%row, %q_w] : i32, view<[%tokens_b]x[%word_width]xi32>
+    %q_wo = index.assume %q_w [lt(%q_w, %out_words)] : index
+    view.store %q_o7, %qw_view[%row, %q_wo] : i32, view<[%tokens_b]x[%out_words]xi32>
   }
   // the token scale, by one lane, after the last loop (a divergent region before a
   // loop is rejected by the branch lowering)

@@ -4,7 +4,7 @@ silu(g)*u out), on the 128x128 and the 256x128 tiles.
 
     python3 tests/test_gemm.py [M] [tile ...]
 """
-import sys
+import os, sys
 from pathlib import Path
 
 import numpy as np
@@ -33,7 +33,7 @@ def interleave(w):
 
 def run(tmp, mode, tile_m, M, K, N, rng, bits=4, bias=False):
     stem = {"plain": "gemm_i4", "resid": "gemm_i4_resid", "swiglu": "gemm_i4_swiglu"}[mode] + ("_256" if tile_m == 256 else "")
-    stem = stem.replace("i4", f"i{bits}") + ("b" if bias else "") + ("_gs" if (bias and mode == "swiglu") else "")
+    stem = stem.replace("i4", f"i{bits}" + os.environ.get("GEMM_VARIANT", "")) + ("b" if bias else "") + ("_gs" if (bias and mode == "swiglu") else "")     # GEMM_VARIANT=u: experiments/ twins
     ns, sym = "h3." + stem, "h3_" + stem
     lim = 7 if bits == 4 else 127
     a = rng.integers(-lim, lim + 1, (M, K)).astype(np.int8); w = rng.integers(-lim, lim + 1, (N, K)).astype(np.int8)
@@ -42,9 +42,12 @@ def run(tmp, mode, tile_m, M, K, N, rng, bits=4, bias=False):
     full = (a.astype(np.float64) @ w.astype(np.float64).T) * w_scale[None] * a_scale[:, None]
     b_vec = (rng.standard_normal(N) * 0.1).astype(np.float32) if bias else None
     if bias: full = full + b_vec[None]
-    g = m_group(M, tile_m); gy = ((M + tile_m - 1) // tile_m + g - 1) // g * g
-    cfg = {f"{ns}.k_size": K, f"{ns}.n_size": N, f"{ns}.m_group": g}
+    g = int(os.environ.get("GEMM_MGROUP", m_group(M, tile_m))); gy = ((M + tile_m - 1) // tile_m + g - 1) // g * g
+    kpad = int(os.environ.get("GEMM_KPAD", "0"))     # extra k columns of garbage in both operands' rows; the kernel reads k_size of the k_stride pitch
+    cfg = {f"{ns}.k_size": K, f"{ns}.n_size": N, f"{ns}.m_group": g, f"{ns}.k_stride": K + kpad}
     pack = pack_i4 if bits == 4 else (lambda q: q.view(np.uint8))
+    if kpad:
+        a = np.concatenate([a, rng.integers(-lim, lim + 1, (M, kpad)).astype(np.int8)], 1); w = np.concatenate([w, rng.integers(-lim, lim + 1, (N, kpad)).astype(np.int8)], 1)
     args = [("i32", M), ("in_u8", pack(a)), ("in_u8", pack(w if mode != "swiglu" else interleave(w))), ("in", w_scale if mode != "swiglu" else interleave(w_scale[:, None])[:, 0]), ("in", a_scale)]
     if mode == "plain":
         args.append(("out_f16", ((M, N), np.float16))); want = full
@@ -60,7 +63,9 @@ def run(tmp, mode, tile_m, M, K, N, rng, bits=4, bias=False):
     if bias:
         args.append(("in", b_vec if mode != "swiglu" else interleave(b_vec[:, None])[:, 0]))
     hs = tmp / f"{stem}_{K}_{N}.hsaco"
-    compile_kernel(ROOT / "kernels" / f"{stem}.loom", sym, cfg, hs)
+    src = ROOT / "kernels" / f"{stem}.loom"
+    if not src.exists(): src = ROOT / "experiments" / f"{stem}.loom"
+    compile_kernel(src, sym, cfg, hs)
     (out,), t = launch(hs, sym, (N // 128, gy, 1), (256, 1, 1), args, tmp, repeat=1 if mode == "resid" else 3)   # in place: once
     tops = 2.0 * M * K * N / (t["per_launch_us"] * 1e-6) / 1e12
     return report(f"{stem:20s} {M}x{K}x{N} {t['per_launch_us'] / 1e3:8.3f} ms {tops:5.1f} TOPS", out.astype(np.float64), want, atol=(2e-3 if mode != "resid" else 2e-1), rtol=2e-3)

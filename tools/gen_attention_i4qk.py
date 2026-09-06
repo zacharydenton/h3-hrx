@@ -14,7 +14,7 @@ STEM = os.environ.get("ATTN_STEM", {8: "attention_i4qk_mha8_lds_f16_wmma", 4: "a
 OUT = ROOT / ("kernels" if STEM in ("attention_i4qk_mha8_lds_f16_wmma", "attention_i4qk_mha_lds_f16_wmma") else "experiments") / f"{STEM}.loom"
 
 # run the f16 generator in-process with every Q fragment hoisted (no Q LDS) and capture its text
-env = {"ATTN_WAVES": str(WAVES), "ATTN_HOIST": "8", "ATTN_QLDS": "0", "ATTN_D": "128", "ATTN_GQA": "1", "ATTN_TILE": "16", "ATTN_CAUSAL": "0",
+env = {"ATTN_WAVES": str(WAVES), "ATTN_HOIST": os.environ.get("ATTN_HOIST", "8"), "ATTN_QLDS": os.environ.get("ATTN_QLDS", "0"), "ATTN_D": "128", "ATTN_GQA": "1", "ATTN_TILE": "16", "ATTN_CAUSAL": "0",
        "ATTN_STEM": "attention_i4qk_scratch"}
 src = (ROOT / "tools/gen_attention_lds.py").read_text()
 os.environ.update(env)
