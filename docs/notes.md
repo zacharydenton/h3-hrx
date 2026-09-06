@@ -845,3 +845,30 @@ an edited kernel source reused a stale binary: a spilling twin ran the 768 step 
 before the cause was found. Both caches now carry a source hash. And a variant must be A/B'd
 in every form it ships in: the carried scale was measured on the plain kernel and shipped to
 the twins untested, where it spilled.
+
+## Head to head with ComfyUI at 768 (2026-09-06)
+
+`tools/bench_comfyui_h3.py` runs ComfyUI's own MiniMax H3 path in the Strix Halo image
+(`podman run --rm ... --entrypoint /opt/venv/bin/python docker.io/kyuz0/amd-strix-halo-comfyui:latest`,
+ComfyUI 62b3c94 of 2026-08-11 inside it, torch 2.14.0a0+rocm7.15, "pytorch attention",
+DynamicVRAM on): the int8 ConvRot checkpoints from `~/comfy-models`, bf16 compute, the minimax
+CLIP (Qwen3-VL-32B int8), the AV latent node, stock Euler on the 'simple' schedule with the
+model's shifts 12/3, cfg 1, no decode. The same prompt, 1344x768, 124 frames, three steps,
+timed per step from the sampler callback; our pipeline ran right after on the same idle GPU.
+
+| | per step | text encode |
+| --- | ---: | ---: |
+| ComfyUI, int8 ConvRot, bf16 compute, pytorch attention | 772.7 / 772.4 / 768.8 s | 28.7 s |
+| this pipeline, int4 blocks, int4-QK attention (same session) | 127.1 / 127.9 / 128.6 s | |
+| this pipeline, best idle runs earlier in the day | 110 / 113 s | |
+
+Six times faster per step (6.0x in the same session, 6.8x against our best idle runs); 30
+steps are 6.4 hours in ComfyUI against 57 to 64 minutes here. The estimate before measuring
+(1.5x) assumed torch SDPA at 18 TFLOP/s; at 37k rows ComfyUI's attention runs far below that.
+Two runs before this one died: with `--disable-mmap` (the toolbox's recommendation, used by
+krea2's bench) the 48 GB of int8 weights sit in RAM next to their device copies and the run
+was OOM-killed at sampling; the script now mmaps and unloads the text encoder before sampling.
+And a container launched from a shell wrapper loses its output if the wrapper dies, so the
+bench runs detached (`podman run -d --name h3bench`, `podman logs`). Another session's GPU job
+(`build/down-component-repeat.py`) overlapped the second attempt; the numbers above are from a
+run with nothing else on the GPU (rocm-smi 0% before, checked).

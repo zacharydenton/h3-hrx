@@ -138,6 +138,10 @@ LDS operand reads per multiply of the 128x128 tile), 15-17% faster per stage at 
 
 At 480p and 4 s (about 10k rows) a step is about 12 s at the rates krea2-loom reaches on
 this part; at 768p and 5 s (about 37k rows) a step is 110-114 s (124 frames), attention about 75% of it.
+Measured head to head against ComfyUI's own H3 path (int8 ConvRot checkpoints, bf16 compute,
+pytorch attention, `tools/bench_comfyui_h3.py` in the Strix Halo image): 771 s per step at
+1344x768 and 124 frames against 128 s here in the same session, six times faster; 30 steps
+are 6.4 hours there and about an hour here (`docs/notes.md`, "Head to head with ComfyUI").
 Attention, not the int4 GEMMs, is the wall at video lengths.
 
 ## Weights and license
