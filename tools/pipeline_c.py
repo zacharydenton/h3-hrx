@@ -1,13 +1,12 @@
 """Text -> video + audio through libh3pipe.so alone: the tokenizer here, everything else in the C
 library (every kernel in Loom). Writes <out>.mp4 (+ .wav) through ffmpeg.
     python3 tools/pipeline_c.py "a red fox ..." [--frames 124 --steps 50 --height 480 --width 864 --seed 0 --out build/clip_c.mp4]"""
-import argparse, subprocess, sys, time, wave
+import argparse, math, subprocess, sys, time, wave
 from pathlib import Path
 import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "tools"))
 from h3pipe_loom import H3Pipe
-from encode_prompt import TOK
 FPS, RATE = 24, 32000
 
 
@@ -15,14 +14,40 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument("prompt"); ap.add_argument("--height", type=int, default=480); ap.add_argument("--width", type=int, default=864)
     ap.add_argument("--frames", type=int, default=124); ap.add_argument("--steps", type=int, default=50); ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cache-threshold", type=float, default=0.0, help="first-block step cache threshold (0 = off)"); ap.add_argument("--vae-bits", type=int, default=8); ap.add_argument("--out", default=str(ROOT / "build/clip_c.mp4")); ap.add_argument("--latents-out", default=None); ap.add_argument("--no-decode", action="store_true", help="stop after denoising (timing runs)")
+    ap.add_argument("--ref-image", action="append", default=[], help="reference image (png/jpg) for ref2va: presented as <Picture i> and encoded by the VAE encoder; repeatable")
+    ap.add_argument("--ref-audio", action="append", default=[], help="reference wav (32 kHz stereo/mono) for ref2va: <Audio j>; repeatable")
+    ap.add_argument("--first-frame", default=None, help="keyframe image for fl2va (resized to the canvas)")
+    ap.add_argument("--blocks", default=None); ap.add_argument("--glue", default=None)
     a = ap.parse_args()
-    from transformers import AutoTokenizer
-    ids = AutoTokenizer.from_pretrained(str(TOK))(a.prompt, add_special_tokens=False)["input_ids"]
-    t0 = time.time(); pipe = H3Pipe(vae_bits=a.vae_bits); print(f"session in {time.time() - t0:.1f} s; {len(ids)} prompt tokens", flush=True)
+    from h3tok_ids import encode_presentation
+    t0 = time.time(); pipe = H3Pipe(vae_bits=a.vae_bits, blocks=a.blocks, glue=a.glue); print(f"session in {time.time() - t0:.1f} s", flush=True)
     p = H3Pipe.params(height=a.height, width=a.width, frames=a.frames, steps=a.steps, seed=a.seed, cache_threshold=a.cache_threshold); sh = pipe.shape(p)
     print(f"{sh.frames} frames at {a.width}x{a.height}: {sh.latent_t}x{sh.lat_h}x{sh.lat_w} latents, {sh.audio_t} audio latents", flush=True)
+    # references (ref2va) and the keyframe (fl2va): images resized as ComfyUI's nodes do, encoded by the Loom encoders
+    refs, kfs, image_tokens = [], [], []
+    def load_image(path, tw, th):
+        from PIL import Image
+        im = Image.open(path).convert("RGB").resize((tw, th), Image.BILINEAR); return np.asarray(im, dtype=np.float32) / 255.0
+    if a.first_frame:
+        img = load_image(a.first_frame, a.width, a.height); z = pipe.encode_video(img)
+        kfs.append({"frame_index": 0, "video": z, "pixels": img}); image_tokens.append((a.height // 32) * (a.width // 32))
+    for path in a.ref_image:
+        from PIL import Image
+        w, h = Image.open(path).size; scale = min(1.0, math.sqrt((a.width * a.height) / (w * h)))
+        tw, th = max(32, round(w * scale / 32) * 32), max(32, round(h * scale / 32) * 32)
+        img = load_image(path, tw, th); z = pipe.encode_video(img)
+        refs.append({"kind": "image", "video": z, "pixels": img}); image_tokens.append((th // 32) * (tw // 32))
+    for path in a.ref_audio:
+        with wave.open(path, "rb") as wf:
+            sr, ch, sw, n = wf.getframerate(), wf.getnchannels(), wf.getsampwidth(), wf.getnframes(); raw = wf.readframes(n)
+        if sr != 32000: raise SystemExit(f"{path}: {sr} Hz; reference audio must be 32 kHz")
+        pcm = np.frombuffer(raw, dtype={1: np.int8, 2: np.int16, 4: np.int32}[sw]).astype(np.float32) / float(2 ** (8 * sw - 1)); pcm = pcm.reshape(n, ch).T
+        if ch == 1: pcm = np.concatenate([pcm, pcm])
+        refs.append({"kind": "audio", "audio": pipe.encode_audio(pcm[:2])})
+    ids = encode_presentation(a.prompt, images=image_tokens, audios=len(a.ref_audio))
+    print(f"{len(ids)} prompt tokens ({len(kfs)} keyframe, {len(a.ref_image)} reference images, {len(a.ref_audio)} reference audio)", flush=True)
     t0 = time.time()
-    video, audio = pipe.denoise(ids, p, progress=lambda step, n, sec: print(f"  step {step}/{n}  {sec:.1f} s", flush=True) or 0)
+    video, audio = pipe.denoise(ids, p, progress=lambda step, n, sec: print(f"  step {step}/{n}  {sec:.1f} s", flush=True) or 0, refs=refs, keyframes=kfs)
     print(f"denoised in {time.time() - t0:.1f} s", flush=True)
     if a.latents_out: np.savez(a.latents_out, video=video, audio=audio)
     if a.no_decode: return

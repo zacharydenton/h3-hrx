@@ -123,8 +123,16 @@ with torch.inference_mode():
         v, au = noise.unbind(); save(f"{tag}_noise_video", v[0]); save(f"{tag}_noise_audio", au[0])
         got = {}
         def cb(step, x0, x, total): got["x0"] = x0; got["x"] = x
+        dm = model.model.diffusion_model; orig_forward = dm.forward   # the network's own inputs and raw outputs at the first call
+        def hooked(x, timestep, context, *args, **kw):
+            out = orig_forward(x, timestep, context, *args, **kw)
+            if "raw" not in got: got["raw"] = (x[0].detach().float().cpu().clone(), x[1].detach().float().cpu().clone(), out[0].detach().float().cpu().clone(), out[1].detach().float().cpu().clone(), timestep.detach().float().cpu().clone())
+            return out
+        dm.forward = hooked
         comfy.sample.sample(model, noise, 1, 1.0, "euler", "simple", positive, positive, latent["samples"], seed=a.seed, callback=cb, disable_pbar=True)
         dv, da = got["x0"].unbind(); save(f"{tag}_denoised_video", dv[0]); save(f"{tag}_denoised_audio", da[0])
         xv, xa = got["x"].unbind(); save(f"{tag}_x_video", xv[0]); save(f"{tag}_x_audio", xa[0])
+        dm.forward = orig_forward
+        iv, ia, ov, oa, ts = got["raw"]; save(f"{tag}_in_video", iv[0]); save(f"{tag}_in_audio", ia[0]); save(f"{tag}_out_video", ov[0]); save(f"{tag}_out_audio", oa[0]); save(f"{tag}_timestep", ts)
       model = None; comfy.model_management.unload_all_models(); comfy.model_management.soft_empty_cache()
     print("done", flush=True)
