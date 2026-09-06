@@ -931,3 +931,28 @@ address proof multiplies config *ranges*, so a `rows_bound` config carries the c
 subtraction the prover cannot bound must sit inside the branch that proves it (reflect's y0 - 1).
 
 Gates (tests/test_vision.py, tests/test_vae_encoder.py, tests/test_ref2va.py --case audio|both|fl2va):
+
+| gate (against ComfyUI's own path) | result |
+| --- | ---: |
+| audio encoder latents (`tests/test_audio_encoder.py`) | cosine 1.0000000, rel 8e-6 |
+| vision tower merged / DeepStack 0, 1, 2 (`tests/test_vision.py`) | 0.99996 / 0.99999, 0.99998, 0.99997 |
+| video VAE encoder, image / 17-frame clip (`tests/test_vae_encoder.py --clip`) | 0.99942 / 0.99938 |
+| presentation ids, all cases | identical |
+| one-step network velocity, video / audio, t2va (no references; the quantisation baseline) | 0.959 / 0.989 |
+| fl2va, first-frame keyframe through the vision tower and the VAE encoder | 0.986 / 0.975 |
+| ref2va, one audio reference (the ref2va GPTQ export) | 0.946 / 0.972 |
+| ref2va, image + audio references | 0.940 / 0.978 |
+
+The one-step comparison is on the network's raw outputs (a forward hook in the harness), not the
+sampler's denoised latents: ComfyUI carries the audio latent on the video schedule and its wrapper
+returns (1 - 4) x_a + (1 + 3 sigma_a) net_out for the audio stream, which made the audio look 0.77
+until undone. The remaining video gap (0.94-0.96) is the int4 GPTQ blocks against ComfyUI's bf16
+compute; the ref2va export was calibrated on the fl2va fixture, which costs about a point.
+
+Process: two truth chains overlapped once because the harness prints its own "done" line that my
+wait keyed on, and the all-cases truth run (text encoder plus DiT resident, about 50 GB) on a box
+already at 83 GB plus 42 GB of zram tipped the global OOM killer, which also took the user's
+`systemd --user` and dbus. Truth runs now go one case per container with a memory check first.
+
+`tools/pipeline_c.py --ref-image ... --ref-audio ... --first-frame ...` runs the whole thing with the
+Loom encoders and the C tokenizer's presentation; the ref2va 480p clip steps at the t2va rate.

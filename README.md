@@ -134,6 +134,27 @@ LDS operand reads per multiply of the 128x128 tile), 15-17% faster per stage at 
 3. The C runtime and ctypes wrapper, the end-to-end clip through the official pipeline
    with the blocks in Loom, PSNR against bf16, then the lever loop.
 
+## Reference conditioning: fl2va and ref2va, all in Loom
+
+The three encoders ComfyUI's graph needs for references now run in Loom: the audio VAE encoder
+(`h3pipe_encode_audio`), Qwen3-VL's vision tower with its DeepStack features into the text encoder
+(`h3pipe_vision_embed`, used by the prompt path), and the video VAE's causal 3-D conv encoder
+(`h3pipe_encode_video`, images and 17-frame clips, tiled as ComfyUI does). `h3pipe_denoise_refs`
+packs keyframes (fl2va) and reference images, videos and audio (ref2va) between the text and the
+target streams with ComfyUI's layout. Against ComfyUI's own encoders: audio 1.0000000, vision
+0.99996, VAE 0.9994; one-step network velocities 0.94-0.99 across t2va, fl2va and ref2va (the gap is
+the int4 blocks). Weights: `tools/export_audio_encoder.py`, `tools/export_vision.py`,
+`tools/export_vae_encoder.py`, and for ref2va `H3_CKPT=<ref2va checkpoint> H3_GLUE_OUT=... tools/export_glue.py`
+plus `tools/gptq_export.py --out ...`. Run:
+
+```sh
+python3 tools/pipeline_c.py "<Picture 1> is the fox. A red fox ... with the sound of <Audio 1>" \
+  --ref-image fox.png --ref-audio fox.wav --blocks build/weights_gptq_ref2va --glue build/weights_glue_ref2va
+python3 tools/pipeline_c.py "A red fox ..." --first-frame fox.png      # fl2va with the default weights
+```
+
+Details and every gate: `docs/plan-refs.md`, `docs/notes.md` ("Reference conditioning").
+
 ## What to expect
 
 At 480p and 4 s (about 10k rows) a step is about 12 s at the rates krea2-loom reaches on
