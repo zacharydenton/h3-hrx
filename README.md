@@ -151,7 +151,21 @@ target streams with ComfyUI's layout. Against ComfyUI's own encoders: audio 1.00
 0.99996, VAE 0.9994; one-step network velocities 0.94-0.99 across t2va, fl2va and ref2va (the gap is
 the int4 blocks). Weights: `tools/export_audio_encoder.py`, `tools/export_vision.py`,
 `tools/export_vae_encoder.py`, and for ref2va `H3_CKPT=<ref2va checkpoint> H3_GLUE_OUT=... tools/export_glue.py`
-plus `tools/gptq_export.py --out ...`. Run:
+plus `tools/gptq_export.py --out ...`.
+
+**`h3`, the whole thing from the shell** (`build/h3`, C++ over the C ABI; ffmpeg decodes the inputs and muxes the output;
+no Python anywhere in the run):
+
+```sh
+h3 ref1.jpg voice.wav < prompt.txt                     # references by extension: <Picture 1>, <Audio 1>, prompt on stdin
+h3 --first-frame fox.png -p "A red fox ..." --out fox.mp4
+h3 -p "..." --frames 124 --steps 31 --width 864 --height 480 --seed 0 --precision int8
+```
+
+Any image or audio format ffmpeg reads; audio is resampled to 32 kHz stereo, images are resized as `tools/pipeline_c.py`
+did (PIL's antialiased bilinear, references to at most the canvas' pixel count on a 32-pixel grid). The ref2va weight
+exports are picked up when a reference is given and they exist. `ln -s $PWD/build/h3 ~/.local/bin/h3` puts it on the PATH;
+it finds the repository from its own location (`--root` overrides). The Python driver remains:
 
 ```sh
 python3 tools/pipeline_c.py "<Picture 1> is the fox. A red fox ... with the sound of <Audio 1>" \
