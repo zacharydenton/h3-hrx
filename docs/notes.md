@@ -1177,3 +1177,26 @@ The f16 GEMMs run at 28-30 TFLOP/s against the int8 kernels' 38 TOPS (the one-pa
 55 KB stage), so bf16 costs about 1.4x at 480p and 1.3x at 768p for a quality difference that is not
 measurable against the bf16 model. It stays as an option; int8 stays the default. Its GEMMs' 32-wide
 k-stage form is the lever if it is ever wanted.
+
+## Why ComfyUI is slow, and what it says about our kernels (2026-09-06)
+
+`torch.profiler` around ComfyUI's own sampling (`tools/bench_comfyui_h3.py`, `H3_TORCH_PROFILE=1`),
+864x480 x 124 frames, two evaluations: `attn_fwd.kd` (aotriton flash attention) 128.7 s of 164.5 s
+of GPU time, 78%; `comfy_kitchen::int8_linear` (its own HIP WMMA int8 GEMMs) 23.4 s, 14%; weight
+streaming (`hipMemMap`, HtoD) about 4 s. Per evaluation that is 64 s of attention for 340 TFLOP:
+5.3 TFLOP/s. Yet the same aotriton kernel, timed alone in the same container on contiguous
+[1, H, S, 128] bf16 tensors, holds 30.5-31 TFLOP/s from 4k to 37.7k tokens. The difference is the
+layout: `comfy/ldm/minimax/model.py` hands attention `x.transpose(0, 1).unsqueeze(0)` views of
+[S, H, D] tensors (head-strided), and on that layout the kernel runs at 5.8 TFLOP/s (measured,
+`build/comfy_sdpa_layout.py`; slices of a fused qkv the same). One missing `.contiguous()`
+costs ComfyUI 5x on attention, which is 78% of a video-length step. At 864x480 x 22 frames,
+where attention is small, ComfyUI's steady evaluation is 3.8 s (the 5.2 s measured earlier
+came from a run that was also dumping tensors every step) against this pipeline's 4.0 s: parity.
+
+What it says about the Loom kernels: the int8 GEMMs here run at 38 TOPS where comfy_kitchen's
+reach 50 and hipBLASLt's bf16 GEMM 39.6 TFLOP/s (54 peak), and the f16/int8 attention here runs at
+15-17.5 TFLOP/s at 37k rows where a Triton flash kernel holds 30.8 on this part. So about 1.3x is
+on the table in the GEMMs and 1.8x in attention, and a 768p evaluation could go from 146 s to
+roughly 90 s at parity precision. Those are the two kernel projects; both have a measured
+existence proof on this silicon. If ComfyUI fixed its layout its 768p step would drop from 771 s
+to roughly 170 s, so the honest comparison is against that number, not the 771.

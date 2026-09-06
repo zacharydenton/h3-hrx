@@ -177,8 +177,12 @@ faster; 30 steps are 6.4 hours there and about an hour here (`docs/notes.md`, "H
 with ComfyUI"). The int8 path, the one whose clips match ComfyUI's, costs 146 s per
 evaluation at that size with int8 QK^T attention (161 s with f16 attention), 5.3x faster than
 ComfyUI; at 864x480 and 124 frames (5 s of video) 33 s against ComfyUI's 103 s, 3.1x; at
-864x480 and 22 frames 4.0 s against 5.2 s. Attention is 70% of a 768p evaluation and runs at
-17 TFLOP/s against the part's 54 peak; the remaining large lever is that kernel's schedule.
+864x480 and 22 frames 4.0 s against 3.8 s, parity. ComfyUI's slowness at video sizes is one
+thing: its H3 model hands torch's flash attention head-strided views, on which aotriton's kernel
+runs at 5.8 TFLOP/s instead of the 30.8 it reaches on contiguous tensors at the same length
+(`docs/notes.md`, "Why ComfyUI is slow"). Its int8 GEMMs (comfy_kitchen) run at 50 TOPS against
+this pipeline's 38, and that 30.8 TFLOP/s attention is the same silicon: the headroom for the
+Loom kernels is about 1.3x on the GEMMs and 1.8x on attention.
 
 ## Weights and license
 

@@ -44,6 +44,12 @@ with torch.inference_mode():
     def cb(step, x0, x, total):
         marks.append(stamp()); print(f"  step {step + 1}/{total}  {marks[-1] - marks[-2]:.1f} s  (cumulative {marks[-1] - marks[0]:.1f} s)", flush=True)
     t3 = stamp()
-    comfy.sample.sample(model, noise, a.steps, 1.0, "euler", "simple", cond, cond, latent["samples"], seed=a.seed, callback=cb, disable_pbar=True)
+    if os.environ.get("H3_TORCH_PROFILE"):
+        from torch.profiler import profile, ProfilerActivity
+        with profile(activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU]) as prof:
+            comfy.sample.sample(model, noise, a.steps, 1.0, "euler", "simple", cond, cond, latent["samples"], seed=a.seed, callback=cb, disable_pbar=True)
+        print(prof.key_averages().table(sort_by="cuda_time_total" if hasattr(prof.key_averages()[0], "cuda_time_total") else "device_time_total", row_limit=18), flush=True)
+    else:
+        comfy.sample.sample(model, noise, a.steps, 1.0, "euler", "simple", cond, cond, latent["samples"], seed=a.seed, callback=cb, disable_pbar=True)
     t4 = stamp()
     print(json.dumps(dict(steps=a.steps, denoise_seconds=t4 - t3, per_step=[round(marks[i + 1] - marks[i], 1) for i in range(len(marks) - 1)], peak_gpu_allocated_gib=torch.cuda.max_memory_allocated() / 2**30)), flush=True)
