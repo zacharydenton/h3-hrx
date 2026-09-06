@@ -1200,3 +1200,36 @@ on the table in the GEMMs and 1.8x in attention, and a 768p evaluation could go 
 roughly 90 s at parity precision. Those are the two kernel projects; both have a measured
 existence proof on this silicon. If ComfyUI fixed its layout its 768p step would drop from 771 s
 to roughly 170 s, so the honest comparison is against that number, not the 771.
+
+## Attention: the direct-load form, measured and rejected (2026-09-06, late)
+
+aotriton's flash kernel on gfx1151 (the bundle carved out of the container: 4 waves, zero LDS,
+217-256 VGPRs, BLOCK_M 64 / BLOCK_N 32 chosen at 37.7k rows from `rocprofv3`, 30.8 TFLOP/s)
+suggested dropping our K/V staging and the per-tile barrier. `tools/gen_attention_direct.py`
+derives that from the int8-QK kernels: every lane loads its K fragment (16 int8 channels of its
+key) and its V^T fragments straight from global memory; only the P scratch and the publish
+stage keep LDS. Exact (`tests/test_attention_i8.py` cosine 0.99999996) and slow: 4 waves 8.7
+TFLOP/s at 4k tokens (staged: 17.1), 8 waves 10.4 at 4k and 5.1 at 16k (staged: 23.4);
+hoisting the V loads ahead of the QK^T chain (Triton's PRE_LOAD_V) changed nothing (4.8 at
+16k). Every wave re-streams the whole K/V of its head through L2, and eight waves per
+workgroup do it eight times; the staged kernel loads each tile once per workgroup. Whatever
+lets Triton's kernel live without LDS (coalesced 16-byte loads redistributed with
+`v_permlanex16`, which its disassembly shows twelve of per loop), it is not per-lane fragment
+loads. Kept in experiments/.
+
+Where the int8 attention actually stands, measured alone at 37723 tokens: 22.0 TFLOP/s for
+the plain 8-wave kernel, 21.3 for the one-workgroup-per-CU form (which helped int4 by 9% and
+costs int8 3%: the host now keeps the plain form for int8 at every length). The pipeline's
+101 s of attention per 768p evaluation is that 22 TFLOP/s over 2.04 PFLOP (4 n^2 D heads per
+block), so the earlier "17.5" was an under-count of the FLOPs, not a pipeline loss. Against
+aotriton's 30.8 the headroom is 1.4x; AMD's ComfyUI blog measures CK-tile flash attention 43-50%
+above aotriton on Strix Halo, which would put the part's demonstrated ceiling near 45 TFLOP/s
+(this torch build has no CK backend, `TORCH_ROCM_FA_PREFER_CK=1` stays on AOTriton).
+
+The WMMA accumulator layout, probed (`build/acc_probe.loom`): lane l holds column l mod 16,
+rows 2i + (l / 16), i = 0..7. So S^T = K Q^T puts a query's keys in one lane pair (8 + 8,
+interleaved by parity): the row max and sum become an in-lane reduction plus one xor-16
+shuffle, and P^T can be assembled in registers as the PV rhs with one shuffle, no LDS round
+trip. That, and SageAttention's f16 PV accumulator (halving the 64 accumulator registers and
+the rescale, which is what a 32-query-per-wave form needs to halve K/V staging and LDS
+fragment reads per MMA), are the next two attention experiments.

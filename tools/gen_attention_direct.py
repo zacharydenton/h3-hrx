@@ -6,6 +6,8 @@ The per-wave 512-byte P scratch and the epilogue stage stay. Writes kernels/atte
 import re
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
+import os
+PRELOAD = os.environ.get("ATTN_PRELOAD_V", "1") == "1"
 
 
 def convert(K: str, waves: int) -> str:
@@ -33,6 +35,11 @@ def convert(K: str, waves: int) -> str:
     K = re.sub(r"  %scratch_offset = index.constant \d+ : offset\n", "  %scratch_offset = index.constant 0 : offset\n", K)
     K = re.sub(r"  %lds_bytes = index.constant \d+ : offset\n", f"  %lds_bytes = index.constant {waves * 1024} : offset\n", K)
     assert "%k_tile_b" not in K and "%v_tile_b" not in K, [l for l in K.splitlines() if "tile_b" in l][:3]
+    if PRELOAD:   # issue this tile's V^T loads before the QK^T chain so their latency hides behind it (Triton's PRE_LOAD_V)
+        vloads = re.findall(r"    %vrow\d+ = .*\n    %vch\d+a = .*\n    %vch\d+ = .*\n    %v_data\d+ = .*\n", K); assert len(vloads) == 8, len(vloads)
+        for v in vloads: K = K.replace(v, "", 1)
+        anchor = "    %krow = index.assume %krow0 [lt(%krow0, %padded_tokens)] : index\n"; assert K.count(anchor) == 1
+        K = K.replace(anchor, anchor + "".join(vloads))
     return K
 
 
@@ -43,7 +50,7 @@ def main():
             out = convert(src, waves)
         except AssertionError as e:
             print("skipped", stem, e); continue
-        (ROOT / "kernels" / f"{stem.replace('i8qk', 'i8qkd')}.loom").write_text(out); print("wrote", stem.replace("i8qk", "i8qkd"))
+        (ROOT / "experiments" / f"{stem.replace('i8qk', 'i8qkd')}.loom").write_text(out); print("wrote", stem.replace("i8qk", "i8qkd"))
 
 
 if __name__ == "__main__":
