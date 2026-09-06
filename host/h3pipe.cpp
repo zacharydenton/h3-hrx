@@ -458,7 +458,7 @@ public:
         rt();
         comp_.exe = cfg.loom_compile; comp_.sources = cfg.kernel_sources; comp_.cache = cfg.cache_dir;
         vae_dir_ = cfg.vae_dir ? cfg.vae_dir : ""; vae_bits_ = cfg.vae_bits ? cfg.vae_bits : 8;
-        aenc_dir_ = cfg.aenc_dir ? cfg.aenc_dir : ""; vision_dir_ = cfg.vision_dir ? cfg.vision_dir : "";
+        aenc_dir_ = cfg.aenc_dir ? cfg.aenc_dir : ""; vision_dir_ = cfg.vision_dir ? cfg.vision_dir : ""; venc_dir_ = cfg.venc_dir ? cfg.venc_dir : "";
         glue_.open(cfg.glue_dir, [](const std::string &n) { return n == "te.embed"; });
         embed_ = glue_.span("te.embed");
         blocks_.open(cfg.blocks_dir);
@@ -746,6 +746,134 @@ public:
         for (int c = 0; c < 2; ++c) for (int t = 0; t < A; ++t) for (int k = 0; k < AUDIO_CH; ++k) audio_out[(size_t(c) * AUDIO_CH + k) * A + t] = arows[(size_t(c) * A + t) * AUDIO_CH + k];
     }
     struct Cancelled {};
+
+    // --- the video VAE encoder: causal 3-D convs as implicit GEMMs on channels-last f16, GroupNorm+SiLU, 256-px tiles blended
+    // in latent space and 17-frame chunks as ComfyUI's tiled_encode / encode_temporal ---
+    struct VConv { std::shared_ptr<Kernel> k; int cout_pad, tout, ho, wo; };
+    VConv vconv_kernel(bool add, int frames, int H, int W, int stride, int tstride, int taps_t, int cin_pad, int cin_stride, int k_size, int cout_pad) {
+        const std::string stem = add ? "conv3d_f16_wmma_add" : "conv3d_f16_wmma", ns = "h3." + stem + ".";
+        const size_t rows = size_t(frames) * H * W, rb = (rows + 63) / 64 * 64;
+        VConv c; c.k = comp_.get(stem, "h3_" + stem, {{ns + "frames", std::to_string(frames)}, {ns + "height", std::to_string(H)}, {ns + "width", std::to_string(W)}, {ns + "stride", std::to_string(stride)}, {ns + "tstride", std::to_string(tstride)},
+                                               {ns + "taps_t", std::to_string(taps_t)}, {ns + "cin_pad", std::to_string(cin_pad)}, {ns + "cin_stride", std::to_string(cin_stride)}, {ns + "rows_bound", std::to_string(rb)}, {ns + "k_size", std::to_string(k_size)}, {ns + "n_size", std::to_string(cout_pad)}});
+        c.cout_pad = cout_pad; c.tout = (frames - 1) / tstride + 1; c.ho = H / stride; c.wo = W / stride; return c;
+    }
+    void vconv_run(const VConv &c, const char *stage, const void *a, const void *w, const void *b, void *out, const void *residual = nullptr) {
+        const size_t m = size_t(c.tout) * c.ho * c.wo; KernArgs args; args.i32(int(m)).ptr(a).ptr(w).ptr(b).ptr(out); if (residual) args.ptr(residual);
+        launch(*c.k, &prof, stage, unsigned(c.cout_pad / 64), unsigned((m + 63) / 64), 256, args);
+    }
+    void gn_silu(int frames, int H, int W, int channels, const void *x, const void *gamma, const void *beta, void *stats, void *out) {
+        const size_t plane = size_t(H) * W, rows = size_t(frames) * plane, rb = (rows + 63) / 64 * 64;
+        const std::string ns = "h3.gn_stats_f16.", na = "h3.gn_silu_f16.";
+        auto ks = comp_.get("gn_stats_f16", "h3_gn_stats_f16", {{ns + "channels", std::to_string(channels)}, {ns + "groups", "32"}, {ns + "plane", std::to_string(plane)}, {ns + "rows_bound", std::to_string(rb)}});
+        auto ka = comp_.get("gn_silu_f16", "h3_gn_silu_f16", {{na + "channels", std::to_string(channels)}, {na + "groups", "32"}, {na + "plane", std::to_string(plane)}, {na + "rows_bound", std::to_string(rb)}, {na + "eps", num(1e-6)}});
+        { KernArgs a; a.i32(frames).ptr(x).ptr(stats); launch(*ks, &prof, "venc groupnorm", unsigned(frames), 32, 32, a); }
+        { KernArgs a; a.i32(frames).ptr(x).ptr(stats).ptr(gamma).ptr(beta).ptr(out); launch(*ka, &prof, "venc groupnorm", unsigned((rows * channels + 255) / 256), 1, 256, a); }
+    }
+    // one tile (or whole image) of `frames` frames -> moments rows [T_lat*h*w][64] f16 on the device (channels 0..23 the mean)
+    void venc_tile(const float *pixels, int frames, int H, int W, int y0, int x0, int TH, int TW, int fullW, std::vector<float> &latent, int &T_lat) {
+        auto Wt = [&](const std::string &nm, size_t bytes) { return venc_.at(nm, bytes); };
+        std::vector<void *> owned; auto buf = [&](size_t bytes) { void *p = rt().alloc(bytes); owned.push_back(p); return p; };
+        const bool image = frames == 1; const int taps_t = image ? 1 : 3;
+        // input rows [frames*TH*TW][8] f16: ImageNet-normalised pixels, channels 3..7 zero
+        const float mean[3] = {0.485f, 0.456f, 0.406f}, stdv[3] = {0.229f, 0.224f, 0.225f};
+        std::vector<uint16_t> in(size_t(frames) * TH * TW * 8, 0);
+        for (int t = 0; t < frames; ++t) for (int y = 0; y < TH; ++y) for (int x = 0; x < TW; ++x) for (int c = 0; c < 3; ++c)
+            in[((size_t(t) * TH + y) * TW + x) * 8 + c] = f32_to_f16((pixels[((size_t(t) * H + y0 + y) * fullW + x0 + x) * 3 + c] - mean[c]) / stdv[c]);
+        const size_t rows0 = size_t(frames) * TH * TW;
+        void *x = buf(rows0 * 8 * 2); rt().h2d(x, in.data(), in.size() * 2);
+        void *h = buf(rows0 * 128 * 2), *y = buf(rows0 * 128 * 2), *tmp = buf(rows0 * 128 * 2), *sc = buf(rows0 * 128 * 2), *stats = buf(size_t(frames) * 32 * 2 * 4);
+        auto W3 = [&](const std::string &nm, int cout_pad, int k) { return Wt(nm + (image ? ".w2" : ".w3"), size_t(cout_pad) * k * 2); };
+        auto ksz = [&](int cin_pad) { return (int)(((image ? 9 : 27) * cin_pad + 31) / 32 * 32); };
+        // conv_in: 3 -> 128
+        int T = frames, th = TH, tw = TW, C = 128;
+        { VConv c = vconv_kernel(false, T, th, tw, 1, 1, taps_t, 8, 8, ksz(8), 128); vconv_run(c, "venc conv_in", x, W3("venc.conv_in", 128, ksz(8)), Wt("venc.conv_in.b", 128 * 4), h); }
+        static const int mid[6] = {128, 256, 256, 512, 512, 1024}, sdown[6] = {2, 2, 2, 2, 1, 1}, tdown[6] = {1, 2, 2, 1, 1, 1};
+        for (int l = 0; l < 6; ++l) {
+            for (int r = 0; r < 2; ++r) {
+                const std::string b = fmt("venc.l%d.r%d.", l, r); const int cin = C, cout = mid[l];
+                gn_silu(T, th, tw, cin, h, Wt(b + "norm1.g", cin * 4), Wt(b + "norm1.b", cin * 4), stats, y);
+                VConv c1 = vconv_kernel(false, T, th, tw, 1, 1, taps_t, cin, cin, ksz(cin), cout); vconv_run(c1, "venc conv", y, W3(b + "conv1", cout, ksz(cin)), Wt(b + "conv1.b", cout * 4), tmp);
+                gn_silu(T, th, tw, cout, tmp, Wt(b + "norm2.g", cout * 4), Wt(b + "norm2.b", cout * 4), stats, y);
+                const void *resid = h;
+                if (cin != cout) {   // 1x1 shortcut: a matmul over channels
+                    const int k = (cin + 31) / 32 * 32; const std::string stem = "matmul_bias_f16_wmma_af16_cf16", ns = "h3." + stem + ".";
+                    auto kk = comp_.get(stem, "h3_" + stem, {{ns + "k_size", std::to_string(k)}, {ns + "n_size", std::to_string(cout)}});
+                    const size_t m = size_t(T) * th * tw; KernArgs a; a.i32(int(m)).ptr(h).ptr(Wt(b + "nin.wm", size_t(cout) * k * 2)).ptr(Wt(b + "nin.b", cout * 4)).ptr(sc);
+                    launch(*kk, &prof, "venc shortcut", unsigned(cout / 64), unsigned((m + 63) / 64), 256, a); resid = sc;
+                }
+                VConv c2 = vconv_kernel(true, T, th, tw, 1, 1, taps_t, cout, cout, ksz(cout), cout); vconv_run(c2, "venc conv", y, W3(b + "conv2", cout, ksz(cout)), Wt(b + "conv2.b", cout * 4), tmp, resid);
+                std::swap(h, tmp); C = cout;
+            }
+            if (sdown[l] * tdown[l] > 1) {
+                const std::string b = fmt("venc.l%d.down", l);
+                VConv c = vconv_kernel(false, T, th, tw, sdown[l], image ? 1 : tdown[l], taps_t, C, C, ksz(C), C); vconv_run(c, "venc down", h, W3(b, C, ksz(C)), Wt(b + ".b", C * 4), tmp);
+                std::swap(h, tmp); T = c.tout; th = c.ho; tw = c.wo;
+            }
+        }
+        gn_silu(T, th, tw, C, h, Wt("venc.norm_out.g", C * 4), Wt("venc.norm_out.b", C * 4), stats, y);
+        { VConv c = vconv_kernel(false, T, th, tw, 1, 1, taps_t, C, C, ksz(C), 64); vconv_run(c, "venc conv_out", y, W3("venc.conv_out", 64, ksz(C)), Wt("venc.conv_out.b", 64 * 4), tmp); }
+        { const std::string stem = "matmul_bias_f16_wmma_af16_cf16", ns = "h3." + stem + ".";
+          auto kk = comp_.get(stem, "h3_" + stem, {{ns + "k_size", "64"}, {ns + "n_size", "64"}});
+          const size_t m = size_t(T) * th * tw; KernArgs a; a.i32(int(m)).ptr(tmp).ptr(Wt("venc.quant.wm", size_t(64) * 64 * 2)).ptr(Wt("venc.quant.b", 64 * 4)).ptr(y);
+          launch(*kk, &prof, "venc quant", 1, unsigned((m + 63) / 64), 256, a); }
+        const size_t m = size_t(T) * th * tw; std::vector<uint16_t> mom(m * 64); rt().sync(); rt().d2h(mom.data(), y, mom.size() * 2);
+        std::vector<float> lmean(24), lstd(24); rt().d2h(lmean.data(), Wt("venc.latents_mean", 24 * 4), 24 * 4); rt().d2h(lstd.data(), Wt("venc.latents_std", 24 * 4), 24 * 4);
+        T_lat = T; latent.assign(size_t(24) * T * th * tw, 0.0f);
+        for (int t = 0; t < T; ++t) for (int yy = 0; yy < th; ++yy) for (int xx = 0; xx < tw; ++xx) for (int c = 0; c < 24; ++c)
+            latent[((size_t(c) * T + t) * th + yy) * tw + xx] = (f16_to_f32(mom[((size_t(t) * th + yy) * tw + xx) * 64 + c]) - lmean[c]) / lstd[c];
+        for (void *q : owned) rt().free(q);
+    }
+    static void split_tiles(int len, std::vector<int> &starts, std::vector<int> &overlaps) {   // ComfyUI's split_tiles: 256-px tiles, overlaps >= 64 in 16-px units
+        starts.clear(); overlaps.clear(); const int tile = 256, omin = 64, ratio = 16;
+        if (tile >= len) { starts = {0}; return; }
+        int N = (len + tile - 1) / tile;
+        while (true) { overlaps.assign(N - 1, omin); const int remaining = tile * N - omin * (N - 1) - len; if (remaining < 0) ++N; else { for (int i = 0; i < remaining / ratio; ++i) overlaps[i % (N - 1)] += ratio; break; } }
+        starts = {0}; for (int i = 0; i < N - 1; ++i) starts.push_back(starts.back() + tile - overlaps[i]);
+    }
+    // one clip of `frames` frames (an image when frames == 1): tiled encode with linear latent blends across the overlaps
+    void venc_clip(const float *pixels, int frames, int H, int W, std::vector<float> &out, int &T_lat) {
+        std::vector<int> ys, yo, xs, xo; split_tiles(H, ys, yo); split_tiles(W, xs, xo);
+        const int ny = int(ys.size()), nx = int(xs.size()); std::vector<std::vector<float>> tiles(size_t(ny) * nx); std::vector<int> th(ny), tw(nx); int T = 0;
+        for (int i = 0; i < ny; ++i) for (int j = 0; j < nx; ++j) {
+            const int TH = ny == 1 ? H : 256, TW = nx == 1 ? W : 256; th[i] = TH / 16; tw[j] = TW / 16;
+            venc_tile(pixels, frames, H, W, ys[i], xs[j], TH, TW, W, tiles[size_t(i) * nx + j], T);
+        }
+        // blend: tile (i, j) with the raw tile above over lat_y_overlap[i-1] rows, then with the raw left tile over lat_x_overlap[j-1] cols;
+        // crop the trailing overlaps; concatenate
+        auto at = [&](const std::vector<float> &v, int h, int w, int c, int t, int y, int x) -> float { return v[((size_t(c) * T + t) * h + y) * w + x]; };
+        const int LH = H / 16, LW = W / 16; out.assign(size_t(24) * T * LH * LW, 0.0f);
+        int oy = 0;
+        for (int i = 0; i < ny; ++i) {
+            int ox = 0; const int h = th[i], ov_y = i > 0 ? yo[i - 1] / 16 : 0, keep_y = i < ny - 1 ? h - yo[i] / 16 : h;
+            for (int j = 0; j < nx; ++j) {
+                const int w = tw[j], ov_x = j > 0 ? xo[j - 1] / 16 : 0, keep_x = j < nx - 1 ? w - xo[j] / 16 : w;
+                const std::vector<float> &cur = tiles[size_t(i) * nx + j];
+                for (int c = 0; c < 24; ++c) for (int t = 0; t < T; ++t) for (int y = 0; y < keep_y; ++y) for (int x = 0; x < keep_x; ++x) {
+                    float v = at(cur, h, w, c, t, y, x);
+                    if (i > 0 && y < ov_y) { const float wa = 1.0f - float(y) / ov_y; const std::vector<float> &up = tiles[size_t(i - 1) * nx + j]; v = wa * at(up, th[i - 1], w, c, t, th[i - 1] - ov_y + y, x) + (1.0f - wa) * v; }
+                    if (j > 0 && x < ov_x) { const float wa = 1.0f - float(x) / ov_x; const std::vector<float> &lf = tiles[size_t(i) * nx + j - 1]; float lv = at(lf, h, tw[j - 1], c, t, y, tw[j - 1] - ov_x + x);
+                        if (i > 0 && y < ov_y) { const float wy = 1.0f - float(y) / ov_y; const std::vector<float> &ul = tiles[size_t(i - 1) * nx + j - 1]; lv = wy * at(ul, th[i - 1], tw[j - 1], c, t, th[i - 1] - ov_y + y, tw[j - 1] - ov_x + x) + (1.0f - wy) * lv; }
+                        v = wa * lv + (1.0f - wa) * v; }
+                    out[((size_t(c) * T + t) * LH + oy + y) * LW + ox + x] = v; }
+                ox += keep_x;
+            }
+            oy += keep_y;
+        }
+        T_lat = T;
+    }
+    void encode_video(const float *pixels, int frames, int H, int W, float *latents, int &latent_t) {
+        if (!venc_open_) { if (venc_dir_.empty()) throw std::runtime_error("no video encoder weights: h3pipe_config.venc_dir is NULL"); venc_.open(venc_dir_); venc_open_ = true; }
+        const int LH = H / 16, LW = W / 16;
+        if (frames == 1) { std::vector<float> z; int T = 0; venc_clip(pixels, 1, H, W, z, T); if (T != 1) throw std::runtime_error("image encode produced more than one latent frame"); memcpy(latents, z.data(), z.size() * 4); latent_t = 1; return; }
+        const int chunks = (frames + 16) / 17, TL = chunks * 5; std::vector<float> all(size_t(24) * TL * LH * LW); std::vector<float> clip(size_t(17) * H * W * 3);
+        for (int ch = 0; ch < chunks; ++ch) {
+            for (int f = 0; f < 17; ++f) { const int src = std::min(ch * 17 + f, frames - 1); memcpy(clip.data() + size_t(f) * H * W * 3, pixels + size_t(src) * H * W * 3, size_t(H) * W * 3 * 4); }
+            std::vector<float> z; int T = 0; venc_clip(clip.data(), 17, H, W, z, T); if (T != 5) throw std::runtime_error("a 17-frame chunk must give 5 latent frames");
+            for (int c = 0; c < 24; ++c) for (int t = 0; t < 5; ++t) memcpy(all.data() + ((size_t(c) * TL + ch * 5 + t) * LH) * LW, z.data() + ((size_t(c) * 5 + t) * LH) * LW, size_t(LH) * LW * 4);
+        }
+        latent_t = TL - 3;   // token_drop
+        for (int c = 0; c < 24; ++c) for (int t = 0; t < latent_t; ++t) memcpy(latents + ((size_t(c) * latent_t + t) * LH) * LW, all.data() + ((size_t(c) * TL + t) * LH) * LW, size_t(LH) * LW * 4);
+    }
 
     // --- the vision tower: Qwen3-VL's ViT (27 blocks, hidden 1152, 16 heads of 72 padded to 128) in f16-weight WMMA GEMMs on
     // an f16 residual stream, the H3 f16 attention per image, the patch merger and the DeepStack mergers ---
@@ -1118,6 +1246,7 @@ private:
     std::map<std::string, Prepare> prepares_; std::map<std::string, Gemm> gemms_; Prepare final_prep_;
     Blob aenc_; bool aenc_open_ = false; std::string aenc_dir_;
     Blob vision_; bool vision_open_ = false; std::string vision_dir_; std::string te_span_sig_; void *ds_buf_ = nullptr;
+    Blob venc_; bool venc_open_ = false; std::string venc_dir_;
     std::shared_ptr<Kernel> norm_f32_;
     size_t seq_cap_ = 0;
     void *ones_ = nullptr, *zeros_ = nullptr, *mods_ = nullptr, *final_table_ = nullptr, *x_ = nullptr, *cls_ = nullptr, *cls0_ = nullptr, *tcls_ = nullptr, *cos_ = nullptr, *sin_ = nullptr,
@@ -1198,6 +1327,15 @@ extern "C" int h3pipe_decode_video(h3pipe_session *s, const h3pipe_params *param
         if (video_elements != size_t(LATENT_CH) * sh.latent_t * sh.lat_h * sh.lat_w) throw std::invalid_argument("video_latents must hold 24 * latent_t * lat_h * lat_w floats");
         if (frame_bytes != size_t(sh.frames) * params->height * params->width * 3) throw std::invalid_argument("frames must hold frames * height * width * 3 bytes");
         std::lock_guard<std::mutex> lock(s->mutex); s->value.decode_video(*params, latents, frames);
+    })
+}
+extern "C" int h3pipe_encode_video(h3pipe_session *s, const float *pixels, int frames, int height, int width, float *latents, size_t latent_elements, int *latent_t, char *error, size_t cap) {
+    GUARD({
+        if (!s || !pixels || !latents || !latent_t || frames < 1) throw std::invalid_argument("session, pixels (frames >= 1), latents and latent_t are required");
+        if (height % 32 || width % 32 || height < 32 || width < 32 || height > 2048 || width > 2048) throw std::invalid_argument("height and width must be multiples of 32 up to 2048");
+        const int TL = frames == 1 ? 1 : 5 * ((frames + 16) / 17) - 3;
+        if (latent_elements < size_t(24) * TL * (height / 16) * (width / 16)) throw std::invalid_argument("latents must hold 24 * latent_t * height/16 * width/16 floats");
+        std::lock_guard<std::mutex> lock(s->mutex); s->value.encode_video(pixels, frames, height, width, latents, *latent_t);
     })
 }
 extern "C" int h3pipe_vision_embed(h3pipe_session *s, const float *pixels, int height, int width, float *merged, size_t merged_elements, float *deepstack, size_t deepstack_elements, int *tokens, char *error, size_t cap) {

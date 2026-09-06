@@ -26,6 +26,7 @@ typedef struct {
     int vae_bits;                // 8 or 4, matching vae_dir
     const char *aenc_dir;        // tools/export_audio_encoder.py: the audio VAE's encoder (reference audio); NULL -> h3pipe_encode_audio unavailable
     const char *vision_dir;      // tools/export_vision.py: Qwen3-VL's vision tower (reference images in the prompt); NULL -> unavailable
+    const char *venc_dir;        // tools/export_vae_encoder.py: the video VAE's encoder (reference images/videos, keyframes); NULL -> unavailable
 } h3pipe_config;
 
 typedef struct {
@@ -90,6 +91,11 @@ int h3pipe_decode_audio(h3pipe_session *s, const float *audio_latents, size_t au
 // reference sizing produces) -> the merged vision embeds [tokens][5120] and the three DeepStack embeds [3][tokens][5120]
 // with tokens = (height / 32) * (width / 32); the element counts must be at least those sizes; *tokens is written.
 int h3pipe_vision_embed(h3pipe_session *s, const float *pixels, int height, int width, float *merged, size_t merged_elements, float *deepstack, size_t deepstack_elements, int *tokens, char *error, size_t error_capacity);
+
+// The video VAE's encoder. Pixels f32 [frames][height][width][3] in [0, 1] (height and width multiples of 32, up to 2048).
+// frames = 1 encodes an image -> latents [24][1][height/16][width/16]; frames > 1 encodes a clip in 17-frame chunks
+// (the last repeat-padded) -> [24][latent_t][height/16][width/16] with latent_t = 5 * ceil(frames / 17) - 3, written to *latent_t.
+int h3pipe_encode_video(h3pipe_session *s, const float *pixels, int frames, int height, int width, float *latents, size_t latent_elements, int *latent_t, char *error, size_t error_capacity);
 
 // Stereo float samples [2][n_samples] at 32 kHz (right-padded to a multiple of 800 inside) -> model-space audio latents
 // [2][32][audio_t] with audio_t = ceil(n_samples / 800) written to *audio_t; latent_elements must be at least 2*32*audio_t.
