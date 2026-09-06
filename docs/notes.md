@@ -1344,3 +1344,41 @@ End to end with both the GEMM levers and the head-major attention above in one b
 unchanged: video rows 0.9988 at block 30, 0.9991 at 49; trajectory rel err 0.0102 after five
 evaluations): 864x480 x 124 frames 26.7 s per evaluation (32 before), 1344x768 x 124 frames
 101-103 s (140 before), no decode, official t2v prompt.
+
+### The scheduler question, answered, and comfy_kitchen measured like for like
+
+The pass that re-sinks source-ordered fragment loads is `sink-single-use-reads` (found with
+`--dump-ir-after-all`: after it, "L16 M16 L8 M16" becomes "L8 M16 L8 M16"). It moves any
+single-use vector read to just before its user, and the user of a stage read is the
+`vector.fragment` op in front of the WMMA. The Loom fork (branch `loom-swizzler`, 8b2d1e882) now
+leaves reads whose user is a fragment where the source put them; kernels written just in time
+are unchanged (the shipped GEMMs and the head-major attention compile to the same ISA and time
+the same: 34.5-34.9 TFLOP/s). With the source order kept, `gemm_i8v_256` issues 16 fragment
+reads ahead and waits at `lgkmcnt(11..8)` instead of `(3..0)`, at 216 VGPRs, no spill.
+
+It does not matter: 40.5 / 39.3 TOPS against 40.1 / 39.3 for the just-in-time form at
+2922x5120x10240, and 40.6 / 40.1 against 41.7 / 42.1 at 2922x7232x5376 (A/B/A). The LDS-read
+latency was already covered by the other waves; deeper issue only costs registers. Falsified.
+
+Then the comparison itself. comfy_kitchen's `int8_linear` timed in isolation in the ComfyUI
+image (torch profiler, `gemm_wmma_kernel<MmaInt8, EpiRowwise, bf16, 256, 128, 64, ...>` kernel
+time only, random operands) against `tools/bench_gemm_i8.py` for the shipped kernel with the
+padded pitches, same shapes, same idle box:
+
+| M x K x N | comfy_kitchen kernel | this pipeline |
+| --- | ---: | ---: |
+| 2922 x 5120 x 10240 | 36.4 | 40.1-42.8 |
+| 2922 x 7168 x 5376 (out) | 38.6 | 41.2-42.1 |
+| 8192 x 21504 x 5376 (down) | 27.9 | 39.4 |
+| 37723 x 5376 x 21504 (qkv) | 41.7 | 44.4 |
+| 37723 x 7168 x 5376 (out) | 42.2 | 43.4 |
+| 37723 x 21504 x 5376 (down) | 26.9 | 35.6 |
+
+The "50 TOPS" attributed to comfy_kitchen earlier came from a whole-run profiler trace, not
+from a kernel measured on a known shape; measured on the same shapes it never reaches 43, and
+the pipeline's kernels are ahead at every one, by 1.3x on the down projection. Both kernels
+lose on the long-K down projection at large M (ours 39.4 at 8192 rows, 35.6 at 37723; unpadded
+28.4), which is the memory system rather than the loop, and the remaining lever there is a
+k-split or a different raster for that one GEMM. The int8 GEMM ceiling on this part is the 46
+of the no-load ablation against a 54 peak; what is left is inside the WMMA chain and is not
+the LDS-read schedule.

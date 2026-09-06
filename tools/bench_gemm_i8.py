@@ -23,7 +23,7 @@ def main():
         tmp = Path(tmp)
         for (M, K, N) in shapes:
             g = g_override or m_group(M, 256); gy = ((M + 255) // 256 + g - 1) // g * g
-            cfg = {f"{ns}.k_size": K, f"{ns}.n_size": N, f"{ns}.m_group": g}
+            cfg = {f"{ns}.k_size": K, f"{ns}.n_size": N, f"{ns}.m_group": g, f"{ns}.k_stride": K}
             hs = tmp / f"{stem}_{K}_{N}_{g}.hsaco"; compile_kernel(src, sym, cfg, hs)
             a = rng.integers(-127, 128, (M, K)).astype(np.int8).view(np.uint8); w = rng.integers(-127, 128, (N, K)).astype(np.int8).view(np.uint8)
             args_ = [("i32", M), ("in_u8", a), ("in_u8", w), ("in", (rng.random(N, dtype=np.float32) / K)), ("in", rng.random(M, dtype=np.float32)), ("out_f16", ((M, N), np.float16))]

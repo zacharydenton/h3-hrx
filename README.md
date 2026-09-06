@@ -188,8 +188,10 @@ evaluation at that size with the head-major int8 QK^T attention and the padded-p
 thing: its H3 model hands torch's flash attention head-strided views, on which aotriton's kernel
 runs at 5.8 TFLOP/s instead of the 30.8 it reaches on contiguous tensors at the same length
 (`docs/notes.md`, "Why ComfyUI is slow"). Its int8 GEMMs (comfy_kitchen) run at 50 TOPS against
-this pipeline's 41-43 after the pitch and load fixes, and that 30.8 TFLOP/s attention is the same silicon: the headroom for the
-Loom kernels is about 1.2x on the GEMMs and 1.8x on attention.
+this pipeline's 41-43 in a whole-run profiler trace; measured in isolation at the same shapes its
+kernel reaches 36-42 and trails these kernels at every H3 shape (`docs/notes.md`, "comfy_kitchen measured like
+for like"). The headroom left is inside the WMMA chain (46 of 54 TOPS without any memory traffic) and about
+1.1x on attention against CK-tile's 38.7.
 
 ## Weights and license
 
