@@ -997,3 +997,31 @@ The Python wrapper replaces `decoder.forward`, preserving diffusers' tiling and 
 On the saved `py22` latents, the grid disappears and C vs Python tiled decoding measures
 48.95 dB PSNR across all 22 frames at 864x480. `tests/test_decoder_tiles.py` reproduces
 this comparison using decoder weights and small heads, without loading the full models.
+
+## Allocation lifetime and bounded decoder validation (2026-09-06)
+
+The C host now reads weight manifests at open and uploads individual tensors on first use.
+Opening a decoder session does not read the DiT/text weight files, allocate the 9.65 GB DiT
+blob, or reserve the skipped 1.56 GB embedding table. Conditioning tables are deferred until
+denoising. Uploads use at most 16 MiB of staging space and failed uploads can be retried.
+
+Device buffers have scoped ownership in both stacks and pipeline sessions. This covers the
+previously omitted 80 MiB DeepStack buffer, constructor failures and temporary vision/audio/
+video encoder allocations. HIP/HRX kernel loading releases partially loaded modules on
+failure. Resized buffers are nulled and setup validity is published only after success.
+Post-quantization decoder weights are read from the current session's glue, with no shared
+static cache. Completed temporal chunks are converted directly into the caller's RGB buffer,
+eliminating the growing float video and repeated copies of all earlier frames.
+
+The independent fp32 decoder test now streams one block at a time and bounds SDPA to 128
+query rows. On the real 256px tile, W8A8 gives 0.999994 update cosine / 64.51 dB frame PSNR
+after 36 blocks, and W4A4 gives 0.998482 / 39.12 dB. Gates require cosine > .999 and PSNR
+> 40 dB for int8; > .9 and > 25 dB for int4. Peak Torch allocations were 0.63 GB. The
+Python rendering tools and tiled parity test use only the small fp32 VAE heads, closing
+native sessions explicitly after decoding.
+
+The corrected 22-frame C output remains bit-identical after these changes, and HIP and
+HRX agree exactly. C/Python tiled parity is 48.95 dB at 864x480 over 22 frames and 52.44 dB
+at 384x320 over 39 frames. A separate regression checks different post-quant weights across
+three successive sessions and five-frame clips. CPU fault injection checks lazy loading,
+failed uploads, failed constructors, resize retries and module cleanup without a GPU.

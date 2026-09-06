@@ -104,35 +104,47 @@ void mkdirs(const std::string &p) { std::string cur; for (size_t i = 0; i <= p.s
 // --- weights: manifest + device blob --------------------------------------------------------
 struct Span { size_t offset, bytes; std::string dtype, shape; };
 
+// Own device allocations even when a constructor or a stage throws.
+class DeviceBuffers {
+    std::vector<void *> pointers_;
+public:
+    DeviceBuffers() = default;
+    DeviceBuffers(const DeviceBuffers &) = delete;
+    DeviceBuffers &operator=(const DeviceBuffers &) = delete;
+    ~DeviceBuffers() { clear(); }
+    void *alloc(size_t bytes) {
+        void *p = rt().alloc(bytes);
+        try { pointers_.push_back(p); } catch (...) { rt().free(p); throw; }
+        return p;
+    }
+    void free(void *p) noexcept {
+        auto it = std::find(pointers_.begin(), pointers_.end(), p);
+        if (it != pointers_.end()) { rt().free(p); pointers_.erase(it); }
+    }
+    void clear() noexcept { for (void *p : pointers_) rt().free(p); pointers_.clear(); }
+};
+
 struct Blob {
-    std::string path; size_t size = 0; void *dev = nullptr; std::map<std::string, Span> spans;
-    void open(const std::string &dir, const std::function<bool(const std::string &)> &skip = {}) {
-        path = dir + "/weights.bin";
+    // File offsets remain unchanged for host reads. Device tensors are loaded on first use.
+    std::string path; size_t size = 0; std::map<std::string, Span> spans;
+    mutable DeviceBuffers memory;
+    mutable std::map<std::string, char *> tensors;
+    bool is_open() const { return !path.empty(); }
+    void open(const std::string &dir) {
+        const std::string next_path = dir + "/weights.bin";
         std::ifstream in(dir + "/manifest.txt");
         if (!in) throw std::runtime_error("cannot read " + dir + "/manifest.txt");
-        std::string line;
+        std::map<std::string, Span> next_spans; std::string line;
         while (std::getline(in, line)) {
             std::istringstream ls(line); std::string name, dtype, shape; size_t offset, bytes;
-            if (ls >> name >> offset >> bytes >> dtype >> shape) spans[name] = {offset, bytes, dtype, shape};
+            if (ls >> name >> offset >> bytes >> dtype >> shape) next_spans[name] = {offset, bytes, dtype, shape};
         }
-        std::ifstream f(path, std::ios::binary | std::ios::ate);
-        if (!f) throw std::runtime_error("cannot read " + path);
-        size = size_t(f.tellg());
-        for (auto &e : spans) if (e.second.offset + e.second.bytes > size) throw std::runtime_error("manifest span '" + e.first + "' runs past " + path);
-        dev = rt().alloc(size);
-        std::vector<char> chunk(size_t(256) << 20);
-        // upload every span except the skipped ones (uploading the whole file keeps it simple; skipped spans stay uninitialised)
-        for (auto &e : spans) {
-            if (skip && skip(e.first)) continue;
-            f.seekg(std::streamoff(e.second.offset));
-            for (size_t done = 0; done < e.second.bytes;) {
-                const size_t n = std::min(chunk.size(), e.second.bytes - done);
-                f.read(chunk.data(), std::streamsize(n));
-                if (!f) throw std::runtime_error("short read of " + path);
-                rt().h2d(((char *)dev + e.second.offset + done), chunk.data(), n);
-                done += n;
-            }
-        }
+        std::ifstream f(next_path, std::ios::binary | std::ios::ate);
+        if (!f || f.tellg() < 0) throw std::runtime_error("cannot read " + next_path);
+        const size_t next_size = size_t(f.tellg());
+        for (auto &e : next_spans) if (e.second.offset > next_size || e.second.bytes > next_size - e.second.offset)
+            throw std::runtime_error("manifest span '" + e.first + "' runs past " + next_path);
+        memory.clear(); tensors.clear(); spans.swap(next_spans); path = next_path; size = next_size;
     }
     const Span &span(const std::string &name) const {
         auto it = spans.find(name);
@@ -142,7 +154,20 @@ struct Blob {
     char *at(const std::string &name, size_t bytes) const {
         const Span &s = span(name);
         if (s.bytes != bytes) throw std::runtime_error("tensor " + name + " has " + std::to_string(s.bytes) + " bytes, expected " + std::to_string(bytes));
-        return (char *)dev + s.offset;
+        auto it = tensors.find(name); if (it != tensors.end()) return it->second;
+        std::ifstream f(path, std::ios::binary); f.seekg(std::streamoff(s.offset));
+        std::vector<char> chunk(std::min(bytes, size_t(16) << 20));
+        char *p = (char *)memory.alloc(std::max(bytes, size_t(1)));
+        try {
+            for (size_t done = 0; done < bytes;) {
+                const size_t n = std::min(chunk.size(), bytes - done);
+                f.read(chunk.data(), std::streamsize(n));
+                if (!f) throw std::runtime_error("short read of " + name);
+                rt().h2d(p + done, chunk.data(), n); done += n;
+            }
+            tensors.emplace(name, p);
+        } catch (...) { memory.free(p); throw; }
+        return p;
     }
     std::vector<float> host_f32(const std::string &name, size_t count) const {
         const Span &s = span(name);
@@ -150,7 +175,6 @@ struct Blob {
         std::vector<float> v(count); std::ifstream f(path, std::ios::binary); f.seekg(std::streamoff(s.offset)); f.read((char *)v.data(), std::streamsize(s.bytes));
         if (!f) throw std::runtime_error("short read of " + name); return v;
     }
-    ~Blob() { if (dev) rt().free(dev); }
 };
 
 // --- kernels: compile through loom-compile into the cache, load, launch ---------------------
@@ -274,6 +298,7 @@ struct StackDims {
 struct LayerCond { const float *table_msa, *gate_msa, *table_mlp, *gate_mlp; };
 
 class Stack {
+    DeviceBuffers memory_;
 public:
     Stack(Compiler &c, const StackDims &d, size_t tokens, int layers, const Blob &w, const std::string &prefix_fmt, bool qk_weights, const float *ones_head)
         : d_(d), tokens_(tokens), layers_(layers) {
@@ -330,24 +355,24 @@ public:
             attention_ = c.get(stem, "h3_" + stem, acfg);
         }
         const size_t T = capacity_;
-        a_q_ = rt().alloc(T * size_t(std::max(d.ffn, std::max(d.hidden, d.inner()))) / per);
-        a_s_ = rt().alloc(T * 4);
-        fused_ = rt().alloc(T * size_t(d.qkv()) * 2);
-        q_ = rt().alloc(T * size_t(d.inner()) * 2);
-        k_ = rt().alloc(T * size_t(d.kv_inner()) * 2);
-        v_ = rt().alloc(T * size_t(d.kv_inner()) * 2);
-        attn_ = rt().alloc(T * size_t(d.inner()) * 2);
-        gu_ = rt().alloc(T * size_t(d.ffn) * 2);
+        a_q_ = memory_.alloc(T * size_t(std::max(d.ffn, std::max(d.hidden, d.inner()))) / per);
+        a_s_ = memory_.alloc(T * 4);
+        fused_ = memory_.alloc(T * size_t(d.qkv()) * 2);
+        q_ = memory_.alloc(T * size_t(d.inner()) * 2);
+        k_ = memory_.alloc(T * size_t(d.kv_inner()) * 2);
+        v_ = memory_.alloc(T * size_t(d.kv_inner()) * 2);
+        attn_ = memory_.alloc(T * size_t(d.inner()) * 2);
+        gu_ = memory_.alloc(T * size_t(d.ffn) * 2);
         for (auto p : {fused_, q_, k_, v_, attn_}) rt().memset(p, 0, T * size_t(p == fused_ ? d.qkv() : (p == q_ || p == attn_ ? d.inner() : d.kv_inner())) * 2);
         if (d.attn_i4) {
-            qi_ = rt().alloc(T * size_t(d.heads) * 64); ki_ = rt().alloc(T * size_t(d.heads) * 64); qs_ = rt().alloc(T * size_t(d.heads) * 4); ks_ = rt().alloc(T * size_t(d.heads) * 4);
-            kmean_ = rt().alloc(size_t(d.inner()) * 4); zmean_ = rt().alloc(size_t(d.inner()) * 4); rt().memset(zmean_, 0, size_t(d.inner()) * 4);
-            vt_ = rt().alloc(size_t(d.inner()) * T * 2); rt().memset(vt_, 0, size_t(d.inner()) * T * 2);
+            qi_ = memory_.alloc(T * size_t(d.heads) * 64); ki_ = memory_.alloc(T * size_t(d.heads) * 64); qs_ = memory_.alloc(T * size_t(d.heads) * 4); ks_ = memory_.alloc(T * size_t(d.heads) * 4);
+            kmean_ = memory_.alloc(size_t(d.inner()) * 4); zmean_ = memory_.alloc(size_t(d.inner()) * 4); rt().memset(zmean_, 0, size_t(d.inner()) * 4);
+            vt_ = memory_.alloc(size_t(d.inner()) * T * 2); rt().memset(vt_, 0, size_t(d.inner()) * T * 2);
             for (auto p : {qi_, ki_}) rt().memset(p, 0, T * size_t(d.heads) * 64);
             for (auto p : {qs_, ks_}) rt().memset(p, 0, T * size_t(d.heads) * 4);
         }
     }
-    ~Stack() { for (void *p : {a_q_, a_s_, fused_, q_, k_, v_, attn_, gu_, qi_, ki_, qs_, ks_, kmean_, zmean_, vt_}) if (p) rt().free(p); }
+
     size_t capacity() const { return capacity_; }
     size_t tokens() const { return tokens_; }
     const std::vector<struct Block_> *dummy = nullptr;
@@ -479,6 +504,7 @@ struct Schedule {                            // diffusers' MiniMaxH3Scheduler
 
 // --- the pipeline ----------------------------------------------------------------------------
 class Pipe {
+    DeviceBuffers memory_;
 public:
     explicit Pipe(const h3pipe_config &cfg) {
         if (!cfg.glue_dir || !cfg.blocks_dir || !cfg.te_dir || !cfg.kernel_sources || !cfg.cache_dir || !cfg.loom_compile) throw std::invalid_argument("every directory and the loom-compile path are required");
@@ -486,38 +512,31 @@ public:
         comp_.exe = cfg.loom_compile; comp_.sources = cfg.kernel_sources; comp_.cache = cfg.cache_dir;
         vae_dir_ = cfg.vae_dir ? cfg.vae_dir : ""; vae_bits_ = cfg.vae_bits ? cfg.vae_bits : 8;
         aenc_dir_ = cfg.aenc_dir ? cfg.aenc_dir : ""; vision_dir_ = cfg.vision_dir ? cfg.vision_dir : ""; venc_dir_ = cfg.venc_dir ? cfg.venc_dir : "";
-        glue_.open(cfg.glue_dir, [](const std::string &n) { return n == "te.embed"; });
+        glue_.open(cfg.glue_dir);
         embed_ = glue_.span("te.embed");
-        blocks_.open(cfg.blocks_dir);
+        blocks_dir_ = cfg.blocks_dir;
         te_dir_ = cfg.te_dir;
-        // host-side conditioning tables
-        curve_ = glue_.host_f32("h3.adaln_t_table", 1025 * 8);
-        inv_freq_ = glue_.host_f32("h3.rope_inv_freq", 16);
-        for (int i = 0; i < 50; ++i) { adaln_w_.push_back(glue_.host_f32(fmt("h3.blocks.%d.adaln.w", i), size_t(3 * 6 * HID) * 8)); adaln_b_.push_back(glue_.host_f32(fmt("h3.blocks.%d.adaln.b", i), size_t(3 * 6 * HID))); }
-        final_w_ = glue_.host_f32("h3.final.adaln.w", size_t(2 * HID) * 8); final_b_ = glue_.host_f32("h3.final.adaln.b", size_t(2 * HID));
-        ones_ = rt().alloc(size_t(HID) * 4); { std::vector<float> o(HID, 1.0f); rt().h2d(ones_, o.data(), o.size() * 4); }
-        zeros_ = rt().alloc(size_t(2 * TE_FFN) * 4); rt().memset(zeros_, 0, size_t(2 * TE_FFN) * 4);
-        mods_ = rt().alloc(size_t(50) * MODS_ROWS * HID * 4);
-        final_table_ = rt().alloc(size_t(4) * HID * 4);
+        ones_ = memory_.alloc(size_t(HID) * 4); { std::vector<float> o(HID, 1.0f); rt().h2d(ones_, o.data(), o.size() * 4); }
+        zeros_ = memory_.alloc(size_t(2 * TE_FFN) * 4); rt().memset(zeros_, 0, size_t(2 * TE_FFN) * 4);
     }
-    ~Pipe() { for (void *p : {ones_, zeros_, mods_, final_table_, x_, cls_, cls0_, tcls_, cos_, sin_, in16_, a_q_, a_s_, out16_, text_copy_, ref_cos_, ref_sin_, te_x_, te_cos_, te_sin_, te_cls_, vx_, vcos_, vsin_, vin16_, va_q_, va_s_, vout16_, vcls_, vnorm_table_, ah_, aacc_, ahj_, ar_, ar2_, atmp_, ain_, xb0_, prev_b0_, cache_resid_, partials_}) if (p) rt().free(p); }
+
 
     Profile prof{std::getenv("H3_PROFILE") != nullptr && *std::getenv("H3_PROFILE") != 0};   // H3_PROFILE=1: synchronized per-stage times printed after every step
 
     // --- the prompt: embedding lookup on the host, the encoder, condition_proj, the refiner ---
     void ensure_seq(size_t seq) {
         if (seq <= seq_cap_) return;
-        for (void **p : {&x_, &cls_, &cls0_, &tcls_, &cos_, &sin_, &in16_, &a_q_, &a_s_, &out16_, &text_copy_}) { if (*p) rt().free(*p); *p = nullptr; }
+        for (void **p : {&x_, &cls_, &cls0_, &tcls_, &cos_, &sin_, &in16_, &a_q_, &a_s_, &out16_, &text_copy_}) { if (*p) memory_.free(*p); *p = nullptr; }
         seq_cap_ = 0;
         const size_t T = (seq + 255) / 256 * 256 + 32;
-        x_ = rt().alloc(T * HID * 4); rt().memset(x_, 0, T * HID * 4);
-        cls_ = rt().alloc(T * 4); rt().memset(cls_, 0, T * 4);
-        cls0_ = rt().alloc(T * 4); rt().memset(cls0_, 0, T * 4);       // the single-class GEMMs (embedders, condition proj) index their gate table with this
-        tcls_ = rt().alloc(T * 4); rt().memset(tcls_, 0, T * 4);
-        cos_ = rt().alloc(T * ROPE_HALF * 4); sin_ = rt().alloc(T * ROPE_HALF * 4);
-        in16_ = rt().alloc(T * TEXT_DIM * 2); rt().memset(in16_, 0, T * TEXT_DIM * 2);
-        a_q_ = rt().alloc(T * size_t(std::max(TEXT_DIM, HID))); a_s_ = rt().alloc(T * 4);   // the final norm writes HID-wide rows, the embedders TEXT_DIM-wide
-        out16_ = rt().alloc(T * FINAL_N * 2);
+        x_ = memory_.alloc(T * HID * 4); rt().memset(x_, 0, T * HID * 4);
+        cls_ = memory_.alloc(T * 4); rt().memset(cls_, 0, T * 4);
+        cls0_ = memory_.alloc(T * 4); rt().memset(cls0_, 0, T * 4);       // the single-class GEMMs (embedders, condition proj) index their gate table with this
+        tcls_ = memory_.alloc(T * 4); rt().memset(tcls_, 0, T * 4);
+        cos_ = memory_.alloc(T * ROPE_HALF * 4); sin_ = memory_.alloc(T * ROPE_HALF * 4);
+        in16_ = memory_.alloc(T * TEXT_DIM * 2); rt().memset(in16_, 0, T * TEXT_DIM * 2);
+        a_q_ = memory_.alloc(T * size_t(std::max(TEXT_DIM, HID))); a_s_ = memory_.alloc(T * 4);   // the final norm writes HID-wide rows, the embedders TEXT_DIM-wide
+        out16_ = memory_.alloc(T * FINAL_N * 2);
         seq_cap_ = T;
     }
 
@@ -543,15 +562,15 @@ public:
               for (int j = 0; j < TEXT_DIM; ++j) emb[size_t(i) * TEXT_DIM + j] = bf16_to_f32(row[j]); } }
         // the encoder's 50 layers
         std::string span_sig; for (const VisionSpan &sp : spans) span_sig += fmt("%zu:%zu:%d:%d;", sp.start, sp.count, sp.merged_h, sp.merged_w);
-        if (!te_ || te_->tokens() != size_t(n) || te_span_sig_ != span_sig) {
-            te_span_sig_ = span_sig;
-            if (!te_blob_.dev) te_blob_.open(te_dir_);
+        if (!te_ready_ || !te_ || te_->tokens() != size_t(n) || te_span_sig_ != span_sig) {
+            te_span_sig_.clear(); te_ready_ = false;
+            if (!te_blob_.is_open()) te_blob_.open(te_dir_);
             te_.reset(); te_ = std::make_unique<Stack>(comp_, StackDims{TE_HID, TE_HEADS, TE_KV, HEAD_DIM, TE_FFN, 128, 1, 8, 1e-6f, false, true, true}, size_t(n), 50, te_blob_, "blocks.%d.", true, nullptr);
-            for (void *p : {te_x_, te_cos_, te_sin_, te_cls_}) if (p) rt().free(p);
+            for (void **q : {&te_x_, &te_cos_, &te_sin_, &te_cls_}) { memory_.free(*q); *q = nullptr; }
             const size_t T = te_->capacity();
-            te_x_ = rt().alloc(T * TE_HID * 4); rt().memset(te_x_, 0, T * TE_HID * 4);
-            te_cos_ = rt().alloc(T * TE_ROPE_HALF * 4); te_sin_ = rt().alloc(T * TE_ROPE_HALF * 4);
-            te_cls_ = rt().alloc(T * 4); rt().memset(te_cls_, 0, T * 4);
+            te_x_ = memory_.alloc(T * TE_HID * 4); rt().memset(te_x_, 0, T * TE_HID * 4);
+            te_cos_ = memory_.alloc(T * TE_ROPE_HALF * 4); te_sin_ = memory_.alloc(T * TE_ROPE_HALF * 4);
+            te_cls_ = memory_.alloc(T * 4); rt().memset(te_cls_, 0, T * 4);
             std::vector<float> c(size_t(n) * TE_ROPE_HALF), s(size_t(n) * TE_ROPE_HALF);
             std::vector<double> pos(size_t(n) * 3);   // (t, h, w) per token: text runs sequentially, each image span its grid (qwen2vl_mrope_position_ids)
             { size_t cursor = 0; double offset = 0; std::vector<VisionSpan> ordered = spans; std::sort(ordered.begin(), ordered.end(), [](const VisionSpan &x, const VisionSpan &y) { return x.start < y.start; });
@@ -567,12 +586,13 @@ public:
                 const double inv = std::pow(5000000.0, -double(2 * j) / HEAD_DIM), ang = pos[size_t(t) * 3 + ax] * inv;
                 c[size_t(t) * TE_ROPE_HALF + j] = float(std::cos(ang)); s[size_t(t) * TE_ROPE_HALF + j] = float(std::sin(ang)); }
             rt().h2d(te_cos_, c.data(), c.size() * 4); rt().h2d(te_sin_, s.data(), s.size() * 4);
+            te_span_sig_ = span_sig; te_ready_ = true;
         }
         rt().h2d(te_x_, emb.data(), emb.size() * 4);
         auto te_cond = [&](int) { return LayerCond{(const float *)zeros_, (const float *)ones_, (const float *)zeros_, (const float *)ones_}; };
         if (spans.empty()) te_->forward(&prof, te_x_, te_cls_, te_cos_, te_sin_, te_cond);
         else {   // DeepStack: the vision tower's features from blocks 8, 16, 24 added at the image rows after the first three layers
-            if (!ds_buf_) ds_buf_ = rt().alloc(size_t(4096) * TEXT_DIM * 4);
+            if (!ds_buf_) ds_buf_ = memory_.alloc(size_t(4096) * TEXT_DIM * 4);
             for (int layer = 0; layer < 3; ++layer) {
                 te_->forward(&prof, te_x_, te_cls_, te_cos_, te_sin_, te_cond, layer, layer + 1);
                 for (const VisionSpan &sp : spans) {
@@ -589,15 +609,17 @@ public:
         rt().h2d(in16_, h16.data(), h16.size() * 2);
         embed_linear("condition proj", 0, size_t(n), TEXT_DIM, "h3.cond");
         // the token refiner: two H3-shaped blocks without rope (identity tables), then its final norm
-        if (!refiner_ || refiner_->tokens() != size_t(n)) {
+        if (!refiner_ready_ || !refiner_ || refiner_->tokens() != size_t(n)) {
+            refiner_ready_ = false;
             refiner_.reset(); refiner_ = std::make_unique<Stack>(comp_, StackDims{HID, HEADS, HEADS, HEAD_DIM, FFN, ROPE_DIM, 1, 8, 1e-5f, false, true, false}, size_t(n), 2, glue_, "h3.refiner.%d.", true, nullptr);
             std::vector<float> c(size_t(n) * ROPE_HALF, 1.0f), s(size_t(n) * ROPE_HALF, 0.0f);
-            for (void *q : {ref_cos_, ref_sin_}) if (q) rt().free(q);
-            ref_cos_ = rt().alloc(c.size() * 4); ref_sin_ = rt().alloc(s.size() * 4);
+            for (void **q : {&ref_cos_, &ref_sin_}) { memory_.free(*q); *q = nullptr; }
+            ref_cos_ = memory_.alloc(c.size() * 4); ref_sin_ = memory_.alloc(s.size() * 4);
             rt().h2d(ref_cos_, c.data(), c.size() * 4); rt().h2d(ref_sin_, s.data(), s.size() * 4);
             const std::string ns = "h3.norm_mod_f32.";
             norm_f32_ = comp_.get("norm_mod_f32", "h3_norm_mod_f32", {{ns + "width", std::to_string(HID)}, {ns + "lanes", std::to_string(lanes_for(HID))}, {ns + "eps", num(1e-5)}, {ns + "classes", "1"}});
         }
+        refiner_ready_ = true;
         refiner_->forward(&prof, x_, cls0_, ref_cos_, ref_sin_, [&](int) { return LayerCond{(const float *)zeros_, (const float *)ones_, (const float *)zeros_, (const float *)ones_}; });
         { KernArgs a; a.i32(n).ptr(x_).ptr(glue_.at("h3.refiner.final_norm", size_t(HID) * 4)).ptr(zeros_).ptr(cls0_); launch(*norm_f32_, &prof, "refiner final norm", unsigned(n), 1, unsigned(lanes_for(HID)), a); }
     }
@@ -648,11 +670,26 @@ public:
         return LayerCond{mod, mod + size_t(CLASSES) * 2 * HID, mod + size_t(CLASSES) * 3 * HID, mod + size_t(CLASSES) * 5 * HID};
     }
 
+    void ensure_conditioning() {
+        if (conditioning_ready_) return;
+        adaln_w_.clear(); adaln_b_.clear();
+        // host-side conditioning tables
+        curve_ = glue_.host_f32("h3.adaln_t_table", 1025 * 8);
+        inv_freq_ = glue_.host_f32("h3.rope_inv_freq", 16);
+        for (int i = 0; i < 50; ++i) { adaln_w_.push_back(glue_.host_f32(fmt("h3.blocks.%d.adaln.w", i), size_t(3 * 6 * HID) * 8)); adaln_b_.push_back(glue_.host_f32(fmt("h3.blocks.%d.adaln.b", i), size_t(3 * 6 * HID))); }
+        final_w_ = glue_.host_f32("h3.final.adaln.w", size_t(2 * HID) * 8); final_b_ = glue_.host_f32("h3.final.adaln.b", size_t(2 * HID));
+        if (!mods_) mods_ = memory_.alloc(size_t(50) * MODS_ROWS * HID * 4);
+        if (!final_table_) final_table_ = memory_.alloc(size_t(4) * HID * 4);
+        if (!blocks_.is_open()) blocks_.open(blocks_dir_);
+        conditioning_ready_ = true;
+    }
+
     // --- denoising ---
     void denoise(const int32_t *ids, int n, const h3pipe_params &p, const float *noise_video, const float *noise_audio, float *video_out, float *audio_out, h3pipe_progress progress, void *user, const std::vector<h3pipe_ref> &refs = {}, const std::vector<h3pipe_keyframe> &kfs = {}) {
         if (p.height % 32 || p.width % 32 || p.height < 64 || p.width < 64) throw std::invalid_argument("height and width must be multiples of 32");
         if (p.steps < 2 || p.steps > 1000) throw std::invalid_argument("steps must be 2..1000");
         h3pipe_shape sh; h3pipe_shape_for(&p, &sh);
+        ensure_conditioning();
         Layout lay(n, sh.latent_t, sh.lat_h, sh.lat_w, sh.audio_t, refs, kfs);
         const size_t L = size_t(n), Rr = lay.ref_rows, LR = L + Rr, Na = lay.audio_rows, Nv = lay.video_rows, S = lay.seq_len;
         ensure_seq(S);
@@ -739,13 +776,14 @@ public:
                         rt().h2d(in16_, in16.data(), sg.rows * KPAD * 2); embed_linear("ref video in", sg.row0, sg.rows, KPAD, "h3.video_in");
                     }
                 }
-                if (!text_copy_) text_copy_ = rt().alloc(seq_cap_ * HID * 4); rt().d2d(text_copy_, x_, LR * HID * 4);
+                if (!text_copy_) text_copy_ = memory_.alloc(seq_cap_ * HID * 4); rt().d2d(text_copy_, x_, LR * HID * 4);
             } else rt().d2d(x_, text_copy_, LR * HID * 4);
             if (p.cache_threshold > 0.0f) {                                          // first-block cache (TeaCache / FBCache style)
                 const size_t n = S * size_t(HID), groups = (n + 2047) / 2048;
                 if (cache_cap_ < n) {
-                    for (void *q : {xb0_, prev_b0_, cache_resid_, partials_}) if (q) rt().free(q);
-                    xb0_ = rt().alloc(n * 4); prev_b0_ = rt().alloc(n * 4); cache_resid_ = rt().alloc(n * 4); partials_ = rt().alloc(groups * 8); cache_cap_ = n;
+                    cache_cap_ = 0;
+                    for (void **q : {&xb0_, &prev_b0_, &cache_resid_, &partials_}) { memory_.free(*q); *q = nullptr; }
+                    xb0_ = memory_.alloc(n * 4); prev_b0_ = memory_.alloc(n * 4); cache_resid_ = memory_.alloc(n * 4); partials_ = memory_.alloc(groups * 8); cache_cap_ = n;
                     absdiff_ = comp_.get("absdiff_sum_f32", "h3_absdiff_sum_f32", {});
                 }
                 dit_->forward(&prof, x_, cls_, cos_, sin_, [&](int i) { return cond(i); }, 0, 1);
@@ -808,7 +846,7 @@ public:
     // one tile (or whole image) of `frames` frames -> moments rows [T_lat*h*w][64] f16 on the device (channels 0..23 the mean)
     void venc_tile(const float *pixels, int frames, int H, int W, int y0, int x0, int TH, int TW, int fullW, std::vector<float> &latent, int &T_lat) {
         auto Wt = [&](const std::string &nm, size_t bytes) { return venc_.at(nm, bytes); };
-        std::vector<void *> owned; auto buf = [&](size_t bytes) { void *p = rt().alloc(bytes); owned.push_back(p); return p; };
+        DeviceBuffers temporary; auto buf = [&](size_t bytes) { return temporary.alloc(bytes); };
         const bool image = frames == 1; const int taps_t = image ? 1 : 3;
         // input rows [frames*TH*TW][8] f16: ImageNet-normalised pixels, channels 3..7 zero
         const float mean[3] = {0.485f, 0.456f, 0.406f}, stdv[3] = {0.229f, 0.224f, 0.225f};
@@ -857,7 +895,7 @@ public:
         T_lat = T; latent.assign(size_t(24) * T * th * tw, 0.0f);
         for (int t = 0; t < T; ++t) for (int yy = 0; yy < th; ++yy) for (int xx = 0; xx < tw; ++xx) for (int c = 0; c < 24; ++c)
             latent[((size_t(c) * T + t) * th + yy) * tw + xx] = (f16_to_f32(mom[((size_t(t) * th + yy) * tw + xx) * 64 + c]) - lmean[c]) / lstd[c];
-        for (void *q : owned) rt().free(q);
+
     }
     static void split_tiles(int len, std::vector<int> &starts, std::vector<int> &overlaps) {   // ComfyUI's split_tiles: 256-px tiles, overlaps >= 64 in 16-px units
         starts.clear(); overlaps.clear(); const int tile = 256, omin = 64, ratio = 16;
@@ -937,7 +975,7 @@ public:
         if (H % 32 || W % 32 || H < 32 || W < 32) throw std::invalid_argument("vision images need height and width multiples of 32");
         const int gh = H / 16, gw = W / 16, n = gh * gw, m = n / 4; const size_t cap = (size_t(n) + 16 + 31) / 32 * 32;
         auto V = [&](const std::string &nm, size_t bytes) { return vision_.at(nm, bytes); };
-        std::vector<void *> owned; auto buf = [&](size_t bytes) { void *p = rt().alloc(bytes); owned.push_back(p); return p; };
+        DeviceBuffers temporary; auto buf = [&](size_t bytes) { return temporary.alloc(bytes); };
         // patches in merge order, content (c, t, py, px) with the image in both temporal slots, CLIP's mean/std (process_qwen2vl_images)
         static const float pmean[3] = {0.48145466f, 0.4578275f, 0.40821073f}, pstd[3] = {0.26862954f, 0.26130258f, 0.27577711f};
         std::vector<float> patches(size_t(n) * 1536);
@@ -1006,7 +1044,7 @@ public:
         gemm16("gelu_erf", "vision merger", m, 4608, 4608, ln, V("vis.merger.fc1.w", size_t(4608) * 4608 * 2), V("vis.merger.fc1.b", 4608 * 4), mid);
         gemm16("bias", "vision merger", m, 4608, VOUT, mid, V("vis.merger.fc2.w", size_t(VOUT) * 4608 * 2), V("vis.merger.fc2.b", VOUT * 4), out5);
         rt().d2h(merged.data(), out5, merged.size() * 4);
-        rt().sync(); for (void *p : owned) rt().free(p);
+        rt().sync();
     }
 
     // --- the audio encoder: the audio VAE's DAC conv stack and posterior head, f32 SIMT Loom kernels (reference audio) ---
@@ -1044,7 +1082,7 @@ public:
         if (!aenc_open_) { if (aenc_dir_.empty()) throw std::runtime_error("no audio encoder weights: h3pipe_config.aenc_dir is NULL"); aenc_.open(aenc_dir_); aenc_open_ = true; }
         const size_t Lp = (size_t(n) + 799) / 800 * 800; const int T = int(Lp / 800); audio_t = T;
         auto W = [&](const std::string &nm, size_t count) { return aenc_.at(nm, count * 4); };
-        std::vector<void *> owned; auto buf = [&](size_t floats) { void *p = rt().alloc(floats * 4); owned.push_back(p); return p; };
+        DeviceBuffers temporary; auto buf = [&](size_t floats) { return temporary.alloc(floats * 4); };
         const size_t plane = size_t(64) * Lp;
         void *x0 = buf(Lp), *h = buf(plane), *h2 = buf(plane), *y = buf(plane), *y2 = buf(plane);
         void *rows = buf(size_t(T) * 2048), *n1 = buf(size_t(T) * 2048), *qkv = buf(size_t(T) * 6144), *pattn = buf(size_t(8) * T * T), *pool = buf(size_t(T) * 32);
@@ -1098,7 +1136,7 @@ public:
             rt().d2h(zrow.data(), xc, size_t(T) * 32 * 4);
             for (int t = 0; t < T; ++t) for (int c = 0; c < 32; ++c) out[(size_t(ch) * 32 + c) * T + t] = (zrow[size_t(t) * 32 + c] - mean_h[c]) / std_h[c];
         }
-        rt().sync(); for (void *p : owned) rt().free(p);
+        rt().sync();
     }
 
     // --- the audio decoder: BigVGAN in f32 SIMT Loom kernels ---
@@ -1130,9 +1168,10 @@ public:
         const int T = audio_t; const size_t L_out = size_t(T) * 800;
         const size_t cap = std::max<size_t>(size_t(2048) * T, size_t(8) * L_out) + 4096;    // the widest [C][len] plane of the stack
         if (audio_cap_ < cap) {
-            for (void *q : {ah_, aacc_, ahj_, ar_, ar2_, atmp_, ain_}) if (q) rt().free(q);
-            ah_ = rt().alloc(cap * 4); aacc_ = rt().alloc(cap * 4); ahj_ = rt().alloc(cap * 4); ar_ = rt().alloc(cap * 4); ar2_ = rt().alloc(cap * 4);
-            atmp_ = rt().alloc(cap * 8); ain_ = rt().alloc(size_t(32) * T * 4 + 4096); audio_cap_ = cap;
+            audio_cap_ = 0;
+            for (void **q : {&ah_, &aacc_, &ahj_, &ar_, &ar2_, &atmp_, &ain_}) { memory_.free(*q); *q = nullptr; }
+            ah_ = memory_.alloc(cap * 4); aacc_ = memory_.alloc(cap * 4); ahj_ = memory_.alloc(cap * 4); ar_ = memory_.alloc(cap * 4); ar2_ = memory_.alloc(cap * 4);
+            atmp_ = memory_.alloc(cap * 8); ain_ = memory_.alloc(size_t(32) * T * 4 + 4096); audio_cap_ = cap;
         }
         std::vector<float> lmean = glue_.host_f32("audio.latents_mean", 32), lstd = glue_.host_f32("audio.latents_std", 32);
         std::vector<float> in(size_t(32) * T), out(L_out);
@@ -1177,17 +1216,17 @@ public:
     // one clip: model-space latents z [24][ft][h][w] (already * std + mean) -> ImageNet-space frames [3][ft*4][h*16][w*16]
     void decode_clip(const float *z, int ft, int h, int w, std::vector<float> &frames) {
         const size_t N = size_t(ft) * h * w, NT = N + VAE_REG + 1;
-        if (!vae_blob_.dev) { if (vae_dir_.empty()) throw std::invalid_argument("vae_dir is required for video decoding"); vae_blob_.open(vae_dir_); }
+        if (!vae_blob_.is_open()) { if (vae_dir_.empty()) throw std::invalid_argument("vae_dir is required for video decoding"); vae_blob_.open(vae_dir_); }
         if (!vae_ || !vae_grid_.matches(ft, h, w)) {
             vae_grid_ = {};
             vae_.reset(); vae_ = std::make_unique<Stack>(comp_, StackDims{VAE_HID, VAE_HEADS, VAE_HEADS, VAE_D, VAE_FFN, 48, 1, vae_bits_, 1e-5f, true, false, false}, NT, 36, vae_blob_, "blocks.%d.", false, (const float *)ones_);
-            for (void **q : {&vx_, &vcos_, &vsin_, &vin16_, &va_q_, &va_s_, &vout16_, &vcls_}) { if (*q) rt().free(*q); *q = nullptr; }
+            for (void **q : {&vx_, &vcos_, &vsin_, &vin16_, &va_q_, &va_s_, &vout16_, &vcls_}) { if (*q) memory_.free(*q); *q = nullptr; }
             const size_t T = vae_->capacity();
-            vx_ = rt().alloc(T * VAE_HID * 4); rt().memset(vx_, 0, T * VAE_HID * 4);
-            vcos_ = rt().alloc(T * VAE_ROPE_HALF * 4); vsin_ = rt().alloc(T * VAE_ROPE_HALF * 4);
-            vin16_ = rt().alloc(T * KPAD * 2); rt().memset(vin16_, 0, T * KPAD * 2);
-            va_q_ = rt().alloc(T * VAE_HID); va_s_ = rt().alloc(T * 4);
-            vout16_ = rt().alloc(T * VAE_OUT * 2); vcls_ = rt().alloc(T * 4); rt().memset(vcls_, 0, T * 4);
+            vx_ = memory_.alloc(T * VAE_HID * 4); rt().memset(vx_, 0, T * VAE_HID * 4);
+            vcos_ = memory_.alloc(T * VAE_ROPE_HALF * 4); vsin_ = memory_.alloc(T * VAE_ROPE_HALF * 4);
+            vin16_ = memory_.alloc(T * KPAD * 2); rt().memset(vin16_, 0, T * KPAD * 2);
+            va_q_ = memory_.alloc(T * VAE_HID); va_s_ = memory_.alloc(T * 4);
+            vout16_ = memory_.alloc(T * VAE_OUT * 2); vcls_ = memory_.alloc(T * 4); rt().memset(vcls_, 0, T * 4);
             // the rotary tables: coordinates 2 * ((i + 0.5) / size) - 1 per axis, angles 2 pi * pos * inv_freq (8 frequencies per axis), zero for the register / cls rows
             std::vector<float> c(T * VAE_ROPE_HALF, 1.0f), s(T * VAE_ROPE_HALF, 0.0f);
             const int sizes[3] = {ft, h, w};
@@ -1199,12 +1238,12 @@ public:
             rt().h2d(vcos_, c.data(), c.size() * 4); rt().h2d(vsin_, s.data(), s.size() * 4);
             vproj_in_prep_.build(comp_, "plain", 8, KPAD); vproj_in_.build(comp_, "resid", 8, true, true, KPAD, VAE_HID, N, 1);
             vnorm_out_.build(comp_, "lnorm", 8, VAE_HID, 1e-5f, 1); vproj_out_.build(comp_, "plain", 8, true, true, VAE_HID, VAE_OUT, NT);
-            if (!vnorm_table_) { vnorm_table_ = rt().alloc(size_t(2) * VAE_HID * 4); rt().memset(vnorm_table_, 0, size_t(VAE_HID) * 4);
+            if (!vnorm_table_) { vnorm_table_ = memory_.alloc(size_t(2) * VAE_HID * 4); rt().memset(vnorm_table_, 0, size_t(VAE_HID) * 4);
                 rt().d2d(((float *)vnorm_table_ + VAE_HID), glue_.at("vae.norm_out.b", size_t(VAE_HID) * 4), size_t(VAE_HID) * 4); }
         }
         vae_grid_ = {ft, h, w};
         // post_quant_conv (a 24x24 matrix per voxel) on the host, then the tokens padded to K = 256 in f16
-        static std::vector<float> pq_w, pq_b; if (pq_w.empty()) { pq_w = glue_.host_f32("vae.post_quant_conv.w", 24 * 24); pq_b = glue_.host_f32("vae.post_quant_conv.b", 24); }
+        const auto pq_w = glue_.host_f32("vae.post_quant_conv.w", 24 * 24), pq_b = glue_.host_f32("vae.post_quant_conv.b", 24);
         std::vector<uint16_t> in16(N * KPAD, 0);
         for (size_t v = 0; v < N; ++v) for (int o = 0; o < LATENT_CH; ++o) { float acc = pq_b[o]; for (int i = 0; i < LATENT_CH; ++i) acc += pq_w[o * 24 + i] * z[size_t(i) * N + v]; in16[v * KPAD + o] = f32_to_f16(acc); }
         rt().h2d(vin16_, in16.data(), in16.size() * 2);
@@ -1274,13 +1313,15 @@ public:
         for (int c = 0; c < LATENT_CH; ++c) for (int t = 0; t < Tp; ++t) for (size_t i = 0; i < size_t(H) * W; ++i)
             zp[(size_t(c) * Tp + t) * H * W + i] = latents[(size_t(c) * T + std::min(t, T - 1)) * H * W + i] * lstd[c] + lmean[c];
         const int chunk_frames = VAE_CHUNK * VAE_TRATIO, pre = ((-VAE_CLIP) % VAE_TRATIO + VAE_TRATIO) % VAE_TRATIO, overlap_frames = std::max(VAE_OVERLAP * VAE_TRATIO - pre, 0);
-        std::vector<float> dec; std::vector<float> overlap; bool have_overlap = false;   // dec: [3][frames][H][W] accumulated
+        std::vector<float> overlap; bool have_overlap = false;
         size_t dec_frames = 0;
         auto append = [&](const std::vector<float> &chunk, size_t nf, size_t src_ft) {
-            const size_t old = dec_frames; dec.resize(size_t(3) * (old + nf) * plane);
-            std::vector<float> tmp(size_t(3) * (old + nf) * plane);
-            for (int c = 0; c < 3; ++c) { memcpy(tmp.data() + size_t(c) * (old + nf) * plane, dec.data() + size_t(c) * old * plane, old * plane * 4); memcpy(tmp.data() + (size_t(c) * (old + nf) + old) * plane, chunk.data() + size_t(c) * src_ft * plane, nf * plane * 4); }
-            dec.swap(tmp); dec_frames = old + nf;
+            const size_t take = dec_frames < size_t(F) ? std::min(nf, size_t(F) - dec_frames) : 0;
+            for (size_t f = 0; f < take; ++f) for (size_t q = 0; q < plane; ++q) for (int c = 0; c < 3; ++c) {
+                const float v = chunk[(size_t(c) * src_ft + f) * plane + q] * IMAGENET_STD[c] + IMAGENET_MEAN[c];
+                out[((dec_frames + f) * plane + q) * 3 + c] = uint8_t(std::lround(std::min(std::max(v, 0.0f), 1.0f) * 255.0f));
+            }
+            dec_frames += nf;
         };
         std::vector<float> clip, chunk;
         for (int i = 0; i < num_chunks; ++i) {
@@ -1314,15 +1355,12 @@ public:
             keep = dec_frames - pad_frames;
         }
         if (keep != size_t(F)) throw std::runtime_error("decoded " + std::to_string(keep) + " frames, expected " + std::to_string(F));
-        for (size_t f = 0; f < keep; ++f) for (size_t q = 0; q < plane; ++q) for (int c = 0; c < 3; ++c) {
-            const float v = dec[(size_t(c) * dec_frames + f) * plane + q] * IMAGENET_STD[c] + IMAGENET_MEAN[c];
-            out[(f * plane + q) * 3 + c] = uint8_t(std::lround(std::min(std::max(v, 0.0f), 1.0f) * 255.0f));
-        }
+
     }
 
 private:
     Compiler comp_;
-    Blob glue_, blocks_, te_blob_; Span embed_; std::string te_dir_, vae_dir_; int vae_bits_ = 8;
+    Blob glue_, blocks_, te_blob_; Span embed_; std::string te_dir_, vae_dir_, blocks_dir_; bool conditioning_ready_ = false, te_ready_ = false, refiner_ready_ = false; int vae_bits_ = 8;
     std::vector<float> curve_, inv_freq_, final_w_, final_b_; std::vector<std::vector<float>> adaln_w_, adaln_b_;
     std::unique_ptr<Stack> te_, refiner_, dit_, vae_; Blob vae_blob_;
     DecoderGrid vae_grid_;

@@ -18,9 +18,11 @@ struct HipRt : Rt {
     void sync() override { HIP_CHECK(hipDeviceSynchronize()); }
     RtKernel *load(const std::string &path, const std::string &symbol) override {
         RtKernel *k = new RtKernel;
-        HIP_CHECK(hipModuleLoad(&k->module, path.c_str()));
-        HIP_CHECK(hipModuleGetFunction(&k->function, k->module, symbol.c_str()));
-        return k;
+        try {
+            HIP_CHECK(hipModuleLoad(&k->module, path.c_str()));
+            HIP_CHECK(hipModuleGetFunction(&k->function, k->module, symbol.c_str()));
+            return k;
+        } catch (...) { unload(k); throw; }
     }
     void unload(RtKernel *k) override { if (k) { if (k->module) (void)hipModuleUnload(k->module); delete k; } }
     void launch(RtKernel *k, unsigned gx, unsigned gy, unsigned bx, const KernArgs &a) override {

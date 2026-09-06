@@ -15,6 +15,8 @@ constexpr hipError_t hipSuccess = 0;
 inline std::unordered_set<void *> fake_allocations;
 inline bool fake_copy_failure = false;
 inline int fake_allocation_count = 0;
+inline bool fake_module_load_failure = true, fake_symbol_failure = true;
+inline std::unordered_set<void *> fake_modules;
 inline const char *hipGetErrorString(hipError_t) { return "injected HIP failure"; }
 inline hipError_t hipInit(unsigned) { return hipSuccess; }
 inline hipError_t hipMalloc(void **p, size_t n) {
@@ -33,9 +35,19 @@ inline hipError_t hipMemcpyHtoD(void *dst, const void *src, size_t n) {
     std::memcpy(dst, src, n); return hipSuccess;
 }
 inline hipError_t hipMemcpyDtoH(void *dst, void *src, size_t n) { std::memcpy(dst, src, n); return hipSuccess; }
+inline hipError_t hipMemcpyDtoD(void *dst, void *src, size_t n) { std::memmove(dst, src, n); return hipSuccess; }
 inline hipError_t hipMemset(void *p, int v, size_t n) { std::memset(p, v, n); return hipSuccess; }
 inline hipError_t hipDeviceSynchronize() { return hipSuccess; }
-inline hipError_t hipModuleLoad(hipModule_t *, const char *) { return 1; }
-inline hipError_t hipModuleGetFunction(hipFunction_t *, hipModule_t, const char *) { return 1; }
-inline hipError_t hipModuleUnload(hipModule_t) { return hipSuccess; }
+inline hipError_t hipModuleLoad(hipModule_t *out, const char *) {
+    if (fake_module_load_failure) return 1;
+    *out = std::malloc(1); fake_modules.insert(*out); return hipSuccess;
+}
+inline hipError_t hipModuleGetFunction(hipFunction_t *out, hipModule_t module, const char *) {
+    if (fake_symbol_failure) return 1;
+    *out = module; return hipSuccess;
+}
+inline hipError_t hipModuleUnload(hipModule_t module) {
+    if (!fake_modules.erase(module)) std::abort();
+    std::free(module); return hipSuccess;
+}
 inline hipError_t hipModuleLaunchKernel(...) { return 1; }

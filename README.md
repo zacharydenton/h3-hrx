@@ -191,3 +191,8 @@ test runner at `build/loomrun`.
 spatial and temporal blending. It loads only decoder weights and small projection tables,
 without the DiT, text encoder or full floating-point VAE. Pass `--latents video.npy` to
 check saved `[24,T,H,W]` latents.
+
+`python tests/test_vae_blocks.py --curve 1,36 --bits 8` checks independent floating-point
+accuracy on a real decoder tile, loading one reference block at a time. It enforces both
+update cosine and frame PSNR; `--full-clip` expands the spatial test while keeping attention
+memory bounded. The normal Python Loom decoding tools also load only the small VAE heads.

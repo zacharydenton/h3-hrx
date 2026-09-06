@@ -58,20 +58,13 @@ def w8a8(x, w_rot, b, kpad=None):
 def decode_video(pipe, a):
     """The C decoder (chunking, heads, blending, ImageNet mapping) vs the Python Loom decoder on the same latents."""
     import math
-    from diffusers import AutoencoderKLMiniMaxH3
-    from pipeline import MODELS
-    from decode_loom import LoomClipDecoder
-    dev = "cuda"; fx = torch.load(ROOT / "build/fox_480p_5s_latents.pt"); frames = 22
+    fx = torch.load(ROOT / "build/fox_480p_5s_latents.pt"); frames = 22
     p = H3Pipe.params(height=480, width=864, frames=frames, steps=2); sh = pipe.shape(p)
     z = fx["video"][0, :, :sh.latent_t].float().numpy()
     t0 = time.time(); got = pipe.decode_video(p, z); print(f"  C decode {frames} frames in {time.time() - t0:.1f} s")
-    vae = AutoencoderKLMiniMaxH3.from_pretrained(str(MODELS / "vae"), torch_dtype=torch.float32).to(dev).eval()
-    mean = torch.tensor(vae.config.latents_mean, device=dev).view(1, -1, 1, 1, 1); std = torch.tensor(vae.config.latents_std, device=dev).view(1, -1, 1, 1, 1)
-    vae.decoder.forward = LoomClipDecoder(vae, weights=str(ROOT / "build/weights_vae_i8"), bits=8).forward
-    with torch.no_grad():
-        t0 = time.time(); video = vae._decode(torch.from_numpy(z)[None].to(dev) * std + mean); torch.cuda.synchronize(); print(f"  Python Loom decode in {time.time() - t0:.1f} s")
-    imstd = torch.tensor((0.229, 0.224, 0.225), device=dev).view(1, 3, 1, 1, 1); immean = torch.tensor((0.485, 0.456, 0.406), device=dev).view(1, 3, 1, 1, 1)
-    want = ((video.float() * imstd + immean).clamp(0, 1)[0] * 255).round().to(torch.uint8).permute(1, 2, 3, 0).cpu().numpy()
+    from test_decoder_tiles import python_decode
+    t0 = time.time(); want = python_decode(z)
+    print(f"  Python Loom decode in {time.time() - t0:.1f} s (small heads only)")
     assert got.shape == want.shape, (got.shape, want.shape)
     mse = float(((got.astype(np.float32) - want.astype(np.float32)) ** 2).mean()); psnr = 10 * math.log10(255.0 ** 2 / max(mse, 1e-9))
     print(f"  {'PASS' if psnr > 35 else 'FAIL'} C video decoder vs Python Loom decoder: PSNR {psnr:.2f} dB over {got.shape[0]} frames (max abs {np.abs(got.astype(int) - want.astype(int)).max()})")
@@ -79,7 +72,7 @@ def decode_video(pipe, a):
         import imageio.v2 as iio
         strip = np.concatenate([got[2], got[11], got[21]], axis=1); iio.imwrite(str(ROOT / "build/pipe_decode_strip.jpg"), strip)
     except Exception: pass
-    del vae; torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
     return psnr > 35
 
 

@@ -3,7 +3,6 @@
 Run in the torch venv: python tests/test_decoder_tiles.py [--latents saved_video.npy]
 """
 import argparse
-import json
 import math
 from pathlib import Path
 import sys
@@ -17,7 +16,7 @@ from h3pipe_loom import H3Pipe
 
 
 def decoder_glue(directory):
-    """Copy only decoder/constructor tables; never load DiT or text encoder weights."""
+    """Copy only decoder tables for tests with different session weights."""
     glue, empty = directory / "glue", directory / "empty"
     glue.mkdir(); empty.mkdir()
     (empty / "weights.bin").write_bytes(b"\0")
@@ -32,7 +31,7 @@ def decoder_glue(directory):
             if name == "te.embed":
                 manifest.append("te.embed 0 0 torch.bfloat16 0")
                 continue
-            if not (name.startswith("vae.") or ".adaln." in name or name in ("h3.adaln_t_table", "h3.rope_inv_freq")):
+            if not name.startswith("vae."):
                 continue
             manifest.append(f"{name} {dst.tell()} {size} {dtype} {shape}")
             src.seek(int(offset)); remaining = int(size)
@@ -47,26 +46,12 @@ def decoder_glue(directory):
 
 def python_decode(z):
     import torch
-    from safetensors import safe_open
-    from diffusers import AutoencoderKLMiniMaxH3
-    from diffusers.models.autoencoders.autoencoder_kl_minimax_h3 import MiniMaxH3VideoRotaryPosEmbed
     from decode_loom import LoomClipDecoder
+    from reference.vae_decoder import DecoderWeights
 
-    model = Path.home() / "h3-models/vae"
-    config = json.loads((model / "config.json").read_text())
-    index = json.loads((model / "diffusion_pytorch_model.safetensors.index.json").read_text())["weight_map"]
-    # Keep the real diffusers tiling/chunking methods, but allocate only the small heads.
-    with torch.device("meta"):
-        vae = AutoencoderKLMiniMaxH3.from_config(config)
-    del vae.encoder, vae.quant_conv
-    vae.decoder.transformer_blocks = torch.nn.ModuleList()
-    state = {}
-    for name, shard in index.items():
-        if name.startswith("post_quant_conv.") or (name.startswith("decoder.") and not name.startswith("decoder.transformer_blocks.")):
-            with safe_open(str(model / shard), framework="pt", device="cpu") as f:
-                state[name] = f.get_tensor(name).to("cuda")
-    vae.load_state_dict(state, strict=True, assign=True)
-    vae.decoder.rope = MiniMaxH3VideoRotaryPosEmbed(48).to("cuda")
+    weights = DecoderWeights()
+    config = weights.config
+    vae = weights.heads()
     loom = LoomClipDecoder(vae, weights=ROOT / "build/weights_vae_i8", bits=8)
     vae.decoder.forward = loom.forward
     try:
@@ -79,8 +64,33 @@ def python_decode(z):
             std = video.new_tensor((.229, .224, .225))[None, :, None, None, None]
             return ((video * std + mean).clamp(0, 1) * 255).round().to(torch.uint8)[0].permute(1, 2, 3, 0).cpu().numpy()
     finally:
-        for session in loom.sessions.values():
-            session.close()
+        loom.close()
+
+
+def session_isolation():
+    """A second session must use its own post-quant weights, even after a prior decode."""
+    import shutil
+    z = np.random.default_rng(3).normal(size=(24, 2, 4, 6)).astype(np.float32)
+    with tempfile.TemporaryDirectory(prefix="h3-decoder-sessions-") as tmp:
+        directory = Path(tmp)
+        first, empty = decoder_glue(directory)
+        second = directory / "second"
+        shutil.copytree(first, second)
+        with (second / "weights.bin").open("r+b") as f:
+            for line in (second / "manifest.txt").read_text().splitlines():
+                name, offset, size, *_ = line.split()
+                if name.startswith("vae.post_quant_conv."):
+                    f.seek(int(offset)); f.write(bytes(int(size)))
+        results = []
+        for glue in (first, second, first):
+            pipe = H3Pipe(glue=glue, blocks=empty)
+            try:
+                results.append(pipe.decode_video(pipe.params(height=64, width=96, frames=5), z))
+            finally:
+                pipe.close()
+        assert not np.array_equal(results[0], results[1]), "second session reused the first session's decoder weights"
+        np.testing.assert_array_equal(results[0], results[2])
+        print("PASS distinct session weights and five-frame decoding")
 
 
 def main():
@@ -93,13 +103,12 @@ def main():
     _, t, h, w = z.shape
     frames = (t - 2) // 5 * 17 + 5
     assert t >= 7 and (t - 2) % 5 == 0 and h > 16 and w > 16
-    with tempfile.TemporaryDirectory(prefix="h3-decoder-tiles-") as tmp:
-        glue, empty = decoder_glue(Path(tmp))
-        pipe = H3Pipe(glue=glue, blocks=empty)
-        try:
-            got = pipe.decode_video(pipe.params(height=h * 16, width=w * 16, frames=frames), z)
-        finally:
-            pipe.close()
+    # Missing DiT/text paths must be harmless for a decoder-only session.
+    pipe = H3Pipe(blocks="/unused/dit", te="/unused/text")
+    try:
+        got = pipe.decode_video(pipe.params(height=h * 16, width=w * 16, frames=frames), z)
+    finally:
+        pipe.close()
     want = python_decode(z)
     assert got.shape == want.shape
     mse = np.mean((got.astype(np.float64) - want.astype(np.float64)) ** 2)
@@ -108,6 +117,7 @@ def main():
     if args.out:
         np.save(args.out, got)
     assert psnr > 40, psnr
+    session_isolation()
 
 
 if __name__ == "__main__":

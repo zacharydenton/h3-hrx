@@ -39,7 +39,8 @@ struct HrxRt : Rt {
         // device-local buffers expose no device pointer, and nothing on the host dereferences one: hand out a synthetic
         // address per allocation (4 KB aligned, never reused) that ref() maps back to (buffer, offset)
         const size_t size = bytes ? bytes : 1; void *p = reinterpret_cast<void *>(next_base); next_base += (size + 4095) & ~size_t(4095);
-        allocs[uintptr_t(p)] = {buf, size}; return p;
+        try { allocs[uintptr_t(p)] = {buf, size}; } catch (...) { hrx_buffer_release(buf); throw; }
+        return p;
     }
     void free(void *p) override {
         auto it = allocs.find(uintptr_t(p)); if (it == allocs.end()) return;
@@ -63,11 +64,14 @@ struct HrxRt : Rt {
     }
     void sync() override { check(hrx_stream_synchronize(stream), "hrx_stream_synchronize"); }
     RtKernel *load(const std::string &path, const std::string &symbol) override {
-        RtKernel *k = new RtKernel; k->symbol = symbol;
-        check(hrx_executable_load_file(dev, path.c_str(), "amdgpu", "gfx1151", &k->exe), ("hrx_executable_load_file " + path).c_str());
-        check(hrx_executable_lookup_export_by_name(k->exe, symbol.c_str(), &k->ordinal), ("export " + symbol).c_str());
-        check(hrx_executable_export_info(k->exe, k->ordinal, &k->info), "hrx_executable_export_info");
-        return k;
+        RtKernel *k = new RtKernel;
+        try {
+            k->symbol = symbol;
+            check(hrx_executable_load_file(dev, path.c_str(), "amdgpu", "gfx1151", &k->exe), ("hrx_executable_load_file " + path).c_str());
+            check(hrx_executable_lookup_export_by_name(k->exe, symbol.c_str(), &k->ordinal), ("export " + symbol).c_str());
+            check(hrx_executable_export_info(k->exe, k->ordinal, &k->info), "hrx_executable_export_info");
+            return k;
+        } catch (...) { unload(k); throw; }
     }
     void unload(RtKernel *k) override { if (k) { if (k->exe) hrx_executable_release(k->exe); delete k; } }
     void launch(RtKernel *k, unsigned gx, unsigned gy, unsigned bx, const KernArgs &a) override {
