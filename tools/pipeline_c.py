@@ -64,8 +64,8 @@ def main():
     with wave.open(str(out.with_suffix(".wav")), "wb") as wf: wf.setnchannels(2); wf.setsampwidth(2); wf.setframerate(RATE); wf.writeframes(pcm.tobytes())
     raw = out.with_suffix(".rgb"); raw.write_bytes(frames.tobytes())
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{a.width}x{a.height}", "-r", str(FPS), "-i", str(raw), "-i", str(out.with_suffix(".wav")),
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-c:a", "aac", "-b:a", "192k", "-shortest", str(out)], check=True)
-    raw.unlink(); print(f"wrote {out}")
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-c:a", "aac", "-b:a", "192k", "-shortest", str(out.with_suffix(".mp4"))], check=True)   # --out with or without .mp4
+    raw.unlink(); print(f"wrote {out.with_suffix('.mp4')}")
 
 
 if __name__ == "__main__":
