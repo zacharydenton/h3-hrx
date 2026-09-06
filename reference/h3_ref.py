@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import math
 import struct
+import os
 from pathlib import Path
 
 import torch
@@ -35,7 +36,7 @@ MODALITIES = 3                                 # AdaLN rows per timestep class: 
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 FRAME_RESCALE = 5.0 / 3.0
 SPATIAL_SCALE = 32.0
-CKPT = Path.home() / "comfy-models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+CKPT = Path(os.environ["H3_CKPT"]) if os.environ.get("H3_CKPT") else Path.home() / "comfy-models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"   # H3_CKPT: the ref2va file for its export
 
 
 # --- rotation and quantisation (as krea2-loom) ---------------------------------------------------

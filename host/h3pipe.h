@@ -41,6 +41,15 @@ typedef struct {
     int text_rows_max;
 } h3pipe_shape;
 
+// A reference block (ref2va), in presentation order: kind 0 = image (video_latent [24][1][lat_h][lat_w], model space, from
+// h3pipe_encode_image), 1 = audio (audio_latent [2][32][audio_t] from h3pipe_encode_audio), 2 = video (video_latent
+// [24][latent_t][lat_h][lat_w], audio_latent optional: its soundtrack). Unused pointers NULL, unused counts 0.
+typedef struct {
+    int kind;
+    const float *video_latent; int latent_t, lat_h, lat_w;
+    const float *audio_latent; int audio_t;
+} h3pipe_ref;
+
 // Called after every denoising step; return nonzero to cancel.
 typedef int (*h3pipe_progress)(void *user, int step, int steps, double seconds);
 
@@ -55,6 +64,13 @@ int h3pipe_denoise(h3pipe_session *s, const int32_t *ids, int n_ids, const h3pip
                    const float *noise_video, const float *noise_audio,
                    float *video_latents, size_t video_elements, float *audio_latents, size_t audio_elements,
                    h3pipe_progress progress, void *user, char *error, size_t error_capacity);
+
+// As h3pipe_denoise with reference blocks packed between the text and the target streams (the ids must carry the
+// matching presentation: "<Picture i>: " + vision span, "<Audio j>: ", "<Video k>: " blocks, then the prompt).
+int h3pipe_denoise_refs(h3pipe_session *s, const int32_t *ids, int n_ids, const h3pipe_params *params, const h3pipe_ref *refs, int n_refs,
+                        const float *noise_video, const float *noise_audio,
+                        float *video_latents, size_t video_elements, float *audio_latents, size_t audio_elements,
+                        h3pipe_progress progress, void *user, char *error, size_t error_capacity);
 
 // Inspection: the refined text rows the blocks see, f32 [n_ids][5376].
 int h3pipe_text_in(h3pipe_session *s, const int32_t *ids, int n_ids, float *out, size_t out_elements, char *error, size_t error_capacity);

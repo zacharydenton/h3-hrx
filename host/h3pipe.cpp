@@ -38,7 +38,8 @@ namespace {
 // --- the model's shapes --------------------------------------------------------------------
 constexpr int HID = 5376, HEADS = 56, HEAD_DIM = 128, FFN = 14336, ROPE_DIM = 96, ROPE_HALF = 48;
 constexpr int TEXT_DIM = 5120, VIDEO_PATCH = 96, AUDIO_CH = 32, KPAD = 256, FINAL_N = 128;
-constexpr int CLASSES = 12, MODALITIES = 3, MODS_ROWS = 6 * CLASSES;      // the AdaLN table rows per layer
+constexpr int CLASSES = 12, MODALITIES = 3, MODS_ROWS = 6 * CLASSES;
+constexpr float VISUAL_COND_AUG = 0.999f;                                  // ComfyUI's VISUAL_COND_TIMESTEP: reference latents at 0.999 * z + 0.001 * noise, timestep class max(t_v, 0.999)      // the AdaLN table rows per layer
 constexpr int TE_HID = 5120, TE_HEADS = 64, TE_KV = 8, TE_FFN = 25600, TE_ROPE_HALF = 64;
 constexpr int LATENT_CH = 24, FPS = 24, AUDIO_LATENTS_PER_S = 40;
 constexpr int VAE_HID = 2048, VAE_HEADS = 32, VAE_D = 64, VAE_FFN = 8192, VAE_ROPE_HALF = 24, VAE_PT = 4, VAE_PS = 16, VAE_OUT = 3 * VAE_PT * VAE_PS * VAE_PS, VAE_REG = 4;
@@ -383,27 +384,57 @@ private:
 };
 
 // --- the packed sequence layout (reference/h3_ref.py Layout) --------------------------------
+struct RefSeg { int kind; size_t row0, rows; int latent_t, lat_h, lat_w, audio_t; bool audio; int ref; };   // one packed segment of a reference block
+
 struct Layout {
-    int text_len, latent_t, lat_h, lat_w, audio_t; size_t audio_rows, video_rows, seq_len;
+    // The packed sequence [text | reference blocks | audio | video] as ComfyUI's PackedLayout: positions (t, h, w), the
+    // AdaLN row (timestep class * 3 + modality tag) and the timestep class per row. Classes: 0 video, 1 audio,
+    // 2 cond video (t = max(t_v, 0.999)), 3 cond audio (t = max(t_a, 1.0)). Tags: 0 video, 1 text, 2 audio.
+    int text_len, latent_t, lat_h, lat_w, audio_t; size_t ref_rows = 0, audio_rows, video_rows, seq_len;
     std::vector<double> pos;                 // [seq][3] (t, h, w)
-    std::vector<int32_t> adaln_rows, tclass; // per row: class*3 + modality; 0 video timestep, 1 audio
+    std::vector<int32_t> adaln_rows, tclass;
+    std::vector<RefSeg> ref_segs;            // the reference segments in row order (a video block with sound gives two)
     static std::vector<double> axis(int dim, double sqrt_area) {
         const double ratio = dim / sqrt_area; const int n = dim / 2; std::vector<double> v(n);
         for (int i = 0; i < n; ++i) v[i] = (i * (ratio / n) + (1.0 - ratio) / 2.0) * SPATIAL_SCALE;
         return v;
     }
-    Layout(int text_len_, int latent_t_, int lat_h_, int lat_w_, int audio_t_) : text_len(text_len_), latent_t(latent_t_), lat_h(lat_h_), lat_w(lat_w_), audio_t(audio_t_) {
+    static double video_span(int n) { double s = 0; for (int k = 0; k < n; ++k) s += FRAME_RESCALE * FRAME_PER_TOKEN[k % 5]; return s; }
+    Layout(int text_len_, int latent_t_, int lat_h_, int lat_w_, int audio_t_, const std::vector<h3pipe_ref> &refs = {}) : text_len(text_len_), latent_t(latent_t_), lat_h(lat_h_), lat_w(lat_w_), audio_t(audio_t_) {
         const double area = std::sqrt(double(lat_h) * lat_w);
         const std::vector<double> ah = axis(lat_h, area), aw = axis(lat_w, area);
-        audio_rows = size_t(audio_t) * 2; video_rows = size_t(latent_t) * ah.size() * aw.size(); seq_len = text_len + audio_rows + video_rows;
+        audio_rows = size_t(audio_t) * 2; video_rows = size_t(latent_t) * ah.size() * aw.size();
+        for (const h3pipe_ref &rf : refs) {
+            if (rf.kind == 1) ref_rows += size_t(rf.audio_t) * 2;
+            else { const int hh = rf.lat_h / 2, ww = rf.lat_w / 2; ref_rows += size_t(rf.kind == 0 ? 1 : rf.latent_t) * hh * ww; if (rf.kind == 2 && rf.audio_latent && rf.audio_t > 0) ref_rows += size_t(rf.audio_t) * 2; }
+        }
+        seq_len = text_len + ref_rows + audio_rows + video_rows;
         pos.assign(seq_len * 3, 0.0); adaln_rows.assign(seq_len, 0); tclass.assign(seq_len, 0);
         size_t r = 0;
         for (int i = 0; i < text_len; ++i, ++r) { pos[3 * r] = i; adaln_rows[r] = 1; tclass[r] = 0; }
-        const double cursor = text_len;
-        for (int c = 0; c < 2; ++c) for (int t = 0; t < audio_t; ++t, ++r) { pos[3 * r] = cursor + t; pos[3 * r + 2] = c == 0 ? aw.front() : aw.back(); adaln_rows[r] = 1 * MODALITIES + 2; tclass[r] = 1; }
-        std::vector<double> tg(latent_t); double acc = cursor;
-        for (int k = 0; k < latent_t; ++k) { tg[k] = acc; acc += FRAME_RESCALE * FRAME_PER_TOKEN[k % 5]; }
-        for (int k = 0; k < latent_t; ++k) for (double hv : ah) for (double wv : aw) { pos[3 * r] = tg[k]; pos[3 * r + 1] = hv; pos[3 * r + 2] = wv; adaln_rows[r] = 0; tclass[r] = 0; ++r; }
+        double cursor = text_len;
+        auto audio_grid = [&](double origin, int t, double w_low, double w_high, int cls) {
+            for (int c = 0; c < 2; ++c) for (int k = 0; k < t; ++k, ++r) { pos[3 * r] = origin + k; pos[3 * r + 2] = c == 0 ? w_low : w_high; adaln_rows[r] = cls * MODALITIES + 2; tclass[r] = cls; } };
+        auto video_grid = [&](double origin, int vt, const std::vector<double> &gh, const std::vector<double> &gw, int cls) {
+            double acc = origin;
+            for (int k = 0; k < vt; ++k) { for (double hv : gh) for (double wv : gw) { pos[3 * r] = acc; pos[3 * r + 1] = hv; pos[3 * r + 2] = wv; adaln_rows[r] = cls * MODALITIES + 0; tclass[r] = cls; ++r; } acc += FRAME_RESCALE * FRAME_PER_TOKEN[k % 5]; } };
+        for (size_t ri = 0; ri < refs.size(); ++ri) {
+            const h3pipe_ref &rf = refs[ri];
+            if (rf.kind == 0 || rf.kind == 2) {
+                const double rarea = std::sqrt(double(rf.lat_h) * rf.lat_w); const std::vector<double> rh = axis(rf.lat_h, rarea), rw = axis(rf.lat_w, rarea);
+                const int vt = rf.kind == 0 ? 1 : rf.latent_t; const bool sound = rf.kind == 2 && rf.audio_latent && rf.audio_t > 0;
+                if (sound) { ref_segs.push_back({rf.kind, r, size_t(rf.audio_t) * 2, 0, 0, 0, rf.audio_t, true, int(ri)}); audio_grid(cursor, rf.audio_t, rw.front(), rw.back(), 3); }
+                ref_segs.push_back({rf.kind, r, size_t(vt) * rh.size() * rw.size(), vt, rf.lat_h, rf.lat_w, 0, false, int(ri)});
+                video_grid(cursor, vt, rh, rw, 2);
+                cursor += rf.kind == 0 ? 1.0 : std::max(sound ? double(rf.audio_t) : 0.0, video_span(vt));
+            } else {
+                if (rf.audio_t > 0) { ref_segs.push_back({1, r, size_t(rf.audio_t) * 2, 0, 0, 0, rf.audio_t, true, int(ri)}); audio_grid(cursor, rf.audio_t, aw.front(), aw.back(), 3); }
+                cursor += rf.audio_t;
+            }
+        }
+        audio_grid(cursor, audio_t, aw.front(), aw.back(), 1);
+        video_grid(cursor, latent_t, ah, aw, 0);
+        if (r != seq_len) throw std::runtime_error("layout row count mismatch");
     }
 };
 
@@ -526,12 +557,12 @@ public:
     }
     // the per-layer tables in the runtime's layout: rows [0,2C) (scale_msa, shift_msa) per class, [2C,3C) gate_msa, [3C,5C) (scale_mlp, shift_mlp), [5C,6C) gate_mlp;
     // class = timestep index * 3 + modality; the projection's chunks per (modality d, j): shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
-    void upload_mods(const float tv[8], const float ta[8]) {
+    void upload_mods(const float tv[8], const float ta[8], const float tcv[8], const float tca[8]) {
         std::vector<float> table(size_t(50) * MODS_ROWS * HID, 0.0f), proj(size_t(3 * 6 * HID));
         for (int i = 0; i < 50; ++i) {
             const float *W = adaln_w_[i].data(), *B = adaln_b_[i].data();
-            for (int m = 0; m < 2; ++m) {
-                const float *te = m == 0 ? tv : ta;
+            for (int m = 0; m < 4; ++m) {
+                const float *te = m == 0 ? tv : (m == 1 ? ta : (m == 2 ? tcv : tca));
                 for (size_t r = 0; r < proj.size(); ++r) { float acc = B[r]; for (int j = 0; j < 8; ++j) acc += W[r * 8 + j] * te[j]; proj[r] = acc; }
                 for (int d = 0; d < 3; ++d) {
                     const int cls = m * 3 + d; float *t = table.data() + size_t(i) * MODS_ROWS * HID;
@@ -560,12 +591,12 @@ public:
     }
 
     // --- denoising ---
-    void denoise(const int32_t *ids, int n, const h3pipe_params &p, const float *noise_video, const float *noise_audio, float *video_out, float *audio_out, h3pipe_progress progress, void *user) {
+    void denoise(const int32_t *ids, int n, const h3pipe_params &p, const float *noise_video, const float *noise_audio, float *video_out, float *audio_out, h3pipe_progress progress, void *user, const std::vector<h3pipe_ref> &refs = {}) {
         if (p.height % 32 || p.width % 32 || p.height < 64 || p.width < 64) throw std::invalid_argument("height and width must be multiples of 32");
         if (p.steps < 2 || p.steps > 1000) throw std::invalid_argument("steps must be 2..1000");
         h3pipe_shape sh; h3pipe_shape_for(&p, &sh);
-        Layout lay(n, sh.latent_t, sh.lat_h, sh.lat_w, sh.audio_t);
-        const size_t L = size_t(n), Na = lay.audio_rows, Nv = lay.video_rows, S = lay.seq_len;
+        Layout lay(n, sh.latent_t, sh.lat_h, sh.lat_w, sh.audio_t, refs);
+        const size_t L = size_t(n), Rr = lay.ref_rows, LR = L + Rr, Na = lay.audio_rows, Nv = lay.video_rows, S = lay.seq_len;
         ensure_seq(S);
         text_in(ids, n);
         // the packed layout's tables
@@ -595,22 +626,42 @@ public:
         Schedule sv(p.steps, p.video_shift > 0 ? p.video_shift : 12.0), sa(p.steps, p.audio_shift > 0 ? p.audio_shift : 3.0);
         cache_acc_ = 0.0; have_cache_ = false; cache_skipped_ = 0;
         if (sv.timesteps.size() != sa.timesteps.size()) throw std::runtime_error("the two schedules differ in length");
-        std::vector<uint16_t> in16(std::max(Na, Nv) * KPAD); std::vector<uint16_t> out16(S * FINAL_N);
+        size_t in_rows = std::max(Na, Nv); for (const RefSeg &sg : lay.ref_segs) in_rows = std::max(in_rows, sg.rows);
+        std::vector<uint16_t> in16(in_rows * KPAD); std::vector<uint16_t> out16(S * FINAL_N);
         const auto t_start = std::chrono::steady_clock::now();
         for (size_t step = 0; step < sv.timesteps.size(); ++step) {
-            float tv[8], ta[8]; temb(sv.timesteps[step], tv); temb(sa.timesteps[step], ta); upload_mods(tv, ta);
+            float tv[8], ta[8], tcv[8], tca[8]; temb(sv.timesteps[step], tv); temb(sa.timesteps[step], ta);
+            temb(std::max(sv.timesteps[step], VISUAL_COND_AUG), tcv); temb(std::max(sa.timesteps[step], 1.0f), tca); upload_mods(tv, ta, tcv, tca);
             // audio rows -> x[L, L+Na), video rows -> x[L+Na, S), each through prepare(256) + the padded-K int8 GEMM
             std::fill(in16.begin(), in16.end(), 0);
             for (size_t r = 0; r < Na; ++r) for (int k = 0; k < AUDIO_CH; ++k) in16[r * KPAD + k] = f32_to_f16(arows[r * AUDIO_CH + k]);
             rt().h2d(in16_, in16.data(), Na * KPAD * 2);
-            embed_linear("audio in", L, Na, KPAD, "h3.audio_in");
+            embed_linear("audio in", LR, Na, KPAD, "h3.audio_in");
             std::fill(in16.begin(), in16.end(), 0);
             for (size_t r = 0; r < Nv; ++r) for (int k = 0; k < VIDEO_PATCH; ++k) in16[r * KPAD + k] = f32_to_f16(vrows[r * VIDEO_PATCH + k]);
             rt().h2d(in16_, in16.data(), Nv * KPAD * 2);
-            embed_linear("video in", L + Na, Nv, KPAD, "h3.video_in");
+            embed_linear("video in", LR + Na, Nv, KPAD, "h3.video_in");
             // the text rows are refreshed from a copy each step (the blocks update x in place)
-            if (step == 0) { if (!text_copy_) text_copy_ = rt().alloc(seq_cap_ * HID * 4); rt().d2d(text_copy_, x_, L * HID * 4); }
-            else rt().d2d(x_, text_copy_, L * HID * 4);
+            if (step == 0) {
+                // reference rows (constant across steps, re-set every step like the text): the packed latents through the
+                // patch projections; visual ones mixed with seeded noise at 0.999 as ComfyUI's condition augmentation
+                for (const RefSeg &sg : lay.ref_segs) {
+                    const h3pipe_ref &rf = refs[size_t(sg.ref)];
+                    std::fill(in16.begin(), in16.end(), 0);
+                    if (sg.audio) {
+                        for (int c = 0; c < 2; ++c) for (int t = 0; t < sg.audio_t; ++t) for (int k = 0; k < AUDIO_CH; ++k) in16[(size_t(c) * sg.audio_t + t) * KPAD + k] = f32_to_f16(rf.audio_latent[(size_t(c) * AUDIO_CH + k) * sg.audio_t + t]);
+                        rt().h2d(in16_, in16.data(), sg.rows * KPAD * 2); embed_linear("ref audio in", sg.row0, sg.rows, KPAD, "h3.audio_in");
+                    } else {
+                        Rng arng(p.seed); const int vt = sg.latent_t, hh = sg.lat_h, ww = sg.lat_w;
+                        for (int c = 0; c < LATENT_CH; ++c) for (int t = 0; t < vt; ++t) for (int y = 0; y < hh; ++y) for (int x = 0; x < ww; ++x) {
+                            const size_t row = (size_t(t) * (hh / 2) + y / 2) * (ww / 2) + x / 2, col = size_t(c) * 4 + (y % 2) * 2 + (x % 2);
+                            const float z = rf.video_latent[((size_t(c) * vt + t) * hh + y) * ww + x];
+                            in16[row * KPAD + col] = f32_to_f16(VISUAL_COND_AUG * z + (1.0f - VISUAL_COND_AUG) * arng.normal()); }
+                        rt().h2d(in16_, in16.data(), sg.rows * KPAD * 2); embed_linear("ref video in", sg.row0, sg.rows, KPAD, "h3.video_in");
+                    }
+                }
+                if (!text_copy_) text_copy_ = rt().alloc(seq_cap_ * HID * 4); rt().d2d(text_copy_, x_, LR * HID * 4);
+            } else rt().d2d(x_, text_copy_, LR * HID * 4);
             if (p.cache_threshold > 0.0f) {                                          // first-block cache (TeaCache / FBCache style)
                 const size_t n = S * size_t(HID), groups = (n + 2047) / 2048;
                 if (cache_cap_ < n) {
@@ -642,8 +693,8 @@ public:
             rt().sync(); rt().d2h(out16.data(), out16_, S * FINAL_N * 2);
             // Euler step per schedule: x0 = x + sigma * v, x' = r x + (1 - r) x0
             const float sg_v = sv.sigmas[step], r_v = sv.sigmas[step + 1] / sg_v, sg_a = sa.sigmas[step], r_a = sa.sigmas[step + 1] / sg_a;
-            for (size_t r = 0; r < Nv; ++r) for (int k = 0; k < VIDEO_PATCH; ++k) { float &x = vrows[r * VIDEO_PATCH + k]; const float v = f16_to_f32(out16[(L + Na + r) * FINAL_N + k]); x = r_v * x + (1.0f - r_v) * (x + sg_v * v); }
-            for (size_t r = 0; r < Na; ++r) for (int k = 0; k < AUDIO_CH; ++k) { float &x = arows[r * AUDIO_CH + k]; const float v = f16_to_f32(out16[(L + r) * FINAL_N + VIDEO_PATCH + k]); x = r_a * x + (1.0f - r_a) * (x + sg_a * v); }
+            for (size_t r = 0; r < Nv; ++r) for (int k = 0; k < VIDEO_PATCH; ++k) { float &x = vrows[r * VIDEO_PATCH + k]; const float v = f16_to_f32(out16[(LR + Na + r) * FINAL_N + k]); x = r_v * x + (1.0f - r_v) * (x + sg_v * v); }
+            for (size_t r = 0; r < Na; ++r) for (int k = 0; k < AUDIO_CH; ++k) { float &x = arows[r * AUDIO_CH + k]; const float v = f16_to_f32(out16[(LR + r) * FINAL_N + VIDEO_PATCH + k]); x = r_a * x + (1.0f - r_a) * (x + sg_a * v); }
             if (prof.on) { double tot = 0; for (auto &kv : prof.us) tot += kv.second; fprintf(stderr, "  step %zu stages (%.1f s):", step + 1, tot * 1e-6); for (auto &kv : prof.us) if (kv.second > 0.01 * tot) fprintf(stderr, "  %s %.2fs", kv.first.c_str(), kv.second * 1e-6); fprintf(stderr, "\n"); prof.us.clear(); }
             if (progress && progress(user, int(step + 1), int(sv.timesteps.size()), std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count())) throw Cancelled();
         }
@@ -984,6 +1035,22 @@ extern "C" int h3pipe_text_in(h3pipe_session *s, const int32_t *ids, int n, floa
     })
 }
 
+extern "C" int h3pipe_denoise_refs(h3pipe_session *s, const int32_t *ids, int n, const h3pipe_params *params, const h3pipe_ref *refs, int n_refs, const float *noise_video, const float *noise_audio,
+                                   float *video, size_t video_elements, float *audio, size_t audio_elements, h3pipe_progress progress, void *user, char *error, size_t cap) {
+    GUARD({
+        if (!s || !ids || !params || !video || !audio || n < 1 || (n_refs > 0 && !refs)) throw std::invalid_argument("session, ids, params, refs and outputs are required");
+        h3pipe_shape sh; h3pipe_shape_for(params, &sh);
+        if (video_elements != size_t(LATENT_CH) * sh.latent_t * sh.lat_h * sh.lat_w) throw std::invalid_argument("video_latents must hold 24 * latent_t * lat_h * lat_w floats");
+        if (audio_elements != size_t(2) * AUDIO_CH * sh.audio_t) throw std::invalid_argument("audio_latents must hold 2 * 32 * audio_t floats");
+        std::vector<h3pipe_ref> rv(refs, refs + n_refs);
+        for (const h3pipe_ref &rf : rv) {
+            if (rf.kind < 0 || rf.kind > 2) throw std::invalid_argument("ref kind must be 0 (image), 1 (audio) or 2 (video)");
+            if (rf.kind != 1 && (!rf.video_latent || rf.lat_h < 2 || rf.lat_w < 2 || rf.lat_h % 2 || rf.lat_w % 2 || (rf.kind == 2 && rf.latent_t < 1))) throw std::invalid_argument("image/video refs need a video latent with even lat_h, lat_w");
+            if (rf.kind == 1 && (!rf.audio_latent || rf.audio_t < 1)) throw std::invalid_argument("audio refs need an audio latent with audio_t >= 1");
+        }
+        std::lock_guard<std::mutex> lock(s->mutex); s->value.denoise(ids, n, *params, noise_video, noise_audio, video, audio, progress, user, rv);
+    })
+}
 extern "C" int h3pipe_denoise(h3pipe_session *s, const int32_t *ids, int n, const h3pipe_params *params, const float *noise_video, const float *noise_audio,
                               float *video, size_t video_elements, float *audio, size_t audio_elements, h3pipe_progress progress, void *user, char *error, size_t cap) {
     GUARD({

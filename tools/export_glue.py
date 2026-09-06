@@ -12,7 +12,8 @@ Text side: the embedding table as stored (bf16). Video VAE side: post_quant_conv
 proj_in (K 24 -> 256, int8), register tokens, norm_out (LayerNorm weight, bias), proj_out
 (int8, N 3072), latents mean/std. Audio side: the BigVGAN decoder with weight norm folded
 and Snake parameters exponentiated, f32 throughout, plus dec_in_proj and latents mean/std."""
-import json, struct, sys, time
+import json
+import os, struct, sys, time
 from pathlib import Path
 import torch
 from safetensors import safe_open
@@ -28,7 +29,7 @@ KPAD = 256
 
 
 def main():
-    out = ROOT / "build/weights_glue"; out.mkdir(parents=True, exist_ok=True)
+    out = Path(os.environ.get("H3_GLUE_OUT", ROOT / "build/weights_glue")); out.mkdir(parents=True, exist_ok=True)   # H3_GLUE_OUT with H3_CKPT: the ref2va glue
     t0 = time.time()
     blobs = []
     def add(name, t): blobs.append((name, t.detach().contiguous().cpu()))
