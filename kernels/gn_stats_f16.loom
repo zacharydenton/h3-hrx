@@ -1,0 +1,66 @@
+// GroupNorm statistics per (frame, group) over channels-last f16 rows [frames*plane][channels]: out[t][g] = (sum, sum of
+// squares) over the group's channels x the frame's plane, f32. One wave per (frame, group).
+amdgpu.target<gfx11-generic> @h3_gn_stats_f16_gfx11 {subgroup_size = 32}
+
+config.decl @h3.gn_stats_f16.channels : %value: index where [range(%value, 32, 4096), mul(%value, 32)]
+
+config.decl @h3.gn_stats_f16.groups : %value: index where [range(%value, 1, 64)]
+
+config.decl @h3.gn_stats_f16.plane : %value: index where [range(%value, 1, 1048576)]
+
+config.decl @h3.gn_stats_f16.rows_bound : %value: index where [range(%value, 64, 2097152), mul(%value, 64)]
+
+kernel.def target(@h3_gn_stats_f16_gfx11) export("h3_gn_stats_f16") @h3_gn_stats_f16(%frames: index) {
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  %groups = config.get @h3.gn_stats_f16.groups : index
+  kernel.launch.config workgroups(%frames, %groups, %c1) workgroup_size(%c32, %c1, %c1) : index
+} launch(%frames: index, %x: buffer, %out: buffer) {
+  %channels = config.get @h3.gn_stats_f16.channels : index
+  %groups = config.get @h3.gn_stats_f16.groups : index
+  %plane = config.get @h3.gn_stats_f16.plane : index
+  %rows_bound = config.get @h3.gn_stats_f16.rows_bound : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c32 = index.constant 32 : index
+  %c0_offset = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %frames_b = index.assume %frames [range(%frames, 1, 64)] : index
+  %rows0 = index.mul %frames_b, %plane : index
+  %rows = index.assume %rows0 [range(%rows0, 1, 2097152), le(%rows0, %rows_bound)] : index
+  %t0 = kernel.workgroup.id<x> : index
+  %t = index.assume %t0 [lt(%t0, %frames_b)] : index
+  %g0 = kernel.workgroup.id<y> : index
+  %g = index.assume %g0 [lt(%g0, %groups)] : index
+  %lane = kernel.workitem.id<x> : index
+  %per_group = index.div %channels, %groups : index
+  %cbase = index.mul %g, %per_group : index
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %out_global = buffer.assume.memory_space<global> %out : buffer
+  %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%rows]x[%channels]xf16>
+  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%frames_b]x[%groups]x[%c2]xf32>
+  %row_base = index.mul %t, %plane : index
+  %sum_l, %sq_l = scf.for %p = [%lane to %plane step %c32](%s = %zero : f32, %q = %zero : f32) -> (f32, f32) {
+    %row0 = index.add %row_base, %p : index
+    %row = index.assume %row0 [lt(%row0, %rows)] : index
+    %s_in, %q_in = scf.for %ci = [%c0 to %per_group step %c1](%s2 = %s : f32, %q2 = %q : f32) -> (f32, f32) {
+      %col0 = index.add %cbase, %ci : index
+      %col = index.assume %col0 [lt(%col0, %channels)] : index
+      %v16 = view.load %x_view[%row, %col] : view<[%rows]x[%channels]xf16> -> f16
+      %v = scalar.extf %v16 : f16 to f32
+      %s3 = scalar.addf %s2, %v : f32
+      %q3 = scalar.fmaf %v, %v, %q2 : f32
+      scf.yield %s3, %q3 : f32, f32
+    }
+    scf.yield %s_in, %q_in : f32, f32
+  }
+  %sum = kernel.subgroup.reduce<addf> %sum_l : f32
+  %sq = kernel.subgroup.reduce<addf> %sq_l : f32
+  %is0 = index.cmp eq, %lane, %c0 : index
+  scf.if %is0 {
+    view.store %sum, %out_view[%t, %g, %c0] : f32, view<[%frames_b]x[%groups]x[%c2]xf32>
+    view.store %sq, %out_view[%t, %g, %c1] : f32, view<[%frames_b]x[%groups]x[%c2]xf32>
+  }
+  kernel.return
+}

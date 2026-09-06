@@ -1,0 +1,94 @@
+// GroupNorm apply + SiLU on channels-last f16 rows [frames*plane][channels] from the (sum, sum of squares) statistics:
+//   y = (x - mean) * rsqrt(var + eps) * gamma[c] + beta[c];  out = y * sigmoid(y)
+amdgpu.target<gfx11-generic> @h3_gn_silu_f16_gfx11 {subgroup_size = 32}
+
+config.decl @h3.gn_silu_f16.channels : %value: index where [range(%value, 32, 4096), mul(%value, 32)]
+
+config.decl @h3.gn_silu_f16.groups : %value: index where [range(%value, 1, 64)]
+
+config.decl @h3.gn_silu_f16.plane : %value: index where [range(%value, 1, 1048576)]
+
+config.decl @h3.gn_silu_f16.rows_bound : %value: index where [range(%value, 64, 2097152), mul(%value, 64)]
+
+config.decl @h3.gn_silu_f16.eps : f32
+
+kernel.def target(@h3_gn_silu_f16_gfx11) export("h3_gn_silu_f16") @h3_gn_silu_f16(%frames: index) {
+  %c1 = index.constant 1 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %plane = config.get @h3.gn_silu_f16.plane : index
+  %channels = config.get @h3.gn_silu_f16.channels : index
+  %rows = index.mul %frames, %plane : index
+  %count = index.mul %rows, %channels : index
+  %rounded = index.add %count, %c255 : index
+  %groups = index.div %rounded, %c256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%frames: index, %x: buffer, %stats: buffer, %gamma: buffer, %beta: buffer, %out: buffer) {
+  %channels = config.get @h3.gn_silu_f16.channels : index
+  %groups = config.get @h3.gn_silu_f16.groups : index
+  %plane = config.get @h3.gn_silu_f16.plane : index
+  %rows_bound = config.get @h3.gn_silu_f16.rows_bound : index
+  %eps = config.get @h3.gn_silu_f16.eps : f32
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c256 = index.constant 256 : index
+  %c0_offset = index.constant 0 : offset
+  %one = scalar.constant 1.0 : f32
+  %frames_b = index.assume %frames [range(%frames, 1, 64)] : index
+  %rows0 = index.mul %frames_b, %plane : index
+  %rows = index.assume %rows0 [range(%rows0, 1, 2097152), le(%rows0, %rows_bound)] : index
+  %count = index.mul %rows, %channels : index
+  %per_group = index.div %channels, %groups : index
+  %n_elems0 = index.mul %plane, %per_group : index
+  %n_elems_i = index.cast %n_elems0 : index to i32
+  %n_elems = scalar.sitofp %n_elems_i : i32 to f32
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %wg, %c256 : index
+  %i = index.add %base, %lane : index
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %st_global = buffer.assume.memory_space<global> %stats : buffer
+  %ga_global = buffer.assume.memory_space<global> %gamma : buffer
+  %be_global = buffer.assume.memory_space<global> %beta : buffer
+  %out_global = buffer.assume.memory_space<global> %out : buffer
+  %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%rows]x[%channels]xf16>
+  %st_view = buffer.view %st_global[%c0_offset] : buffer -> view<[%frames_b]x[%groups]x[%c2]xf32>
+  %ga_view = buffer.view %ga_global[%c0_offset] : buffer -> view<[%channels]xf32>
+  %be_view = buffer.view %be_global[%c0_offset] : buffer -> view<[%channels]xf32>
+  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%rows]x[%channels]xf16>
+  %active = index.cmp ult, %i, %count : index
+  scf.if %active {
+    %row0 = index.div %i, %channels : index
+    %row = index.assume %row0 [lt(%row0, %rows)] : index
+    %c = index.rem %i, %channels : index
+    %t0 = index.div %row, %plane : index
+    %t = index.assume %t0 [lt(%t0, %frames_b)] : index
+    %g0 = index.div %c, %per_group : index
+    %g = index.assume %g0 [lt(%g0, %groups)] : index
+    %sum = view.load %st_view[%t, %g, %c0] : view<[%frames_b]x[%groups]x[%c2]xf32> -> f32
+    %sq = view.load %st_view[%t, %g, %c1] : view<[%frames_b]x[%groups]x[%c2]xf32> -> f32
+    %mean = scalar.divf %sum, %n_elems : f32
+    %ex2 = scalar.divf %sq, %n_elems : f32
+    %m2 = scalar.mulf %mean, %mean : f32
+    %var0 = scalar.subf %ex2, %m2 : f32
+    %var = scalar.maxnumf %var0, %eps : f32
+    %var_eps = scalar.addf %var, %eps : f32
+    %rinv = scalar.rsqrtf %var_eps : f32
+    %v16 = view.load %x_view[%row, %c] : view<[%rows]x[%channels]xf16> -> f16
+    %v = scalar.extf %v16 : f16 to f32
+    %ga = view.load %ga_view[%c] : view<[%channels]xf32> -> f32
+    %be = view.load %be_view[%c] : view<[%channels]xf32> -> f32
+    %d = scalar.subf %v, %mean : f32
+    %nrm = scalar.mulf %d, %rinv : f32
+    %y = scalar.fmaf %nrm, %ga, %be : f32
+    %ny = scalar.negf %y : f32
+    %e = scalar.expf<afn> %ny : f32
+    %den = scalar.addf %one, %e : f32
+    %sig = scalar.divf %one, %den : f32
+    %r = scalar.mulf %y, %sig : f32
+    %r16 = scalar.fptrunc %r : f32 to f16
+    view.store %r16, %out_view[%row, %c] : f16, view<[%rows]x[%channels]xf16>
+  }
+  kernel.return
+}
