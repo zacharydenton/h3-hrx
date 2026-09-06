@@ -52,6 +52,17 @@ constexpr int THREADS = 256;
 
 
 // --- small host helpers --------------------------------------------------------------------
+int mrope_axis(int pair) { return pair < 60 ? pair % 3 : 0; }   // interleaved Qwen3-VL [24, 20, 20]
+
+struct DecoderGrid {
+    int frames = 0, height = 0, width = 0;
+    bool matches(int f, int h, int w) const { return frames == f && height == h && width == w; }
+};
+
+int decoder_chunks(int tokens, int padding) {
+    return std::max(1, (tokens + VAE_TOKEN_DROP + padding) / VAE_CHUNK - 1);
+}
+
 uint16_t f32_to_f16(float f) {
     uint32_t x; memcpy(&x, &f, 4);
     const uint32_t sign = (x >> 16) & 0x8000; int exp = int((x >> 23) & 0xff) - 127 + 15; uint32_t mant = x & 0x7fffff;
@@ -395,6 +406,11 @@ struct Layout {
     std::vector<double> pos;                 // [seq][3] (t, h, w)
     std::vector<int32_t> adaln_rows, tclass;
     std::vector<RefSeg> ref_segs;            // the reference segments in row order (a video block with sound gives two)
+    void mark_vision(size_t start, size_t count) {
+        if (start > size_t(text_len) || count > size_t(text_len) - start) throw std::invalid_argument("vision span outside presentation");
+        const size_t begin = start ? start - 1 : 0, end = std::min(size_t(text_len), start + count + 1);
+        std::fill(adaln_rows.begin() + begin, adaln_rows.begin() + end, 0);   // embeddings and flanking vision tokens
+    }
     static std::vector<double> axis(int dim, double sqrt_area) {
         const double ratio = dim / sqrt_area; const int n = dim / 2; std::vector<double> v(n);
         for (int i = 0; i < n; ++i) v[i] = (i * (ratio / n) + (1.0 - ratio) / 2.0) * SPATIAL_SCALE;
@@ -491,9 +507,9 @@ public:
     // --- the prompt: embedding lookup on the host, the encoder, condition_proj, the refiner ---
     void ensure_seq(size_t seq) {
         if (seq <= seq_cap_) return;
-        for (void *p : {x_, cls_, cls0_, tcls_, cos_, sin_, in16_, a_q_, a_s_, out16_}) if (p) rt().free(p);
-        seq_cap_ = (seq + 255) / 256 * 256 + 32;
-        const size_t T = seq_cap_;
+        for (void **p : {&x_, &cls_, &cls0_, &tcls_, &cos_, &sin_, &in16_, &a_q_, &a_s_, &out16_, &text_copy_}) { if (*p) rt().free(*p); *p = nullptr; }
+        seq_cap_ = 0;
+        const size_t T = (seq + 255) / 256 * 256 + 32;
         x_ = rt().alloc(T * HID * 4); rt().memset(x_, 0, T * HID * 4);
         cls_ = rt().alloc(T * 4); rt().memset(cls_, 0, T * 4);
         cls0_ = rt().alloc(T * 4); rt().memset(cls0_, 0, T * 4);       // the single-class GEMMs (embedders, condition proj) index their gate table with this
@@ -502,6 +518,7 @@ public:
         in16_ = rt().alloc(T * TEXT_DIM * 2); rt().memset(in16_, 0, T * TEXT_DIM * 2);
         a_q_ = rt().alloc(T * size_t(std::max(TEXT_DIM, HID))); a_s_ = rt().alloc(T * 4);   // the final norm writes HID-wide rows, the embedders TEXT_DIM-wide
         out16_ = rt().alloc(T * FINAL_N * 2);
+        seq_cap_ = T;
     }
 
     // x rows [row0, row0 + rows) = W · in + b through the int8 family: in f16 [rows][k] on in16_, rows zeroed first
@@ -546,7 +563,7 @@ public:
               }
               for (size_t i = cursor; i < size_t(n); ++i) for (int ax = 0; ax < 3; ++ax) pos[i * 3 + ax] = double(i) + offset; }
             for (int t = 0; t < n; ++t) for (int j = 0; j < TE_ROPE_HALF; ++j) {
-                const int ax = j < 24 ? 0 : (j < 44 ? 1 : 2);   // interleaved mrope sections [24, 20, 20]: pair j takes the t / h / w position
+                const int ax = mrope_axis(j);   // interleaved mrope sections [24, 20, 20]: pair j takes the t / h / w position
                 const double inv = std::pow(5000000.0, -double(2 * j) / HEAD_DIM), ang = pos[size_t(t) * 3 + ax] * inv;
                 c[size_t(t) * TE_ROPE_HALF + j] = float(std::cos(ang)); s[size_t(t) * TE_ROPE_HALF + j] = float(std::sin(ang)); }
             rt().h2d(te_cos_, c.data(), c.size() * 4); rt().h2d(te_sin_, s.data(), s.size() * 4);
@@ -656,6 +673,7 @@ public:
           }
           if (ri != runs.size()) throw std::invalid_argument("placeholder runs in the ids without an image reference with pixels");
           for (size_t i = 0; i < spans.size(); ++i) { spans[i].merged = vmerged[i].data(); spans[i].deepstack = vdeep[i].data(); } }
+        for (const VisionSpan &sp : spans) lay.mark_vision(sp.start, sp.count);
         text_in(ids, n, spans);
         // the packed layout's tables
         rt().h2d(cls_, lay.adaln_rows.data(), S * 4); rt().h2d(tcls_, lay.tclass.data(), S * 4);
@@ -666,7 +684,8 @@ public:
             const char *qk = std::getenv("H3_ATTN_QK"); StackDims dd{HID, HEADS, HEADS, HEAD_DIM, FFN, ROPE_DIM, CLASSES, 4, 1e-5f, false, true, false}; dd.attn_i4 = !(qk && std::string(qk) == "f16");   // int4 QK^T by default
             dit_.reset(); dit_ = std::make_unique<Stack>(comp_, dd, S, 50, blocks_, "blocks.%d.", true, nullptr); }
         if (!final_prep_.k) { final_prep_.build(comp_, "norm", 8, HID, 1e-5f, 2); }
-        Gemm &final_gemm = gemms_[fmt("final_%zu", S)]; if (!final_gemm.k) final_gemm.build(comp_, "plain", 8, true, true, HID, FINAL_N, S);
+        const size_t generated_rows = Na + Nv;   // the final head has only the video/audio timestep classes
+        Gemm &final_gemm = gemms_[fmt("final_%zu", generated_rows)]; if (!final_gemm.k) final_gemm.build(comp_, "plain", 8, true, true, HID, FINAL_N, generated_rows);
         // latents as rows: video [Nv][96] (row = (t*(H/2) + hh)*(W/2) + ww, column = c*4 + dy*2 + dx), audio [2*audio_t][32] (row = c*audio_t + t)
         std::vector<float> vrows(Nv * VIDEO_PATCH), arows(Na * AUDIO_CH);
         const int T = sh.latent_t, H = sh.lat_h, W = sh.lat_w, A = sh.audio_t;
@@ -685,7 +704,7 @@ public:
         cache_acc_ = 0.0; have_cache_ = false; cache_skipped_ = 0;
         if (sv.timesteps.size() != sa.timesteps.size()) throw std::runtime_error("the two schedules differ in length");
         size_t in_rows = std::max(Na, Nv); for (const RefSeg &sg : lay.ref_segs) in_rows = std::max(in_rows, sg.rows);
-        std::vector<uint16_t> in16(in_rows * KPAD); std::vector<uint16_t> out16(S * FINAL_N);
+        std::vector<uint16_t> in16(in_rows * KPAD); std::vector<uint16_t> out16(generated_rows * FINAL_N);
         const auto t_start = std::chrono::steady_clock::now();
         for (size_t step = 0; step < sv.timesteps.size(); ++step) {
             float tv[8], ta[8], tcv[8], tca[8]; temb(sv.timesteps[step], tv); temb(sa.timesteps[step], ta);
@@ -748,13 +767,13 @@ public:
                     have_cache_ = true; cache_acc_ = 0.0;
                 }
             } else dit_->forward(&prof, x_, cls_, cos_, sin_, [&](int i) { return cond(i); });
-            final_prep_.run(&prof, "final norm", unsigned(S), x_, glue_.at("h3.final.norm", size_t(HID) * 4), final_table_, tcls_, a_q_, a_s_);
-            final_gemm.run(&prof, "final out", unsigned(S), a_q_, glue_.at("h3.final.out.q", size_t(FINAL_N) * HID), glue_.at("h3.final.out.s", size_t(FINAL_N) * 4), a_s_, out16_, nullptr, nullptr, glue_.at("h3.final.out.b", size_t(FINAL_N) * 4));
-            rt().sync(); rt().d2h(out16.data(), out16_, S * FINAL_N * 2);
+            final_prep_.run(&prof, "final norm", unsigned(generated_rows), (float *)x_ + LR * HID, glue_.at("h3.final.norm", size_t(HID) * 4), final_table_, (int32_t *)tcls_ + LR, a_q_, a_s_);
+            final_gemm.run(&prof, "final out", unsigned(generated_rows), a_q_, glue_.at("h3.final.out.q", size_t(FINAL_N) * HID), glue_.at("h3.final.out.s", size_t(FINAL_N) * 4), a_s_, out16_, nullptr, nullptr, glue_.at("h3.final.out.b", size_t(FINAL_N) * 4));
+            rt().sync(); rt().d2h(out16.data(), out16_, generated_rows * FINAL_N * 2);
             // Euler step per schedule: x0 = x + sigma * v, x' = r x + (1 - r) x0
             const float sg_v = sv.sigmas[step], r_v = sv.sigmas[step + 1] / sg_v, sg_a = sa.sigmas[step], r_a = sa.sigmas[step + 1] / sg_a;
-            for (size_t r = 0; r < Nv; ++r) for (int k = 0; k < VIDEO_PATCH; ++k) { float &x = vrows[r * VIDEO_PATCH + k]; const float v = f16_to_f32(out16[(LR + Na + r) * FINAL_N + k]); x = r_v * x + (1.0f - r_v) * (x + sg_v * v); }
-            for (size_t r = 0; r < Na; ++r) for (int k = 0; k < AUDIO_CH; ++k) { float &x = arows[r * AUDIO_CH + k]; const float v = f16_to_f32(out16[(LR + r) * FINAL_N + VIDEO_PATCH + k]); x = r_a * x + (1.0f - r_a) * (x + sg_a * v); }
+            for (size_t r = 0; r < Nv; ++r) for (int k = 0; k < VIDEO_PATCH; ++k) { float &x = vrows[r * VIDEO_PATCH + k]; const float v = f16_to_f32(out16[(Na + r) * FINAL_N + k]); x = r_v * x + (1.0f - r_v) * (x + sg_v * v); }
+            for (size_t r = 0; r < Na; ++r) for (int k = 0; k < AUDIO_CH; ++k) { float &x = arows[r * AUDIO_CH + k]; const float v = f16_to_f32(out16[r * FINAL_N + VIDEO_PATCH + k]); x = r_a * x + (1.0f - r_a) * (x + sg_a * v); }
             if (prof.on) { double tot = 0; for (auto &kv : prof.us) tot += kv.second; fprintf(stderr, "  step %zu stages (%.1f s):", step + 1, tot * 1e-6); for (auto &kv : prof.us) if (kv.second > 0.01 * tot) fprintf(stderr, "  %s %.2fs", kv.first.c_str(), kv.second * 1e-6); fprintf(stderr, "\n"); prof.us.clear(); }
             if (progress && progress(user, int(step + 1), int(sv.timesteps.size()), std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count())) throw Cancelled();
         }
@@ -855,26 +874,30 @@ public:
             const int TH = ny == 1 ? H : 256, TW = nx == 1 ? W : 256; th[i] = TH / 16; tw[j] = TW / 16;
             venc_tile(pixels, frames, H, W, ys[i], xs[j], TH, TW, W, tiles[size_t(i) * nx + j], T);
         }
-        // blend: tile (i, j) with the raw tile above over lat_y_overlap[i-1] rows, then with the raw left tile over lat_x_overlap[j-1] cols;
-        // crop the trailing overlaps; concatenate
-        auto at = [&](const std::vector<float> &v, int h, int w, int c, int t, int y, int x) -> float { return v[((size_t(c) * T + t) * h + y) * w + x]; };
+        // ComfyUI's tiled_encode, literally: for tile (i, j), blend(raw above, tile) over the y overlap (the first ov_y rows of the
+        // tile become the linear blend of the upper tile's last ov_y rows and its own), then blend(raw left, tile) over the x overlap
+        // on the result, crop the trailing overlaps, concatenate. Latent tiles are [24][T][h][w].
         const int LH = H / 16, LW = W / 16; out.assign(size_t(24) * T * LH * LW, 0.0f);
+        auto blend = [&](const std::vector<float> &av, int ah, int aw, const std::vector<float> &bv, int bh, int bw, int ext, bool ydim) {
+            std::vector<float> r(bv); const int e = std::min(ext, ydim ? std::min(ah, bh) : std::min(aw, bw));
+            for (int c = 0; c < 24; ++c) for (int t = 0; t < T; ++t) for (int y = 0; y < bh; ++y) for (int x = 0; x < bw; ++x) {
+                const int k = ydim ? y : x; if (k >= e) continue; const float wb = float(k) / e, wa = 1.0f - wb;
+                const int ay = ydim ? ah - e + y : y, ax = ydim ? x : aw - e + x;
+                r[((size_t(c) * T + t) * bh + y) * bw + x] = wa * av[((size_t(c) * T + t) * ah + ay) * aw + ax] + wb * bv[((size_t(c) * T + t) * bh + y) * bw + x]; }
+            return r; };
         int oy = 0;
         for (int i = 0; i < ny; ++i) {
-            int ox = 0; const int h = th[i], ov_y = i > 0 ? yo[i - 1] / 16 : 0, keep_y = i < ny - 1 ? h - yo[i] / 16 : h;
+            int ox = 0; const int h = th[i];
             for (int j = 0; j < nx; ++j) {
-                const int w = tw[j], ov_x = j > 0 ? xo[j - 1] / 16 : 0, keep_x = j < nx - 1 ? w - xo[j] / 16 : w;
-                const std::vector<float> &cur = tiles[size_t(i) * nx + j];
-                for (int c = 0; c < 24; ++c) for (int t = 0; t < T; ++t) for (int y = 0; y < keep_y; ++y) for (int x = 0; x < keep_x; ++x) {
-                    float v = at(cur, h, w, c, t, y, x);
-                    if (i > 0 && y < ov_y) { const float wa = 1.0f - float(y) / ov_y; const std::vector<float> &up = tiles[size_t(i - 1) * nx + j]; v = wa * at(up, th[i - 1], w, c, t, th[i - 1] - ov_y + y, x) + (1.0f - wa) * v; }
-                    if (j > 0 && x < ov_x) { const float wa = 1.0f - float(x) / ov_x; const std::vector<float> &lf = tiles[size_t(i) * nx + j - 1]; float lv = at(lf, h, tw[j - 1], c, t, y, tw[j - 1] - ov_x + x);
-                        if (i > 0 && y < ov_y) { const float wy = 1.0f - float(y) / ov_y; const std::vector<float> &ul = tiles[size_t(i - 1) * nx + j - 1]; lv = wy * at(ul, th[i - 1], tw[j - 1], c, t, th[i - 1] - ov_y + y, tw[j - 1] - ov_x + x) + (1.0f - wy) * lv; }
-                        v = wa * lv + (1.0f - wa) * v; }
-                    out[((size_t(c) * T + t) * LH + oy + y) * LW + ox + x] = v; }
+                const int w = tw[j]; std::vector<float> tile = tiles[size_t(i) * nx + j];
+                if (i > 0) tile = blend(tiles[size_t(i - 1) * nx + j], th[i - 1], w, tile, h, w, yo[i - 1] / 16, true);
+                if (j > 0) tile = blend(tiles[size_t(i) * nx + j - 1], h, tw[j - 1], tile, h, w, xo[j - 1] / 16, false);
+                const int keep_y = i < ny - 1 ? h - yo[i] / 16 : h, keep_x = j < nx - 1 ? w - xo[j] / 16 : w;
+                for (int c = 0; c < 24; ++c) for (int t = 0; t < T; ++t) for (int y = 0; y < keep_y; ++y) for (int x = 0; x < keep_x; ++x)
+                    out[((size_t(c) * T + t) * LH + oy + y) * LW + ox + x] = tile[((size_t(c) * T + t) * h + y) * w + x];
                 ox += keep_x;
             }
-            oy += keep_y;
+            oy += (i < ny - 1 ? h - yo[i] / 16 : h);
         }
         T_lat = T;
     }
@@ -1155,9 +1178,10 @@ public:
     void decode_clip(const float *z, int ft, int h, int w, std::vector<float> &frames) {
         const size_t N = size_t(ft) * h * w, NT = N + VAE_REG + 1;
         if (!vae_blob_.dev) { if (vae_dir_.empty()) throw std::invalid_argument("vae_dir is required for video decoding"); vae_blob_.open(vae_dir_); }
-        if (!vae_ || vae_->tokens() != NT) {
+        if (!vae_ || !vae_grid_.matches(ft, h, w)) {
+            vae_grid_ = {};
             vae_.reset(); vae_ = std::make_unique<Stack>(comp_, StackDims{VAE_HID, VAE_HEADS, VAE_HEADS, VAE_D, VAE_FFN, 48, 1, vae_bits_, 1e-5f, true, false, false}, NT, 36, vae_blob_, "blocks.%d.", false, (const float *)ones_);
-            for (void *q : {vx_, vcos_, vsin_, vin16_, va_q_, va_s_, vout16_, vcls_}) if (q) rt().free(q);
+            for (void **q : {&vx_, &vcos_, &vsin_, &vin16_, &va_q_, &va_s_, &vout16_, &vcls_}) { if (*q) rt().free(*q); *q = nullptr; }
             const size_t T = vae_->capacity();
             vx_ = rt().alloc(T * VAE_HID * 4); rt().memset(vx_, 0, T * VAE_HID * 4);
             vcos_ = rt().alloc(T * VAE_ROPE_HALF * 4); vsin_ = rt().alloc(T * VAE_ROPE_HALF * 4);
@@ -1178,6 +1202,7 @@ public:
             if (!vnorm_table_) { vnorm_table_ = rt().alloc(size_t(2) * VAE_HID * 4); rt().memset(vnorm_table_, 0, size_t(VAE_HID) * 4);
                 rt().d2d(((float *)vnorm_table_ + VAE_HID), glue_.at("vae.norm_out.b", size_t(VAE_HID) * 4), size_t(VAE_HID) * 4); }
         }
+        vae_grid_ = {ft, h, w};
         // post_quant_conv (a 24x24 matrix per voxel) on the host, then the tokens padded to K = 256 in f16
         static std::vector<float> pq_w, pq_b; if (pq_w.empty()) { pq_w = glue_.host_f32("vae.post_quant_conv.w", 24 * 24); pq_b = glue_.host_f32("vae.post_quant_conv.b", 24); }
         std::vector<uint16_t> in16(N * KPAD, 0);
@@ -1207,7 +1232,7 @@ public:
         const int T = sh.latent_t, H = sh.lat_h, W = sh.lat_w, F = sh.frames;
         const size_t FH = size_t(H) * VAE_PS, FW = size_t(W) * VAE_PS, plane = FH * FW;
         std::vector<float> lmean = glue_.host_f32("vae.latents_mean", 24), lstd = glue_.host_f32("vae.latents_std", 24);
-        const int num_tokens = T + VAE_TOKEN_DROP, pad_tokens = ((-num_tokens) % VAE_CHUNK + VAE_CHUNK) % VAE_CHUNK, num_chunks = (num_tokens + pad_tokens) / VAE_CHUNK - 1;
+        const int num_tokens = T + VAE_TOKEN_DROP, pad_tokens = ((-num_tokens) % VAE_CHUNK + VAE_CHUNK) % VAE_CHUNK, num_chunks = decoder_chunks(T, pad_tokens);
         const int Tp = T + pad_tokens;
         std::vector<float> zp(size_t(LATENT_CH) * Tp * H * W);
         for (int c = 0; c < LATENT_CH; ++c) for (int t = 0; t < Tp; ++t) for (size_t i = 0; i < size_t(H) * W; ++i)
@@ -1264,6 +1289,7 @@ private:
     Blob glue_, blocks_, te_blob_; Span embed_; std::string te_dir_, vae_dir_; int vae_bits_ = 8;
     std::vector<float> curve_, inv_freq_, final_w_, final_b_; std::vector<std::vector<float>> adaln_w_, adaln_b_;
     std::unique_ptr<Stack> te_, refiner_, dit_, vae_; Blob vae_blob_;
+    DecoderGrid vae_grid_;
     Prepare vproj_in_prep_, vnorm_out_; Gemm vproj_in_, vproj_out_;
     std::shared_ptr<Kernel> absdiff_; void *xb0_ = nullptr, *prev_b0_ = nullptr, *cache_resid_ = nullptr, *partials_ = nullptr; size_t cache_cap_ = 0;
     double cache_acc_ = 0.0; bool have_cache_ = false; int cache_skipped_ = 0;
