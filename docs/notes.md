@@ -1091,3 +1091,13 @@ Two harness traps found on the way: ComfyUI's pack stores the audio noise as [32
 (transpose to [2, 32, A]; a reshape scrambles the audio rows and they, not the video, then
 diverge from block 5), and hooking a block's input by reading `args[0]` after the call sees
 the output, because the blocks update the hidden state in place.
+
+## 480p, 124 frames, 30 evaluations (2026-09-06)
+
+The default is 30 evaluations now (`--steps 31`; ComfyUI's stock workflows use 20). At
+864x480 x 124 frames (5.2 s of video, 37x30x54 latents, 15.4k rows) one evaluation is 36 s
+int8 + f16 and 31 s int4 here, 103 s in ComfyUI (`tools/bench_comfyui_h3.py`, 105.7 / 103.6 /
+98.4 s; same session order, idle GPU): 2.9x and 3.3x. A 30-evaluation clip is 18 min at int8,
+15.5 min at int4, 51 min in ComfyUI. Attention is about 60% of the int8 evaluation at this size
+(340 TFLOP per evaluation at ~15 TFLOP/s against 590 TOPS of int8 GEMM at ~38), so the
+attention levers apply here too.

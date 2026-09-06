@@ -154,7 +154,7 @@ python3 tools/pipeline_c.py "A red fox ..." --first-frame fox.png      # fl2va w
 ```
 
 The defaults are the stock ComfyUI workflows' settings: `res_multistep` on the `simple`
-schedule, 20 evaluations (`--steps 21` grid points), no CFG, shifts 12/3, and
+schedule, 30 evaluations (`--steps 31` grid points; ComfyUI's workflows use 20), no CFG, shifts 12/3, and
 `--precision int8` (the checkpoint's int8 rows, `tools/export_weights.py --bits 8`, with f16
 attention). `--precision int4` is the 2x-per-step path (GPTQ int4 blocks, int4 QK^T attention):
 fine for text-only previews, but it ghosts keyframe and reference clips, because its deep-block

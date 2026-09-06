@@ -77,8 +77,8 @@ class H3Pipe:
         except Exception: pass
 
     @staticmethod
-    def params(height=480, width=864, frames=124, steps=21, seed=0, video_shift=0.0, audio_shift=0.0, cache_threshold=0.0, sampler="res_multistep") -> Params:
-        """steps = sigma grid points (steps - 1 evaluations); the defaults are the stock ComfyUI workflows' res_multistep / simple / 20 evaluations."""
+    def params(height=480, width=864, frames=124, steps=31, seed=0, video_shift=0.0, audio_shift=0.0, cache_threshold=0.0, sampler="res_multistep") -> Params:
+        """steps = sigma grid points (steps - 1 evaluations); the defaults are res_multistep on the simple schedule with 30 evaluations (ComfyUI's stock workflows use 20)."""
         return Params(height, width, frames, steps, seed, video_shift, audio_shift, {"euler": 0, "res_multistep": 1}[sampler], cache_threshold)
 
     def shape(self, p: Params) -> Shape:

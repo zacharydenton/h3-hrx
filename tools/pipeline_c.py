@@ -12,7 +12,7 @@ FPS, RATE = 24, 32000
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("prompt"); ap.add_argument("--height", type=int, default=480); ap.add_argument("--width", type=int, default=864)
-    ap.add_argument("--frames", type=int, default=124); ap.add_argument("--steps", type=int, default=21, help="sigma grid points; 21 = the ComfyUI workflows' 20 evaluations"); ap.add_argument("--sampler", choices=["euler", "res_multistep"], default="res_multistep", help="res_multistep is the ComfyUI workflows' sampler"); ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--frames", type=int, default=124); ap.add_argument("--steps", type=int, default=31, help="sigma grid points = evaluations + 1; 31 = 30 evaluations (ComfyUI's stock workflows use 21)"); ap.add_argument("--sampler", choices=["euler", "res_multistep"], default="res_multistep", help="res_multistep is the ComfyUI workflows' sampler"); ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cache-threshold", type=float, default=0.0, help="first-block step cache threshold (0 = off)"); ap.add_argument("--vae-bits", type=int, default=8); ap.add_argument("--out", default=str(ROOT / "build/clip_c.mp4")); ap.add_argument("--latents-out", default=None); ap.add_argument("--no-decode", action="store_true", help="stop after denoising (timing runs)")
     ap.add_argument("--ref-image", action="append", default=[], help="reference image (png/jpg) for ref2va: presented as <Picture i> and encoded by the VAE encoder; repeatable")
     ap.add_argument("--ref-audio", action="append", default=[], help="reference wav (32 kHz stereo/mono) for ref2va: <Audio j>; repeatable")

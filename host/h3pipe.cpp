@@ -759,9 +759,12 @@ public:
         size_t in_rows = std::max(Na, Nv); for (const RefSeg &sg : lay.ref_segs) in_rows = std::max(in_rows, sg.rows);
         std::vector<uint16_t> in16(in_rows * KPAD); std::vector<uint16_t> out16(generated_rows * FINAL_N);
         const auto t_start = std::chrono::steady_clock::now();
+        auto hnow = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
         for (size_t step = 0; step < sv.timesteps.size(); ++step) {
+            const double h0 = hnow(); double h_mods = 0, h_embed = 0, h_dit = 0, h_final = 0;
             float tv[8], ta[8], tcv[8], tca[8]; temb(sv.timesteps[step], tv); temb(sa.timesteps[step], ta);
             temb(std::max(sv.timesteps[step], VISUAL_COND_AUG), tcv); temb(std::max(sa.timesteps[step], 1.0f), tca); upload_mods(tv, ta, tcv, tca);
+            h_mods = hnow();
             // audio rows -> x[L, L+Na), video rows -> x[L+Na, S), each through prepare(256) + the padded-K int8 GEMM
             std::fill(in16.begin(), in16.end(), 0);
             if (res) { const float carry = sa.sigmas[step] / sv.sigmas[step]; for (size_t i = 0; i < arows.size(); ++i) arows[i] = yrows[i] * carry; }
@@ -795,6 +798,7 @@ public:
                 }
                 if (!text_copy_) text_copy_ = memory_.alloc(seq_cap_ * HID * 4); rt().d2d(text_copy_, x_, LR * HID * 4);
             } else rt().d2d(x_, text_copy_, LR * HID * 4);
+            h_embed = hnow();
             if (p.cache_threshold > 0.0f) {                                          // first-block cache (TeaCache / FBCache style)
                 const size_t n = S * size_t(HID), groups = (n + 2047) / 2048;
                 if (cache_cap_ < n) {
@@ -822,9 +826,11 @@ public:
                     have_cache_ = true; cache_acc_ = 0.0;
                 }
             } else dit_->forward(&prof, x_, cls_, cos_, sin_, [&](int i) { return cond(i); });
+            if (prof.on) rt().sync(); h_dit = hnow();
             final_prep_.run(&prof, "final norm", unsigned(generated_rows), (float *)x_ + LR * HID, glue_.at("h3.final.norm", size_t(HID) * 4), final_table_, (int32_t *)tcls_ + LR, a_q_, a_s_);
             final_gemm.run(&prof, "final out", unsigned(generated_rows), a_q_, glue_.at("h3.final.out.q", size_t(FINAL_N) * HID), glue_.at("h3.final.out.s", size_t(FINAL_N) * 4), a_s_, out16_, nullptr, nullptr, glue_.at("h3.final.out.b", size_t(FINAL_N) * 4));
             rt().sync(); rt().d2h(out16.data(), out16_, generated_rows * FINAL_N * 2);
+            h_final = hnow();
             const float sg_v = sv.sigmas[step], sg_next = sv.sigmas[step + 1], r_v = sg_next / sg_v, sg_a = sa.sigmas[step], r_a = sa.sigmas[step + 1] / sg_a;
             if (!res) {
                 // Euler step per schedule: x0 = x + sigma * v, x' = r x + (1 - r) x0
@@ -850,6 +856,7 @@ public:
                 advance(vrows, den_v, old_v); advance(yrows, den_a, old_a); old_v.swap(den_v); old_a.swap(den_a);
             }
             dump(step + 1);
+            if (prof.on) fprintf(stderr, "  step %zu host phases: mods %.2fs  embed %.2fs  blocks %.2fs  final+d2h %.2fs  euler %.2fs\n", step + 1, h_mods - h0, h_embed - h_mods, h_dit - h_embed, h_final - h_dit, hnow() - h_final);
             if (prof.on) { double tot = 0; for (auto &kv : prof.us) tot += kv.second; fprintf(stderr, "  step %zu stages (%.1f s):", step + 1, tot * 1e-6); for (auto &kv : prof.us) if (kv.second > 0.01 * tot) fprintf(stderr, "  %s %.2fs", kv.first.c_str(), kv.second * 1e-6); fprintf(stderr, "\n"); prof.us.clear(); }
             if (progress && progress(user, int(step + 1), int(sv.timesteps.size()), std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count())) throw Cancelled();
         }
