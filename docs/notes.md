@@ -1382,3 +1382,36 @@ lose on the long-K down projection at large M (ours 39.4 at 8192 rows, 35.6 at 3
 k-split or a different raster for that one GEMM. The int8 GEMM ceiling on this part is the 46
 of the no-load ablation against a 54 peak; what is left is inside the WMMA chain and is not
 the LDS-read schedule.
+
+## ComfyUI's checkpoints read as they are (2026-09-07)
+
+The export step is gone. `libh3pipe` memory-maps the four Comfy-Org files and runs every tensor in the dtype the
+checkpoint stores, with no rotation, quantisation or conversion at load; the loader only ever changes layout
+(concatenating rows, the 16-row gate/up interleave, zero padding to a kernel's K, N or pitch) and widens the small
+vectors the f32 kernels and the CPU take, which is exact. `host/checkpoint.h` is the safetensors view, `Weights` +
+`Recipe` in `host/h3pipe.cpp` the plan per file (`dit_plan`, `te_plan`, `vvae_plan`, `avae_plan`), and uploads stay
+lazy and memoised, so a session is 0.26 s and only what a call touches becomes resident.
+
+What that changed in the arithmetic, per file:
+
+| was, exported | is, as stored | why |
+| --- | --- | --- |
+| DiT and text encoder blocks: int8 rows verbatim | the same rows, mapped | already exact |
+| condition_proj, the token refiner, the vision tower: rotated and quantised to int8 (tower: cast to f16) | bf16 on `gemm_bf16_*` and `matmul_*_bf16_wmma` | the checkpoint stores bf16; quantising it was the export's choice, not the model's |
+| the patch embedders and the final layer: K padded to 256, rotated, quantised | f32 on `matmul_f32` | 128-wide and 96/32-wide heads: the SIMT kernel costs ~0.1% of a step |
+| the video VAE decoder: rotated and quantised to int8 | f16 on the f16 GEMMs with the unrotated prepares | the VAE ships f16 |
+| the video VAE encoder, the audio VAE | the same values, re-laid | already exact |
+
+Measured against ComfyUI's own run (`tests/test_comfy_parity.py`, video rows, int8 QK^T attention), the exported path
+first and the checkpoint path second: block 30 0.9988 -> 0.9991, block 40 0.9929 -> 0.9942, block 49 0.9991 -> 0.9992;
+the trajectory's relative error after five evaluations 0.0132. The video VAE encoder against ComfyUI's dump improved
+from 0.9994 to 0.999992, the audio encoder stayed at 1.0000000, and `text_in` matches the exported text encoder at
+cosine 1.000000. The gain is where the export used to quantise something the checkpoint had not.
+
+Kernels this needed: unrotated `prepare_{norm,lnorm,plain}_{f16,bf16}` (the Hadamard only ever served quantisation),
+a bf16 element type in `tools/gen_gemm_f16.py` (six `gemm_bf16_*` twins), `tools/gen_matmul_bf16.py` for the vision
+tower's four matmuls, and `matmul_f32` bounded at 1048576 rows rather than 32768. The f16 GEMM twins also gained the
+`k_stride` pitch the int8 kernels had: the old ones read `k_size`, so a padded operand pitch would have misread rows.
+
+Qwen's `tokenizer.json` is compiled into the library (`assets/`, `host/tokenizer_blob.S`), so `h3tok_create(NULL)`
+needs no file and a clip needs nothing beyond the four checkpoints.
