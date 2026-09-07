@@ -19,7 +19,7 @@ def main():
     ckpt = R.Checkpoint(device="cuda", dtype=torch.bfloat16); ref = R.H3Ref(ckpt, quant="none")
     with torch.no_grad(): want = ref.text_in(prompt["embeds"].cuda()).float().cpu().numpy()
     del ref, ckpt; torch.cuda.empty_cache()
-    t0 = time.time(); pipe = H3Pipe(); print(f"session in {time.time() - t0:.1f} s")
+    t0 = time.time(); pipe = H3Pipe(blocks=str(ROOT / "build/weights_gptq"), attn="i4"); print(f"session in {time.time() - t0:.1f} s")   # the step comparison is against the int4 Python blocks below
     t0 = time.time(); got = pipe.text_in(ids); print(f"text_in in {time.time() - t0:.2f} s")
     c = float(np.dot(got.ravel(), want.ravel()) / (np.linalg.norm(got) * np.linalg.norm(want) + 1e-30)); err = float(np.linalg.norm(got - want) / (np.linalg.norm(want) + 1e-30))
     print(f"  {'PASS' if c > 0.999 else 'FAIL'} text_in: cosine {c:.5f}, rel err {err:.4f}  (the C path re-encodes the prompt in Loom; the reference uses the cached Loom embeddings)")

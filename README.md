@@ -50,29 +50,58 @@ Kernel-level, 56 heads x 128, measured in `docs/`:
   (`scripts/env.sh` points at the build directory). Kernels are compiled on first use for each
   shape into `build/kernel_cache`.
 - **ffmpeg** for the `h3` command (input decoding, output muxing).
-- **Python 3 with ROCm PyTorch, diffusers and transformers** only for exporting the weights and
-  running the reference tests. The clip itself never touches Python.
+- **Python 3 with NumPy** for the kernel tests and generators; **ROCm PyTorch, diffusers, transformers
+  and safetensors** only for exporting the weights and the reference tier of the tests
+  (`H3_REFERENCE_PYTHON` names that interpreter). The clip itself never touches Python.
+- Optional, for the toy ComfyUI comparison in the test suite: **podman** and the
+  `docker.io/kyuz0/amd-strix-halo-comfyui` image (skipped when podman is absent).
 
 ## Weights
 
-Two downloads, then the exports. The DiT blocks come from ComfyUI's int8 ConvRot checkpoint
-(`pruned_int8_convrot` from [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3),
-21 GB) and its int8 Qwen3-VL-32B text encoder; the VAEs, tokenizer and schedules come from the
-original [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) release
-(`scripts/download.sh` fetches the FL2VA partition into `~/h3-models`).
+Two downloads, then the exports. The DiT blocks and the int8 text encoder come from ComfyUI's
+int8 ConvRot checkpoints in [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3)
+(21 GB and 27 GB), the encoders' sources from the same repository; the VAEs, tokenizer and
+schedules come from the original [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3)
+release. Every tool takes its paths as options (`--ckpt`, `--te`, `--src`, `--out`); the defaults
+below are what the commands here produce.
+
+```sh
+scripts/download.sh                              # MiniMaxAI/MiniMax-H3: VAEs, tokenizer, schedules -> ~/h3-models (--all adds the bf16 originals)
+hf download Comfy-Org/MiniMax-H3 --local-dir ~/comfy-models \
+    --include diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
+              text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors \
+              vae/minimax_h3_video_vae_fp16.safetensors vae/minimax_h3_audio_vae_fp32.safetensors
+python3 tools/export_weights.py --bits 8         # -> build/weights_i8       (the checkpoint's int8 rows)
+python3 tools/export_te.py                       # -> build/weights_te
+python3 tools/export_glue.py                     # -> build/weights_glue
+python3 tools/export_vae.py --bits 8             # -> build/weights_vae_i8
+python3 tools/export_vae_encoder.py              # -> build/weights_venc     (references, keyframes)
+python3 tools/export_vision.py                   # -> build/weights_vision   (reference images in the prompt)
+python3 tools/export_audio_encoder.py            # -> build/weights_aenc     (reference audio)
+```
 
 | export | tool | on disk |
 | --- | --- | ---: |
-| DiT blocks, int8 rows | `tools/export_weights.py --bits 8` | 18 GB |
-| text encoder, int8 | `tools/export_te.py` | 23 GB |
-| conditioning tables, embedders, refiner, heads, audio decoder | `tools/export_glue.py` | 2.7 GB |
-| video VAE decoder, int8 | `tools/export_vae.py --bits 8` | 2.3 GB |
-| video VAE encoder, vision tower, audio encoder (references) | `tools/export_vae_encoder.py`, `tools/export_vision.py`, `tools/export_audio_encoder.py` | 2 GB |
-| ref2va blocks and glue (reference-conditioned clips) | the same two tools with `H3_CKPT=<ref2va checkpoint>` and `--out ..._ref2va` | 21 GB |
+| DiT blocks, int8 rows: `build/weights_i8` | `tools/export_weights.py --bits 8` | 18 GB |
+| text encoder, int8: `build/weights_te` | `tools/export_te.py` | 23 GB |
+| conditioning tables, embedders, refiner, heads, audio decoder: `build/weights_glue` | `tools/export_glue.py` | 2.7 GB |
+| video VAE decoder, int8: `build/weights_vae_i8` | `tools/export_vae.py --bits 8` | 2.3 GB |
+| video VAE encoder, vision tower, audio encoder (references): `build/weights_venc`, `weights_vision`, `weights_aenc` | `tools/export_vae_encoder.py`, `tools/export_vision.py`, `tools/export_audio_encoder.py` | 2 GB |
+| ref2va blocks and glue (reference-conditioned clips): `build/weights_i8_ref2va`, `weights_glue_ref2va` | the two commands below | 21 GB |
 
-Optional: `tools/export_weights.py --bits 16` for the pruned bf16 checkpoint's rows in f16 (36 GB,
-`--precision bf16`), `tools/gptq_export.py` for GPTQ int4 blocks (9 GB, `--precision int4`, preview
-quality only).
+Reference-conditioned clips (`h3 ref.jpg voice.wav ...`) run the ref2va checkpoint
+(`minimax_h3_ref2va_pruned_int8_convrot.safetensors` from the same repository); `h3` selects its
+exports whenever reference files are given and refuses to run references on the base checkpoint
+unless `--base-weights` says so:
+
+```sh
+python3 tools/export_weights.py --bits 8 --ckpt ~/comfy-models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors --out build/weights_i8_ref2va
+python3 tools/export_glue.py --ckpt ~/comfy-models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors --out build/weights_glue_ref2va
+```
+
+Optional: `tools/export_weights.py --bits 16` for the pruned bf16 checkpoint's rows in f16
+(`build/weights_f16`, 36 GB, `--precision bf16`), `tools/gptq_export.py` for GPTQ int4 blocks
+(`build/weights_gptq`, 9 GB, `--precision int4`, preview quality only).
 
 The weights are under the MiniMax H3 Community License, which permits open-weight use in the USA,
 EU, UK and South Korea; other regions apply to MiniMax for a licence. Nothing in this repository is
@@ -127,7 +156,10 @@ modes, their costs, and the pieces of this repository worth taking elsewhere.
 **Knobs.** `H3_PROFILE=1` prints per-stage times after every step; `H3_TRACE=1` prints and
 synchronises every launch; `--precision bf16` runs the pruned bf16 checkpoint's rows in f16 at
 about the int8 speed; `--precision int4` is a 2x-per-step preview path that ghosts keyframe and
-reference clips (do not use it for conditioned generation); `--attn f16` restores f16 attention.
+reference clips (do not use it for conditioned generation); `--attn f16` restores f16 attention;
+`--base-weights` runs reference files on the base checkpoint when the ref2va exports are absent.
+Unknown options, missing values and out-of-range numbers are errors, as are `--audio-only` with
+`--still` and `--no-decode` with either.
 
 ## Quality
 
@@ -205,17 +237,20 @@ attention form.
 | `reference/` | a NumPy/torch reference of the block stack and the VAE decoder |
 | `docs/` | `abi.md` (the C ABI contract), `tricks.md` (voice, sound, stills, reusable pieces), `notes.md` (every measured lever, won or lost), the attention and GEMM reports, the reference-conditioning plan |
 | `examples/` | the minimal client in C, Rust and Go |
-| `scripts/` | `env.sh`, `build_host.sh`, `test.sh`, `download.sh` |
+| `scripts/` | `env.sh` (toolchain and runtime paths, all overridable), `build_host.sh`, `test.sh`, `test_host.sh`, `download.sh` |
 
 ## Tests
 
 ```sh
-bash scripts/test.sh --quick    # format, generators, host build, CPU host tests, kernel tests, tokenizer
-bash scripts/test.sh            # plus the decoder, encoder and block comparisons against the references
-python3 tests/test_comfy_parity.py   # the ComfyUI parity gate (needs the dumps from tools/comfy_clip.py)
+bash scripts/test.sh --cpu      # no GPU, weights or containers: Python parses, CPU host regressions, generators (CI)
+bash scripts/test.sh --quick    # plus the host build, the kernel tests on the GPU (including the production int8 attention), the tokenizer
+bash scripts/test.sh            # plus the reference tier: decoder, encoder, block, text encoder, pipeline and ComfyUI parity checks
+python3 tests/test_comfy_parity.py --require   # the ComfyUI parity gate alone (needs the dumps from tools/comfy_clip.py); without --require, missing dumps skip
 ```
 
-`bash scripts/test_host.sh` runs the CPU-only host regressions without weights or a GPU.
+`bash scripts/test_host.sh` is the CPU tier's host part: bounded C++ and Python regressions without
+weights or a GPU. `H3_PYTHON` names the interpreter for the kernel tests (NumPy), `H3_REFERENCE_PYTHON`
+the one with torch, diffusers and transformers for the reference tier.
 
 ## Limitations
 

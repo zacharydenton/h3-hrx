@@ -10,7 +10,10 @@ nibbles low first) with an f32 scale; nothing is rotated again. Per block:
   down : mlp.fc2        [5376][14336]
 plus f32 vectors norm1, norm2, q_norm, k_norm. The AdaLN tables are computed per forward by
 the Python wrapper from the 8-d curve (tiny) and are not exported.
-Output: build/weights/weights.bin + manifest.txt (name offset bytes dtype shape) + config.json.
+Output: <out>/weights.bin + manifest.txt (name offset bytes dtype shape) + config.json, where <out> follows --bits unless
+--out is given: build/weights_i8 (--bits 8, what h3 and the examples load), build/weights_f16 (--bits 16, --precision bf16),
+build/weights (--bits 4, the requantised int4 study path; the int4 the CLI runs is tools/gptq_export.py's build/weights_gptq).
+--ckpt (or H3_CKPT) names the checkpoint: the ref2va file with --out build/weights_i8_ref2va for reference-conditioned clips.
 """
 import argparse
 import json
@@ -50,12 +53,14 @@ def interleave_gate_up(w: torch.Tensor) -> torch.Tensor:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--layers", type=int, default=50)
-    ap.add_argument("--out", default=str(ROOT / "build/weights"))
-    ap.add_argument("--source", default=str(R.CKPT))
+    ap.add_argument("--out", default=None, help="destination (default: build/weights_i8 for --bits 8, build/weights_f16 for 16, build/weights for 4)")
+    ap.add_argument("--ckpt", "--source", dest="source", default=str(R.CKPT), help="the checkpoint (default: H3_CKPT or the Comfy-Org int8 ConvRot file in ~/comfy-models)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--bits", type=int, choices=(4, 8, 16), default=4, help="8: the checkpoint's int8 rows and scales verbatim (tools/quant_study.py: velocity cosine 0.9997 vs 0.98-0.99 for int4)")
     a = ap.parse_args()
-    out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+    out = Path(a.out) if a.out else ROOT / {8: "build/weights_i8", 16: "build/weights_f16", 4: "build/weights"}[a.bits]
+    if not Path(a.source).is_file(): raise SystemExit(f"checkpoint not found: {a.source} (README, Weights: --ckpt or H3_CKPT)")
+    out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     ckpt = R.Checkpoint(Path(a.source), device="cpu", dtype=torch.float32)
     blobs = []

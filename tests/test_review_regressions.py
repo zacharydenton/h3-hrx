@@ -1,7 +1,11 @@
 """CPU-only binding/cache/runner regressions; no model weights or GPU contexts."""
+import contextlib
 import ctypes
+import importlib.util
+import io
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,6 +19,17 @@ sys.path[:0] = [str(ROOT), str(ROOT / "tools")]
 from h3pipe_loom import H3Pipe, Shape
 import kernel_cache
 import kernel_test
+
+
+def spy_pipe(shape=Shape(22, 7, 4, 6, 37, 4096)):
+    """An H3Pipe whose native calls record their arguments and succeed, with a fixed shape; no library is loaded."""
+    pipe = H3Pipe.__new__(H3Pipe); pipe.shape = lambda p: shape; calls = []
+    class Native:
+        def __getattr__(self, name):
+            def call(*args): calls.append((name, args)); return 0
+            return call
+    pipe._native, pipe._handle = Native(), None
+    return pipe, calls
 
 
 class ReviewRegressions(unittest.TestCase):
@@ -43,6 +58,82 @@ class ReviewRegressions(unittest.TestCase):
         video = np.arange(24 * 4 * 6, dtype=np.float32).reshape(24, 1, 4, 6)
         pipe.denoise([1], H3Pipe.params(height=64, width=96, frames=22), keyframes=[{"frame_index": 0, "video": video}])
         np.testing.assert_array_equal(seen[0], video.ravel())
+
+    def test_undersized_arrays_never_reach_native(self):
+        """Every array crosses to C as a raw pointer with a size C derives from other arguments; the binding checks the shape first (also under python -O)."""
+        pipe, calls = spy_pipe()
+        p = H3Pipe.params(height=64, width=96, frames=22)
+        bad = [
+            ("encode_video", (np.zeros((1, 32, 32, 1)),), "channels"),        # grayscale: 1024 floats where C reads 3072
+            ("encode_video", (np.zeros((32, 32)),), "dimensions"),
+            ("encode_video", (np.zeros((1, 32, 40, 3)),), "multiples of 32"),
+            ("encode_video", (np.zeros((0, 32, 32, 3)),), "empty"),
+            ("vision_embed", (np.zeros((32, 32)),), "dimensions"),
+            ("vision_embed", (np.zeros((32, 32, 4)),), "channels"),
+            ("encode_audio", (np.zeros((1, 800)),), "shape"),                  # mono: 800 floats where C reads 1600
+            ("encode_audio", (np.zeros(800),), "dimensions"),
+            ("decode_audio", (np.zeros((2, 31, 5)),), "shape"),
+            ("decode_video", (p, np.zeros((24, 7, 4, 5))), "shape"),
+            ("denoise", ([1], p), "noise_video", {"noise_video": np.zeros((24, 7, 4, 5))}),
+            ("denoise", ([1], p), "ref 0 image latents", {"refs": [{"kind": "image", "video": np.zeros((24, 2, 4, 6))}]}),   # an image reference is one latent frame
+            ("denoise", ([1], p), "even lat_h", {"refs": [{"kind": "image", "video": np.zeros((24, 1, 3, 6))}]}),
+            ("denoise", ([1], p), "ref 0 video latents", {"refs": [{"kind": "video", "video": np.zeros((23, 2, 4, 6))}]}),
+            ("denoise", ([1], p), "ref 0 pixels", {"refs": [{"kind": "image", "video": np.zeros((24, 1, 4, 6)), "pixels": np.zeros((64, 96))}]}),
+            ("denoise", ([1], p), "do not match", {"refs": [{"kind": "image", "video": np.zeros((24, 1, 4, 6)), "pixels": np.zeros((32, 32, 3))}]}),
+            ("denoise", ([1], p), "ref 0 audio latents", {"refs": [{"kind": "audio", "audio": np.zeros((1, 32, 5))}]}),
+            ("denoise", ([1], p), "audio needs", {"refs": [{"kind": "audio"}]}),
+            ("denoise", ([1], p), "kind", {"refs": [{"kind": "picture", "video": np.zeros((24, 1, 4, 6))}]}),
+            ("denoise", ([1], p), "keyframe pixels", {"keyframes": [{"frame_index": 0, "video": np.zeros((24, 1, 4, 6)), "pixels": np.zeros((32, 32, 3))}]}),
+            ("denoise", ([], p), "at least one", {}),
+        ]
+        for method, args, message, *kw in bad:
+            with self.subTest(method=method, message=message), self.assertRaisesRegex(ValueError, message):
+                getattr(pipe, method)(*args, **(kw[0] if kw else {}))
+        self.assertEqual(calls, [])
+        # the well-formed calls do reach C with the sizes C will read
+        pipe.encode_video(np.zeros((32, 32, 3))); pipe.vision_embed(np.zeros((32, 64, 3))); pipe.encode_audio(np.zeros((2, 801))); pipe.decode_audio(np.zeros((2, 32, 3)))
+        pipe.denoise([1], p, refs=[{"kind": "image", "video": np.zeros((24, 1, 4, 6)), "pixels": np.zeros((64, 96, 3))}, {"kind": "audio", "audio": np.zeros((2, 32, 5))}])
+        self.assertEqual([c[0] for c in calls], ["h3pipe_encode_video", "h3pipe_vision_embed", "h3pipe_encode_audio", "h3pipe_decode_audio", "h3pipe_denoise_refs"])
+        self.assertEqual(calls[0][1][2:5], (1, 32, 32)); self.assertEqual(calls[2][1][2], 801)
+        refs = calls[4][1][6]; self.assertEqual((refs[0].latent_t, refs[0].lat_h, refs[0].lat_w, refs[0].height, refs[0].width, refs[1].audio_t), (1, 4, 6, 64, 96, 5))
+
+    def test_shape_failure_is_an_error(self):
+        pipe = H3Pipe.__new__(H3Pipe)
+        class Native:
+            def h3pipe_shape_for(self, p, s): return 64
+        pipe._native = Native()
+        with self.assertRaisesRegex(ValueError, "invalid parameters"): pipe.shape(H3Pipe.params(height=31))
+
+    def test_parity_gate_fails_on_broken_comparisons(self):
+        """The ComfyUI parity gate: a comparison that exits nonzero, or omits an expected block or the trajectory line, is a failure; missing fixtures skip unless required."""
+        spec = importlib.util.spec_from_file_location("parity", ROOT / "tests/test_comfy_parity.py"); parity = importlib.util.module_from_spec(spec); spec.loader.exec_module(parity)
+        blocks = " ".join(f"blk_{b}: [video 0.9995]" for b in parity.REQUIRED_BLOCKS)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); (root / "tools").mkdir()
+            for f in ("build/comfy_t2va_blocks/blocks/blk_49.npy", "build/comfy_fl2va/x_19.npy", "build/weights_i8/manifest.txt"):
+                (root / f).parent.mkdir(parents=True, exist_ok=True); (root / f).write_text("")
+            compare = root / "tools/compare_comfy.py"
+            def fake(body): compare.write_text("import sys\n" + body)
+            with patch.object(parity, "ROOT", root), contextlib.redirect_stdout(io.StringIO()):
+                fake("sys.exit(42)"); self.assertEqual(parity.main(), 1)                                            # every comparison crashed
+                fake("print('')"); self.assertEqual(parity.main(), 1)                                               # no results at all
+                fake(f"print('{blocks}'.replace(' blk_', '\\nblk_'))"); self.assertEqual(parity.main(), 1)          # blocks but no trajectory
+                fake(f"print('{blocks}'.replace(' blk_', '\\nblk_')); print('x_05: rel err 0.01')"); self.assertEqual(parity.main(), 0)
+                fake(f"print('{blocks}'.replace(' blk_', '\\nblk_').replace('blk_40: [video 0.9995]', 'blk_40: [video 0.98]')); print('x_05: rel err 0.01')"); self.assertEqual(parity.main(), 1)
+                fake(f"print('{blocks}'.replace(' blk_', '\\nblk_').replace('blk_40: [video 0.9995]\\n', '')); print('x_05: rel err 0.01')"); self.assertEqual(parity.main(), 1)   # block 40 missing
+                fake(f"print('{blocks}'.replace(' blk_', '\\nblk_')); print('x_05: rel err 0.03')"); self.assertEqual(parity.main(), 1)
+                shutil.rmtree(root / "build/weights_i8")
+                self.assertEqual(parity.main(), 0)                                                                  # a skip without the exports
+                with patch.dict(os.environ, {"H3_REQUIRE_PARITY": "1"}): self.assertEqual(parity.main(), 1)         # never for the release gate
+
+    def test_export_destinations_follow_the_clients(self):
+        """README's export commands must write the directories h3, the bindings and the examples load."""
+        weights = (ROOT / "tools/export_weights.py").read_text(); glue = (ROOT / "tools/export_glue.py").read_text()
+        self.assertIn('8: "build/weights_i8"', weights); self.assertIn('16: "build/weights_f16"', weights)
+        self.assertIn('"--out"', glue); self.assertIn('"--ckpt"', glue)
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("export_weights.py --bits 8 --ckpt", readme); self.assertIn("--out build/weights_i8_ref2va", readme); self.assertIn("export_glue.py --ckpt", readme); self.assertIn("--out build/weights_glue_ref2va", readme)
+        for tool in ("export_audio_encoder", "export_vae_encoder", "export_vision"): self.assertNotIn("/mnt/", (ROOT / f"tools/{tool}.py").read_text())
 
     def test_cache_invalidation_and_failed_compile(self):
         with tempfile.TemporaryDirectory() as tmp:

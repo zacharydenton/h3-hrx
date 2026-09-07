@@ -6,7 +6,9 @@
 // Build: ./scripts/build_host.sh  (host-only code against the HIP runtime API)
 #include "rt.h"
 
+#include <fcntl.h>
 #include <spawn.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -24,6 +26,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -210,18 +213,36 @@ using Cfg = std::vector<std::pair<std::string, std::string>>;
 
 struct Compiler {
     std::string exe, sources, cache;
+    static constexpr const char *BACKEND = "amdgpu-hal", *TARGET = "gfx1151";
     std::map<std::string, std::shared_ptr<Kernel>> loaded;
-    // one kernel per (stem, source, config); the cache file name carries a hash of the .loom text and the config,
-    // so an edited kernel source never reuses a stale binary
+    std::string compiler_id_;   // computed once per Compiler
+    // One kernel per (stem, source text, symbol, backend, target, config, compiler binary): the cache file name carries a hash
+    // of all of them, so neither an edited kernel source nor a replaced loom-compile ever reuses a stale binary
+    // (tools/kernel_cache.py keeps the same policy for the Python harnesses).
+    static uint64_t fnv(const std::string &text, uint64_t h = 1469598103934665603ull) { for (unsigned char c : text) { h ^= c; h *= 1099511628211ull; } return h; }
+    static std::string hex(uint64_t h, size_t digits) { char buf[17]; snprintf(buf, sizeof buf, "%016llx", (unsigned long long)h); return std::string(buf, digits); }
     static std::string source_hash(const std::string &path) {
         std::ifstream f(path, std::ios::binary); if (!f) throw std::runtime_error("missing kernel source " + path);
         std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        uint64_t h = 1469598103934665603ull; for (unsigned char c : text) { h ^= c; h *= 1099511628211ull; }
-        char buf[17]; snprintf(buf, sizeof buf, "%016llx", (unsigned long long)h); return std::string(buf, 10);
+        return hex(fnv(text), 10);
+    }
+    // The compiler binary as posix_spawnp finds it (a bare name searches PATH), with its size and modification time.
+    std::string compiler_id() {
+        if (!compiler_id_.empty()) return compiler_id_;
+        std::string path = exe;
+        if (exe.find('/') == std::string::npos) {
+            const char *env = getenv("PATH"); std::string dirs = env ? env : "";
+            for (size_t b = 0; b <= dirs.size();) { const size_t e = dirs.find(':', b); const std::string d = dirs.substr(b, e == std::string::npos ? std::string::npos : e - b); const std::string cand = (d.empty() ? "." : d) + "/" + exe; if (access(cand.c_str(), X_OK) == 0) { path = cand; break; } if (e == std::string::npos) break; b = e + 1; }
+        }
+        struct stat st; if (stat(path.c_str(), &st) != 0) throw std::runtime_error("loom-compile not found: " + exe);
+        compiler_id_ = path + ":" + std::to_string((long long)st.st_size) + ":" + std::to_string((long long)st.st_mtim.tv_sec) + "." + std::to_string((long long)st.st_mtim.tv_nsec);
+        return compiler_id_;
     }
     std::shared_ptr<Kernel> get(const std::string &stem, const std::string &symbol, const Cfg &cfg) {
         std::string tag = stem + "__s" + source_hash(sources + "/" + stem + ".loom");
-        for (auto &c : cfg) { tag += "__" + c.first.substr(c.first.rfind('.') + 1) + "_" + c.second; }
+        std::string identity = std::string(BACKEND) + "\n" + TARGET + "\n" + symbol + "\n" + compiler_id() + "\n";
+        for (auto &c : cfg) { tag += "__" + c.first.substr(c.first.rfind('.') + 1) + "_" + c.second; identity += c.first + "=" + c.second + "\n"; }
+        tag += "__i" + hex(fnv(identity), 10);
         for (char &ch : tag) if (!isalnum((unsigned char)ch) && ch != '_' && ch != '-' && ch != '.') ch = '_';
         auto it = loaded.find(tag);
         if (it != loaded.end()) return it->second;
@@ -229,19 +250,28 @@ struct Compiler {
         if (!exists(path)) compile(stem, symbol, cfg, path);
         auto k = std::make_shared<Kernel>(); k->load(path, symbol); loaded[tag] = k; return k;
     }
+    // Compile into a unique temporary and rename it into place under a lock on <path>.lock, so several sessions asking for the
+    // same kernel at once neither load a half-written binary nor clobber each other's temporary.
     void compile(const std::string &stem, const std::string &symbol, const Cfg &cfg, const std::string &path) {
         mkdirs(cache);
-        const std::string tmp = path + ".tmp." + std::to_string(getpid());
-        std::vector<std::string> args = {exe, sources + "/" + stem + ".loom", "--backend=amdgpu-hal", "--target=gfx1151", "--root=@" + symbol, "--output=" + tmp};
+        const int lock = open((path + ".lock").c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+        if (lock < 0) throw std::runtime_error("cannot create " + path + ".lock");
+        struct Unlock { int fd; ~Unlock() { flock(fd, LOCK_UN); close(fd); } } unlock{lock};
+        if (flock(lock, LOCK_EX) != 0) throw std::runtime_error("cannot lock " + path + ".lock");
+        if (exists(path)) return;   // another session published it while we waited
+        std::random_device rd; const std::string tmp = path + ".tmp." + std::to_string(getpid()) + "." + hex((uint64_t(rd()) << 32) | rd(), 16);
+        std::vector<std::string> args = {exe, sources + "/" + stem + ".loom", std::string("--backend=") + BACKEND, std::string("--target=") + TARGET, "--root=@" + symbol, "--output=" + tmp};
         for (auto &c : cfg) args.push_back("--config=" + c.first + "=" + c.second);
         std::vector<char *> argv; for (auto &a : args) argv.push_back(const_cast<char *>(a.c_str())); argv.push_back(nullptr);
         pid_t pid; if (posix_spawnp(&pid, exe.c_str(), nullptr, nullptr, argv.data(), environ) != 0) throw std::runtime_error("cannot spawn " + exe);
         int status = 0; waitpid(pid, &status, 0);
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || !exists(tmp)) {
+        struct stat st; const bool produced = stat(tmp.c_str(), &st) == 0 && st.st_size > 0;
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || !produced) {
+            unlink(tmp.c_str());
             std::string cmd; for (auto &a : args) cmd += a + " ";
             throw std::runtime_error("loom-compile failed for " + stem + ": " + cmd);
         }
-        if (rename(tmp.c_str(), path.c_str()) != 0) throw std::runtime_error("cannot rename " + tmp);
+        if (rename(tmp.c_str(), path.c_str()) != 0) { unlink(tmp.c_str()); throw std::runtime_error("cannot rename " + tmp); }
     }
 };
 
@@ -558,6 +588,12 @@ struct Layout {
 };
 
 int align_frames(int n) { while (n % 17 != 5) ++n; return n; }
+constexpr int MAX_SIDE = 8192, MAX_FRAMES = 1 << 20;   // canvas sides (multiples of 32) and frame counts h3pipe_shape_for accepts: every derived count fits an int
+bool valid_canvas(int height, int width) { return height >= 32 && width >= 32 && height <= MAX_SIDE && width <= MAX_SIDE && height % 32 == 0 && width % 32 == 0; }
+h3pipe_shape shape_or_throw(const h3pipe_params &p) {
+    h3pipe_shape sh; if (h3pipe_shape_for(&p, &sh)) throw std::invalid_argument("height and width must be multiples of 32 up to 8192, frames 1..1048576");
+    return sh;
+}
 
 struct Schedule {                            // diffusers' MiniMaxH3Scheduler
     std::vector<float> sigmas, timesteps;
@@ -754,9 +790,8 @@ public:
 
     // --- denoising ---
     void denoise(const int32_t *ids, int n, const h3pipe_params &p, const float *noise_video, const float *noise_audio, float *video_out, float *audio_out, h3pipe_progress progress, void *user, const std::vector<h3pipe_ref> &refs = {}, const std::vector<h3pipe_keyframe> &kfs = {}) {
-        if (p.height % 32 || p.width % 32 || p.height < 32 || p.width < 32) throw std::invalid_argument("height and width must be multiples of 32");   // 32 = one 2x2 latent patch: the audio-only canvas
+        const h3pipe_shape sh = shape_or_throw(p);   // 32 = one 2x2 latent patch: the audio-only canvas
         if (p.steps < 2 || p.steps > 1000) throw std::invalid_argument("steps must be 2..1000");
-        h3pipe_shape sh; h3pipe_shape_for(&p, &sh);
         ensure_conditioning();
         Layout lay(n, sh.latent_t, sh.lat_h, sh.lat_w, sh.audio_t, refs, kfs);
         const size_t L = size_t(n), Rr = lay.ref_rows, LR = L + Rr, Na = lay.audio_rows, Nv = lay.video_rows, S = lay.seq_len;
@@ -1409,7 +1444,7 @@ public:
 
     // the clip loop of diffusers' _decode: 5-token chunks with a 2-token overlap, 17 kept frames per chunk (3 dropped in front), 5-frame cross-fades
     void decode_video(const h3pipe_params &p, const float *latents, uint8_t *out) {
-        h3pipe_shape sh; h3pipe_shape_for(&p, &sh);
+        const h3pipe_shape sh = shape_or_throw(p);
         const int T = sh.latent_t, H = sh.lat_h, W = sh.lat_w, F = sh.frames;
         const size_t FH = size_t(H) * VAE_PS, FW = size_t(W) * VAE_PS, plane = FH * FW;
         std::vector<float> lmean = glue_.host_f32("vae.latents_mean", 24), lstd = glue_.host_f32("vae.latents_std", 24);
@@ -1496,6 +1531,7 @@ extern "C" void h3pipe_destroy(h3pipe_session *s) { delete s; }
 
 extern "C" int h3pipe_shape_for(const h3pipe_params *p, h3pipe_shape *out) {
     if (!p || !out) return H3PIPE_INVALID_ARGUMENT;
+    if (!valid_canvas(p->height, p->width) || p->frames < 1 || p->frames > MAX_FRAMES) return H3PIPE_INVALID_ARGUMENT;
     out->frames = align_frames(std::max(p->frames, 5)); out->latent_t = (out->frames - 5) / 17 * 5 + 2;
     out->lat_h = p->height / 16; out->lat_w = p->width / 16; out->audio_t = int(std::lround(double(out->frames) / FPS * AUDIO_LATENTS_PER_S));
     out->text_rows_max = 4096;
@@ -1520,7 +1556,7 @@ extern "C" int h3pipe_create(const h3pipe_config *config, h3pipe_session **out, 
 extern "C" int h3pipe_text_in(h3pipe_session *s, const int32_t *ids, int n, float *outp, size_t out_elements, char *error, size_t cap) {
     GUARD({
         if (!s || !ids || !outp || n < 1) throw std::invalid_argument("session, ids (n >= 1) and out are required");
-        if (out_elements != size_t(n) * HID) throw std::invalid_argument("out must hold n_ids * 5376 floats");
+        if (out_elements < size_t(n) * HID) throw std::invalid_argument("out must hold at least n_ids * 5376 floats");
         std::lock_guard<std::mutex> lock(s->mutex); s->value.get_text_in(ids, n, outp);
     })
 }
@@ -1529,9 +1565,9 @@ extern "C" int h3pipe_denoise_refs(h3pipe_session *s, const int32_t *ids, int n,
                                    float *video, size_t video_elements, float *audio, size_t audio_elements, h3pipe_progress progress, void *user, char *error, size_t cap) {
     GUARD({
         if (!s || !ids || !params || !video || !audio || n < 1 || (n_refs > 0 && !refs) || (n_keyframes > 0 && !keyframes)) throw std::invalid_argument("session, ids, params, keyframes, refs and outputs are required");
-        h3pipe_shape sh; h3pipe_shape_for(params, &sh);
-        if (video_elements != size_t(LATENT_CH) * sh.latent_t * sh.lat_h * sh.lat_w) throw std::invalid_argument("video_latents must hold 24 * latent_t * lat_h * lat_w floats");
-        if (audio_elements != size_t(2) * AUDIO_CH * sh.audio_t) throw std::invalid_argument("audio_latents must hold 2 * 32 * audio_t floats");
+        const h3pipe_shape sh = shape_or_throw(*params);
+        if (video_elements < size_t(LATENT_CH) * sh.latent_t * sh.lat_h * sh.lat_w) throw std::invalid_argument("video_latents must hold at least 24 * latent_t * lat_h * lat_w floats");
+        if (audio_elements < size_t(2) * AUDIO_CH * sh.audio_t) throw std::invalid_argument("audio_latents must hold at least 2 * 32 * audio_t floats");
         std::vector<h3pipe_ref> rv(refs, refs + n_refs); std::vector<h3pipe_keyframe> kv(keyframes, keyframes + n_keyframes);
         for (const h3pipe_keyframe &kf : kv) { if (!kf.video_latent || kf.frame_index < 0 || kf.frame_index >= sh.frames) throw std::invalid_argument("keyframes need a video latent and a frame index inside the clip"); if (kf.audio_latent && kf.audio_t < 1) throw std::invalid_argument("keyframe audio needs audio_t >= 1"); }
         for (const h3pipe_ref &rf : rv) {
@@ -1546,9 +1582,9 @@ extern "C" int h3pipe_denoise(h3pipe_session *s, const int32_t *ids, int n, cons
                               float *video, size_t video_elements, float *audio, size_t audio_elements, h3pipe_progress progress, void *user, char *error, size_t cap) {
     GUARD({
         if (!s || !ids || !params || !video || !audio || n < 1) throw std::invalid_argument("session, ids, params and outputs are required");
-        h3pipe_shape sh; h3pipe_shape_for(params, &sh);
-        if (video_elements != size_t(LATENT_CH) * sh.latent_t * sh.lat_h * sh.lat_w) throw std::invalid_argument("video_latents must hold 24 * latent_t * lat_h * lat_w floats");
-        if (audio_elements != size_t(2) * AUDIO_CH * sh.audio_t) throw std::invalid_argument("audio_latents must hold 2 * 32 * audio_t floats");
+        const h3pipe_shape sh = shape_or_throw(*params);
+        if (video_elements < size_t(LATENT_CH) * sh.latent_t * sh.lat_h * sh.lat_w) throw std::invalid_argument("video_latents must hold at least 24 * latent_t * lat_h * lat_w floats");
+        if (audio_elements < size_t(2) * AUDIO_CH * sh.audio_t) throw std::invalid_argument("audio_latents must hold at least 2 * 32 * audio_t floats");
         std::lock_guard<std::mutex> lock(s->mutex); s->value.denoise(ids, n, *params, noise_video, noise_audio, video, audio, progress, user);
     })
 }
@@ -1556,15 +1592,15 @@ extern "C" int h3pipe_denoise(h3pipe_session *s, const int32_t *ids, int n, cons
 extern "C" int h3pipe_decode_video(h3pipe_session *s, const h3pipe_params *params, const float *latents, size_t video_elements, uint8_t *frames, size_t frame_bytes, char *error, size_t cap) {
     GUARD({
         if (!s || !params || !latents || !frames) throw std::invalid_argument("session, params, latents and frames are required");
-        h3pipe_shape sh; h3pipe_shape_for(params, &sh);
-        if (video_elements != size_t(LATENT_CH) * sh.latent_t * sh.lat_h * sh.lat_w) throw std::invalid_argument("video_latents must hold 24 * latent_t * lat_h * lat_w floats");
-        if (frame_bytes != size_t(sh.frames) * params->height * params->width * 3) throw std::invalid_argument("frames must hold frames * height * width * 3 bytes");
+        const h3pipe_shape sh = shape_or_throw(*params);
+        if (video_elements < size_t(LATENT_CH) * sh.latent_t * sh.lat_h * sh.lat_w) throw std::invalid_argument("video_latents must hold at least 24 * latent_t * lat_h * lat_w floats");
+        if (frame_bytes < size_t(sh.frames) * params->height * params->width * 3) throw std::invalid_argument("frames must hold at least frames * height * width * 3 bytes");
         std::lock_guard<std::mutex> lock(s->mutex); s->value.decode_video(*params, latents, frames);
     })
 }
 extern "C" int h3pipe_encode_video(h3pipe_session *s, const float *pixels, int frames, int height, int width, float *latents, size_t latent_elements, int *latent_t, char *error, size_t cap) {
     GUARD({
-        if (!s || !pixels || !latents || !latent_t || frames < 1) throw std::invalid_argument("session, pixels (frames >= 1), latents and latent_t are required");
+        if (!s || !pixels || !latents || !latent_t || frames < 1 || frames > MAX_FRAMES) throw std::invalid_argument("session, pixels (frames 1..1048576), latents and latent_t are required");
         if (height % 32 || width % 32 || height < 32 || width < 32 || height > 2048 || width > 2048) throw std::invalid_argument("height and width must be multiples of 32 up to 2048");
         const int TL = frames == 1 ? 1 : 5 * ((frames + 16) / 17) - 3;
         if (latent_elements < size_t(24) * TL * (height / 16) * (width / 16)) throw std::invalid_argument("latents must hold 24 * latent_t * height/16 * width/16 floats");
@@ -1574,7 +1610,7 @@ extern "C" int h3pipe_encode_video(h3pipe_session *s, const float *pixels, int f
 extern "C" int h3pipe_vision_embed(h3pipe_session *s, const float *pixels, int height, int width, float *merged, size_t merged_elements, float *deepstack, size_t deepstack_elements, int *tokens, char *error, size_t cap) {
     GUARD({
         if (!s || !pixels || !merged || !deepstack || !tokens) throw std::invalid_argument("session, pixels, merged, deepstack and tokens are required");
-        if (height % 32 || width % 32 || height < 32 || width < 32) throw std::invalid_argument("height and width must be multiples of 32");
+        if (!valid_canvas(height, width)) throw std::invalid_argument("height and width must be multiples of 32 up to 8192");
         const size_t m = size_t(height / 32) * size_t(width / 32);
         if (merged_elements < m * 5120 || deepstack_elements < 3 * m * 5120) throw std::invalid_argument("merged needs tokens * 5120 floats, deepstack 3 * tokens * 5120");
         std::lock_guard<std::mutex> lock(s->mutex); std::vector<float> mg; std::vector<float> ds; s->value.vision_embed(pixels, height, width, mg, ds);
@@ -1583,7 +1619,7 @@ extern "C" int h3pipe_vision_embed(h3pipe_session *s, const float *pixels, int h
 }
 extern "C" int h3pipe_encode_audio(h3pipe_session *s, const float *samples, int n_samples, float *latents, size_t latent_elements, int *audio_t, char *error, size_t cap) {
     GUARD({
-        if (!s || !samples || n_samples < 1 || !latents || !audio_t) throw std::invalid_argument("session, samples (n_samples >= 1), latents and audio_t are required");
+        if (!s || !samples || n_samples < 1 || n_samples > (1 << 30) || !latents || !audio_t) throw std::invalid_argument("session, samples (n_samples 1..2^30), latents and audio_t are required");
         const int T = (n_samples + 799) / 800;
         if (latent_elements < size_t(2) * AUDIO_CH * T) throw std::invalid_argument("latents must hold at least 2 * 32 * ceil(n_samples / 800) floats");
         std::lock_guard<std::mutex> lock(s->mutex); s->value.encode_audio(samples, n_samples, latents, *audio_t);
@@ -1591,9 +1627,9 @@ extern "C" int h3pipe_encode_audio(h3pipe_session *s, const float *samples, int 
 }
 extern "C" int h3pipe_decode_audio(h3pipe_session *s, const float *latents, size_t audio_elements, int audio_t, float *samples, size_t sample_elements, char *error, size_t cap) {
     GUARD({
-        if (!s || !latents || !samples || audio_t < 1) throw std::invalid_argument("session, latents (audio_t >= 1) and samples are required");
-        if (audio_elements != size_t(2) * AUDIO_CH * audio_t) throw std::invalid_argument("audio_latents must hold 2 * 32 * audio_t floats");
-        if (sample_elements != size_t(2) * audio_t * 800) throw std::invalid_argument("samples must hold 2 * audio_t * 800 floats");
+        if (!s || !latents || !samples || audio_t < 1 || audio_t > (1 << 24)) throw std::invalid_argument("session, latents (audio_t 1..2^24) and samples are required");
+        if (audio_elements < size_t(2) * AUDIO_CH * audio_t) throw std::invalid_argument("audio_latents must hold at least 2 * 32 * audio_t floats");
+        if (sample_elements < size_t(2) * audio_t * 800) throw std::invalid_argument("samples must hold at least 2 * audio_t * 800 floats");
         std::lock_guard<std::mutex> lock(s->mutex); s->value.decode_audio(latents, audio_t, samples);
     })
 }

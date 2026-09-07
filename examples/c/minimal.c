@@ -38,7 +38,7 @@ int main(int argc, char **argv) {
 
     /* sizes from the parameters */
     h3pipe_params p = {480, 864, argc > 2 ? atoi(argv[2]) : 124, argc > 3 ? atoi(argv[3]) : 31, 0, 0.0f, 0.0f, 1, 0.0f};
-    h3pipe_shape sh; h3pipe_shape_for(&p, &sh);
+    h3pipe_shape sh; if (h3pipe_shape_for(&p, &sh)) { fprintf(stderr, "invalid parameters\n"); return 64; }
     const size_t nv = (size_t)24 * sh.latent_t * sh.lat_h * sh.lat_w, na = (size_t)64 * sh.audio_t;
     float *video = malloc(nv * sizeof(float)), *audio = malloc(na * sizeof(float));
     fprintf(stderr, "%d frames, %dx%dx%d latents, %d audio latents, %d prompt tokens\n", sh.frames, sh.latent_t, sh.lat_h, sh.lat_w, sh.audio_t, n_ids);
@@ -52,15 +52,17 @@ int main(int argc, char **argv) {
     h3pipe_destroy(s);
 
     char path[4096];
-    snprintf(path, sizeof path, "%s.rgb", out); FILE *f = fopen(path, "wb"); fwrite(frames, 1, nf, f); fclose(f);
+    snprintf(path, sizeof path, "%s.rgb", out); FILE *f = fopen(path, "wb");
+    if (!f || fwrite(frames, 1, nf, f) != nf || fclose(f) != 0) { perror(path); return 1; }
     snprintf(path, sizeof path, "%s.wav", out); f = fopen(path, "wb");
+    if (!f) { perror(path); return 1; }
     {   /* 16-bit PCM, interleaved stereo, 32 kHz */
         const uint32_t n = (uint32_t)sh.audio_t * 800, bytes = n * 4, rate = 32000, fmt = 16; const uint16_t pcm = 1, ch = 2, align = 4, bits = 16;
         fwrite("RIFF", 1, 4, f); uint32_t riff = 36 + bytes; fwrite(&riff, 4, 1, f); fwrite("WAVEfmt ", 1, 8, f); fwrite(&fmt, 4, 1, f);
         fwrite(&pcm, 2, 1, f); fwrite(&ch, 2, 1, f); fwrite(&rate, 4, 1, f); uint32_t bps = rate * 4; fwrite(&bps, 4, 1, f); fwrite(&align, 2, 1, f); fwrite(&bits, 2, 1, f);
         fwrite("data", 1, 4, f); fwrite(&bytes, 4, 1, f);
         for (uint32_t i = 0; i < n; ++i) for (int c = 0; c < 2; ++c) { float v = samples[(size_t)c * n + i]; v = v < -1 ? -1 : (v > 1 ? 1 : v); int16_t q = (int16_t)(v * 32767.0f); fwrite(&q, 2, 1, f); }
-        fclose(f);
+        if (ferror(f) || fclose(f) != 0) { perror(path); return 1; }
     }
     fprintf(stderr, "wrote %s.rgb (%d x %dx%d rgb24) and %s.wav; mux: ffmpeg -f rawvideo -pix_fmt rgb24 -s %dx%d -r 24 -i %s.rgb -i %s.wav %s.mp4\n",
             out, sh.frames, p.width, p.height, out, p.width, p.height, out, out, out);

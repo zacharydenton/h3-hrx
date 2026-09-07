@@ -8,7 +8,7 @@ import argparse, json, struct, time
 from pathlib import Path
 import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
-ap = argparse.ArgumentParser(); ap.add_argument("--src", default="/mnt/usb/models/comfy/vae/minimax_h3_video_vae_fp16.safetensors"); ap.add_argument("--out", default=str(ROOT / "build/weights_venc"))
+ap = argparse.ArgumentParser(); ap.add_argument("--src", default=str(Path.home() / "comfy-models/vae/minimax_h3_video_vae_fp16.safetensors")); ap.add_argument("--out", default=str(ROOT / "build/weights_venc"))
 a = ap.parse_args()
 def up(n, m): return (n + m - 1) // m * m
 with open(a.src, "rb") as fh:

@@ -1,11 +1,11 @@
 """The audio VAE's encoder (DAC conv stack + posterior head) from ComfyUI's minimax_h3_audio_vae_fp32.safetensors
 into build/weights_aenc/{weights.bin,manifest.txt} (the Blob format libh3pipe reads; f32, no torch needed).
-    python3 tools/export_audio_encoder.py [--src /mnt/usb/models/comfy/vae/minimax_h3_audio_vae_fp32.safetensors]"""
+    python3 tools/export_audio_encoder.py [--src ~/comfy-models/vae/minimax_h3_audio_vae_fp32.safetensors]"""
 import argparse, json, struct, time
 from pathlib import Path
 import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
-ap = argparse.ArgumentParser(); ap.add_argument("--src", default="/mnt/usb/models/comfy/vae/minimax_h3_audio_vae_fp32.safetensors"); ap.add_argument("--out", default=str(ROOT / "build/weights_aenc"))
+ap = argparse.ArgumentParser(); ap.add_argument("--src", default=str(Path.home() / "comfy-models/vae/minimax_h3_audio_vae_fp32.safetensors")); ap.add_argument("--out", default=str(ROOT / "build/weights_aenc"))
 a = ap.parse_args()
 DT = {"F32": np.float32, "F16": np.float16, "BF16": np.uint16}
 with open(a.src, "rb") as fh:

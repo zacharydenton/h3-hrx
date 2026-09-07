@@ -26,12 +26,17 @@ type or a pointer, so no language needs a bindings generator.
 **Return codes.** Every call returns `H3PIPE_OK` (0) on success, `H3PIPE_INVALID_ARGUMENT` (64)
 for a bad parameter or a buffer that is too small, `H3PIPE_CANCELLED` (2) when the progress
 callback cancelled, `H3PIPE_ERROR` (1) otherwise. On failure the `error` buffer holds a NUL-terminated
-message (pass its capacity; 4096 bytes is plenty). `h3tok_encode` returns the id count or -1.
+message (pass its capacity; 4096 bytes is plenty). `h3tok_encode` returns the id count or -1: the count is
+what the text needs even when it exceeds the buffer's capacity, and only the first `capacity` ids are
+written, so check the count against the capacity (or call with capacity 0 to size the buffer).
+`h3pipe_shape_for` returns `H3PIPE_INVALID_ARGUMENT` for a canvas that is not multiples of 32 in 32..8192
+or a frame count outside 1..1048576; check it before allocating from the shape.
 
 **Ownership.** The caller allocates every buffer and keeps it alive for the duration of the call;
-the library never keeps a pointer past the call except the session's own state. Latent and
+the library never keeps a pointer past the call except the session's own state. Latent, frame and
 sample buffers must be at least the sizes below; pass their element counts, and the library
-refuses short ones rather than writing past them.
+refuses short ones rather than writing past them. A larger buffer (a pooled one, say) is accepted
+and exactly the required count is read or written; the rest is untouched.
 
 **Threading.** A session serialises its calls with an internal mutex: concurrent calls from several
 threads are safe and run one at a time. The progress callback runs on the calling thread between
@@ -99,14 +104,14 @@ parity path.
 
 char err[4096];
 h3tok *tok = h3tok_create("~/h3-models/tokenizer/tokenizer.json", err, sizeof err);
-int32_t ids[4096]; int n = h3tok_encode(tok, "A red fox on a mossy log ...", ids, 4096);
+int32_t ids[4096]; int n = h3tok_encode(tok, "A red fox on a mossy log ...", ids, 4096);   /* n > 4096: the buffer was too small */
 
 h3pipe_config cfg = { "build/weights_glue", "build/weights_i8", "build/weights_te", "build/weights_vae_i8",
                       "kernels", "build/kernel_cache", "loom-compile", 8, NULL, NULL, NULL, 8 };
 h3pipe_session *s; h3pipe_create(&cfg, &s, err, sizeof err);
 
 h3pipe_params p = { 480, 864, 124, 31, 0, 0, 0, 1, 0 };
-h3pipe_shape sh; h3pipe_shape_for(&p, &sh);
+h3pipe_shape sh; if (h3pipe_shape_for(&p, &sh)) return 64;
 float *video = malloc(sizeof(float) * 24 * sh.latent_t * sh.lat_h * sh.lat_w), *audio = malloc(sizeof(float) * 64 * sh.audio_t);
 h3pipe_denoise(s, ids, n, &p, NULL, NULL, video, 24 * sh.latent_t * sh.lat_h * sh.lat_w, audio, 64 * sh.audio_t, NULL, NULL, err, sizeof err);
 

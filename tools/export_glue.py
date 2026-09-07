@@ -1,5 +1,7 @@
 """Everything outside the three block stacks, as one weights dir for the C pipeline
 (host/h3pipe.cpp): build/weights_glue/{weights.bin,manifest.txt}.
+    python3 tools/export_glue.py [--ckpt H3.safetensors] [--te qwen3vl.safetensors] [--vae ~/h3-models/vae] [--audio-vae ~/h3-models/audio_vae] [--out build/weights_glue]
+The ref2va glue: --ckpt <the ref2va checkpoint> --out build/weights_glue_ref2va (H3_CKPT and H3_GLUE_OUT are the same knobs as environment variables).
 
 H3 side (from the ComfyUI int8 checkpoint): the AdaLN curve table and the per-layer /
 final AdaLN projections in f32 (the host evaluates them on the CPU per step), rope.inv_freq,
@@ -12,6 +14,7 @@ Text side: the embedding table as stored (bf16). Video VAE side: post_quant_conv
 proj_in (K 24 -> 256, int8), register tokens, norm_out (LayerNorm weight, bias), proj_out
 (int8, N 3072), latents mean/std. Audio side: the BigVGAN decoder with weight norm folded
 and Snake parameters exponentiated, f32 throughout, plus dec_in_proj and latents mean/std."""
+import argparse
 import json
 import os, struct, sys, time
 from pathlib import Path
@@ -21,15 +24,21 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "reference")); sys.path.insert(0, str(ROOT / "tools"))
 import h3_ref as R
 from export_weights import interleave_gate_up
-H3 = R.CKPT
-TE = Path.home() / "comfy-models/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
-VAE = Path.home() / "h3-models/vae"
-AVAE = Path.home() / "h3-models/audio_vae"
 KPAD = 256
 
 
 def main():
-    out = Path(os.environ.get("H3_GLUE_OUT", ROOT / "build/weights_glue")); out.mkdir(parents=True, exist_ok=True)   # H3_GLUE_OUT with H3_CKPT: the ref2va glue
+    ap = argparse.ArgumentParser(description="the weights outside the block stacks, as build/weights_glue for host/h3pipe.cpp")
+    ap.add_argument("--ckpt", default=str(R.CKPT), help="the H3 checkpoint (default: H3_CKPT or the Comfy-Org int8 ConvRot file in ~/comfy-models); the ref2va file for the ref2va glue")
+    ap.add_argument("--te", default=str(Path.home() / "comfy-models/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"), help="the Comfy-Org int8 text encoder (its embedding table)")
+    ap.add_argument("--vae", default=str(Path.home() / "h3-models/vae"), help="the video VAE directory from MiniMaxAI/MiniMax-H3 (scripts/download.sh)")
+    ap.add_argument("--audio-vae", default=str(Path.home() / "h3-models/audio_vae"), help="the audio VAE directory from MiniMaxAI/MiniMax-H3")
+    ap.add_argument("--out", default=os.environ.get("H3_GLUE_OUT", str(ROOT / "build/weights_glue")), help="destination (build/weights_glue_ref2va for the ref2va glue)")
+    a = ap.parse_args()
+    H3, TE, VAE, AVAE = Path(a.ckpt), Path(a.te), Path(a.vae), Path(a.audio_vae)
+    for path, what in ((H3, "--ckpt"), (TE, "--te"), (VAE / "config.json", "--vae"), (AVAE / "config.json", "--audio-vae")):
+        if not path.exists(): raise SystemExit(f"{what}: {path} not found (README, Weights)")
+    out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     blobs = []
     def add(name, t): blobs.append((name, t.detach().contiguous().cpu()))

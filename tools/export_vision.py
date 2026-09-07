@@ -6,7 +6,7 @@ import argparse, json, struct, time
 from pathlib import Path
 import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
-ap = argparse.ArgumentParser(); ap.add_argument("--src", default="/mnt/usb/models/comfy/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"); ap.add_argument("--out", default=str(ROOT / "build/weights_vision"))
+ap = argparse.ArgumentParser(); ap.add_argument("--src", default=str(Path.home() / "comfy-models/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors")); ap.add_argument("--out", default=str(ROOT / "build/weights_vision"))
 a = ap.parse_args()
 HID, HEADS, HD, HDP, MLP, MLPP, OUT = 1152, 16, 72, 128, 4304, 4352, 5120
 with open(a.src, "rb") as fh:

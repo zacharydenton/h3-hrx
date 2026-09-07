@@ -19,9 +19,13 @@ def _native():
         if not _lib._tok: raise RuntimeError(err.value.decode())
     return _lib
 def encode_text(text: str) -> list:
-    lib = _native(); buf = (ctypes.c_int32 * 8192)(); n = lib.h3tok_encode(lib._tok, text.encode("utf-8"), buf, 8192)
+    """h3tok_encode returns the count the text needs even when the buffer is smaller: size the buffer to it."""
+    lib = _native(); utf8 = text.encode("utf-8"); cap = 8192; buf = (ctypes.c_int32 * cap)(); n = lib.h3tok_encode(lib._tok, utf8, buf, cap)
     if n < 0: raise RuntimeError("h3tok_encode failed")
-    return [int(buf[i]) for i in range(min(n, 8192))]
+    if n > cap:
+        cap = n; buf = (ctypes.c_int32 * cap)()
+        if lib.h3tok_encode(lib._tok, utf8, buf, cap) != n: raise RuntimeError("h3tok_encode failed")
+    return [int(buf[i]) for i in range(n)]
 def encode_presentation(prompt: str, images=(), audios: int = 0, videos=()) -> list:
     """images: merged vision token counts per reference image; videos: lists of (token_count, timestamp) per block."""
     ids = []

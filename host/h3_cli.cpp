@@ -12,16 +12,21 @@
 //   --frames 124        --steps 31 (= 30 evaluations)   --width 864  --height 480   --seed 0
 //   --precision int8|bf16|int4  (int8: the checkpoint's int8 rows, int8 QK^T)   --attn f16|i8|i4   --sampler res_multistep|euler
 //   --root DIR          the repository (default: the binary's parent's parent)   --no-decode   --audio-only (voice/sound: 32x32 canvas, wav only)   --still frame.png [--still-frame N] (one frame as an image)   --latents prefix
+//   --base-weights      run reference files on the base checkpoint when the ref2va exports are absent (otherwise an error)
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "h3pipe.h"
@@ -32,13 +37,39 @@ namespace {
 constexpr int32_t VISION_START = 151652, VISION_END = 151653;
 constexpr int FPS = 24, RATE = 32000;
 
-const char *arg(int argc, char **argv, const char *name, const char *dflt) {
-    for (int i = 1; i + 1 < argc; ++i) if (!strcmp(argv[i], name)) return argv[i + 1];
-    return dflt;
+// The command line, parsed once against a fixed table: unknown options and missing values are errors, and a value
+// (a prompt of "--help", say) is never mistaken for an option.
+struct Options {
+    std::map<std::string, std::string> values; std::set<std::string> flags; std::vector<std::string> files;
+    const char *get(const char *name, const char *dflt = nullptr) const { auto it = values.find(name); return it == values.end() ? dflt : it->second.c_str(); }
+    bool has(const char *name) const { return flags.count(name) || values.count(name); }
+};
+const std::set<std::string> VALUED = {"-p", "--first-frame", "--out", "--frames", "--steps", "--width", "--height", "--seed", "--precision", "--attn", "--sampler", "--root", "--still", "--still-frame", "--latents"};
+const std::set<std::string> FLAGS = {"--no-decode", "--audio-only", "--base-weights", "-h", "--help"};
+bool parse_options(int argc, char **argv, Options *o, std::string *error) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a.size() > 1 && a[0] == '-') {
+            if (FLAGS.count(a)) { o->flags.insert(a); continue; }
+            if (!VALUED.count(a)) { *error = "unknown option " + a; return false; }
+            if (i + 1 >= argc) { *error = "option " + a + " needs a value"; return false; }
+            o->values[a] = argv[++i]; continue;
+        }
+        o->files.push_back(a);
+    }
+    return true;
 }
-bool flag(int argc, char **argv, const char *name) {
-    for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], name)) return true;
-    return false;
+// A whole decimal integer in [lo, hi], or an error naming the option.
+bool parse_int(const Options &o, const char *name, int dflt, int lo, int hi, int *out, std::string *error) {
+    const char *v = o.get(name); if (!v) { *out = dflt; return true; }
+    char *end = nullptr; errno = 0; const long long n = strtoll(v, &end, 10);
+    if (*v == 0 || *end != 0 || errno != 0 || n < lo || n > hi) { *error = std::string(name) + " must be an integer in " + std::to_string(lo) + ".." + std::to_string(hi) + ", got \"" + v + "\""; return false; }
+    *out = int(n); return true;
+}
+bool parse_choice(const Options &o, const char *name, const char *dflt, const std::set<std::string> &choices, std::string *out, std::string *error) {
+    *out = o.get(name, dflt);
+    if (choices.count(*out)) return true;
+    *error = std::string(name) + " must be one of"; for (const std::string &c : choices) *error += " " + c; *error += ", got \"" + *out + "\""; return false;
 }
 std::string lower_ext(const std::string &path) {
     const size_t dot = path.rfind('.'), slash = path.rfind('/');
@@ -48,6 +79,29 @@ std::string lower_ext(const std::string &path) {
 bool is_image(const std::string &e) { return e == "jpg" || e == "jpeg" || e == "png" || e == "webp" || e == "bmp" || e == "gif" || e == "tif" || e == "tiff"; }
 bool is_audio(const std::string &e) { return e == "wav" || e == "mp3" || e == "flac" || e == "ogg" || e == "m4a" || e == "aac" || e == "opus"; }
 bool exists(const std::string &path) { return access(path.c_str(), R_OK) == 0; }
+// The directory a path would be written into exists and is writable (checked before the long generation begins).
+bool dir_writable(const std::string &path) {
+    const size_t slash = path.rfind('/'); const std::string dir = slash == std::string::npos ? "." : slash == 0 ? "/" : path.substr(0, slash);
+    struct stat st; return stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && access(dir.c_str(), W_OK) == 0;
+}
+// Every byte to the file, or false with errno set.
+bool write_file(const std::string &path, const void *data, size_t bytes) {
+    FILE *f = fopen(path.c_str(), "wb"); if (!f) return false;
+    const bool written = fwrite(data, 1, bytes, f) == bytes; const int saved = errno;
+    if (fclose(f) != 0) return false;
+    if (!written) errno = saved;
+    return written;
+}
+// 16-bit PCM WAV bytes: interleaved stereo at RATE from planar float samples [2][n].
+std::vector<uint8_t> wav_bytes(const float *samples, uint32_t n) {
+    std::vector<uint8_t> w; w.reserve(44 + size_t(n) * 4);
+    auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) w.push_back(uint8_t(v >> (8 * i))); }; auto u16 = [&](uint16_t v) { w.push_back(uint8_t(v)); w.push_back(uint8_t(v >> 8)); };
+    auto tag = [&](const char *t) { w.insert(w.end(), t, t + 4); };
+    const uint32_t data_bytes = n * 4;
+    tag("RIFF"); u32(36 + data_bytes); tag("WAVE"); tag("fmt "); u32(16); u16(1); u16(2); u32(RATE); u32(RATE * 4); u16(4); u16(16); tag("data"); u32(data_bytes);
+    for (uint32_t i = 0; i < n; ++i) for (int c = 0; c < 2; ++c) { float v = samples[size_t(c) * n + i]; v = v < -1 ? -1 : (v > 1 ? 1 : v); u16(uint16_t(int16_t(v * 32767.0f))); }
+    return w;
+}
 std::string shell_quote(const std::string &s) { std::string q = "'"; for (char c : s) q += c == '\'' ? "'\\''" : std::string(1, c); return q + "'"; }
 
 // Everything a child process writes to stdout.
@@ -132,58 +186,83 @@ struct Tok {
     h3tok *t = nullptr;
     explicit Tok(const std::string &path) { char e[512]; t = h3tok_create(path.c_str(), e, sizeof e); if (!t) fprintf(stderr, "tokenizer: %s\n", e); }
     ~Tok() { if (t) h3tok_destroy(t); }
+    // h3tok_encode returns the count the text needs even when the buffer is smaller: size the buffer to it.
     bool encode(const std::string &text, std::vector<int32_t> *ids) const {
-        std::vector<int32_t> buf(1 << 15); const int n = h3tok_encode(t, text.c_str(), buf.data(), buf.size());
-        if (n < 0) return false; ids->insert(ids->end(), buf.begin(), buf.begin() + n); return true;
+        std::vector<int32_t> buf(4096); int n = h3tok_encode(t, text.c_str(), buf.data(), buf.size());
+        if (n < 0) return false;
+        if (size_t(n) > buf.size()) { buf.resize(size_t(n)); if (h3tok_encode(t, text.c_str(), buf.data(), buf.size()) != n) return false; }
+        ids->insert(ids->end(), buf.begin(), buf.begin() + n); return true;
     }
 };
 
 }  // namespace
 
 int main(int argc, char **argv) {
-    std::vector<std::string> image_files, audio_files;
-    for (int i = 1; i < argc; ++i) {
-        if (argv[i][0] == '-') { if (strcmp(argv[i], "--no-decode") && strcmp(argv[i], "--audio-only") && strcmp(argv[i], "-h") && strcmp(argv[i], "--help")) ++i; continue; }
-        const std::string e = lower_ext(argv[i]);
-        if (is_image(e)) image_files.push_back(argv[i]);
-        else if (is_audio(e)) audio_files.push_back(argv[i]);
-        else { fprintf(stderr, "h3: %s: not an image or audio file by extension\n", argv[i]); return 64; }
-    }
-    if (flag(argc, argv, "-h") || flag(argc, argv, "--help")) {
+    Options opt; std::string perr;
+    if (!parse_options(argc, argv, &opt, &perr)) { fprintf(stderr, "h3: %s (h3 --help)\n", perr.c_str()); return 64; }
+    if (opt.has("-h") || opt.has("--help")) {
         fprintf(stderr, "usage: h3 [ref.jpg ... ref.wav ...] [-p \"prompt\" | < prompt] [--first-frame img] [--out clip.mp4] [--frames 124] [--steps 31]\n"
                         "          [--width 864] [--height 480] [--seed 0] [--precision int8|bf16|int4] [--attn f16|i8|i4] [--sampler res_multistep|euler]\n"
-                        "          [--root DIR] [--no-decode] [--audio-only] [--still frame.png [--still-frame N]] [--latents prefix]\n"); return 64;
+                        "          [--root DIR] [--no-decode] [--audio-only] [--still frame.png [--still-frame N]] [--latents prefix] [--base-weights]\n"); return 0;
     }
-    std::string prompt = arg(argc, argv, "-p", "");
+    std::vector<std::string> image_files, audio_files;
+    for (const std::string &f : opt.files) {
+        const std::string e = lower_ext(f);
+        if (is_image(e)) image_files.push_back(f);
+        else if (is_audio(e)) audio_files.push_back(f);
+        else { fprintf(stderr, "h3: %s: not an image or audio file by extension\n", f.c_str()); return 64; }
+    }
+    std::string prompt = opt.get("-p", "");
     if (prompt.empty()) { char buf[1 << 16]; size_t n; while ((n = fread(buf, 1, sizeof buf, stdin)) > 0) prompt.append(buf, n); }
     while (!prompt.empty() && (prompt.back() == '\n' || prompt.back() == '\r' || prompt.back() == ' ')) prompt.pop_back();
     if (prompt.empty()) { fprintf(stderr, "h3: no prompt (give -p \"...\" or pipe it on stdin)\n"); return 64; }
 
-    const std::string root = arg(argc, argv, "--root", exe_root().c_str());
-    std::string out = arg(argc, argv, "--out", "h3_out.mp4");
+    // the options, validated before anything expensive
+    std::string precision, attn, sampler; int height, width, n_frames, steps, still_frame;
+    if (!parse_choice(opt, "--precision", "int8", {"int8", "bf16", "int4"}, &precision, &perr) ||
+        !parse_choice(opt, "--attn", precision == "bf16" ? "f16" : precision == "int4" ? "i4" : "i8", {"f16", "i8", "i4"}, &attn, &perr) ||
+        !parse_choice(opt, "--sampler", "res_multistep", {"res_multistep", "euler"}, &sampler, &perr) ||
+        !parse_int(opt, "--height", 480, 32, 8192, &height, &perr) || !parse_int(opt, "--width", 864, 32, 8192, &width, &perr) ||
+        !parse_int(opt, "--frames", 124, 1, 1 << 20, &n_frames, &perr) || !parse_int(opt, "--steps", 31, 2, 1000, &steps, &perr) ||
+        !parse_int(opt, "--still-frame", 0, 0, 1 << 20, &still_frame, &perr)) { fprintf(stderr, "h3: %s\n", perr.c_str()); return 64; }
+    uint64_t seed = 0;
+    if (const char *sv = opt.get("--seed")) { char *end = nullptr; errno = 0; seed = strtoull(sv, &end, 10); if (*sv == 0 || *end != 0 || errno != 0) { fprintf(stderr, "h3: --seed must be an unsigned integer, got \"%s\"\n", sv); return 64; } }
+    if (height % 32 || width % 32) { fprintf(stderr, "h3: --width and --height must be multiples of 32\n"); return 64; }
+    const bool no_decode = opt.has("--no-decode"), audio_only = opt.has("--audio-only");   // audio only (voice and sound): skip the video decoder, write <out>.wav only (use a 32x32 canvas)
+    const char *still = opt.get("--still"), *latents_prefix = opt.get("--latents");
+    if (audio_only && still) { fprintf(stderr, "h3: --audio-only decodes no frames; it cannot be combined with --still\n"); return 64; }
+    if (no_decode && (still || audio_only)) { fprintf(stderr, "h3: --no-decode decodes nothing; it cannot be combined with --still or --audio-only\n"); return 64; }
+
+    const std::string root = opt.get("--root", exe_root().c_str());
+    std::string out = opt.get("--out", "h3_out.mp4");
     if (lower_ext(out) != "mp4") out += ".mp4";
     const std::string out_stem = out.substr(0, out.size() - 4);
-    const std::string precision = arg(argc, argv, "--precision", "int8");
+    if (!no_decode && !dir_writable(out)) { fprintf(stderr, "h3: cannot write %s: the directory is missing or not writable\n", out.c_str()); return 64; }
+    if (latents_prefix && !dir_writable(latents_prefix)) { fprintf(stderr, "h3: cannot write %s.video.f32: the directory is missing or not writable\n", latents_prefix); return 64; }
+    if (still && !dir_writable(still)) { fprintf(stderr, "h3: cannot write %s: the directory is missing or not writable\n", still); return 64; }
     const int bits = precision == "bf16" ? 16 : precision == "int4" ? 4 : 8;
     const std::string wdir = bits == 16 ? "weights_f16" : bits == 4 ? "weights_gptq" : "weights_i8";
-    const bool ref2va = (!image_files.empty() || !audio_files.empty()) && exists(root + "/build/" + wdir + "_ref2va/manifest.txt") && exists(root + "/build/weights_glue_ref2va/manifest.txt");
+    // references (ref2va) need the reference-conditioned checkpoint's exports; the base checkpoint only on request
+    const bool want_refs = !image_files.empty() || !audio_files.empty();
+    const bool have_ref2va = exists(root + "/build/" + wdir + "_ref2va/manifest.txt") && exists(root + "/build/weights_glue_ref2va/manifest.txt");
+    const bool ref2va = want_refs && have_ref2va && !opt.has("--base-weights");
+    if (want_refs && !have_ref2va && !opt.has("--base-weights")) {
+        fprintf(stderr, "h3: reference files need the ref2va exports, build/%s_ref2va and build/weights_glue_ref2va (README, Weights); --base-weights runs the base checkpoint anyway\n", wdir.c_str()); return 64;
+    }
     const std::string blocks = root + "/build/" + wdir + (ref2va ? "_ref2va" : ""), glue = root + "/build/weights_glue" + (ref2va ? "_ref2va" : "");
     const std::string te = root + "/build/weights_te", vae = root + "/build/weights_vae_i8", aenc = root + "/build/weights_aenc", vision = root + "/build/weights_vision", venc = root + "/build/weights_venc";
     const std::string sources = root + "/kernels", cache = root + "/build/kernel_cache";
     const char *loom_env = getenv("LOOM_COMPILE");
-    const std::string attn = arg(argc, argv, "--attn", bits == 16 ? "f16" : bits == 4 ? "i4" : "i8");
     const char *home = getenv("HOME");
     const std::string tok_path = getenv("H3_TOKENIZER") ? getenv("H3_TOKENIZER") : std::string(home ? home : ".") + "/h3-models/tokenizer/tokenizer.json";
 
-    h3pipe_params p = {atoi(arg(argc, argv, "--height", "480")), atoi(arg(argc, argv, "--width", "864")), atoi(arg(argc, argv, "--frames", "124")), atoi(arg(argc, argv, "--steps", "31")),
-                       (uint64_t)atoll(arg(argc, argv, "--seed", "0")), 0.0f, 0.0f, std::string(arg(argc, argv, "--sampler", "res_multistep")) == "euler" ? 0 : 1, 0.0f};
-    if (p.height % 32 || p.width % 32 || p.height < 32 || p.width < 32) { fprintf(stderr, "h3: --width and --height must be multiples of 32\n"); return 64; }
+    h3pipe_params p = {height, width, n_frames, steps, seed, 0.0f, 0.0f, sampler == "euler" ? 0 : 1, 0.0f};
     h3pipe_shape sh; if (h3pipe_shape_for(&p, &sh)) { fprintf(stderr, "h3: invalid parameters\n"); return 64; }
 
     // inputs first (cheap, and they fail fast): the keyframe to the canvas, references to at most the canvas' pixel count
     struct Image { std::vector<float> pixels; int w, h; };
     std::vector<Image> ref_images; Image keyframe; bool have_keyframe = false;
-    if (const char *ff = arg(argc, argv, "--first-frame", nullptr)) {
+    if (const char *ff = opt.get("--first-frame")) {
         std::vector<uint8_t> rgb; int w, h;
         if (!decode_image(ff, &rgb, &w, &h)) { fprintf(stderr, "h3: cannot decode %s (ffmpeg)\n", ff); return 1; }
         keyframe = {resize_pil_bilinear(rgb, w, h, p.width, p.height), p.width, p.height}; have_keyframe = true;
@@ -214,6 +293,7 @@ int main(int argc, char **argv) {
     for (const Image &im : ref_images) if (!vision_span(im.w, im.h)) return 1;
     for (size_t j = 0; j < ref_audio.size(); ++j) { char label[64]; snprintf(label, sizeof label, "<Audio %zu>: ", j + 1); if (!tok.encode(label, &ids)) return 1; }
     if (!tok.encode(prompt, &ids)) { fprintf(stderr, "h3: cannot tokenize the prompt\n"); return 1; }
+    if (ids.size() > size_t(sh.text_rows_max)) { fprintf(stderr, "h3: the presentation is %zu tokens; the model takes at most %d\n", ids.size(), sh.text_rows_max); return 64; }
 
     fprintf(stderr, "%d frames at %dx%d: %dx%dx%d latents, %d audio latents; %zu prompt tokens (%d keyframe, %zu reference images, %zu reference audio)%s\n",
             sh.frames, p.width, p.height, sh.latent_t, sh.lat_h, sh.lat_w, sh.audio_t, ids.size(), have_keyframe ? 1 : 0, ref_images.size(), ref_audio.size(), ref2va ? ", ref2va weights" : "");
@@ -255,13 +335,13 @@ int main(int argc, char **argv) {
         : h3pipe_denoise_refs(s, ids.data(), int(ids.size()), &p, kfs.data(), int(kfs.size()), refs.data(), int(refs.size()), nullptr, nullptr, video.data(), video.size(), audio.data(), audio.size(), progress, &t0, err, sizeof err);
     if (rc) { fprintf(stderr, "h3: denoise: %s\n", err); return 1; }
     fprintf(stderr, "denoised in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-    if (const char *lat = arg(argc, argv, "--latents", nullptr)) {
-        FILE *f = fopen((std::string(lat) + ".video.f32").c_str(), "wb"); if (f) { fwrite(video.data(), 4, video.size(), f); fclose(f); }
-        f = fopen((std::string(lat) + ".audio.f32").c_str(), "wb"); if (f) { fwrite(audio.data(), 4, audio.size(), f); fclose(f); }
+    if (latents_prefix) {
+        for (const auto &part : {std::make_pair(std::string(latents_prefix) + ".video.f32", &video), std::make_pair(std::string(latents_prefix) + ".audio.f32", &audio)})
+            if (!write_file(part.first, part.second->data(), part.second->size() * 4)) { fprintf(stderr, "h3: cannot write %s: %s\n", part.first.c_str(), strerror(errno)); return 1; }
+        fprintf(stderr, "wrote %s.video.f32 and %s.audio.f32\n", latents_prefix, latents_prefix);
     }
-    if (flag(argc, argv, "--no-decode")) { h3pipe_destroy(s); return 0; }
+    if (no_decode) { h3pipe_destroy(s); return 0; }
 
-    const bool audio_only = flag(argc, argv, "--audio-only");   // voice and sound: skip the video decoder, write <out>.wav only (use a 32x32 canvas)
     t0 = std::chrono::steady_clock::now();
     std::vector<uint8_t> frames(audio_only ? 0 : size_t(sh.frames) * p.height * p.width * 3);
     if (!audio_only && h3pipe_decode_video(s, &p, video.data(), video.size(), frames.data(), frames.size(), err, sizeof err)) { fprintf(stderr, "h3: decode video: %s\n", err); return 1; }
@@ -271,19 +351,16 @@ int main(int argc, char **argv) {
     fprintf(stderr, "decoded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 
     {   // <out>.wav: 16-bit PCM, interleaved stereo, 32 kHz
-        const uint32_t n = uint32_t(sh.audio_t) * 800, data_bytes = n * 4;
-        FILE *f = fopen((out_stem + ".wav").c_str(), "wb"); if (!f) { perror("wav"); return 1; }
-        auto u32 = [&](uint32_t v) { fwrite(&v, 4, 1, f); }; auto u16 = [&](uint16_t v) { fwrite(&v, 2, 1, f); };
-        fwrite("RIFF", 1, 4, f); u32(36 + data_bytes); fwrite("WAVEfmt ", 1, 8, f); u32(16); u16(1); u16(2); u32(RATE); u32(RATE * 4); u16(4); u16(16); fwrite("data", 1, 4, f); u32(data_bytes);
-        for (uint32_t i = 0; i < n; ++i) for (int c = 0; c < 2; ++c) { float v = samples[size_t(c) * n + i]; v = v < -1 ? -1 : (v > 1 ? 1 : v); u16(uint16_t(int16_t(v * 32767.0f))); }
-        fclose(f);
+        const std::vector<uint8_t> w = wav_bytes(samples.data(), uint32_t(sh.audio_t) * 800);
+        if (!write_file(out_stem + ".wav", w.data(), w.size())) { fprintf(stderr, "h3: cannot write %s.wav: %s\n", out_stem.c_str(), strerror(errno)); return 1; }
     }
-    if (const char *still = arg(argc, argv, "--still", nullptr)) {   // one frame as an image (any format ffmpeg writes by extension): H3 as an image generator or editor
-        const int idx = std::min(sh.frames - 1, std::max(0, atoi(arg(argc, argv, "--still-frame", "0"))));
+    if (still) {   // one frame as an image (any format ffmpeg writes by extension): H3 as an image generator or editor
+        const int idx = std::min(sh.frames - 1, still_frame);
         char size[32]; snprintf(size, sizeof size, "%dx%d", p.width, p.height);
         const std::string cmd = "ffmpeg -y -loglevel error -f rawvideo -pix_fmt rgb24 -s " + std::string(size) + " -i - -frames:v 1 " + shell_quote(still);
         FILE *ff = popen(cmd.c_str(), "w"); if (!ff) { perror("ffmpeg"); return 1; }
-        const size_t fb = size_t(p.height) * p.width * 3; fwrite(frames.data() + size_t(idx) * fb, 1, fb, ff);
+        const size_t fb = size_t(p.height) * p.width * 3;
+        if (fwrite(frames.data() + size_t(idx) * fb, 1, fb, ff) != fb) { fprintf(stderr, "h3: short write to ffmpeg\n"); pclose(ff); return 1; }
         if (pclose(ff) != 0) { fprintf(stderr, "h3: ffmpeg failed writing %s\n", still); return 1; }
         fprintf(stderr, "wrote %s (frame %d)\n", still, idx);
     }

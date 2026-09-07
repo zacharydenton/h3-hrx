@@ -1,6 +1,9 @@
 // CPU-only checks: no runtime implementation or model files are linked/loaded.
 #include "../host/h3pipe.cpp"
 #include <cassert>
+#include <climits>
+
+Rt &rt() { throw std::logic_error("no runtime in this test: every call here must be refused before it reaches the session"); }
 
 int main() {
     assert(gemm_m_group_for(37723, FFN, HID, 8) == 2);
@@ -55,5 +58,19 @@ int main() {
         const int decoded = shape.latent_t == 2 ? 2 * VAE_TRATIO - 3 : chunks * 17 + 5;
         assert(decoded == frames);
     }
-    puts("PASS host layout, MRoPE, decoder shape and short-clip checks");
+    // the public shape call refuses what nothing downstream could allocate from
+    for (auto bad : {std::tuple<int, int, int>{0, 0, 5}, {-32, 32, 5}, {31, 32, 5}, {32, 33, 5}, {32, 32, 0}, {32, 32, -1}, {32, 32, INT_MAX}, {MAX_SIDE + 32, 32, 5}}) {
+        h3pipe_params p{}; std::tie(p.height, p.width, p.frames) = bad; h3pipe_shape shape{};
+        assert(h3pipe_shape_for(&p, &shape) == H3PIPE_INVALID_ARGUMENT);
+    }
+    { h3pipe_params p{}; p.height = p.width = 32; p.frames = 1; h3pipe_shape shape{}; assert(h3pipe_shape_for(&p, &shape) == H3PIPE_OK && shape.frames == 5 && shape.latent_t == 2 && shape.lat_h == 2); }
+    { h3pipe_params p{}; p.height = p.width = MAX_SIDE; p.frames = MAX_FRAMES; h3pipe_shape shape{}; assert(h3pipe_shape_for(&p, &shape) == H3PIPE_OK && shape.frames >= MAX_FRAMES && shape.audio_t > 0); }
+    assert(h3pipe_shape_for(nullptr, nullptr) == H3PIPE_INVALID_ARGUMENT);
+    // the entry points reject an undersized buffer before touching the session
+    { char err[256]; h3pipe_params p{}; p.height = p.width = 64; p.frames = 22; float latents[1]; uint8_t frames[1]; float samples[1];
+      assert(h3pipe_decode_video(reinterpret_cast<h3pipe_session *>(1), &p, latents, 1, frames, 1, err, sizeof err) == H3PIPE_INVALID_ARGUMENT && std::string(err).find("at least") != std::string::npos);
+      assert(h3pipe_decode_audio(reinterpret_cast<h3pipe_session *>(1), latents, 64, 1, samples, 1599, err, sizeof err) == H3PIPE_INVALID_ARGUMENT);
+      assert(h3pipe_text_in(reinterpret_cast<h3pipe_session *>(1), reinterpret_cast<const int32_t *>(latents), 1, samples, HID - 1, err, sizeof err) == H3PIPE_INVALID_ARGUMENT);
+      p.height = 31; assert(h3pipe_denoise(reinterpret_cast<h3pipe_session *>(1), reinterpret_cast<const int32_t *>(latents), 1, &p, nullptr, nullptr, latents, 1, samples, 1, nullptr, nullptr, err, sizeof err) == H3PIPE_INVALID_ARGUMENT); }
+    puts("PASS host layout, MRoPE, decoder shape, short-clip, shape validation and buffer checks");
 }

@@ -3,10 +3,15 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mkdir -p build
+PY="${H3_PYTHON:-python3}"
 g++ -std=c++17 -O2 -Wno-subobject-linkage -ffunction-sections -fdata-sections tests/test_host_logic.cpp -Wl,--gc-sections -o build/test_host_logic
 build/test_host_logic
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -ffunction-sections -fdata-sections tests/test_host_cli.cpp host/h3tok.cpp -Wl,--gc-sections -o "$tmpdir/host_cli"
+"$tmpdir/host_cli" "$tmpdir"
+g++ -std=c++17 -O1 -Wno-subobject-linkage -ffunction-sections -fdata-sections tests/test_kernel_cache.cpp -Wl,--gc-sections -o "$tmpdir/kernel_cache" -pthread
+mkdir -p "$tmpdir/cache_test"; "$tmpdir/kernel_cache" "$tmpdir/cache_test"
 g++ -std=c++17 -O1 -Wno-subobject-linkage -ffunction-sections -fdata-sections tests/test_pipe_memory.cpp -Wl,--gc-sections -o "$tmpdir/pipe_memory"
 "$tmpdir/pipe_memory" "$tmpdir"
 g++ -std=c++17 -O1 -Itests/fakes tests/test_runtime_cleanup.cpp -o "$tmpdir/runtime_cleanup"
@@ -15,5 +20,5 @@ for variant in DIT TE VAE; do
   g++ -std=c++17 -O1 -Wno-subobject-linkage -Itests/fakes -D"TEST_$variant" tests/test_session_cleanup.cpp -o "$tmpdir/cleanup"
   "$tmpdir/cleanup" "$tmpdir"
 done
-python3 tests/test_review_regressions.py
-python3 -O tests/test_review_regressions.py
+"$PY" tests/test_review_regressions.py
+"$PY" -O tests/test_review_regressions.py
