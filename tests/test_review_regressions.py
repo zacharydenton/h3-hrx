@@ -131,13 +131,14 @@ class ReviewRegressions(unittest.TestCase):
         """The ComfyUI parity gate: a comparison that exits nonzero, or omits an expected block or the trajectory line, is a failure; missing fixtures skip unless required."""
         spec = importlib.util.spec_from_file_location("parity", ROOT / "tests/test_comfy_parity.py"); parity = importlib.util.module_from_spec(spec); spec.loader.exec_module(parity)
         blocks = " ".join(f"blk_{b}: [video 0.9995]" for b in parity.REQUIRED_BLOCKS)
+        import h3pipe_loom
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); (root / "tools").mkdir()
-            for f in ("build/comfy_t2va_blocks/blocks/blk_49.npy", "build/comfy_fl2va/x_19.npy", "build/weights_i8/manifest.txt"):
+            for f in ("build/comfy_t2va_blocks/blocks/blk_49.npy", "build/comfy_fl2va/x_19.npy", "checkpoint.safetensors"):
                 (root / f).parent.mkdir(parents=True, exist_ok=True); (root / f).write_text("")
             compare = root / "tools/compare_comfy.py"
             def fake(body): compare.write_text("import sys\n" + body)
-            with patch.object(parity, "ROOT", root), contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(parity, "ROOT", root), patch.object(h3pipe_loom, "DIT", root / "checkpoint.safetensors"), contextlib.redirect_stdout(io.StringIO()):
                 fake("sys.exit(42)"); self.assertEqual(parity.main(), 1)                                            # every comparison crashed
                 fake("print('')"); self.assertEqual(parity.main(), 1)                                               # no results at all
                 fake(f"print('{blocks}'.replace(' blk_', '\\nblk_'))"); self.assertEqual(parity.main(), 1)          # blocks but no trajectory
@@ -145,18 +146,21 @@ class ReviewRegressions(unittest.TestCase):
                 fake(f"print('{blocks}'.replace(' blk_', '\\nblk_').replace('blk_40: [video 0.9995]', 'blk_40: [video 0.98]')); print('x_05: rel err 0.01')"); self.assertEqual(parity.main(), 1)
                 fake(f"print('{blocks}'.replace(' blk_', '\\nblk_').replace('blk_40: [video 0.9995]\\n', '')); print('x_05: rel err 0.01')"); self.assertEqual(parity.main(), 1)   # block 40 missing
                 fake(f"print('{blocks}'.replace(' blk_', '\\nblk_')); print('x_05: rel err 0.03')"); self.assertEqual(parity.main(), 1)
-                shutil.rmtree(root / "build/weights_i8")
-                self.assertEqual(parity.main(), 0)                                                                  # a skip without the exports
+                (root / "checkpoint.safetensors").unlink()
+                self.assertEqual(parity.main(), 0)                                                                  # a skip without the checkpoint
                 with patch.dict(os.environ, {"H3_REQUIRE_PARITY": "1"}): self.assertEqual(parity.main(), 1)         # never for the release gate
 
-    def test_export_destinations_follow_the_clients(self):
-        """README's export commands must write the directories h3, the bindings and the examples load."""
-        weights = (ROOT / "tools/export_weights.py").read_text(); glue = (ROOT / "tools/export_glue.py").read_text()
-        self.assertIn('8: "build/weights_i8"', weights); self.assertIn('16: "build/weights_f16"', weights)
-        self.assertIn('"--out"', glue); self.assertIn('"--ckpt"', glue)
-        readme = (ROOT / "README.md").read_text()
-        self.assertIn("export_weights.py --bits 8 --ckpt", readme); self.assertIn("--out build/weights_i8_ref2va", readme); self.assertIn("export_glue.py --ckpt", readme); self.assertIn("--out build/weights_glue_ref2va", readme)
-        for tool in ("export_audio_encoder", "export_vae_encoder", "export_vision"): self.assertNotIn("/mnt/", (ROOT / f"tools/{tool}.py").read_text())
+    def test_clients_agree_on_the_checkpoint_layout(self):
+        """h3, the binding and the examples must name the same four ComfyUI files under the same models directory."""
+        import h3pipe_loom
+        files = ["diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors", "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+                 "vae/minimax_h3_video_vae_fp16.safetensors", "vae/minimax_h3_audio_vae_fp32.safetensors"]
+        for name, want in zip(("DIT", "TE", "VIDEO_VAE", "AUDIO_VAE"), files):
+            self.assertTrue(str(getattr(h3pipe_loom, name)).endswith(want), name)
+        for path in ("host/h3_cli.cpp", "examples/c/minimal.c", "examples/rust/src/main.rs", "examples/go/main.go", "README.md"):
+            text = (ROOT / path).read_text()
+            for want in files: self.assertIn(want, text, f"{path} does not name {want}")
+            self.assertIn("H3_MODELS", text, path)
 
     def test_cache_invalidation_and_failed_compile(self):
         with tempfile.TemporaryDirectory() as tmp:

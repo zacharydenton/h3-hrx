@@ -14,7 +14,8 @@
 extern "C" {
 #endif
 typedef struct h3tok h3tok;
-// tokenizer_json: the HF tokenizer.json (BPE model with a ByteLevel pre-tokenizer).
+// tokenizer_json: the HF tokenizer.json (BPE model with a ByteLevel pre-tokenizer), or NULL for the tokenizer compiled into the
+// library (Qwen's, assets/tokenizer.json; H3_TOKENIZER=<file> overrides it).
 h3tok *h3tok_create(const char *tokenizer_json, char *error, size_t error_capacity);
 void h3tok_destroy(h3tok *t);
 // Returns the number of ids the text encodes to and writes up to `capacity` of them; -1 on error.

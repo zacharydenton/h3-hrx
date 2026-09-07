@@ -52,18 +52,25 @@ int main(int argc, char **argv) {
     }
     assert(fake.allocations.empty());
     std::ofstream(dir + "/weights.bin", std::ios::binary).write((const char *)values, sizeof values);
-    h3pipe_config cfg{}; cfg.glue_dir = dir.c_str(); cfg.blocks_dir = "/missing/dit"; cfg.te_dir = "/missing/te";
+    h3pipe_config cfg{}; cfg.dit_file = "/missing/dit.safetensors"; cfg.te_file = "/missing/te.safetensors";
     cfg.kernel_sources = "/missing/kernels"; cfg.cache_dir = dir.c_str(); cfg.loom_compile = "/missing/compiler";
     for (int failure = 0; failure < 2; ++failure) {
         fake.fail_after = failure;
         try { Pipe pipe(cfg); assert(false); } catch (const std::runtime_error &) {}
         assert(fake.allocations.empty());
     }
-    fake.fail_after = -1; fake.fail_copy = true;
+    fake.fail_copy = true; fake.fail_after = -1;
     try { Pipe pipe(cfg); assert(false); } catch (const std::runtime_error &) {}
     assert(fake.allocations.empty()); fake.fail_copy = false;
-    for (int failure = 0; failure < 10; ++failure) {
-        { Pipe pipe(cfg); assert(fake.bytes < 256 * 1024); // opens without DiT or text weights
+    { Pipe pipe(cfg); bool failed = false;   // a missing checkpoint is named, not a crash
+      try { pipe.ensure_dit(); } catch (const std::exception &e) { failed = std::string(e.what()).find("/missing/dit.safetensors") != std::string::npos; }
+      assert(failed); }
+    assert(fake.allocations.empty());
+    int buffers = 0;   // how many allocations one ensure_seq makes: every one of them is failure-injected below
+    { Pipe pipe(cfg); const size_t before = fake.allocations.size(); pipe.ensure_seq(16); buffers = int(fake.allocations.size() - before); }
+    assert(buffers > 0 && fake.allocations.empty());
+    for (int failure = 0; failure < buffers; ++failure) {
+        { Pipe pipe(cfg); assert(fake.bytes < 256 * 1024); // opens without the checkpoints
           fake.fail_after = failure;
           try { pipe.ensure_seq(16); assert(false); } catch (const std::runtime_error &) {}
           fake.fail_after = -1; pipe.ensure_seq(16); // retry after partially allocated buffers

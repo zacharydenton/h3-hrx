@@ -7,7 +7,7 @@ Python tools use. `host/h3_cli.cpp` is the complete client: references, keyframe
 muxing.
 
 ```
-h3pipe_abi_version                                   -> 6
+h3pipe_abi_version                                   -> 7
 h3tok_create / h3tok_encode / h3tok_vocab_size / h3tok_destroy      text -> token ids
 h3pipe_create / h3pipe_destroy                       a session: weights resident, kernels cached
 h3pipe_shape_for                                     parameters -> latent and frame counts (no session needed)
@@ -19,7 +19,7 @@ h3pipe_text_in                                       the refined text rows (insp
 
 ## Contract
 
-**Versioning.** `h3pipe_abi_version()` returns `H3PIPE_ABI_VERSION` (6). Check it before using
+**Versioning.** `h3pipe_abi_version()` returns `H3PIPE_ABI_VERSION` (7). Check it before using
 the structs; the structs' layouts are frozen per version and every field is a fixed-width C
 type or a pointer, so no language needs a bindings generator.
 
@@ -47,6 +47,10 @@ one per process and reuse it.
 **Kernels.** The first call at a new shape spawns `loom-compile` (path in the config) for the kernels
 that shape needs and caches the binaries in `cache_dir`; later runs at the same shape load from the
 cache. Expect tens of seconds the first time a size is used.
+
+**Weights.** The checkpoints are memory-mapped and each tensor is uploaded to the device the first
+time a stage asks for it, so creating a session costs milliseconds and only what a call touches is
+resident.
 
 ## Sizes and layouts
 
@@ -78,7 +82,7 @@ replaces the placeholder rows with the vision tower's embeds of the pixels you p
 - **Reference image** (`h3pipe_ref.kind` 0): resize so its pixel count is at most the canvas' and
   both sides are multiples of 32; `h3pipe_encode_video` on the one frame gives `video_latent`
   (`[24][1][h/16][w/16]`, `latent_t` 1); pass the same pixels (f32 `[h][w][3]` in [0, 1]) as
-  `pixels`. The reference-conditioned checkpoint (`*_ref2va` exports) is the one to load.
+  `pixels`. The reference-conditioned checkpoint (`..._ref2va_...safetensors`) is the one to load.
 - **Reference audio** (kind 1): `h3pipe_encode_audio` on planar stereo f32 samples at 32 kHz gives
   `audio_latent` and `audio_t`.
 - **Keyframe** (`h3pipe_keyframe`, first-frame generation): the frame resized to the canvas,
@@ -87,14 +91,21 @@ replaces the placeholder rows with the vision tower's embeds of the pixels you p
 `h3pipe_denoise_refs` takes the keyframe and reference arrays; `h3pipe_denoise` is the plain
 text-to-video call.
 
-## Configuration directories
+## Configuration files
 
-`h3pipe_config` names the exported weight directories (`docs/../README.md`, "Weights"): `blocks_dir`
-(`build/weights_i8`, or `weights_f16` with `attn_qk_bits` 16, or `weights_gptq` with 4), `glue_dir`,
-`te_dir`, `vae_dir` (`weights_vae_i8`, `vae_bits` 8), and, for references, `venc_dir`, `vision_dir`,
-`aenc_dir` (NULL disables the corresponding encoder). `kernel_sources` is the repository's `kernels/`,
-`cache_dir` any writable directory, `loom_compile` the compiler binary. `attn_qk_bits` 8 is the
-parity path.
+`h3pipe_config` names ComfyUI's four checkpoints, read as they are (README, "Weights"):
+`dit_file` (`minimax_h3_fl2va_pruned_int8_convrot.safetensors`, or the `ref2va` one for
+reference-conditioned clips), `te_file`, `video_vae_file` and `audio_vae_file`. There is no export
+step and no conversion at load: the DiT blocks' and text encoder's int8 ConvRot rows run on the
+int8 GEMMs with their stored scales, the bf16 refiner, condition projection and vision tower on
+bf16 kernels, the video VAE's f16 and the audio VAE's f32 tensors in their own types. A file may
+be NULL; the calls that need it then fail with a message naming it, and each file is opened on
+first use. `kernel_sources` is the repository's `kernels/`, `cache_dir` any writable directory,
+`loom_compile` the compiler binary. `attn_qk_bits` chooses the DiT attention's QK^T operands: 8
+(the default and the parity path), 16 for f16, or 4 for int4.
+
+`h3tok_create(NULL, ...)` uses the tokenizer compiled into the library (`H3_TOKENIZER=<file>`
+overrides it); passing a path reads that file instead.
 
 ## Minimal client, in C
 
@@ -103,11 +114,14 @@ parity path.
 #include "h3tok.h"
 
 char err[4096];
-h3tok *tok = h3tok_create("~/h3-models/tokenizer/tokenizer.json", err, sizeof err);
+h3tok *tok = h3tok_create(NULL, err, sizeof err);   /* the tokenizer compiled into the library */
 int32_t ids[4096]; int n = h3tok_encode(tok, "A red fox on a mossy log ...", ids, 4096);   /* n > 4096: the buffer was too small */
 
-h3pipe_config cfg = { "build/weights_glue", "build/weights_i8", "build/weights_te", "build/weights_vae_i8",
-                      "kernels", "build/kernel_cache", "loom-compile", 8, NULL, NULL, NULL, 8 };
+h3pipe_config cfg = { "~/comfy-models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+                      "~/comfy-models/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+                      "~/comfy-models/vae/minimax_h3_video_vae_fp16.safetensors",
+                      "~/comfy-models/vae/minimax_h3_audio_vae_fp32.safetensors",
+                      "kernels", "build/kernel_cache", "loom-compile", 8 };
 h3pipe_session *s; h3pipe_create(&cfg, &s, err, sizeof err);
 
 h3pipe_params p = { 480, 864, 124, 31, 0, 0, 0, 1, 0 };

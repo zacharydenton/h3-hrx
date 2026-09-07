@@ -6,9 +6,9 @@ use std::io::Write;
 
 #[repr(C)]
 pub struct H3pipeConfig {
-    glue_dir: *const c_char, blocks_dir: *const c_char, te_dir: *const c_char, vae_dir: *const c_char,
-    kernel_sources: *const c_char, cache_dir: *const c_char, loom_compile: *const c_char, vae_bits: c_int,
-    aenc_dir: *const c_char, vision_dir: *const c_char, venc_dir: *const c_char, attn_qk_bits: c_int,
+    dit_file: *const c_char, te_file: *const c_char, video_vae_file: *const c_char, audio_vae_file: *const c_char,
+    kernel_sources: *const c_char, cache_dir: *const c_char, loom_compile: *const c_char,
+    attn_qk_bits: c_int,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -51,17 +51,20 @@ fn main() {
     let mut err = vec![0 as c_char; 4096];
     unsafe {
         assert_eq!(h3pipe_abi_version(), 6, "libh3pipe ABI");
-        let tok = h3tok_create(c(format!("{home}/h3-models/tokenizer/tokenizer.json")).as_ptr(), err.as_mut_ptr(), err.len());
+        let tok = h3tok_create(std::ptr::null(), err.as_mut_ptr(), err.len());   // the tokenizer compiled into libh3pipe
         if tok.is_null() { eprintln!("tokenizer: {}", err_text(&err)); std::process::exit(1); }
         let mut ids = vec![0i32; 4096];
         let n = h3tok_encode(tok, c(args[1].clone()).as_ptr(), ids.as_mut_ptr(), ids.len());
         h3tok_destroy(tok);
         assert!(n >= 0 && n as usize <= ids.len(), "cannot tokenize the prompt"); ids.truncate(n as usize);
 
-        let dirs: Vec<CString> = ["build/weights_glue", "build/weights_i8", "build/weights_te", "build/weights_vae_i8", "kernels", "build/kernel_cache"].iter().map(|d| c(format!("{root}/{d}"))).collect();
+        let models = std::env::var("H3_MODELS").unwrap_or(format!("{home}/comfy-models"));
+        let files: Vec<CString> = ["diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors", "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+                                   "vae/minimax_h3_video_vae_fp16.safetensors", "vae/minimax_h3_audio_vae_fp32.safetensors"].iter().map(|f| c(format!("{models}/{f}"))).collect();
+        let dirs: Vec<CString> = ["kernels", "build/kernel_cache"].iter().map(|d| c(format!("{root}/{d}"))).collect();
         let loom = c(std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into()));
-        let cfg = H3pipeConfig { glue_dir: dirs[0].as_ptr(), blocks_dir: dirs[1].as_ptr(), te_dir: dirs[2].as_ptr(), vae_dir: dirs[3].as_ptr(), kernel_sources: dirs[4].as_ptr(), cache_dir: dirs[5].as_ptr(),
-                                 loom_compile: loom.as_ptr(), vae_bits: 8, aenc_dir: std::ptr::null(), vision_dir: std::ptr::null(), venc_dir: std::ptr::null(), attn_qk_bits: 8 };
+        let cfg = H3pipeConfig { dit_file: files[0].as_ptr(), te_file: files[1].as_ptr(), video_vae_file: files[2].as_ptr(), audio_vae_file: files[3].as_ptr(),
+                                 kernel_sources: dirs[0].as_ptr(), cache_dir: dirs[1].as_ptr(), loom_compile: loom.as_ptr(), attn_qk_bits: 8 };
         let mut s: *mut H3pipeSession = std::ptr::null_mut();
         if h3pipe_create(&cfg, &mut s, err.as_mut_ptr(), err.len()) != 0 { eprintln!("create: {}", err_text(&err)); std::process::exit(1); }
 

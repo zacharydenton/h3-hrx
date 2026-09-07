@@ -1,5 +1,5 @@
 // h3pipe: prompt token ids -> raw RGB frames + 16-bit stereo WAV through libh3pipe (every kernel in Loom).
-//   h3pipe --ids 32 1234 ... [--frames 124] [--steps 31] [--width 864] [--height 480] [--seed 0] [--out build/clip] [--attn i8|f16|i4]  (build/weights_i8, the int8 path)
+//   h3pipe --ids 32 1234 ... [--frames 124] [--steps 31] [--width 864] [--height 480] [--seed 0] [--out build/clip] [--attn i8|f16|i4] [--models DIR]
 //     writes <out>.rgb (frames x height x width x 3, uint8) and <out>.wav (32 kHz stereo);
 //     ffmpeg -f rawvideo -pix_fmt rgb24 -s WxH -r 24 -i out.rgb -i out.wav out.mp4 muxes them.
 //   --prompt "text" tokenizes in C (host/h3tok.cpp, the Qwen3-VL tokenizer.json); --ids takes ids from elsewhere (tools/prompt_ids.py).
@@ -24,8 +24,8 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], "--ids")) { for (int j = i + 1; j < argc && argv[j][0] != '-'; ++j) ids.push_back(atoi(argv[j])); }
     const std::string root = arg(argc, argv, "--root", "."), out = arg(argc, argv, "--out", "build/clip");
     if (const char *prompt = arg(argc, argv, "--prompt", nullptr)) {          // the tokenizer in C (host/h3tok.cpp)
-        const char *home = getenv("HOME"); const std::string tok_path = arg(argc, argv, "--tokenizer", (std::string(home ? home : ".") + "/h3-models/tokenizer/tokenizer.json").c_str());
-        char terr[512]; h3tok *tok = h3tok_create(tok_path.c_str(), terr, sizeof terr);
+        const char *tok_path = arg(argc, argv, "--tokenizer", nullptr);   // NULL: the tokenizer compiled into libh3pipe
+        char terr[512]; h3tok *tok = h3tok_create(tok_path, terr, sizeof terr);
         if (!tok) { fprintf(stderr, "tokenizer: %s\n", terr); return 1; }
         ids.resize(4096); int n = h3tok_encode(tok, prompt, ids.data(), ids.size());   // the count the text needs, even past the buffer
         if (n >= 0 && size_t(n) > ids.size()) { ids.resize(size_t(n)); if (h3tok_encode(tok, prompt, ids.data(), ids.size()) != n) n = -1; }
@@ -33,10 +33,15 @@ int main(int argc, char **argv) {
         if (n < 0) { fprintf(stderr, "tokenizer: cannot encode the prompt\n"); return 1; } ids.resize(size_t(n));
     }
     if (ids.empty()) { fprintf(stderr, "usage: h3pipe (--prompt \"text\" | --ids <token ids...>) [--frames N] [--steps N] [--width W] [--height H] [--seed S] [--out prefix] [--tokenizer tokenizer.json]\n"); return 64; }
-    const std::string glue = root + "/build/weights_glue", blocks = root + "/build/weights_i8", te = root + "/build/weights_te", vae = root + "/build/weights_vae_i8";
+    const char *models_env = getenv("H3_MODELS"), *home0 = getenv("HOME");
+    const std::string models = arg(argc, argv, "--models", models_env && *models_env ? models_env : (std::string(home0 ? home0 : ".") + "/comfy-models").c_str());
+    const std::string dit = arg(argc, argv, "--dit", (models + "/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors").c_str());
+    const std::string te = arg(argc, argv, "--te", (models + "/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors").c_str());
+    const std::string video_vae = arg(argc, argv, "--video-vae", (models + "/vae/minimax_h3_video_vae_fp16.safetensors").c_str());
+    const std::string audio_vae = arg(argc, argv, "--audio-vae", (models + "/vae/minimax_h3_audio_vae_fp32.safetensors").c_str());
     const char *loom = getenv("LOOM_COMPILE");
     const std::string sources = root + "/kernels", cache = root + "/build/kernel_cache";
-    h3pipe_config cfg = {glue.c_str(), blocks.c_str(), te.c_str(), vae.c_str(), sources.c_str(), cache.c_str(), loom ? loom : "loom-compile", 8, nullptr, nullptr, nullptr, std::string(arg(argc, argv, "--attn", "i8")) == "f16" ? 16 : (std::string(arg(argc, argv, "--attn", "i8")) == "i4" ? 4 : 8)};
+    h3pipe_config cfg = {dit.c_str(), te.c_str(), video_vae.c_str(), audio_vae.c_str(), sources.c_str(), cache.c_str(), loom ? loom : "loom-compile", std::string(arg(argc, argv, "--attn", "i8")) == "f16" ? 16 : (std::string(arg(argc, argv, "--attn", "i8")) == "i4" ? 4 : 8)};
     h3pipe_params p = {atoi(arg(argc, argv, "--height", "480")), atoi(arg(argc, argv, "--width", "864")), atoi(arg(argc, argv, "--frames", "124")), atoi(arg(argc, argv, "--steps", "31")), (uint64_t)atoll(arg(argc, argv, "--seed", "0")), 0.0f, 0.0f, std::string(arg(argc, argv, "--sampler", "res_multistep")) == "euler" ? 0 : 1, (float)atof(arg(argc, argv, "--cache", "0"))};
     char err[4096]; h3pipe_session *s = nullptr;
     h3pipe_shape sh; if (h3pipe_shape_for(&p, &sh)) { fprintf(stderr, "invalid parameters: width and height are multiples of 32, frames >= 1\n"); return 64; }

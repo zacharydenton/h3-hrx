@@ -11,8 +11,10 @@
 //   --first-frame img   fl2va keyframe          --out clip.mp4    (default h3_out.mp4; <out>.wav is kept next to it)
 //   --frames 124        --steps 31 (= 30 evaluations)   --width 864  --height 480   --seed 0
 //   --attn f16|i8|i4    the DiT attention's QK^T operands (i8: the parity path)   --sampler res_multistep|euler
+//   --models DIR        ComfyUI's models directory (default $H3_MODELS, else ~/comfy-models): diffusion_models/, text_encoders/, vae/
+//   --dit FILE  --te FILE  --video-vae FILE  --audio-vae FILE      the four checkpoints, overriding --models
 //   --root DIR          the repository (default: the binary's parent's parent)   --no-decode   --audio-only (voice/sound: 32x32 canvas, wav only)   --still frame.png [--still-frame N] (one frame as an image)   --latents prefix
-//   --base-weights      run reference files on the base checkpoint when the ref2va exports are absent (otherwise an error)
+//   --base-weights      run reference files on the base checkpoint when the ref2va checkpoint is absent (otherwise an error)
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
@@ -44,7 +46,7 @@ struct Options {
     const char *get(const char *name, const char *dflt = nullptr) const { auto it = values.find(name); return it == values.end() ? dflt : it->second.c_str(); }
     bool has(const char *name) const { return flags.count(name) || values.count(name); }
 };
-const std::set<std::string> VALUED = {"-p", "--first-frame", "--out", "--frames", "--steps", "--width", "--height", "--seed", "--attn", "--sampler", "--root", "--still", "--still-frame", "--latents"};
+const std::set<std::string> VALUED = {"-p", "--first-frame", "--out", "--frames", "--steps", "--width", "--height", "--seed", "--attn", "--sampler", "--root", "--still", "--still-frame", "--latents", "--models", "--dit", "--te", "--video-vae", "--audio-vae"};
 const std::set<std::string> FLAGS = {"--no-decode", "--audio-only", "--base-weights", "-h", "--help"};
 bool parse_options(int argc, char **argv, Options *o, std::string *error) {
     for (int i = 1; i < argc; ++i) {
@@ -184,7 +186,7 @@ int progress(void *user, int step, int steps, double sec) {
 
 struct Tok {
     h3tok *t = nullptr;
-    explicit Tok(const std::string &path) { char e[512]; t = h3tok_create(path.c_str(), e, sizeof e); if (!t) fprintf(stderr, "tokenizer: %s\n", e); }
+    explicit Tok(const std::string &path) { char e[512]; t = h3tok_create(path.empty() ? nullptr : path.c_str(), e, sizeof e); if (!t) fprintf(stderr, "tokenizer: %s\n", e); }
     ~Tok() { if (t) h3tok_destroy(t); }
     // h3tok_encode returns the count the text needs even when the buffer is smaller: size the buffer to it.
     bool encode(const std::string &text, std::vector<int32_t> *ids) const {
@@ -203,6 +205,7 @@ int main(int argc, char **argv) {
     if (opt.has("-h") || opt.has("--help")) {
         fprintf(stderr, "usage: h3 [ref.jpg ... ref.wav ...] [-p \"prompt\" | < prompt] [--first-frame img] [--out clip.mp4] [--frames 124] [--steps 31]\n"
                         "          [--width 864] [--height 480] [--seed 0] [--attn f16|i8|i4] [--sampler res_multistep|euler]\n"
+                        "          [--models DIR] [--dit FILE] [--te FILE] [--video-vae FILE] [--audio-vae FILE]\n"
                         "          [--root DIR] [--no-decode] [--audio-only] [--still frame.png [--still-frame N]] [--latents prefix] [--base-weights]\n"); return 0;
     }
     std::vector<std::string> image_files, audio_files;
@@ -239,20 +242,26 @@ int main(int argc, char **argv) {
     if (!no_decode && !dir_writable(out)) { fprintf(stderr, "h3: cannot write %s: the directory is missing or not writable\n", out.c_str()); return 64; }
     if (latents_prefix && !dir_writable(latents_prefix)) { fprintf(stderr, "h3: cannot write %s.video.f32: the directory is missing or not writable\n", latents_prefix); return 64; }
     if (still && !dir_writable(still)) { fprintf(stderr, "h3: cannot write %s: the directory is missing or not writable\n", still); return 64; }
-    const std::string wdir = "weights_i8";   // the checkpoint's int8 rows
-    // references (ref2va) need the reference-conditioned checkpoint's exports; the base checkpoint only on request
+    // ComfyUI's models directory: the four checkpoints, read as they are
+    const char *models_env = getenv("H3_MODELS"), *home0 = getenv("HOME");
+    const std::string models = opt.get("--models", models_env && *models_env ? models_env : (std::string(home0 ? home0 : ".") + "/comfy-models").c_str());
+    // references (ref2va) need the reference-conditioned checkpoint; the base one only on request
     const bool want_refs = !image_files.empty() || !audio_files.empty();
-    const bool have_ref2va = exists(root + "/build/" + wdir + "_ref2va/manifest.txt") && exists(root + "/build/weights_glue_ref2va/manifest.txt");
-    const bool ref2va = want_refs && have_ref2va && !opt.has("--base-weights");
-    if (want_refs && !have_ref2va && !opt.has("--base-weights")) {
-        fprintf(stderr, "h3: reference files need the ref2va exports, build/%s_ref2va and build/weights_glue_ref2va (README, Weights); --base-weights runs the base checkpoint anyway\n", wdir.c_str()); return 64;
+    const std::string dit_base = models + "/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors";
+    const std::string dit_ref2va = models + "/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors";
+    const bool have_ref2va = exists(dit_ref2va), ref2va = want_refs && have_ref2va && !opt.has("--base-weights");
+    if (want_refs && !have_ref2va && !opt.has("--base-weights") && !opt.get("--dit")) {
+        fprintf(stderr, "h3: reference files need the ref2va checkpoint, %s (README, Weights); --base-weights runs the base checkpoint anyway\n", dit_ref2va.c_str()); return 64;
     }
-    const std::string blocks = root + "/build/" + wdir + (ref2va ? "_ref2va" : ""), glue = root + "/build/weights_glue" + (ref2va ? "_ref2va" : "");
-    const std::string te = root + "/build/weights_te", vae = root + "/build/weights_vae_i8", aenc = root + "/build/weights_aenc", vision = root + "/build/weights_vision", venc = root + "/build/weights_venc";
+    const std::string dit = opt.get("--dit", (ref2va ? dit_ref2va : dit_base).c_str());
+    const std::string te = opt.get("--te", (models + "/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors").c_str());
+    const std::string video_vae = opt.get("--video-vae", (models + "/vae/minimax_h3_video_vae_fp16.safetensors").c_str());
+    const std::string audio_vae = opt.get("--audio-vae", (models + "/vae/minimax_h3_audio_vae_fp32.safetensors").c_str());
+    if (!exists(dit)) { fprintf(stderr, "h3: %s not found (README, Weights; --models or --dit)\n", dit.c_str()); return 64; }
     const std::string sources = root + "/kernels", cache = root + "/build/kernel_cache";
     const char *loom_env = getenv("LOOM_COMPILE");
     const char *home = getenv("HOME");
-    const std::string tok_path = getenv("H3_TOKENIZER") ? getenv("H3_TOKENIZER") : std::string(home ? home : ".") + "/h3-models/tokenizer/tokenizer.json";
+    (void)home;
 
     h3pipe_params p = {height, width, n_frames, steps, seed, 0.0f, 0.0f, sampler == "euler" ? 0 : 1, 0.0f};
     h3pipe_shape sh; if (h3pipe_shape_for(&p, &sh)) { fprintf(stderr, "h3: invalid parameters\n"); return 64; }
@@ -280,7 +289,7 @@ int main(int argc, char **argv) {
     }
 
     // the presentation: keyframe, then reference images ("<Picture i>: " + a vision span), then "<Audio j>: ", then the prompt
-    Tok tok(tok_path); if (!tok.t) return 1;
+    Tok tok{std::string()}; if (!tok.t) return 1;   // the tokenizer compiled into libh3pipe (H3_TOKENIZER overrides it)
     std::vector<int32_t> ids; int picture = 0;
     auto vision_span = [&](int w, int h) {
         char label[64]; snprintf(label, sizeof label, "<Picture %d>: ", ++picture);
@@ -296,13 +305,12 @@ int main(int argc, char **argv) {
     fprintf(stderr, "%d frames at %dx%d: %dx%dx%d latents, %d audio latents; %zu prompt tokens (%d keyframe, %zu reference images, %zu reference audio)%s\n",
             sh.frames, p.width, p.height, sh.latent_t, sh.lat_h, sh.lat_w, sh.audio_t, ids.size(), have_keyframe ? 1 : 0, ref_images.size(), ref_audio.size(), ref2va ? ", ref2va weights" : "");
 
-    h3pipe_config cfg = {glue.c_str(), blocks.c_str(), te.c_str(), vae.c_str(), sources.c_str(), cache.c_str(), loom_env ? loom_env : "loom-compile", 8,
-                         exists(aenc + "/manifest.txt") ? aenc.c_str() : nullptr, exists(vision + "/manifest.txt") ? vision.c_str() : nullptr, exists(venc + "/manifest.txt") ? venc.c_str() : nullptr,
+    h3pipe_config cfg = {dit.c_str(), te.c_str(), video_vae.c_str(), audio_vae.c_str(), sources.c_str(), cache.c_str(), loom_env ? loom_env : "loom-compile",
                          attn == "f16" ? 16 : attn == "i8" ? 8 : 4};
     char err[4096]; h3pipe_session *s = nullptr;
     auto t0 = std::chrono::steady_clock::now();
     if (h3pipe_create(&cfg, &s, err, sizeof err)) { fprintf(stderr, "h3: create: %s\n", err); return 1; }
-    fprintf(stderr, "session in %.1f s (%s, %s attention)\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), blocks.c_str() + root.size() + 7, attn.c_str());
+    fprintf(stderr, "session in %.1f s (%s, %s attention)\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), dit.substr(dit.find_last_of('/') + 1).c_str(), attn.c_str());
 
     // encoders: latents for the keyframe and the references
     std::vector<h3pipe_keyframe> kfs; std::vector<h3pipe_ref> refs;

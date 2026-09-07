@@ -33,6 +33,7 @@
 #include <vector>
 #include <tuple>
 
+#include "checkpoint.h"
 #include "h3pipe.h"
 
 extern char **environ;
@@ -104,7 +105,16 @@ std::string num(double v) { char b[64]; snprintf(b, sizeof b, "%.17g", v); retur
 bool exists(const std::string &p) { struct stat st; return stat(p.c_str(), &st) == 0; }
 void mkdirs(const std::string &p) { std::string cur; for (size_t i = 0; i <= p.size(); ++i) { if (i == p.size() || p[i] == '/') { if (!cur.empty()) mkdir(cur.c_str(), 0755); } if (i < p.size()) cur += p[i]; } }
 
-// --- weights: manifest + device blob --------------------------------------------------------
+// --- weights ---------------------------------------------------------------------------------
+// What the stacks and stages read from: a checkpoint file through its recipes (Weights), or, until every file is read
+// directly, an exported manifest + weights.bin (Blob). Device tensors are uploaded on first use and memoised by name.
+struct WeightSource {
+    virtual ~WeightSource() {}
+    virtual bool has(const std::string &name) const = 0;
+    virtual char *at(const std::string &name, size_t bytes) const = 0;                                          // exactly `bytes` on the device
+    virtual char *rows(const std::string &name, size_t n, size_t row_bytes, size_t pitch_bytes) const = 0;      // n rows at a (zero-padded) pitch
+};
+
 struct Span { size_t offset, bytes; std::string dtype, shape; };
 
 // Own device allocations even when a constructor or a stage throws.
@@ -127,12 +137,14 @@ public:
     void clear() noexcept { for (void *p : pointers_) rt().free(p); pointers_.clear(); }
 };
 
-struct Blob {
+struct Blob : WeightSource {
     // File offsets remain unchanged for host reads. Device tensors are loaded on first use.
     std::string path; size_t size = 0; std::map<std::string, Span> spans;
     mutable DeviceBuffers memory;
     mutable std::map<std::string, char *> tensors;
     bool is_open() const { return !path.empty(); }
+    bool has(const std::string &name) const override { return spans.count(name) != 0; }
+    char *rows(const std::string &name, size_t n, size_t row_bytes, size_t pitch_bytes) const override { return at_padded(name, n, row_bytes, pitch_bytes); }
     void open(const std::string &dir) {
         const std::string next_path = dir + "/weights.bin";
         std::ifstream in(dir + "/manifest.txt");
@@ -154,7 +166,7 @@ struct Blob {
         if (it == spans.end()) throw std::runtime_error("missing tensor " + name + " in " + path);
         return it->second;
     }
-    char *at(const std::string &name, size_t bytes) const {
+    char *at(const std::string &name, size_t bytes) const override {
         const Span &s = span(name);
         if (s.bytes != bytes) throw std::runtime_error("tensor " + name + " has " + std::to_string(s.bytes) + " bytes, expected " + std::to_string(bytes));
         auto it = tensors.find(name); if (it != tensors.end()) return it->second;
@@ -202,6 +214,132 @@ struct Blob {
         if (!f) throw std::runtime_error("short read of " + name); return v;
     }
 };
+
+// A checkpoint tensor's home on the device and where its bytes come from: ordered row segments of the mapped file
+// (a fused operand is several tensors' rows; the gate/up interleave is 16-row runs of two halves), written at a pitch
+// whose pad bytes stay zero (the GEMMs read k_size of the k_stride pitch); or a small host-built array (per-row scales
+// in the same order, bf16/f16 vectors widened to f32 for the kernels that take f32, exp of the Snake parameters).
+// Nothing here rotates or quantises: the checkpoint's dtypes are what the kernels run.
+struct Segment { const char *src; size_t rows; };
+struct Recipe {
+    size_t rows = 0, row_bytes = 0, pitch_bytes = 0;
+    std::vector<Segment> segments;
+    std::function<std::vector<char>()> build; size_t built_bytes = 0;
+    size_t device_bytes() const { return build ? built_bytes : rows * pitch_bytes; }
+};
+
+class Weights : public WeightSource {
+    std::unique_ptr<Checkpoint> file_; std::map<std::string, Recipe> recipes_;
+    mutable DeviceBuffers memory_; mutable std::map<std::string, char *> tensors_;
+public:
+    bool is_open() const { return bool(file_); }
+    const Checkpoint &file() const { if (!file_) throw std::runtime_error("no checkpoint open"); return *file_; }
+    // Map the file and build its recipe table (the plan validates every source tensor's dtype and shape up front).
+    void open(const std::string &path, void (*plan)(const Checkpoint &, Weights &)) {
+        auto next = std::make_unique<Checkpoint>(path);
+        std::map<std::string, Recipe> keep; keep.swap(recipes_);
+        try { plan(*next, *this); } catch (...) { recipes_.swap(keep); throw; }
+        memory_.clear(); tensors_.clear(); file_ = std::move(next);
+    }
+    void add(const std::string &name, Recipe r) { recipes_[name] = std::move(r); }
+    bool has(const std::string &name) const override { return recipes_.count(name) != 0; }
+    const Recipe &recipe(const std::string &name) const {
+        auto it = recipes_.find(name);
+        if (it == recipes_.end()) throw std::runtime_error("no recipe for tensor " + name + (file_ ? " in " + file_->path : std::string()));
+        return it->second;
+    }
+    // The recipe's bytes on the host: the built array, or the segments gathered at the pitch.
+    std::vector<char> assemble(const Recipe &r) const {
+        if (r.build) { std::vector<char> h = r.build(); if (h.size() != r.built_bytes) throw std::runtime_error("a built tensor's size does not match its recipe"); return h; }
+        std::vector<char> h(r.rows * r.pitch_bytes, 0); size_t row = 0;
+        for (const Segment &sg : r.segments) for (size_t i = 0; i < sg.rows; ++i, ++row) memcpy(h.data() + row * r.pitch_bytes, sg.src + i * r.row_bytes, r.row_bytes);
+        if (row != r.rows) throw std::runtime_error("a recipe's segments do not add up to its rows");
+        return h;
+    }
+    char *at(const std::string &name, size_t bytes) const override {
+        const Recipe &r = recipe(name);
+        if (r.device_bytes() != bytes) throw std::runtime_error("tensor " + name + " is " + std::to_string(r.device_bytes()) + " bytes on the device, expected " + std::to_string(bytes));
+        auto it = tensors_.find(name); if (it != tensors_.end()) return it->second;
+        char *p = (char *)memory_.alloc(std::max(bytes, size_t(1)));
+        try {
+            const size_t chunk = size_t(16) << 20;
+            if (r.build) { const std::vector<char> h = assemble(r); rt().h2d(p, h.data(), h.size()); }
+            else if (r.segments.size() == 1 && r.pitch_bytes == r.row_bytes) {   // one straight run of the map
+                const char *src = r.segments[0].src; file_->will_need(src, bytes);
+                for (size_t done = 0; done < bytes;) { const size_t n = std::min(chunk, bytes - done); rt().h2d(p + done, src + done, n); done += n; }
+            } else {                                                                 // rows gathered at the pitch through a zeroed staging buffer
+                const size_t per = std::max<size_t>(1, chunk / r.pitch_bytes); std::vector<char> stage(per * r.pitch_bytes, 0); size_t staged = 0, written = 0;
+                auto flush = [&] { rt().h2d(p + written * r.pitch_bytes, stage.data(), staged * r.pitch_bytes); written += staged; staged = 0; };
+                for (const Segment &sg : r.segments) {
+                    file_->will_need(sg.src, sg.rows * r.row_bytes);
+                    for (size_t i = 0; i < sg.rows; ++i) { memcpy(stage.data() + staged * r.pitch_bytes, sg.src + i * r.row_bytes, r.row_bytes); if (++staged == per) flush(); }
+                }
+                if (staged) flush();
+                if (written != r.rows) throw std::runtime_error("a recipe's segments do not add up to its rows");
+            }
+            tensors_.emplace(name, p);
+        } catch (...) { memory_.free(p); throw; }
+        return p;
+    }
+    char *rows(const std::string &name, size_t n, size_t row_bytes, size_t pitch_bytes) const override {
+        const Recipe &r = recipe(name);
+        if (r.build || r.rows != n || r.row_bytes != row_bytes || r.pitch_bytes != pitch_bytes)
+            throw std::runtime_error("tensor " + name + " is not " + std::to_string(n) + " rows of " + std::to_string(row_bytes) + " bytes at pitch " + std::to_string(pitch_bytes));
+        return at(name, n * pitch_bytes);
+    }
+    std::vector<float> host_f32(const std::string &name, size_t count) const {
+        const std::vector<char> h = assemble(recipe(name));
+        if (h.size() != count * 4) throw std::runtime_error("tensor " + name + " is " + std::to_string(h.size()) + " bytes, expected " + std::to_string(count * 4));
+        std::vector<float> v(count); memcpy(v.data(), h.data(), h.size()); return v;
+    }
+};
+
+// --- recipe primitives: layout only, bit for bit ---------------------------------------------
+using Entry = Checkpoint::Entry;
+// The rows of one or more tensors of the same row width, in order, at pitch_bytes (0: the row width).
+Recipe rows_of(const Checkpoint &ck, std::initializer_list<const Entry *> parts, size_t pitch_bytes = 0) {
+    Recipe r;
+    for (const Entry *e : parts) {
+        if (r.segments.empty()) r.row_bytes = e->row_bytes(); else if (e->row_bytes() != r.row_bytes) throw std::runtime_error("concatenated tensors differ in row width");
+        r.segments.push_back({ck.data(*e), e->rows()}); r.rows += e->rows();
+    }
+    r.pitch_bytes = pitch_bytes ? pitch_bytes : r.row_bytes;
+    if (r.pitch_bytes < r.row_bytes) throw std::runtime_error("a pitch narrower than the rows");
+    return r;
+}
+// 16-row runs alternating the two halves (first rows i..i+16, then second rows i..i+16): the gate|up operand of the fused
+// SwiGLU GEMM (tools/export_weights.py's interleave_gate_up). Each half is `rows_each` rows starting at its tensor's row0.
+Recipe interleave16(const Checkpoint &ck, const Entry &first, size_t first_row0, const Entry &second, size_t second_row0, size_t rows_each, size_t pitch_bytes = 0) {
+    if (first.row_bytes() != second.row_bytes() || rows_each % 16 || first_row0 + rows_each > first.rows() || second_row0 + rows_each > second.rows()) throw std::runtime_error("interleave: the halves do not fit");
+    Recipe r; r.row_bytes = first.row_bytes(); r.pitch_bytes = pitch_bytes ? pitch_bytes : r.row_bytes; r.rows = 2 * rows_each;
+    for (size_t i = 0; i < rows_each; i += 16) { r.segments.push_back({ck.data(first) + (first_row0 + i) * r.row_bytes, 16}); r.segments.push_back({ck.data(second) + (second_row0 + i) * r.row_bytes, 16}); }
+    return r;
+}
+float widen_one(const Entry &e, const char *p) {
+    if (e.dtype == "F32") { float f; memcpy(&f, p, 4); return f; }
+    if (e.dtype == "F16") { uint16_t h; memcpy(&h, p, 2); return f16_to_f32(h); }
+    if (e.dtype == "BF16") { uint16_t h; memcpy(&h, p, 2); return bf16_to_f32(h); }
+    throw std::runtime_error("cannot widen " + e.dtype + " to f32");
+}
+size_t elem_bytes(const Entry &e) { return e.dtype == "F32" ? 4 : (e.dtype == "F16" || e.dtype == "BF16") ? 2 : e.dtype == "I8" ? 1 : 0; }
+// A float tensor as f32, element for element (F32 verbatim; F16 and BF16 widened, which is exact).
+Recipe widen_f32(const Checkpoint &ck, std::initializer_list<const Entry *> parts) {
+    Recipe r; size_t n = 0; std::vector<std::pair<const Entry *, const char *>> srcs;
+    for (const Entry *e : parts) { if (!elem_bytes(*e) || e->dtype == "I8") throw std::runtime_error("widen_f32 on " + e->dtype); srcs.push_back({e, ck.data(*e)}); n += e->elements(); }
+    r.built_bytes = n * 4;
+    r.build = [srcs, n] { std::vector<char> h(n * 4); float *o = (float *)h.data(); size_t k = 0;
+        for (auto &se : srcs) { const size_t eb = elem_bytes(*se.first); for (size_t i = 0; i < se.first->elements(); ++i) o[k++] = widen_one(*se.first, se.second + i * eb); } return h; };
+    return r;
+}
+// The f32 [N,1] per-row scales of concatenated int8 operands, or of the two halves of an interleaved one, in the rows' order.
+Recipe scales_rows(const Checkpoint &ck, std::initializer_list<const Entry *> parts) { return widen_f32(ck, parts); }
+Recipe scales_interleave16(const Checkpoint &ck, const Entry &first, size_t first_row0, const Entry &second, size_t second_row0, size_t rows_each) {
+    if (first.dtype != "F32" || second.dtype != "F32" || first.row_bytes() != 4 || second.row_bytes() != 4) throw std::runtime_error("scales must be f32 [N, 1]");
+    Recipe r; r.built_bytes = 2 * rows_each * 4; const char *a = ck.data(first) + first_row0 * 4, *b = ck.data(second) + second_row0 * 4;
+    r.build = [a, b, rows_each] { std::vector<char> h(2 * rows_each * 4);
+        for (size_t i = 0; i < rows_each; i += 16) { memcpy(h.data() + (2 * i) * 4, a + i * 4, 64); memcpy(h.data() + (2 * i + 16) * 4, b + i * 4, 64); } return h; };
+    return r;
+}
 
 // --- kernels: compile through loom-compile into the cache, load, launch ---------------------
 struct Kernel {
@@ -313,45 +451,50 @@ size_t gemm_pitch(size_t k, int bits) {
 }
 unsigned gemm_grid_y(size_t tokens, unsigned group) { return unsigned(((tokens + 255) / 256 + group - 1) / group * group); }
 
-// A prepare kernel (norm / lnorm / plain) for one width, ready to launch.
+// The GEMM operand element types the stacks run: the checkpoint's int8 ConvRot rows (rotated activations, per-token
+// scales), or its f16 / bf16 rows as stored (unrotated activations narrowed to the same type, no scales).
+bool quantised(const std::string &elem) { return elem == "i8"; }
+int elem_bits(const std::string &elem) { return quantised(elem) ? 8 : 16; }
+
+// A prepare kernel (norm / lnorm / plain) for one width and operand type, ready to launch.
 struct Prepare {
-    std::shared_ptr<Kernel> k; int lanes = 0; std::string form; int bits = 8;
-    void build(Compiler &c, const std::string &form_, int bits_, int width, float eps = 1e-5f, int classes = 1, int out_stride = 0) {
-        form = form_; bits = bits_;
-        std::string stem = "prepare_" + form + (bits == 16 ? "_f16" : "_i" + std::to_string(bits));
-        if (form == "plain" && size_t(width) * 4 > 65536) stem = "prepare_plain16_i" + std::to_string(bits);   // f16 LDS for rows past 64 KB of f32
+    std::shared_ptr<Kernel> k; int lanes = 0; std::string form, elem = "i8";
+    void build(Compiler &c, const std::string &form_, const std::string &elem_, int width, float eps = 1e-5f, int classes = 1, int out_stride = 0) {
+        form = form_; elem = elem_;
+        std::string stem = "prepare_" + form + "_" + elem;
+        if (form == "plain" && quantised(elem) && size_t(width) * 4 > 65536) stem = "prepare_plain16_i8";   // f16 LDS for rows past 64 KB of f32
         lanes = lanes_for(width);
         const std::string ns = "h3." + stem + ".";
         Cfg cfg = {{ns + "width", std::to_string(width)}, {ns + "lanes", std::to_string(lanes)}};
         if (form != "plain") { cfg.push_back({ns + "eps", num(eps)}); cfg.push_back({ns + "classes", std::to_string(classes)}); }
-        if (bits != 16) cfg.push_back({ns + "out_stride", std::to_string(out_stride ? out_stride : width)});   // the quantised rows' pitch = the GEMM's k_stride
+        cfg.push_back({ns + "out_stride", std::to_string(out_stride ? out_stride : width)});   // the operand rows' pitch = the GEMM's k_stride
         k = c.get(stem, "h3_" + stem, cfg);
     }
-    // norm forms: (x f32, weight, table, cls) -> a_q, a_s; plain: (h f16) -> a_q, a_s
+    // norm forms: (x f32, weight, table, cls) -> a_q[, a_s]; plain: (h f16) -> a_q[, a_s]
     void run(Profile *p, const char *stage, unsigned tokens, const void *x, const void *weight, const void *table, const void *cls, void *a_q, void *a_s) {
         KernArgs a; a.i32(int(tokens)).ptr(x);
         if (form != "plain") a.ptr(weight).ptr(table).ptr(cls);
-        a.ptr(a_q); if (bits != 16) a.ptr(a_s);   // the f16 forms write rows, no token scale
+        a.ptr(a_q); if (quantised(elem)) a.ptr(a_s);   // the float forms write rows, no token scale
         launch(*k, p, stage, tokens, 1, unsigned(lanes), a);
     }
 };
 
-// A GEMM of the int4/int8 family for one (K, N, m_group).
+// A GEMM of the int8 / f16 / bf16 family for one (K, N, m_group).
 struct Gemm {
-    std::shared_ptr<Kernel> k; int n = 0; bool resid = false, bias = false; int bits = 8;
+    std::shared_ptr<Kernel> k; int n = 0; bool resid = false, bias = false; std::string elem = "i8";
     unsigned m_group = 1;
-    void build(Compiler &c, const std::string &mode, int bits_, bool bias_, bool gate_first, int k_size, int n_size, size_t tokens, int classes = 1, int k_stride = 0) {
-        resid = mode == "resid"; bias = bias_; n = n_size; bits = bits_;
-        m_group = gemm_m_group_for(tokens, k_size, n_size, bits);
-        std::string stem = (bits == 16 ? std::string("gemm_f16") : "gemm_i" + std::to_string(bits)) + (mode == "plain" ? "" : "_" + mode) + "_256" + (bias ? "b" : "") + (mode == "swiglu" && !gate_first ? "_gs" : "");
+    void build(Compiler &c, const std::string &mode, const std::string &elem_, bool bias_, bool gate_first, int k_size, int n_size, size_t tokens, int classes = 1, int k_stride = 0) {
+        resid = mode == "resid"; bias = bias_; n = n_size; elem = elem_;
+        m_group = gemm_m_group_for(tokens, k_size, n_size, elem_bits(elem));
+        std::string stem = "gemm_" + elem + (mode == "plain" ? "" : "_" + mode) + "_256" + (bias ? "b" : "") + (mode == "swiglu" && !gate_first ? "_gs" : "");
         const std::string ns = "h3." + stem + ".";
         Cfg cfg = {{ns + "k_size", std::to_string(k_size)}, {ns + "n_size", std::to_string(n_size)}, {ns + "m_group", std::to_string(m_group)}};
         if (resid) cfg.push_back({ns + "classes", std::to_string(classes)});
-        if (bits != 16) cfg.push_back({ns + "k_stride", std::to_string(k_stride ? k_stride : k_size)});   // operand row pitch (see gemm_pitch)
+        cfg.push_back({ns + "k_stride", std::to_string(k_stride ? k_stride : k_size)});   // operand row pitch (see gemm_pitch)
         k = c.get(stem, "h3_" + stem, cfg);
     }
     void run(Profile *p, const char *stage, unsigned tokens, const void *a_q, const void *w_q, const void *w_s, const void *a_s, void *out, const void *gate = nullptr, const void *cls = nullptr, const void *b = nullptr) {
-        KernArgs a; a.i32(int(tokens)).ptr(a_q).ptr(w_q); if (bits != 16) a.ptr(w_s).ptr(a_s); a.ptr(out);   // f16 operands carry no scales
+        KernArgs a; a.i32(int(tokens)).ptr(a_q).ptr(w_q); if (quantised(elem)) a.ptr(w_s).ptr(a_s); a.ptr(out);   // float operands carry no scales
         if (resid) a.ptr(gate).ptr(cls);
         if (bias) a.ptr(b);
         launch(*k, p, stage, unsigned(n / 128), gemm_grid_y(tokens, m_group), THREADS, a);
@@ -360,7 +503,9 @@ struct Gemm {
 
 // --- the generic transformer stack -----------------------------------------------------------
 struct StackDims {
-    int hidden, heads, kv_heads, head_dim, ffn, rope_dim, classes, bits; float eps; bool bias, gate_first, causal; bool attn_i4 = false; int attn_qk_bits = 16;   // attn_i4: QK^T in int4 (prepare_qk_i4 operands); attn_qk_bits 8: int8 operands (prepare_qk_i8, attention_i8qk_*), 4 = attn_i4
+    int hidden, heads, kv_heads, head_dim, ffn, rope_dim, classes, wbits; float eps; bool bias, gate_first, causal; bool attn_i4 = false; int attn_qk_bits = 16;   // attn_i4: QK^T in int4 (prepare_qk_i4 operands); attn_qk_bits 8: int8 operands (prepare_qk_i8, attention_i8qk_*), 4 = attn_i4
+    bool bf16 = false;                                     // wbits 8: the checkpoint's int8 rows; 16: its f16 rows, or bf16 rows with bf16 set
+    std::string elem() const { return wbits == 8 ? "i8" : bf16 ? "bf16" : "f16"; }
     int inner() const { return heads * head_dim; }
     int kv_inner() const { return kv_heads * head_dim; }
     int qkv() const { return inner() + 2 * kv_inner(); }
@@ -370,13 +515,13 @@ struct LayerCond { const float *table_msa, *gate_msa, *table_mlp, *gate_mlp; };
 class Stack {
     DeviceBuffers memory_;
 public:
-    Stack(Compiler &c, const StackDims &d, size_t tokens, int layers, const Blob &w, const std::string &prefix_fmt, bool qk_weights, const float *ones_head)
-        : d_(d), tokens_(tokens), layers_(layers) {
-        const int bits = d.bits; const bool f16w = bits == 16;
-        auto wbytes = [&](size_t n, size_t k) { return bits == 4 ? n * k / 2 : bits == 8 ? n * k : n * k * 2; };
-        auto scale = [&](const std::string &name, size_t n) -> char * { return f16w ? nullptr : w.at(name, n * 4); };
+    Stack(Compiler &c, const StackDims &d, size_t tokens, int layers, const WeightSource &w, const std::string &prefix_fmt, bool qk_weights, const float *ones_head, const std::string &tag = "stack")
+        : d_(d), tokens_(tokens), layers_(layers), tag_(tag) {
+        const std::string elem = d.elem(); const int bits = d.wbits; const bool quant = quantised(elem);
+        auto wbytes = [&](size_t n, size_t k) { return quant ? n * k : n * k * 2; };
+        auto scale = [&](const std::string &name, size_t n) -> char * { return quant ? w.at(name, n * 4) : nullptr; };
         auto pitch = [&](size_t k) { return gemm_pitch(k, bits); };
-        auto wpad = [&](const std::string &name, size_t n, size_t k) { return w.at_padded(name, n, wbytes(1, k), wbytes(1, pitch(k))); };
+        auto wpad = [&](const std::string &name, size_t n, size_t k) { return w.rows(name, n, wbytes(1, k), wbytes(1, pitch(k))); };
         waves_ = d.causal ? 8 : (tokens >= 4096 ? 8 : 4);
         capacity_ = std::max<size_t>((tokens + 16 + 31) / 32 * 32, (tokens + 16 * waves_ - 1) / (16 * waves_) * (16 * waves_));
         capacity_ = std::max<size_t>(capacity_, (tokens + 255) / 256 * 256);
@@ -391,16 +536,16 @@ public:
             b.norm1 = w.at(p + "norm1", size_t(d.hidden) * 4); b.norm2 = w.at(p + "norm2", size_t(d.hidden) * 4);
             if (qk_weights) { b.qnorm = w.at(p + "qnorm", size_t(d.head_dim) * 4); b.knorm = w.at(p + "knorm", size_t(d.head_dim) * 4); }
             else b.qnorm = b.knorm = (char *)ones_head;
-            if (w.spans.count(p + "scale1")) { b.scale1 = w.at(p + "scale1", size_t(d.hidden) * 4); b.scale2 = w.at(p + "scale2", size_t(d.hidden) * 4); }
+            if (w.has(p + "scale1")) { b.scale1 = w.at(p + "scale1", size_t(d.hidden) * 4); b.scale2 = w.at(p + "scale2", size_t(d.hidden) * 4); }
             blocks_.push_back(b);
         }
-        prep_norm_.build(c, "norm", bits, d.hidden, d.eps, d.classes, int(pitch(d.hidden)));
-        prep_attn_.build(c, "plain", bits, d.inner(), 1e-5f, 1, int(pitch(d.inner())));
-        prep_down_.build(c, "plain", bits, d.ffn, 1e-5f, 1, int(pitch(d.ffn)));
-        gemm_qkv_.build(c, "plain", bits, d.bias, true, d.hidden, d.qkv(), tokens, 1, int(pitch(d.hidden)));
-        gemm_gu_.build(c, "swiglu", bits, d.bias, d.gate_first, d.hidden, 2 * d.ffn, tokens, 1, int(pitch(d.hidden)));
-        gemm_out_.build(c, "resid", bits, d.bias, true, d.inner(), d.hidden, tokens, d.classes, int(pitch(d.inner())));
-        gemm_down_.build(c, "resid", bits, d.bias, true, d.ffn, d.hidden, tokens, d.classes, int(pitch(d.ffn)));
+        prep_norm_.build(c, "norm", elem, d.hidden, d.eps, d.classes, int(pitch(d.hidden)));
+        direct_ = elem == "f16";   // f16 rows: the f16 attention output and gate|up product are the out / down operands as they are
+        if (!direct_) { prep_attn_.build(c, "plain", elem, d.inner(), 1e-5f, 1, int(pitch(d.inner()))); prep_down_.build(c, "plain", elem, d.ffn, 1e-5f, 1, int(pitch(d.ffn))); }
+        gemm_qkv_.build(c, "plain", elem, d.bias, true, d.hidden, d.qkv(), tokens, 1, int(pitch(d.hidden)));
+        gemm_gu_.build(c, "swiglu", elem, d.bias, d.gate_first, d.hidden, 2 * d.ffn, tokens, 1, int(pitch(d.hidden)));
+        gemm_out_.build(c, "resid", elem, d.bias, true, d.inner(), d.hidden, tokens, d.classes, int(pitch(d.inner())));
+        gemm_down_.build(c, "resid", elem, d.bias, true, d.ffn, d.hidden, tokens, d.classes, int(pitch(d.ffn)));
         {
             const std::string stem = d.head_dim == 64 ? "rope64_qknorm_f16" : (d.rope_dim == 128 ? "rope128_qknorm_f16" : "rope_qknorm_f16");
             const std::string ns = "h3." + stem + ".";
@@ -446,7 +591,7 @@ public:
             attention_ = c.get(stem, "h3_" + stem, acfg);
         }
         const size_t T = capacity_;
-        a_q_ = memory_.alloc(T * std::max(pitch(d.ffn), std::max(pitch(d.hidden), pitch(d.inner()))) * (bits == 4 ? 1 : bits == 8 ? 1 : 2) / (bits == 4 ? 2 : 1));
+        a_q_ = memory_.alloc(T * std::max(pitch(d.ffn), std::max(pitch(d.hidden), pitch(d.inner()))) * (quant ? 1 : 2));
         a_s_ = memory_.alloc(T * 4);
         fused_ = memory_.alloc(T * size_t(d.qkv()) * 2);
         q_ = memory_.alloc(T * size_t(d.inner()) * 2);
@@ -475,10 +620,12 @@ public:
     void forward(Profile *prof, void *x, const void *cls, const void *cos, const void *sin, const std::function<LayerCond(int)> &cond, int first = 0, int last = -1) {
         const unsigned T = unsigned(tokens_);
         if (last < 0) last = layers_;
-        static const char *dump_blocks = std::getenv("H3_DUMP_BLOCKS");   // H3_DUMP_BLOCKS=<dir>: x before the first block (h_in) and after every block (blk_NN), [tokens][hidden] f32, first call only
-        static int dump_calls = 0; const bool dumping = dump_blocks && dump_calls == 0 && layers_ == 50 && d_.classes > 1;   // the DiT, not the 50-layer text encoder if (dumping) ++dump_calls;
+        // H3_DUMP_BLOCKS=<dir>: this stack's x before the first block (<tag>_h_in.f32) and after every block (<tag>_blk_NN.f32), [tokens][hidden]
+        // f32, on its H3_DUMP_CALL-th forward (default 0; the DiT's first step, the decoder's first clip)
+        static const char *dump_blocks = std::getenv("H3_DUMP_BLOCKS"); static const int dump_call = std::getenv("H3_DUMP_CALL") ? atoi(std::getenv("H3_DUMP_CALL")) : 0;
+        const bool dumping = dump_blocks && calls_++ == dump_call && first == 0;
         auto dump_x = [&](const std::string &name) { if (!dumping) return; std::vector<float> hbuf(size_t(T) * d_.hidden); rt().sync(); rt().d2h(hbuf.data(), x, hbuf.size() * 4);
-            if (FILE *f = fopen((std::string(dump_blocks) + "/" + name + ".f32").c_str(), "wb")) { fwrite(hbuf.data(), 4, hbuf.size(), f); fclose(f); } };
+            if (FILE *f = fopen((std::string(dump_blocks) + "/" + tag_ + "_" + name + ".f32").c_str(), "wb")) { fwrite(hbuf.data(), 4, hbuf.size(), f); fclose(f); } };
         dump_x("h_in");
         for (int i = first; i < last; ++i) {
             const Block &b = blocks_[i]; const LayerCond lc = cond(i);
@@ -497,18 +644,18 @@ public:
               KernArgs a; a.i32(int(T)).ptr(q_).ptr(k_).ptr(v_).ptr(attn_);
               if (d_.causal) launch(*attention_, prof, "attention", (T + 15) / 16, unsigned(d_.kv_heads), THREADS, a);
               else { const unsigned qb = 16 * unsigned(waves_); launch(*attention_, prof, "attention", (T + qb - 1) / qb, unsigned(d_.heads), 32 * unsigned(waves_), a); } }
-            prep_attn_.run(prof, "prepare out input", T, attn_, nullptr, nullptr, nullptr, a_q_, a_s_);
-            gemm_out_.run(prof, "gemm out + residual", T, a_q_, b.out_q, b.out_s, a_s_, x, lc.gate_msa, cls, b.out_b);
+            if (!direct_) prep_attn_.run(prof, "prepare out input", T, attn_, nullptr, nullptr, nullptr, a_q_, a_s_);
+            gemm_out_.run(prof, "gemm out + residual", T, direct_ ? attn_ : a_q_, b.out_q, b.out_s, a_s_, x, lc.gate_msa, cls, b.out_b);
             prep_norm_.run(prof, "prepare norm", T, x, b.norm2, lc.table_mlp, cls, a_q_, a_s_);
             gemm_gu_.run(prof, "gemm ff + swiglu", T, a_q_, b.gu_q, b.gu_s, a_s_, gu_, nullptr, nullptr, b.gu_b);
-            prep_down_.run(prof, "prepare down input", T, gu_, nullptr, nullptr, nullptr, a_q_, a_s_);
-            gemm_down_.run(prof, "gemm down + residual", T, a_q_, b.down_q, b.down_s, a_s_, x, lc.gate_mlp, cls, b.down_b);
+            if (!direct_) prep_down_.run(prof, "prepare down input", T, gu_, nullptr, nullptr, nullptr, a_q_, a_s_);
+            gemm_down_.run(prof, "gemm down + residual", T, direct_ ? gu_ : a_q_, b.down_q, b.down_s, a_s_, x, lc.gate_mlp, cls, b.down_b);
             dump_x(fmt("blk_%02d", i));
         }
     }
 
 private:
-    StackDims d_; size_t tokens_, capacity_ = 0; int layers_, waves_ = 4;
+    StackDims d_; size_t tokens_, capacity_ = 0; int layers_, waves_ = 4; std::string tag_; int calls_ = 0; bool direct_ = false;
     std::vector<Block> blocks_;
     Prepare prep_norm_, prep_attn_, prep_down_;
     Gemm gemm_qkv_, gemm_gu_, gemm_out_, gemm_down_;
@@ -605,21 +752,68 @@ struct Schedule {                            // diffusers' MiniMaxH3Scheduler
     }
 };
 
+// --- ComfyUI's H3 checkpoint (minimax_h3_{fl2va,ref2va}_pruned_int8_convrot.safetensors) as the DiT stack, the token
+// refiner, the embedders, the final layer and the conditioning tables read: the 50 blocks' int8 ConvRot rows with their
+// scales, everything else in its stored float type (bf16 refiner and condition_proj, f32 patch projections and heads, f16
+// AdaLN projections widened for the CPU), laid out for the kernels but never converted.
+void dit_plan(const Checkpoint &ck, Weights &w) {
+    auto I8 = [&](const std::string &n, int64_t rows, int64_t cols) -> const Entry & { return ck.at(n + ".weight", "I8", {rows, cols}); };
+    auto S = [&](const std::string &n, int64_t rows) -> const Entry & { return ck.at(n + ".weight_scale", "F32", {rows, 1}); };
+    auto vec = [&](const std::string &n, const char *dtype, int64_t len) -> const Entry & { return ck.at(n, dtype, {len}); };
+    const int inner = HEADS * HEAD_DIM, qkv = 3 * inner;
+    for (int i = 0; i < 50; ++i) {
+        const std::string p = fmt("blocks.%d.", i), q = p + "attn.qkv_proj", o = p + "attn.out_proj", f1 = p + "mlp.fc1", f2 = p + "mlp.fc2";
+        w.add(p + "qkv.q", rows_of(ck, {&I8(q, qkv, HID)}, gemm_pitch(HID, 8)));      w.add(p + "qkv.s", scales_rows(ck, {&S(q, qkv)}));
+        w.add(p + "out.q", rows_of(ck, {&I8(o, HID, inner)}, gemm_pitch(inner, 8)));  w.add(p + "out.s", scales_rows(ck, {&S(o, HID)}));
+        const Entry &gu = I8(f1, 2 * FFN, HID), &gus = S(f1, 2 * FFN);               // gate rows first, then up: interleaved in 16-row runs for the fused SwiGLU
+        w.add(p + "gu.q", interleave16(ck, gu, 0, gu, FFN, FFN, gemm_pitch(HID, 8))); w.add(p + "gu.s", scales_interleave16(ck, gus, 0, gus, FFN, FFN));
+        w.add(p + "down.q", rows_of(ck, {&I8(f2, HID, FFN)}, gemm_pitch(FFN, 8)));   w.add(p + "down.s", scales_rows(ck, {&S(f2, HID)}));
+        w.add(p + "norm1", widen_f32(ck, {&vec(p + "norm1.weight", "BF16", HID)}));   w.add(p + "norm2", widen_f32(ck, {&vec(p + "norm2.weight", "BF16", HID)}));
+        w.add(p + "qnorm", widen_f32(ck, {&vec(p + "attn.q_norm.weight", "BF16", HEAD_DIM)})); w.add(p + "knorm", widen_f32(ck, {&vec(p + "attn.k_norm.weight", "BF16", HEAD_DIM)}));
+        w.add(fmt("h3.blocks.%d.adaln.w", i), widen_f32(ck, {&ck.at(p + "adaln_proj.linear.weight", "F16", {3 * 6 * HID, 8})}));
+        w.add(fmt("h3.blocks.%d.adaln.b", i), widen_f32(ck, {&vec(p + "adaln_proj.linear.bias", "F16", 3 * 6 * HID)}));
+    }
+    w.add("h3.adaln_t_table", widen_f32(ck, {&ck.at("adaln_t_table", "F32", {1025, 8})}));
+    w.add("h3.rope_inv_freq", widen_f32(ck, {&vec("rope.inv_freq", "F32", 16)}));
+    w.add("h3.final.adaln.w", widen_f32(ck, {&ck.at("final_layer.adaln_proj.linear.weight", "F16", {2 * HID, 8})}));
+    w.add("h3.final.adaln.b", widen_f32(ck, {&vec("final_layer.adaln_proj.linear.bias", "F16", 2 * HID)}));
+    w.add("h3.final.norm", widen_f32(ck, {&vec("final_layer.norm.weight", "BF16", HID)}));
+    // the two heads stacked to N = 128 (video 96 | audio 32) for one f32 matmul
+    w.add("h3.final.out.w", rows_of(ck, {&ck.at("final_layer.video_out.weight", "F32", {VIDEO_PATCH, HID}), &ck.at("final_layer.audio_out.weight", "F32", {AUDIO_CH, HID})}));
+    w.add("h3.final.out.b", widen_f32(ck, {&vec("final_layer.video_out.bias", "F32", VIDEO_PATCH), &vec("final_layer.audio_out.bias", "F32", AUDIO_CH)}));
+    w.add("h3.cond.w", rows_of(ck, {&ck.at("condition_proj.weight", "BF16", {HID, TEXT_DIM})}));          w.add("h3.cond.b", widen_f32(ck, {&vec("condition_proj.bias", "BF16", HID)}));
+    w.add("h3.video_in.w", rows_of(ck, {&ck.at("video_patch_proj.weight", "F32", {HID, VIDEO_PATCH})})); w.add("h3.video_in.b", widen_f32(ck, {&vec("video_patch_proj.bias", "F32", HID)}));
+    w.add("h3.audio_in.w", rows_of(ck, {&ck.at("audio_patch_proj.weight", "F32", {HID, AUDIO_CH})}));    w.add("h3.audio_in.b", widen_f32(ck, {&vec("audio_patch_proj.bias", "F32", HID)}));
+    for (int j = 0; j < 2; ++j) {   // the token refiner: bf16 rows as stored (unrotated), on the bf16 GEMMs
+        const std::string p = fmt("h3.refiner.%d.", j), src = fmt("token_refiner.blocks.%d.", j);
+        w.add(p + "qkv.q", rows_of(ck, {&ck.at(src + "attn.qkv_proj.weight", "BF16", {qkv, HID})}, gemm_pitch(HID, 16) * 2));
+        w.add(p + "out.q", rows_of(ck, {&ck.at(src + "attn.out_proj.weight", "BF16", {HID, inner})}, gemm_pitch(inner, 16) * 2));
+        const Entry &gu = ck.at(src + "mlp.fc1.weight", "BF16", {2 * FFN, HID});
+        w.add(p + "gu.q", interleave16(ck, gu, 0, gu, FFN, FFN, gemm_pitch(HID, 16) * 2));
+        w.add(p + "down.q", rows_of(ck, {&ck.at(src + "mlp.fc2.weight", "BF16", {HID, FFN})}, gemm_pitch(FFN, 16) * 2));
+        w.add(p + "norm1", widen_f32(ck, {&vec(src + "norm1.weight", "BF16", HID)}));  w.add(p + "norm2", widen_f32(ck, {&vec(src + "norm2.weight", "BF16", HID)}));
+        w.add(p + "qnorm", widen_f32(ck, {&vec(src + "attn.q_norm.weight", "BF16", HEAD_DIM)})); w.add(p + "knorm", widen_f32(ck, {&vec(src + "attn.k_norm.weight", "BF16", HEAD_DIM)}));
+    }
+    w.add("h3.refiner.final_norm", widen_f32(ck, {&vec("token_refiner.final_norm.weight", "BF16", HID)}));
+}
+
+std::string parent_dir(const std::string &path) { const size_t s = path.find_last_of('/'); return s == std::string::npos ? "." : s == 0 ? "/" : path.substr(0, s); }
+
 // --- the pipeline ----------------------------------------------------------------------------
 class Pipe {
     DeviceBuffers memory_;
 public:
     explicit Pipe(const h3pipe_config &cfg) {
-        if (!cfg.glue_dir || !cfg.blocks_dir || !cfg.te_dir || !cfg.kernel_sources || !cfg.cache_dir || !cfg.loom_compile) throw std::invalid_argument("every directory and the loom-compile path are required");
+        if (!cfg.kernel_sources || !cfg.cache_dir || !cfg.loom_compile) throw std::invalid_argument("kernel_sources, cache_dir and loom_compile are required");
         rt();
         comp_.exe = cfg.loom_compile; comp_.sources = cfg.kernel_sources; comp_.cache = cfg.cache_dir;
-        vae_dir_ = cfg.vae_dir ? cfg.vae_dir : ""; vae_bits_ = cfg.vae_bits ? cfg.vae_bits : 8;
-        aenc_dir_ = cfg.aenc_dir ? cfg.aenc_dir : ""; vision_dir_ = cfg.vision_dir ? cfg.vision_dir : ""; venc_dir_ = cfg.venc_dir ? cfg.venc_dir : "";
-        attn_qk_bits_ = cfg.attn_qk_bits ? cfg.attn_qk_bits : 4; if (attn_qk_bits_ != 4 && attn_qk_bits_ != 8 && attn_qk_bits_ != 16) throw std::invalid_argument("attn_qk_bits must be 4, 8 or 16");
-        glue_.open(cfg.glue_dir);
-        embed_ = glue_.span("te.embed");
-        blocks_dir_ = cfg.blocks_dir;
-        te_dir_ = cfg.te_dir;
+        dit_file_ = cfg.dit_file ? cfg.dit_file : "";
+        // the text encoder, the VAEs and the encoders still read their exported directories beside the kernel sources (build/weights_*)
+        // until each file is read directly; te_file / video_vae_file / audio_vae_file are recorded for that
+        te_file_ = cfg.te_file ? cfg.te_file : ""; video_vae_file_ = cfg.video_vae_file ? cfg.video_vae_file : ""; audio_vae_file_ = cfg.audio_vae_file ? cfg.audio_vae_file : "";
+        const std::string build = parent_dir(cfg.kernel_sources) + "/build/";
+        glue_dir_ = build + "weights_glue"; te_dir_ = build + "weights_te"; vae_dir_ = build + "weights_vae_i8"; aenc_dir_ = build + "weights_aenc"; vision_dir_ = build + "weights_vision"; venc_dir_ = build + "weights_venc";
+        attn_qk_bits_ = cfg.attn_qk_bits ? cfg.attn_qk_bits : 8; if (attn_qk_bits_ != 4 && attn_qk_bits_ != 8 && attn_qk_bits_ != 16) throw std::invalid_argument("attn_qk_bits must be 4, 8 or 16");
         ones_ = memory_.alloc(size_t(HID) * 4); { std::vector<float> o(HID, 1.0f); rt().h2d(ones_, o.data(), o.size() * 4); }
         zeros_ = memory_.alloc(size_t(2 * TE_FFN) * 4); rt().memset(zeros_, 0, size_t(2 * TE_FFN) * 4);
     }
@@ -630,7 +824,7 @@ public:
     // --- the prompt: embedding lookup on the host, the encoder, condition_proj, the refiner ---
     void ensure_seq(size_t seq) {
         if (seq <= seq_cap_) return;
-        for (void **p : {&x_, &cls_, &cls0_, &tcls_, &cos_, &sin_, &in16_, &a_q_, &a_s_, &out16_, &text_copy_}) { if (*p) memory_.free(*p); *p = nullptr; }
+        for (void **p : {&x_, &cls_, &cls0_, &tcls_, &cos_, &sin_, &in32_, &out32_, &text_copy_}) { if (*p) memory_.free(*p); *p = nullptr; }
         seq_cap_ = 0;
         const size_t T = (seq + 255) / 256 * 256 + 32;
         x_ = memory_.alloc(T * HID * 4); rt().memset(x_, 0, T * HID * 4);
@@ -638,20 +832,20 @@ public:
         cls0_ = memory_.alloc(T * 4); rt().memset(cls0_, 0, T * 4);       // the single-class GEMMs (embedders, condition proj) index their gate table with this
         tcls_ = memory_.alloc(T * 4); rt().memset(tcls_, 0, T * 4);
         cos_ = memory_.alloc(T * ROPE_HALF * 4); sin_ = memory_.alloc(T * ROPE_HALF * 4);
-        in16_ = memory_.alloc(T * TEXT_DIM * 2); rt().memset(in16_, 0, T * TEXT_DIM * 2);
-        a_q_ = memory_.alloc(T * size_t(std::max(TEXT_DIM, HID))); a_s_ = memory_.alloc(T * 4);   // the final norm writes HID-wide rows, the embedders TEXT_DIM-wide
-        out16_ = memory_.alloc(T * FINAL_N * 2);
+        in32_ = memory_.alloc(T * VIDEO_PATCH * 4);        // the embedders' f32 rows [rows][96 | 32]
+        out32_ = memory_.alloc(T * FINAL_N * 4);           // the final layer's f32 rows [rows][128]
         seq_cap_ = T;
     }
 
-    // x rows [row0, row0 + rows) = W · in + b through the int8 family: in f16 [rows][k] on in16_, rows zeroed first
-    void embed_linear(const char *stage, size_t row0, size_t rows, int k, const std::string &wname) {
-        Prepare &prep = prepares_[fmt("plain_%d_%zu", k, rows)]; if (!prep.k) prep.build(comp_, "plain", 8, k);
-        Gemm &g = gemms_[fmt("resid_%d_%zu", k, rows)]; if (!g.k) g.build(comp_, "resid", 8, true, true, k, HID, rows, 1);
-        prep.run(&prof, stage, unsigned(rows), in16_, nullptr, nullptr, nullptr, a_q_, a_s_);
-        float *xr = (float *)x_ + row0 * HID;
-        rt().memset(xr, 0, rows * HID * 4);
-        g.run(&prof, stage, unsigned(rows), a_q_, glue_.at(wname + ".q", size_t(HID) * k), glue_.at(wname + ".s", size_t(HID) * 4), a_s_, xr, ones_, cls0_, glue_.at(wname + ".b", size_t(HID) * 4));
+    // The DiT checkpoint, opened on first use (the conditioning tables, the refiner, the embedders, the blocks, the final layer).
+    void ensure_dit() {
+        if (dit_w_.is_open()) return;
+        if (dit_file_.empty()) throw std::invalid_argument("no DiT checkpoint: h3pipe_config.dit_file is NULL");
+        dit_w_.open(dit_file_, dit_plan);
+    }
+    // x rows [row0, row0 + rows) = W · in + b on the checkpoint's f32 patch projection as stored: in f32 [rows][k] on in32_
+    void embed_f32(const char *stage, size_t row0, size_t rows, int k, const std::string &wname) {
+        matmul(stage, rows, k, HID, in32_, dit_w_.at(wname + ".w", size_t(HID) * k * 4), dit_w_.at(wname + ".b", size_t(HID) * 4), (float *)x_ + row0 * HID);
     }
 
     struct VisionSpan { size_t start, count; int merged_h, merged_w; const float *merged, *deepstack; };   // an image's rows in the presentation
@@ -659,6 +853,7 @@ public:
         // embedding rows from the file (bf16) -> f32; vision spans take the merged vision embeds
         std::vector<float> emb(size_t(n) * TEXT_DIM);
         for (const VisionSpan &sp : spans) memcpy(emb.data() + sp.start * TEXT_DIM, sp.merged, sp.count * TEXT_DIM * 4);
+        if (!glue_.is_open()) { glue_.open(glue_dir_); embed_ = glue_.span("te.embed"); }
         { std::ifstream f(glue_.path, std::ios::binary); std::vector<uint16_t> row(TEXT_DIM);
           for (int i = 0; i < n; ++i) { if (ids[i] < 0) { bool in_span = false; for (const VisionSpan &sp : spans) in_span |= size_t(i) >= sp.start && size_t(i) < sp.start + sp.count; if (in_span) continue; }
               if (ids[i] < 0 || size_t(ids[i]) * TEXT_DIM * 2 >= embed_.bytes) throw std::invalid_argument("token id out of range: " + std::to_string(ids[i]));
@@ -669,7 +864,7 @@ public:
         if (!te_ready_ || !te_ || te_->tokens() != size_t(n) || te_span_sig_ != span_sig) {
             te_span_sig_.clear(); te_ready_ = false;
             if (!te_blob_.is_open()) te_blob_.open(te_dir_);
-            te_.reset(); te_ = std::make_unique<Stack>(comp_, StackDims{TE_HID, TE_HEADS, TE_KV, HEAD_DIM, TE_FFN, 128, 1, 8, 1e-6f, false, true, true}, size_t(n), 50, te_blob_, "blocks.%d.", true, nullptr);
+            te_.reset(); te_ = std::make_unique<Stack>(comp_, StackDims{TE_HID, TE_HEADS, TE_KV, HEAD_DIM, TE_FFN, 128, 1, 8, 1e-6f, false, true, true}, size_t(n), 50, te_blob_, "blocks.%d.", true, nullptr, "te");
             for (void **q : {&te_x_, &te_cos_, &te_sin_, &te_cls_}) { memory_.free(*q); *q = nullptr; }
             const size_t T = te_->capacity();
             te_x_ = memory_.alloc(T * TE_HID * 4); rt().memset(te_x_, 0, T * TE_HID * 4);
@@ -707,15 +902,17 @@ public:
             }
             te_->forward(&prof, te_x_, te_cls_, te_cos_, te_sin_, te_cond, 3, 50);
         }
-        // hidden -> f16 -> condition_proj into x rows [0, n)
-        std::vector<float> hid(size_t(n) * TE_HID); rt().sync(); rt().d2h(hid.data(), te_x_, hid.size() * 4);
-        std::vector<uint16_t> h16(hid.size()); for (size_t i = 0; i < hid.size(); ++i) h16[i] = f32_to_f16(hid[i]);
-        rt().h2d(in16_, h16.data(), h16.size() * 2);
-        embed_linear("condition proj", 0, size_t(n), TEXT_DIM, "h3.cond");
-        // the token refiner: two H3-shaped blocks without rope (identity tables), then its final norm
+        // condition_proj: the encoder's f32 hidden rows through the bf16 matmul on the checkpoint's bf16 rows, into x rows [0, n)
+        ensure_dit();
+        { const std::string stem = "matmul_bias_bf16_wmma", ns = "h3." + stem + ".";
+          auto k = comp_.get(stem, "h3_" + stem, {{ns + "k_size", std::to_string(TEXT_DIM)}, {ns + "n_size", std::to_string(HID)}});
+          KernArgs a; a.i32(n).ptr(te_x_).ptr(dit_w_.at("h3.cond.w", size_t(HID) * TEXT_DIM * 2)).ptr(dit_w_.at("h3.cond.b", size_t(HID) * 4)).ptr(x_);
+          launch(*k, &prof, "condition proj", unsigned(HID / 64), unsigned((n + 63) / 64), 256, a); }
+        // the token refiner: two H3-shaped blocks on bf16 rows without rope (identity tables), then its final norm
         if (!refiner_ready_ || !refiner_ || refiner_->tokens() != size_t(n)) {
             refiner_ready_ = false;
-            refiner_.reset(); refiner_ = std::make_unique<Stack>(comp_, StackDims{HID, HEADS, HEADS, HEAD_DIM, FFN, ROPE_DIM, 1, 8, 1e-5f, false, true, false}, size_t(n), 2, glue_, "h3.refiner.%d.", true, nullptr);
+            StackDims rd{HID, HEADS, HEADS, HEAD_DIM, FFN, ROPE_DIM, 1, 16, 1e-5f, false, true, false}; rd.bf16 = true;
+            refiner_.reset(); refiner_ = std::make_unique<Stack>(comp_, rd, size_t(n), 2, dit_w_, "h3.refiner.%d.", true, nullptr, "refiner");
             std::vector<float> c(size_t(n) * ROPE_HALF, 1.0f), s(size_t(n) * ROPE_HALF, 0.0f);
             for (void **q : {&ref_cos_, &ref_sin_}) { memory_.free(*q); *q = nullptr; }
             ref_cos_ = memory_.alloc(c.size() * 4); ref_sin_ = memory_.alloc(s.size() * 4);
@@ -725,11 +922,11 @@ public:
         }
         refiner_ready_ = true;
         refiner_->forward(&prof, x_, cls0_, ref_cos_, ref_sin_, [&](int) { return LayerCond{(const float *)zeros_, (const float *)ones_, (const float *)zeros_, (const float *)ones_}; });
-        { KernArgs a; a.i32(n).ptr(x_).ptr(glue_.at("h3.refiner.final_norm", size_t(HID) * 4)).ptr(zeros_).ptr(cls0_); launch(*norm_f32_, &prof, "refiner final norm", unsigned(n), 1, unsigned(lanes_for(HID)), a); }
+        { KernArgs a; a.i32(n).ptr(x_).ptr(dit_w_.at("h3.refiner.final_norm", size_t(HID) * 4)).ptr(zeros_).ptr(cls0_); launch(*norm_f32_, &prof, "refiner final norm", unsigned(n), 1, unsigned(lanes_for(HID)), a); }
     }
 
     void get_text_in(const int32_t *ids, int n, float *out) {
-        ensure_seq(size_t(n));
+        ensure_dit(); ensure_seq(size_t(n));
         text_in(ids, n);
         rt().sync(); rt().d2h(out, x_, size_t(n) * HID * 4);
     }
@@ -777,14 +974,14 @@ public:
     void ensure_conditioning() {
         if (conditioning_ready_) return;
         adaln_w_.clear(); adaln_b_.clear();
-        // host-side conditioning tables
-        curve_ = glue_.host_f32("h3.adaln_t_table", 1025 * 8);
-        inv_freq_ = glue_.host_f32("h3.rope_inv_freq", 16);
-        for (int i = 0; i < 50; ++i) { adaln_w_.push_back(glue_.host_f32(fmt("h3.blocks.%d.adaln.w", i), size_t(3 * 6 * HID) * 8)); adaln_b_.push_back(glue_.host_f32(fmt("h3.blocks.%d.adaln.b", i), size_t(3 * 6 * HID))); }
-        final_w_ = glue_.host_f32("h3.final.adaln.w", size_t(2 * HID) * 8); final_b_ = glue_.host_f32("h3.final.adaln.b", size_t(2 * HID));
+        ensure_dit();
+        // host-side conditioning tables (the checkpoint's f32 curve and f16 projections, widened)
+        curve_ = dit_w_.host_f32("h3.adaln_t_table", 1025 * 8);
+        inv_freq_ = dit_w_.host_f32("h3.rope_inv_freq", 16);
+        for (int i = 0; i < 50; ++i) { adaln_w_.push_back(dit_w_.host_f32(fmt("h3.blocks.%d.adaln.w", i), size_t(3 * 6 * HID) * 8)); adaln_b_.push_back(dit_w_.host_f32(fmt("h3.blocks.%d.adaln.b", i), size_t(3 * 6 * HID))); }
+        final_w_ = dit_w_.host_f32("h3.final.adaln.w", size_t(2 * HID) * 8); final_b_ = dit_w_.host_f32("h3.final.adaln.b", size_t(2 * HID));
         if (!mods_) mods_ = memory_.alloc(size_t(50) * MODS_ROWS * HID * 4);
         if (!final_table_) final_table_ = memory_.alloc(size_t(4) * HID * 4);
-        if (!blocks_.is_open()) blocks_.open(blocks_dir_);
         conditioning_ready_ = true;
     }
 
@@ -821,12 +1018,10 @@ public:
           for (size_t r = 0; r < S; ++r) for (int ax = 0; ax < 3; ++ax) for (int j = 0; j < 16; ++j) { const float ang = float(lay.pos[3 * r + ax]) * inv_freq_[j]; c[r * ROPE_HALF + ax * 16 + j] = std::cos(ang); s[r * ROPE_HALF + ax * 16 + j] = std::sin(ang); }
           rt().h2d(cos_, c.data(), c.size() * 4); rt().h2d(sin_, s.data(), s.size() * 4); }
         if (!dit_ || dit_->tokens() != S) {
-            const char *qk = std::getenv("H3_ATTN_QK"); StackDims dd{HID, HEADS, HEADS, HEAD_DIM, FFN, ROPE_DIM, CLASSES, 4, 1e-5f, false, true, false}; const int qkb = qk ? (std::string(qk) == "f16" ? 16 : (std::string(qk) == "i8" ? 8 : 4)) : attn_qk_bits_; dd.attn_i4 = qkb == 4; dd.attn_qk_bits = qkb;   // H3_ATTN_QK=f16|i8|i4 overrides the config
-            { const size_t qb = blocks_.span("blocks.0.qkv.q").bytes, nk = size_t(dd.qkv()) * dd.hidden; dd.bits = qb == nk ? 8 : qb == 2 * nk ? 16 : 4; }   // the export's width: int8 rows verbatim, f16 rows (--bits 16), or packed int4
-            dit_.reset(); dit_ = std::make_unique<Stack>(comp_, dd, S, 50, blocks_, "blocks.%d.", true, nullptr); }
-        if (!final_prep_.k) { final_prep_.build(comp_, "norm", 8, HID, 1e-5f, 2); }
+            const char *qk = std::getenv("H3_ATTN_QK"); StackDims dd{HID, HEADS, HEADS, HEAD_DIM, FFN, ROPE_DIM, CLASSES, 8, 1e-5f, false, true, false}; const int qkb = qk ? (std::string(qk) == "f16" ? 16 : (std::string(qk) == "i8" ? 8 : 4)) : attn_qk_bits_; dd.attn_i4 = qkb == 4; dd.attn_qk_bits = qkb;   // H3_ATTN_QK=f16|i8|i4 overrides the config
+            dit_.reset(); dit_ = std::make_unique<Stack>(comp_, dd, S, 50, dit_w_, "blocks.%d.", true, nullptr, "dit"); }
+        if (!final_norm_) { const std::string ns = "h3.norm_mod_f32."; final_norm_ = comp_.get("norm_mod_f32", "h3_norm_mod_f32", {{ns + "width", std::to_string(HID)}, {ns + "lanes", std::to_string(lanes_for(HID))}, {ns + "eps", num(1e-5)}, {ns + "classes", "2"}}); }
         const size_t generated_rows = Na + Nv;   // the final head has only the video/audio timestep classes
-        Gemm &final_gemm = gemms_[fmt("final_%zu", generated_rows)]; if (!final_gemm.k) final_gemm.build(comp_, "plain", 8, true, true, HID, FINAL_N, generated_rows);
         // latents as rows: video [Nv][96] (row = (t*(H/2) + hh)*(W/2) + ww, column = c*4 + dy*2 + dx), audio [2*audio_t][32] (row = c*audio_t + t)
         std::vector<float> vrows(Nv * VIDEO_PATCH), arows(Na * AUDIO_CH);
         const bool res = p.sampler == 1;   // ComfyUI's res_multistep over the pack on the video sigma grid; arows is what the network sees, yrows the carried audio variable
@@ -853,7 +1048,7 @@ public:
         cache_acc_ = 0.0; have_cache_ = false; cache_skipped_ = 0;
         if (sv.timesteps.size() != sa.timesteps.size()) throw std::runtime_error("the two schedules differ in length");
         size_t in_rows = std::max(Na, Nv); for (const RefSeg &sg : lay.ref_segs) in_rows = std::max(in_rows, sg.rows);
-        std::vector<uint16_t> in16(in_rows * KPAD); std::vector<uint16_t> out16(generated_rows * FINAL_N);
+        std::vector<float> in32(in_rows * VIDEO_PATCH); std::vector<float> out32(generated_rows * FINAL_N);
         const auto t_start = std::chrono::steady_clock::now();
         auto hnow = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
         for (size_t step = 0; step < sv.timesteps.size(); ++step) {
@@ -861,16 +1056,12 @@ public:
             float tv[8], ta[8], tcv[8], tca[8]; temb(sv.timesteps[step], tv); temb(sa.timesteps[step], ta);
             temb(std::max(sv.timesteps[step], VISUAL_COND_AUG), tcv); temb(std::max(sa.timesteps[step], 1.0f), tca); upload_mods(tv, ta, tcv, tca);
             h_mods = hnow();
-            // audio rows -> x[L, L+Na), video rows -> x[L+Na, S), each through prepare(256) + the padded-K int8 GEMM
-            std::fill(in16.begin(), in16.end(), 0);
+            // audio rows -> x[L, L+Na), video rows -> x[L+Na, S), each through the f32 patch projection as stored
             if (res) { const float carry = sa.sigmas[step] / sv.sigmas[step]; for (size_t i = 0; i < arows.size(); ++i) arows[i] = yrows[i] * carry; }
-            for (size_t r = 0; r < Na; ++r) for (int k = 0; k < AUDIO_CH; ++k) in16[r * KPAD + k] = f32_to_f16(arows[r * AUDIO_CH + k]);
-            rt().h2d(in16_, in16.data(), Na * KPAD * 2);
-            embed_linear("audio in", LR, Na, KPAD, "h3.audio_in");
-            std::fill(in16.begin(), in16.end(), 0);
-            for (size_t r = 0; r < Nv; ++r) for (int k = 0; k < VIDEO_PATCH; ++k) in16[r * KPAD + k] = f32_to_f16(vrows[r * VIDEO_PATCH + k]);
-            rt().h2d(in16_, in16.data(), Nv * KPAD * 2);
-            embed_linear("video in", LR + Na, Nv, KPAD, "h3.video_in");
+            rt().h2d(in32_, arows.data(), Na * AUDIO_CH * 4);
+            embed_f32("audio in", LR, Na, AUDIO_CH, "h3.audio_in");
+            rt().h2d(in32_, vrows.data(), Nv * VIDEO_PATCH * 4);
+            embed_f32("video in", LR + Na, Nv, VIDEO_PATCH, "h3.video_in");
             // the text rows are refreshed from a copy each step (the blocks update x in place)
             if (step == 0) {
                 // reference rows (constant across steps, re-set every step like the text): the packed latents through the
@@ -879,17 +1070,16 @@ public:
                     h3pipe_ref rf{};
                     if (sg.kind == 3) { const h3pipe_keyframe &kf = kfs[size_t(sg.ref)]; rf.kind = 0; rf.video_latent = kf.video_latent; rf.latent_t = 1; rf.lat_h = sh.lat_h; rf.lat_w = sh.lat_w; rf.audio_latent = kf.audio_latent; rf.audio_t = kf.audio_t; }
                     else rf = refs[size_t(sg.ref)];
-                    std::fill(in16.begin(), in16.end(), 0);
                     if (sg.audio) {
-                        for (int c = 0; c < 2; ++c) for (int t = 0; t < sg.audio_t; ++t) for (int k = 0; k < AUDIO_CH; ++k) in16[(size_t(c) * sg.audio_t + t) * KPAD + k] = f32_to_f16(rf.audio_latent[(size_t(c) * AUDIO_CH + k) * sg.audio_t + t]);
-                        rt().h2d(in16_, in16.data(), sg.rows * KPAD * 2); embed_linear("ref audio in", sg.row0, sg.rows, KPAD, "h3.audio_in");
+                        for (int c = 0; c < 2; ++c) for (int t = 0; t < sg.audio_t; ++t) for (int k = 0; k < AUDIO_CH; ++k) in32[(size_t(c) * sg.audio_t + t) * AUDIO_CH + k] = rf.audio_latent[(size_t(c) * AUDIO_CH + k) * sg.audio_t + t];
+                        rt().h2d(in32_, in32.data(), sg.rows * AUDIO_CH * 4); embed_f32("ref audio in", sg.row0, sg.rows, AUDIO_CH, "h3.audio_in");
                     } else {
                         Rng arng(p.seed); const int vt = sg.latent_t, hh = sg.lat_h, ww = sg.lat_w;
                         for (int c = 0; c < LATENT_CH; ++c) for (int t = 0; t < vt; ++t) for (int y = 0; y < hh; ++y) for (int x = 0; x < ww; ++x) {
                             const size_t row = (size_t(t) * (hh / 2) + y / 2) * (ww / 2) + x / 2, col = size_t(c) * 4 + (y % 2) * 2 + (x % 2);
                             const float z = rf.video_latent[((size_t(c) * vt + t) * hh + y) * ww + x];
-                            in16[row * KPAD + col] = f32_to_f16(VISUAL_COND_AUG * z + (1.0f - VISUAL_COND_AUG) * arng.normal()); }
-                        rt().h2d(in16_, in16.data(), sg.rows * KPAD * 2); embed_linear("ref video in", sg.row0, sg.rows, KPAD, "h3.video_in");
+                            in32[row * VIDEO_PATCH + col] = VISUAL_COND_AUG * z + (1.0f - VISUAL_COND_AUG) * arng.normal(); }
+                        rt().h2d(in32_, in32.data(), sg.rows * VIDEO_PATCH * 4); embed_f32("ref video in", sg.row0, sg.rows, VIDEO_PATCH, "h3.video_in");
                     }
                 }
                 if (!text_copy_) text_copy_ = memory_.alloc(seq_cap_ * HID * 4); rt().d2d(text_copy_, x_, LR * HID * 4);
@@ -923,22 +1113,24 @@ public:
                 }
             } else dit_->forward(&prof, x_, cls_, cos_, sin_, [&](int i) { return cond(i); });
             if (prof.on) rt().sync(); h_dit = hnow();
-            final_prep_.run(&prof, "final norm", unsigned(generated_rows), (float *)x_ + LR * HID, glue_.at("h3.final.norm", size_t(HID) * 4), final_table_, (int32_t *)tcls_ + LR, a_q_, a_s_);
-            final_gemm.run(&prof, "final out", unsigned(generated_rows), a_q_, glue_.at("h3.final.out.q", size_t(FINAL_N) * HID), glue_.at("h3.final.out.s", size_t(FINAL_N) * 4), a_s_, out16_, nullptr, nullptr, glue_.at("h3.final.out.b", size_t(FINAL_N) * 4));
-            rt().sync(); rt().d2h(out16.data(), out16_, generated_rows * FINAL_N * 2);
+            // the final layer: the modulated RMSNorm in place on the generated rows (re-embedded next step), then the two f32 heads
+            { KernArgs a; a.i32(int(generated_rows)).ptr((float *)x_ + LR * HID).ptr(dit_w_.at("h3.final.norm", size_t(HID) * 4)).ptr(final_table_).ptr((int32_t *)tcls_ + LR);
+              launch(*final_norm_, &prof, "final norm", unsigned(generated_rows), 1, unsigned(lanes_for(HID)), a); }
+            matmul("final out", generated_rows, HID, FINAL_N, (float *)x_ + LR * HID, dit_w_.at("h3.final.out.w", size_t(FINAL_N) * HID * 4), dit_w_.at("h3.final.out.b", size_t(FINAL_N) * 4), out32_);
+            rt().sync(); rt().d2h(out32.data(), out32_, generated_rows * FINAL_N * 4);
             h_final = hnow();
             const float sg_v = sv.sigmas[step], sg_next = sv.sigmas[step + 1], r_v = sg_next / sg_v, sg_a = sa.sigmas[step], r_a = sa.sigmas[step + 1] / sg_a;
             if (!res) {
                 // Euler step per schedule: x0 = x + sigma * v, x' = r x + (1 - r) x0
-                for (size_t r = 0; r < Nv; ++r) for (int k = 0; k < VIDEO_PATCH; ++k) { float &x = vrows[r * VIDEO_PATCH + k]; const float v = f16_to_f32(out16[(Na + r) * FINAL_N + k]); x = r_v * x + (1.0f - r_v) * (x + sg_v * v); }
-                for (size_t r = 0; r < Na; ++r) for (int k = 0; k < AUDIO_CH; ++k) { float &x = arows[r * AUDIO_CH + k]; const float v = f16_to_f32(out16[r * FINAL_N + VIDEO_PATCH + k]); x = r_a * x + (1.0f - r_a) * (x + sg_a * v); }
+                for (size_t r = 0; r < Nv; ++r) for (int k = 0; k < VIDEO_PATCH; ++k) { float &x = vrows[r * VIDEO_PATCH + k]; const float v = out32[(Na + r) * FINAL_N + k]; x = r_v * x + (1.0f - r_v) * (x + sg_v * v); }
+                for (size_t r = 0; r < Na; ++r) for (int k = 0; k < AUDIO_CH; ++k) { float &x = arows[r * AUDIO_CH + k]; const float v = out32[r * FINAL_N + VIDEO_PATCH + k]; x = r_a * x + (1.0f - r_a) * (x + sg_a * v); }
             } else {
                 // ComfyUI (comfy/k_diffusion/sampling.py res_multistep, eta 0): denoised D = X - sigma_v * OUT over the pack. The video's OUT is
                 // -v. The audio's carried variable y = (sigma_v / sigma_a) x_a sees OUT_a = (1 - scale) x_a + (1 + (scale - 1) sigma_a) (-v_a),
                 // scale = shift_v / shift_a (comfy/ldm/minimax/model.py forward); the network itself sees x_a and t_a = 1 - sigma_a.
                 den_v.resize(vrows.size()); den_a.resize(arows.size());
-                for (size_t i = 0; i < vrows.size(); ++i) { const size_t r = i / VIDEO_PATCH, k = i % VIDEO_PATCH; den_v[i] = vrows[i] + sg_v * f16_to_f32(out16[(Na + r) * FINAL_N + k]); }
-                for (size_t i = 0; i < arows.size(); ++i) { const size_t r = i / AUDIO_CH, k = i % AUDIO_CH; const float v = f16_to_f32(out16[r * FINAL_N + VIDEO_PATCH + k]);
+                for (size_t i = 0; i < vrows.size(); ++i) { const size_t r = i / VIDEO_PATCH, k = i % VIDEO_PATCH; den_v[i] = vrows[i] + sg_v * out32[(Na + r) * FINAL_N + k]; }
+                for (size_t i = 0; i < arows.size(); ++i) { const size_t r = i / AUDIO_CH, k = i % AUDIO_CH; const float v = out32[r * FINAL_N + VIDEO_PATCH + k];
                     const double out = (1.0 - ascale) * arows[i] - (1.0 + (ascale - 1.0) * sg_a) * v; den_a[i] = float(yrows[i] - sg_v * out); }
                 auto advance = [&](std::vector<float> &x, const std::vector<float> &d, const std::vector<float> &od) {
                     if (sg_next == 0.0f || od.empty()) { for (size_t i = 0; i < x.size(); ++i) x[i] = r_v * x[i] + (1.0f - r_v) * d[i]; }   // Euler: x + (x - D) / sigma * (sigma_next - sigma)
@@ -1081,7 +1273,7 @@ public:
         T_lat = T;
     }
     void encode_video(const float *pixels, int frames, int H, int W, float *latents, int &latent_t) {
-        if (!venc_open_) { if (venc_dir_.empty()) throw std::runtime_error("no video encoder weights: h3pipe_config.venc_dir is NULL"); venc_.open(venc_dir_); venc_open_ = true; }
+        if (!venc_open_) { venc_.open(venc_dir_); venc_open_ = true; }
         const int LH = H / 16, LW = W / 16;
         if (frames == 1) { std::vector<float> z; int T = 0; venc_clip(pixels, 1, H, W, z, T); if (T != 1) throw std::runtime_error("image encode produced more than one latent frame"); memcpy(latents, z.data(), z.size() * 4); latent_t = 1; return; }
         const int chunks = (frames + 16) / 17, TL = chunks * 5; std::vector<float> all(size_t(24) * TL * LH * LW); std::vector<float> clip(size_t(17) * H * W * 3);
@@ -1112,7 +1304,7 @@ public:
     }
     // pixels [H][W][3] in [0, 1] -> merged [n/4][5120], deepstack [3][n/4][5120]; n = (H/16) * (W/16) patches in 2x2 merge order
     void vision_embed(const float *pixels, int H, int W, std::vector<float> &merged, std::vector<float> &deepstack) {
-        if (!vision_open_) { if (vision_dir_.empty()) throw std::runtime_error("no vision tower weights: h3pipe_config.vision_dir is NULL"); vision_.open(vision_dir_); vision_open_ = true; }
+        if (!vision_open_) { vision_.open(vision_dir_); vision_open_ = true; }
         if (H % 32 || W % 32 || H < 32 || W < 32) throw std::invalid_argument("vision images need height and width multiples of 32");
         const int gh = H / 16, gw = W / 16, n = gh * gw, m = n / 4; const size_t cap = (size_t(n) + 16 + 31) / 32 * 32;
         auto V = [&](const std::string &nm, size_t bytes) { return vision_.at(nm, bytes); };
@@ -1209,10 +1401,11 @@ public:
         auto k = comp_.get("layernorm_f32", "h3_layernorm_f32", {{ns + "width", std::to_string(width)}, {ns + "eps", num(1e-5)}});
         KernArgs a; a.i32(int(rows)).ptr(x).ptr(w).ptr(b).ptr(out); launch(*k, &prof, "aenc layernorm", unsigned(rows), 1, 32, a);
     }
-    void matmul(size_t m, int kdim, int n, const void *x, const void *w, const void *b, void *out) {
+    // out [m][n] f32 = x [m][k] f32 . w [n][k] f32 + b: one lane per output element (the audio encoder's heads, the patch projections, the final layer)
+    void matmul(const char *stage, size_t m, int kdim, int n, const void *x, const void *w, const void *b, void *out) {
         const std::string ns = "h3.matmul_f32.";
         auto k = comp_.get("matmul_f32", "h3_matmul_f32", {{ns + "k", std::to_string(kdim)}, {ns + "n", std::to_string(n)}});
-        KernArgs a; a.i32(int(m)).ptr(x).ptr(w).ptr(b).ptr(out); launch(*k, &prof, "aenc matmul", unsigned((n + 255) / 256), unsigned(m), THREADS, a);
+        KernArgs a; a.i32(int(m)).ptr(x).ptr(w).ptr(b).ptr(out); launch(*k, &prof, stage, unsigned((n + 255) / 256), unsigned(m), THREADS, a);
     }
     void transpose_f32(size_t rows, int cols, const void *x, void *out) {
         const std::string ns = "h3.transpose_f32.";
@@ -1220,7 +1413,7 @@ public:
         KernArgs a; a.i32(int(rows)).ptr(x).ptr(out); launch(*k, &prof, "aenc transpose", unsigned((rows * size_t(cols) + 255) / 256), 1, THREADS, a);
     }
     void encode_audio(const float *samples, int n, float *out, int &audio_t) {
-        if (!aenc_open_) { if (aenc_dir_.empty()) throw std::runtime_error("no audio encoder weights: h3pipe_config.aenc_dir is NULL"); aenc_.open(aenc_dir_); aenc_open_ = true; }
+        if (!aenc_open_) { aenc_.open(aenc_dir_); aenc_open_ = true; }
         const size_t Lp = (size_t(n) + 799) / 800 * 800; const int T = int(Lp / 800); audio_t = T;
         auto W = [&](const std::string &nm, size_t count) { return aenc_.at(nm, count * 4); };
         DeviceBuffers temporary; auto buf = [&](size_t floats) { return temporary.alloc(floats * 4); };
@@ -1257,23 +1450,23 @@ public:
             transpose_f32(2048, T, h, rows);                                   // [2048][T] -> [T][2048]
             // AttnProjection: x = proj(norm3(x)) + attn(norm1(x)); x += mlp(norm2(x))
             layernorm(T, 2048, rows, W("aenc.pre.norm3.w", 2048), W("aenc.pre.norm3.b", 2048), n1);
-            matmul(T, 2048, 32, n1, W("aenc.pre.proj.w", size_t(32) * 2048), W("aenc.pre.proj.b", 32), xa);
+            matmul("aenc matmul", T, 2048, 32, n1, W("aenc.pre.proj.w", size_t(32) * 2048), W("aenc.pre.proj.b", 32), xa);
             layernorm(T, 2048, rows, W("aenc.pre.norm1.w", 2048), W("aenc.pre.norm1.b", 2048), n1);
-            matmul(T, 2048, 6144, n1, W("aenc.pre.qkv.w", size_t(6144) * 2048), W("aenc.pre.qkv.b", 6144), qkv);
+            matmul("aenc matmul", T, 2048, 6144, n1, W("aenc.pre.qkv.w", size_t(6144) * 2048), W("aenc.pre.qkv.b", 6144), qkv);
             { const std::string ns = "h3.attn_scores_f32."; auto k = comp_.get("attn_scores_f32", "h3_attn_scores_f32", {{ns + "heads", "8"}, {ns + "hd", "256"}, {ns + "scale", num(1.0 / 16.0)}});
               KernArgs a; a.i32(T).ptr(qkv).ptr(pattn); launch(*k, &prof, "aenc attention", unsigned((T + 255) / 256), 8, THREADS, a); }
             { const std::string ns = "h3.attn_pv_pool_f32."; auto k = comp_.get("attn_pv_pool_f32", "h3_attn_pv_pool_f32", {{ns + "heads", "8"}, {ns + "hd", "256"}, {ns + "pool", "8"}});
               KernArgs a; a.i32(T).ptr(qkv).ptr(pattn).ptr(pool); launch(*k, &prof, "aenc attention", unsigned(T), 1, 32, a); }
-            matmul(T, 32, 32, pool, W("aenc.pre.attn_proj.w", 32 * 32), W("aenc.pre.attn_proj.b", 32), xb);
+            matmul("aenc matmul", T, 32, 32, pool, W("aenc.pre.attn_proj.w", 32 * 32), W("aenc.pre.attn_proj.b", 32), xb);
             axpy(1.0f, 1.0f, size_t(T) * 32, xb, xa);                                                       // xa = proj + attn
             layernorm(T, 32, xa, W("aenc.pre.norm2.w", 32), W("aenc.pre.norm2.b", 32), xb);
             layernorm(T, 32, xb, W("aenc.pre.mlp.norm.w", 32), W("aenc.pre.mlp.norm.b", 32), xc);
-            matmul(T, 32, 64, xc, W("aenc.pre.mlp.w0.w", 64 * 32), W("aenc.pre.mlp.w0.b", 64), a0);
-            matmul(T, 32, 64, xc, W("aenc.pre.mlp.w1.w", 64 * 32), W("aenc.pre.mlp.w1.b", 64), a1);
+            matmul("aenc matmul", T, 32, 64, xc, W("aenc.pre.mlp.w0.w", 64 * 32), W("aenc.pre.mlp.w0.b", 64), a0);
+            matmul("aenc matmul", T, 32, 64, xc, W("aenc.pre.mlp.w1.w", 64 * 32), W("aenc.pre.mlp.w1.b", 64), a1);
             { auto k = comp_.get("geglu_tanh_f32", "h3_geglu_tanh_f32", {}); KernArgs a; a.i32(T * 64).ptr(a0).ptr(a1).ptr(g); launch(*k, &prof, "aenc geglu", unsigned((T * 64 + 255) / 256), 1, THREADS, a); }
-            matmul(T, 64, 32, g, W("aenc.pre.mlp.w2.w", 32 * 64), W("aenc.pre.mlp.w2.b", 32), xb);
+            matmul("aenc matmul", T, 64, 32, g, W("aenc.pre.mlp.w2.w", 32 * 64), W("aenc.pre.mlp.w2.b", 32), xb);
             axpy(1.0f, 1.0f, size_t(T) * 32, xb, xa);                                                       // xa += mlp
-            matmul(T, 32, 32, xa, W("aenc.mean_proj.w", 32 * 32), W("aenc.mean_proj.b", 32), xc);
+            matmul("aenc matmul", T, 32, 32, xa, W("aenc.mean_proj.w", 32 * 32), W("aenc.mean_proj.b", 32), xc);
             rt().d2h(zrow.data(), xc, size_t(T) * 32 * 4);
             for (int t = 0; t < T; ++t) for (int c = 0; c < 32; ++c) out[(size_t(ch) * 32 + c) * T + t] = (zrow[size_t(t) * 32 + c] - mean_h[c]) / std_h[c];
         }
@@ -1314,6 +1507,7 @@ public:
             ah_ = memory_.alloc(cap * 4); aacc_ = memory_.alloc(cap * 4); ahj_ = memory_.alloc(cap * 4); ar_ = memory_.alloc(cap * 4); ar2_ = memory_.alloc(cap * 4);
             atmp_ = memory_.alloc(cap * 8); ain_ = memory_.alloc(size_t(32) * T * 4 + 4096); audio_cap_ = cap;
         }
+        if (!glue_.is_open()) { glue_.open(glue_dir_); embed_ = glue_.span("te.embed"); }
         std::vector<float> lmean = glue_.host_f32("audio.latents_mean", 32), lstd = glue_.host_f32("audio.latents_std", 32);
         std::vector<float> in(size_t(32) * T), out(L_out);
         for (int ch = 0; ch < 2; ++ch) {
@@ -1357,10 +1551,11 @@ public:
     // one clip: model-space latents z [24][ft][h][w] (already * std + mean) -> ImageNet-space frames [3][ft*4][h*16][w*16]
     void decode_clip(const float *z, int ft, int h, int w, std::vector<float> &frames) {
         const size_t N = size_t(ft) * h * w, NT = N + VAE_REG + 1;
-        if (!vae_blob_.is_open()) { if (vae_dir_.empty()) throw std::invalid_argument("vae_dir is required for video decoding"); vae_blob_.open(vae_dir_); }
+        if (!vae_blob_.is_open()) vae_blob_.open(vae_dir_);
+        if (!glue_.is_open()) { glue_.open(glue_dir_); embed_ = glue_.span("te.embed"); }
         if (!vae_ || !vae_grid_.matches(ft, h, w)) {
             vae_grid_ = {};
-            vae_.reset(); vae_ = std::make_unique<Stack>(comp_, StackDims{VAE_HID, VAE_HEADS, VAE_HEADS, VAE_D, VAE_FFN, 48, 1, vae_bits_, 1e-5f, true, false, false}, NT, 36, vae_blob_, "blocks.%d.", false, (const float *)ones_);
+            vae_.reset(); vae_ = std::make_unique<Stack>(comp_, StackDims{VAE_HID, VAE_HEADS, VAE_HEADS, VAE_D, VAE_FFN, 48, 1, 8, 1e-5f, true, false, false}, NT, 36, vae_blob_, "blocks.%d.", false, (const float *)ones_, "vae");
             for (void **q : {&vx_, &vcos_, &vsin_, &vin16_, &va_q_, &va_s_, &vout16_, &vcls_}) { if (*q) memory_.free(*q); *q = nullptr; }
             const size_t T = vae_->capacity();
             vx_ = memory_.alloc(T * VAE_HID * 4); rt().memset(vx_, 0, T * VAE_HID * 4);
@@ -1377,8 +1572,8 @@ public:
                     const double pos = 2.0 * ((idx[ax] + 0.5) / sizes[ax]) - 1.0, inv = std::pow(100.0, -double(j) * 6.0 / 48.0), ang = 2.0 * M_PI * pos * inv;
                     c[r * VAE_ROPE_HALF + ax * 8 + j] = float(std::cos(ang)); s[r * VAE_ROPE_HALF + ax * 8 + j] = float(std::sin(ang)); } }
             rt().h2d(vcos_, c.data(), c.size() * 4); rt().h2d(vsin_, s.data(), s.size() * 4);
-            vproj_in_prep_.build(comp_, "plain", 8, KPAD); vproj_in_.build(comp_, "resid", 8, true, true, KPAD, VAE_HID, N, 1);
-            vnorm_out_.build(comp_, "lnorm", 8, VAE_HID, 1e-5f, 1); vproj_out_.build(comp_, "plain", 8, true, true, VAE_HID, VAE_OUT, NT);
+            vproj_in_prep_.build(comp_, "plain", "i8", KPAD); vproj_in_.build(comp_, "resid", "i8", true, true, KPAD, VAE_HID, N, 1);
+            vnorm_out_.build(comp_, "lnorm", "i8", VAE_HID, 1e-5f, 1); vproj_out_.build(comp_, "plain", "i8", true, true, VAE_HID, VAE_OUT, NT);
             if (!vnorm_table_) { vnorm_table_ = memory_.alloc(size_t(2) * VAE_HID * 4); rt().memset(vnorm_table_, 0, size_t(VAE_HID) * 4);
                 rt().d2d(((float *)vnorm_table_ + VAE_HID), glue_.at("vae.norm_out.b", size_t(VAE_HID) * 4), size_t(VAE_HID) * 4); }
         }
@@ -1447,6 +1642,7 @@ public:
         const h3pipe_shape sh = shape_or_throw(p);
         const int T = sh.latent_t, H = sh.lat_h, W = sh.lat_w, F = sh.frames;
         const size_t FH = size_t(H) * VAE_PS, FW = size_t(W) * VAE_PS, plane = FH * FW;
+        if (!glue_.is_open()) { glue_.open(glue_dir_); embed_ = glue_.span("te.embed"); }
         std::vector<float> lmean = glue_.host_f32("vae.latents_mean", 24), lstd = glue_.host_f32("vae.latents_std", 24);
         const int num_tokens = T + VAE_TOKEN_DROP, pad_tokens = ((-num_tokens) % VAE_CHUNK + VAE_CHUNK) % VAE_CHUNK, num_chunks = decoder_chunks(T, pad_tokens);
         const int Tp = T + pad_tokens;
@@ -1501,7 +1697,8 @@ public:
 
 private:
     Compiler comp_;
-    Blob glue_, blocks_, te_blob_; Span embed_; std::string te_dir_, vae_dir_, blocks_dir_; bool conditioning_ready_ = false, te_ready_ = false, refiner_ready_ = false; int vae_bits_ = 8;
+    Weights dit_w_; std::string dit_file_, te_file_, video_vae_file_, audio_vae_file_;
+    Blob glue_, te_blob_; Span embed_; std::string glue_dir_, te_dir_, vae_dir_; bool conditioning_ready_ = false, te_ready_ = false, refiner_ready_ = false;
     std::vector<float> curve_, inv_freq_, final_w_, final_b_; std::vector<std::vector<float>> adaln_w_, adaln_b_;
     std::unique_ptr<Stack> te_, refiner_, dit_, vae_; Blob vae_blob_;
     DecoderGrid vae_grid_;
@@ -1510,14 +1707,14 @@ private:
     double cache_acc_ = 0.0; bool have_cache_ = false; int cache_skipped_ = 0;
     size_t audio_cap_ = 0; void *ah_ = nullptr, *aacc_ = nullptr, *ahj_ = nullptr, *ar_ = nullptr, *ar2_ = nullptr, *atmp_ = nullptr, *ain_ = nullptr;
     void *vx_ = nullptr, *vcos_ = nullptr, *vsin_ = nullptr, *vin16_ = nullptr, *va_q_ = nullptr, *va_s_ = nullptr, *vout16_ = nullptr, *vcls_ = nullptr, *vnorm_table_ = nullptr;
-    std::map<std::string, Prepare> prepares_; std::map<std::string, Gemm> gemms_; Prepare final_prep_;
+    std::shared_ptr<Kernel> final_norm_;
     Blob aenc_; bool aenc_open_ = false; std::string aenc_dir_;
     Blob vision_; bool vision_open_ = false; std::string vision_dir_; std::string te_span_sig_; void *ds_buf_ = nullptr;
-    Blob venc_; bool venc_open_ = false; std::string venc_dir_; int attn_qk_bits_ = 4;
+    Blob venc_; bool venc_open_ = false; std::string venc_dir_; int attn_qk_bits_ = 8;
     std::shared_ptr<Kernel> norm_f32_;
     size_t seq_cap_ = 0;
     void *ones_ = nullptr, *zeros_ = nullptr, *mods_ = nullptr, *final_table_ = nullptr, *x_ = nullptr, *cls_ = nullptr, *cls0_ = nullptr, *tcls_ = nullptr, *cos_ = nullptr, *sin_ = nullptr,
-         *in16_ = nullptr, *a_q_ = nullptr, *a_s_ = nullptr, *out16_ = nullptr, *text_copy_ = nullptr, *ref_cos_ = nullptr, *ref_sin_ = nullptr, *te_x_ = nullptr, *te_cos_ = nullptr, *te_sin_ = nullptr, *te_cls_ = nullptr;
+         *in32_ = nullptr, *out32_ = nullptr, *text_copy_ = nullptr, *ref_cos_ = nullptr, *ref_sin_ = nullptr, *te_x_ = nullptr, *te_cos_ = nullptr, *te_sin_ = nullptr, *te_cls_ = nullptr;
 };
 
 void write_error(char *error, size_t cap, const char *m) noexcept { if (error && cap) std::snprintf(error, cap, "%s", m ? m : "unknown error"); }

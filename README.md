@@ -51,54 +51,42 @@ Kernel-level, 56 heads x 128, measured in `docs/`:
   shape into `build/kernel_cache`.
 - **ffmpeg** for the `h3` command (input decoding, output muxing).
 - **Python 3 with NumPy** for the kernel generators and the CPU tier of the tests (`H3_PYTHON`);
-  **ROCm PyTorch, diffusers, transformers and safetensors** for exporting the weights and for the
-  GPU and reference tiers of the tests, whose float64 references are torch (`H3_REFERENCE_PYTHON`).
-  The clip itself never touches Python.
+  **ROCm PyTorch, diffusers and transformers** only for the GPU and reference tiers of the tests,
+  whose float64 references are torch (`H3_REFERENCE_PYTHON`). Generating a clip never touches
+  Python: the host reads the checkpoints itself.
 - Optional, for the toy ComfyUI comparison in the test suite: **podman** and the
   `docker.io/kyuz0/amd-strix-halo-comfyui` image (skipped when podman is absent).
 
 ## Weights
 
-Two downloads, then the exports. The DiT blocks and the int8 text encoder come from ComfyUI's
-int8 ConvRot checkpoints in [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3)
-(21 GB and 27 GB), the encoders' sources from the same repository; the VAEs, tokenizer and
-schedules come from the original [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3)
-release. Every tool takes its paths as options (`--ckpt`, `--te`, `--src`, `--out`); the defaults
-below are what the commands here produce.
+Four files from [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3), read as they
+are: no export step and no conversion at load. The DiT checkpoint's int8 ConvRot rows run on the
+int8 GEMMs with their stored scales; its bf16 token refiner and condition projection, and the
+whole vision tower, run on bf16 kernels; the video VAE's f16 and the audio VAE's f32 tensors run
+in their own types.
 
 ```sh
-scripts/download.sh                              # MiniMaxAI/MiniMax-H3: VAEs, tokenizer, schedules -> ~/h3-models (--all adds the bf16 originals)
 hf download Comfy-Org/MiniMax-H3 --local-dir ~/comfy-models \
     --include diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
               text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors \
               vae/minimax_h3_video_vae_fp16.safetensors vae/minimax_h3_audio_vae_fp32.safetensors
-python3 tools/export_weights.py --bits 8         # -> build/weights_i8       (the checkpoint's int8 rows)
-python3 tools/export_te.py                       # -> build/weights_te
-python3 tools/export_glue.py                     # -> build/weights_glue
-python3 tools/export_vae.py --bits 8             # -> build/weights_vae_i8
-python3 tools/export_vae_encoder.py              # -> build/weights_venc     (references, keyframes)
-python3 tools/export_vision.py                   # -> build/weights_vision   (reference images in the prompt)
-python3 tools/export_audio_encoder.py            # -> build/weights_aenc     (reference audio)
 ```
 
-| export | tool | on disk |
+| file | holds | on disk |
 | --- | --- | ---: |
-| DiT blocks, int8 rows: `build/weights_i8` | `tools/export_weights.py --bits 8` | 18 GB |
-| text encoder, int8: `build/weights_te` | `tools/export_te.py` | 23 GB |
-| conditioning tables, embedders, refiner, heads, audio decoder: `build/weights_glue` | `tools/export_glue.py` | 2.7 GB |
-| video VAE decoder, int8: `build/weights_vae_i8` | `tools/export_vae.py --bits 8` | 2.3 GB |
-| video VAE encoder, vision tower, audio encoder (references): `build/weights_venc`, `weights_vision`, `weights_aenc` | `tools/export_vae_encoder.py`, `tools/export_vision.py`, `tools/export_audio_encoder.py` | 2 GB |
-| ref2va blocks and glue (reference-conditioned clips): `build/weights_i8_ref2va`, `weights_glue_ref2va` | the two commands below | 21 GB |
+| `diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors` | the 50 DiT blocks, the token refiner, the embedders, the final layer, the AdaLN tables | 21 GB |
+| `text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors` | the text encoder's 50 layers, its embedding table, the vision tower | 27 GB |
+| `vae/minimax_h3_video_vae_fp16.safetensors` | the video VAE's decoder and encoder | 5.2 GB |
+| `vae/minimax_h3_audio_vae_fp32.safetensors` | the audio vocoder and encoder | 0.6 GB |
 
-Reference-conditioned clips (`h3 ref.jpg voice.wav ...`) run the ref2va checkpoint
-(`minimax_h3_ref2va_pruned_int8_convrot.safetensors` from the same repository); `h3` selects its
-exports whenever reference files are given and refuses to run references on the base checkpoint
-unless `--base-weights` says so:
+`h3 --models DIR` (or `$H3_MODELS`, default `~/comfy-models`) points at ComfyUI's models
+directory; `--dit`, `--te`, `--video-vae` and `--audio-vae` override one file each. Qwen's
+tokenizer is compiled into the library, so nothing else is downloaded.
 
-```sh
-python3 tools/export_weights.py --bits 8 --ckpt ~/comfy-models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors --out build/weights_i8_ref2va
-python3 tools/export_glue.py --ckpt ~/comfy-models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors --out build/weights_glue_ref2va
-```
+Reference-conditioned clips (`h3 ref.jpg voice.wav ...`) run the ref2va checkpoint,
+`diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors` from the same repository
+(21 GB). `h3` picks it whenever reference files are given, and refuses to run references on the
+base checkpoint unless `--base-weights` says so.
 
 The weights are under the MiniMax H3 Community License, which permits open-weight use in the USA,
 EU, UK and South Korea; other regions apply to MiniMax for a licence. Nothing in this repository is
@@ -136,8 +124,8 @@ of 32; frame counts snap to 17n + 5 (22, 39, ..., 124).
 (`h3pipe_loom.py`) with the same flags (`--ref-image`, `--ref-audio`, `--first-frame`,
 `--latents-out`, `--no-decode`).
 
-**From C.** `host/h3pipe.h` is the whole pipeline behind a C ABI: `h3pipe_create` (weight
-directories, kernel sources, cache, the `loom-compile` path), `h3tok_encode` (text to ids, the
+**From C.** `host/h3pipe.h` is the whole pipeline behind a C ABI: `h3pipe_create` (the four
+checkpoint files, kernel sources, cache, the `loom-compile` path), `h3tok_encode` (text to ids, the
 Qwen2 byte-level BPE in C), `h3pipe_encode_video` / `h3pipe_encode_audio` / `h3pipe_vision_embed`
 (references), `h3pipe_denoise` and `h3pipe_denoise_refs` (ids and references to model-space
 latents, with a progress callback), `h3pipe_decode_video` and `h3pipe_decode_audio`.
@@ -153,7 +141,8 @@ modes, their costs, and the pieces of this repository worth taking elsewhere.
 **Knobs.** `H3_PROFILE=1` prints per-stage times after every step; `H3_TRACE=1` prints and
 synchronises every launch; `--attn f16` restores f16 attention, `--attn i4` is a faster int4
 QK^T that ghosts keyframe and reference clips (do not use it for conditioned generation);
-`--base-weights` runs reference files on the base checkpoint when the ref2va exports are absent.
+`--base-weights` runs reference files on the base checkpoint when the ref2va one is absent;
+`--models`, `--dit`, `--te`, `--video-vae` and `--audio-vae` choose the checkpoints ($H3_MODELS).
 Unknown options, missing values and out-of-range numbers are errors, as are `--audio-only` with
 `--still` and `--no-decode` with either.
 
@@ -163,13 +152,13 @@ The gate is ComfyUI's own run of the same step, dumped from inside its image
 (`tools/comfy_clip.py --dump-blocks`, `tests/test_comfy_parity.py`): the residual stream after
 each block, video rows only, cosine against ComfyUI.
 
-| block | int8 rows, int8 QK^T attention (default) | int8 rows, f16 attention |
+| block | int8 QK^T attention (default) | f16 attention |
 | ---: | ---: | ---: |
 | 0 to 10 | 1.0000 | 1.0000 |
 | 20 | 0.9999 | 0.9999 |
-| 30 | 0.9988 | 0.9990 |
-| 40 | 0.9929 | 0.9935 |
-| 49 | 0.9991 | 0.9992 |
+| 30 | 0.9991 | 0.9992 |
+| 40 | 0.9942 | 0.9947 |
+| 49 | 0.9992 | 0.9993 |
 
 The 20-evaluation trajectory matches ComfyUI's to a relative error of 0.01 after five
 evaluations; the final latents end at a cosine of about 0.90, the same figure ComfyUI's own bf16
@@ -228,11 +217,12 @@ attention form.
 | --- | --- |
 | `host/` | the C++ host: `h3pipe.cpp` (the pipeline behind `h3pipe.h`), `h3_cli.cpp` (`h3`), `h3tok.cpp` (tokenizer), the text encoder, VAE and runtime bindings |
 | `kernels/` | the Loom kernels; `experiments/` the measured losers, kept with their numbers |
-| `tools/` | kernel generators (`gen_*.py`), weight exports (`export_*.py`, `gptq_export.py`), the Python driver, benches, the ComfyUI harness |
+| `tools/` | kernel generators (`gen_*.py`), weight exports (`export_*.py`, the reference tier's oracles), the Python driver, benches, the ComfyUI harness |
 | `tests/` | kernel tests against float64 references, host tests, the ComfyUI parity gate |
 | `reference/` | a NumPy/torch reference of the block stack and the VAE decoder |
 | `docs/` | `abi.md` (the C ABI contract), `tricks.md` (voice, sound, stills, reusable pieces), `notes.md` (every measured lever, won or lost), the attention and GEMM reports, the reference-conditioning plan |
 | `examples/` | the minimal client in C, Rust and Go |
+| `assets/` | Qwen's `tokenizer.json`, compiled into `libh3pipe.so` |
 | `scripts/` | `env.sh` (toolchain and runtime paths, all overridable), `build_host.sh`, `test.sh`, `test_host.sh`, `download.sh` |
 
 ## Tests

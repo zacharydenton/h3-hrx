@@ -46,8 +46,7 @@ func main() {
 	if uint32(C.h3pipe_abi_version()) != uint32(C.H3PIPE_ABI_VERSION) { fmt.Fprintln(os.Stderr, "libh3pipe ABI mismatch"); os.Exit(1) }
 
 	// text -> ids
-	tokPath := C.CString(home + "/h3-models/tokenizer/tokenizer.json"); defer C.free(unsafe.Pointer(tokPath))
-	tok := C.h3tok_create(tokPath, &err[0], C.size_t(len(err)))
+	tok := C.h3tok_create(nil, &err[0], C.size_t(len(err)))   // the tokenizer compiled into libh3pipe
 	if tok == nil { fail("tokenizer", err) }
 	prompt := C.CString(os.Args[1]); defer C.free(unsafe.Pointer(prompt))
 	ids := make([]C.int32_t, 4096)
@@ -59,8 +58,10 @@ func main() {
 	cs := func(s string) *C.char { return C.CString(s) }
 	loom := "loom-compile"
 	if v := os.Getenv("LOOM_COMPILE"); v != "" { loom = v }
-	cfg := C.h3pipe_config{glue_dir: cs(root + "/build/weights_glue"), blocks_dir: cs(root + "/build/weights_i8"), te_dir: cs(root + "/build/weights_te"), vae_dir: cs(root + "/build/weights_vae_i8"),
-		kernel_sources: cs(root + "/kernels"), cache_dir: cs(root + "/build/kernel_cache"), loom_compile: cs(loom), vae_bits: 8, attn_qk_bits: 8}
+	models := os.Getenv("H3_MODELS"); if models == "" { models = home + "/comfy-models" }
+	cfg := C.h3pipe_config{dit_file: cs(models + "/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"), te_file: cs(models + "/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
+		video_vae_file: cs(models + "/vae/minimax_h3_video_vae_fp16.safetensors"), audio_vae_file: cs(models + "/vae/minimax_h3_audio_vae_fp32.safetensors"),
+		kernel_sources: cs(root + "/kernels"), cache_dir: cs(root + "/build/kernel_cache"), loom_compile: cs(loom), attn_qk_bits: 8}
 	var s *C.h3pipe_session
 	if C.h3pipe_create(&cfg, &s, &err[0], C.size_t(len(err))) != 0 { fail("create", err) }
 

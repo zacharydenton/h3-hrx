@@ -1,6 +1,6 @@
 // The smallest complete client of libh3pipe: prompt -> frames + samples, written as <out>.rgb and <out>.wav.
 //   gcc -O2 -I../../host minimal.c -L../../build -lh3pipe -Wl,-rpath,$(cd ../../build && pwd) -o minimal
-//   ./minimal "A red fox ..." [frames] [steps] [out]        (run from the repository root, or set H3_ROOT)
+//   ./minimal "A red fox ..." [frames] [steps] [out]        (run from the repository root, or set H3_ROOT; models: $H3_MODELS or ~/comfy-models)
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,8 +22,8 @@ int main(int argc, char **argv) {
     char err[4096];
     if (h3pipe_abi_version() != H3PIPE_ABI_VERSION) { fprintf(stderr, "libh3pipe ABI %u, header %u\n", h3pipe_abi_version(), H3PIPE_ABI_VERSION); return 1; }
 
-    /* text -> ids */
-    h3tok *tok = h3tok_create(join(home, "h3-models/tokenizer/tokenizer.json"), err, sizeof err);
+    /* text -> ids (NULL: the tokenizer compiled into libh3pipe) */
+    h3tok *tok = h3tok_create(NULL, err, sizeof err);
     if (!tok) { fprintf(stderr, "tokenizer: %s\n", err); return 1; }
     int32_t ids[4096]; const int n_ids = h3tok_encode(tok, argv[1], ids, 4096);
     h3tok_destroy(tok);
@@ -31,8 +31,11 @@ int main(int argc, char **argv) {
 
     /* a session: weights resident, kernels compiled on first use into cache_dir */
     const char *loom = getenv("LOOM_COMPILE") ? getenv("LOOM_COMPILE") : "loom-compile";
-    h3pipe_config cfg = {join(root, "build/weights_glue"), join(root, "build/weights_i8"), join(root, "build/weights_te"), join(root, "build/weights_vae_i8"),
-                         join(root, "kernels"), join(root, "build/kernel_cache"), loom, 8, NULL, NULL, NULL, 8};
+    /* ComfyUI's models directory: the four checkpoints, read as they are */
+    const char *models = getenv("H3_MODELS") ? getenv("H3_MODELS") : join(home, "comfy-models");
+    h3pipe_config cfg = {join(models, "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"), join(models, "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
+                         join(models, "vae/minimax_h3_video_vae_fp16.safetensors"), join(models, "vae/minimax_h3_audio_vae_fp32.safetensors"),
+                         join(root, "kernels"), join(root, "build/kernel_cache"), loom, 8};
     h3pipe_session *s = NULL;
     if (h3pipe_create(&cfg, &s, err, sizeof err)) { fprintf(stderr, "create: %s\n", err); return 1; }
 

@@ -3,8 +3,9 @@
 The same program three times: prompt -> denoise -> decode -> `<out>.rgb` + `<out>.wav`, through
 `build/libh3pipe.so` and the C ABI in `host/h3pipe.h` (`docs/abi.md` is the contract). Build the
 host first (`scripts/build_host.sh`) and run from the repository root (or set `H3_ROOT`); the
-ROCm runtime comes from `scripts/env.sh`. All three produce byte-identical frames and audio for
-the same prompt and seed.
+checkpoints come from `$H3_MODELS` (default `~/comfy-models`, README "Weights") and the ROCm
+runtime from `scripts/env.sh`. All three produce byte-identical frames and audio for the same
+prompt and seed.
 
 | | build | run |
 | --- | --- | --- |

@@ -13,24 +13,22 @@ FPS, RATE = 24, 32000
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("prompt"); ap.add_argument("--height", type=int, default=480); ap.add_argument("--width", type=int, default=864)
     ap.add_argument("--frames", type=int, default=124); ap.add_argument("--steps", type=int, default=31, help="sigma grid points = evaluations + 1; 31 = 30 evaluations (ComfyUI's stock workflows use 21)"); ap.add_argument("--sampler", choices=["euler", "res_multistep"], default="res_multistep", help="res_multistep is the ComfyUI workflows' sampler"); ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--cache-threshold", type=float, default=0.0, help="first-block step cache threshold (0 = off)"); ap.add_argument("--vae-bits", type=int, default=8); ap.add_argument("--out", default=str(ROOT / "build/clip_c.mp4")); ap.add_argument("--latents-out", default=None); ap.add_argument("--no-decode", action="store_true", help="stop after denoising (timing runs)")
+    ap.add_argument("--cache-threshold", type=float, default=0.0, help="first-block step cache threshold (0 = off)"); ap.add_argument("--out", default=str(ROOT / "build/clip_c.mp4")); ap.add_argument("--latents-out", default=None); ap.add_argument("--no-decode", action="store_true", help="stop after denoising (timing runs)")
     ap.add_argument("--ref-image", action="append", default=[], help="reference image (png/jpg) for ref2va: presented as <Picture i> and encoded by the VAE encoder; repeatable")
     ap.add_argument("--ref-audio", action="append", default=[], help="reference wav (32 kHz stereo/mono) for ref2va: <Audio j>; repeatable")
     ap.add_argument("--first-frame", default=None, help="keyframe image for fl2va (resized to the canvas)")
-    ap.add_argument("--blocks", default=None, help="override the block weights directory"); ap.add_argument("--attn", choices=["f16", "i8", "i4"], default="i8", help="the DiT attention's QK^T operands (i8: the parity path; i4 ghosts keyframe/reference clips)"); ap.add_argument("--glue", default=None)
-    ap.add_argument("--base-weights", action="store_true", help="run reference files on the base checkpoint when the ref2va exports are absent (otherwise an error)")
+    ap.add_argument("--dit", default=None, help="the DiT checkpoint (default: the fl2va file under $H3_MODELS, or the ref2va one when references are given)")
+    ap.add_argument("--attn", choices=["f16", "i8", "i4"], default="i8", help="the DiT attention's QK^T operands (i8: the parity path; i4 ghosts keyframe/reference clips)")
+    ap.add_argument("--base-weights", action="store_true", help="run reference files on the base checkpoint when the ref2va one is absent (otherwise an error)")
     a = ap.parse_args()
     from h3tok_ids import encode_presentation
-    # reference runs take the ref2va checkpoint's exports (README, Weights: export_weights.py --ckpt <ref2va> --out build/weights_i8_ref2va, export_glue.py --ckpt <ref2va> --out build/weights_glue_ref2va)
-    wdir = "weights_i8"   # the checkpoint's int8 rows
+    from h3pipe_loom import DIT, REF2VA
     want_refs = bool(a.ref_image or a.ref_audio)
-    have_ref2va = (ROOT / f"build/{wdir}_ref2va/manifest.txt").exists() and (ROOT / "build/weights_glue_ref2va/manifest.txt").exists()
-    if want_refs and not have_ref2va and not a.base_weights and not (a.blocks and a.glue):
-        raise SystemExit(f"references need the ref2va exports, build/{wdir}_ref2va and build/weights_glue_ref2va (README, Weights); --base-weights runs the base checkpoint anyway, or give --blocks and --glue")
-    suffix = "_ref2va" if want_refs and have_ref2va and not a.base_weights else ""
-    blocks = a.blocks or str(ROOT / ("build/" + wdir + suffix)); attn = a.attn
-    glue = a.glue or (str(ROOT / "build/weights_glue_ref2va") if suffix else None)
-    t0 = time.time(); pipe = H3Pipe(vae_bits=a.vae_bits, blocks=blocks, glue=glue, attn=attn); print(f"session in {time.time() - t0:.1f} s ({os.path.basename(blocks)}, {attn} attention{', ref2va glue' if glue else ''})", flush=True)
+    if want_refs and not REF2VA.exists() and not a.base_weights and not a.dit:
+        raise SystemExit(f"references need the ref2va checkpoint, {REF2VA} (README, Weights); --base-weights runs the base checkpoint anyway, or give --dit")
+    dit = a.dit or str(REF2VA if want_refs and REF2VA.exists() and not a.base_weights else DIT)
+    attn = a.attn
+    t0 = time.time(); pipe = H3Pipe(dit=dit, attn=attn); print(f"session in {time.time() - t0:.1f} s ({os.path.basename(dit)}, {attn} attention)", flush=True)
     p = H3Pipe.params(height=a.height, width=a.width, frames=a.frames, steps=a.steps, seed=a.seed, cache_threshold=a.cache_threshold, sampler=a.sampler); sh = pipe.shape(p)
     print(f"{sh.frames} frames at {a.width}x{a.height}: {sh.latent_t}x{sh.lat_h}x{sh.lat_w} latents, {sh.audio_t} audio latents", flush=True)
     # references (ref2va) and the keyframe (fl2va): images resized as ComfyUI's nodes do, encoded by the Loom encoders

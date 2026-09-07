@@ -8,7 +8,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent; sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "tools"))
 from h3pipe_loom import H3Pipe
 ap = argparse.ArgumentParser(); ap.add_argument("--case", default="audio", help="t2va | audio | both | fl2va"); ap.add_argument("--own-encoders", action="store_true")
-ap.add_argument("--blocks", default=None); ap.add_argument("--glue", default=None)
+ap.add_argument("--dit", default=None, help="the DiT checkpoint (default: the ref2va file under $H3_MODELS)")
 ap.add_argument("--prompt", default="A red fox trotting through a snowy forest at dawn, cinematic, with the sound of <Audio 1>")
 a = ap.parse_args()
 T = ROOT / "build/ref_truth"; L = lambda n: np.load(T / f"{n}.npy")
@@ -23,7 +23,8 @@ ids = encode_presentation(a.prompt, images=[n_img] if img is not None else [], a
 ids_ref = np.concatenate([np.full(n_img, -1, np.int64) if v == -1 else np.array([v], np.int64) for v in ids_ref.tolist()])   # comfy keeps one entry per vision span
 ok_ids = np.array_equal(np.asarray(ids), ids_ref); print(f"presentation ids: ours {len(ids)} vs comfy {len(ids_ref)}: {'match' if ok_ids else 'DIFFER'}")
 if not ok_ids: print("  ours:", ids[:24], "\n  ref: ", ids_ref[:24].tolist())
-pipe = H3Pipe(blocks=a.blocks, glue=a.glue)
+from h3pipe_loom import REF2VA
+pipe = H3Pipe(dit=a.dit or str(REF2VA))
 nv, na = L(f"{a.case}_noise_video"), L(f"{a.case}_noise_audio")               # [24][T][H][W], [32][2][t] -> ours [2][32][t]
 na = np.transpose(na, (1, 0, 2))
 refs, kfs = [], []

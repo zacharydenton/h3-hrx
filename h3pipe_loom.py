@@ -8,14 +8,22 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent
-_ABI, _ERR = 6, 4096
+_ABI, _ERR = 7, 4096
 _F32P, _U8P, _I32P = ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_int32)
 PROGRESS = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_double)
 
 
 class Config(ctypes.Structure):
-    _fields_ = [("glue_dir", ctypes.c_char_p), ("blocks_dir", ctypes.c_char_p), ("te_dir", ctypes.c_char_p), ("vae_dir", ctypes.c_char_p),
-                ("kernel_sources", ctypes.c_char_p), ("cache_dir", ctypes.c_char_p), ("loom_compile", ctypes.c_char_p), ("vae_bits", ctypes.c_int), ("aenc_dir", ctypes.c_char_p), ("vision_dir", ctypes.c_char_p), ("venc_dir", ctypes.c_char_p), ("attn_qk_bits", ctypes.c_int)]
+    _fields_ = [("dit_file", ctypes.c_char_p), ("te_file", ctypes.c_char_p), ("video_vae_file", ctypes.c_char_p), ("audio_vae_file", ctypes.c_char_p),
+                ("kernel_sources", ctypes.c_char_p), ("cache_dir", ctypes.c_char_p), ("loom_compile", ctypes.c_char_p), ("attn_qk_bits", ctypes.c_int)]
+
+
+MODELS = Path(os.environ.get("H3_MODELS") or Path.home() / "comfy-models")   # ComfyUI's models directory: the four checkpoints, read as they are
+DIT = MODELS / "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+REF2VA = MODELS / "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+TE = MODELS / "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+VIDEO_VAE = MODELS / "vae/minimax_h3_video_vae_fp16.safetensors"
+AUDIO_VAE = MODELS / "vae/minimax_h3_audio_vae_fp32.safetensors"
 
 
 class Ref(ctypes.Structure):
@@ -62,8 +70,9 @@ def default_loom_compile() -> str:
 
 
 class H3Pipe:
-    def __init__(self, glue=None, blocks=None, te=None, vae=None, vae_bits=8, cache=None, library=None, aenc=None, vision=None, venc=None, attn="i8"):
-        """blocks: build/weights_i8 (the checkpoint's int8 rows; the default, as h3 and the examples); attn: "f16", "i8" (the parity path) or "i4" QK^T (int4 ghosts conditioned clips, docs/notes.md)."""
+    def __init__(self, dit=None, te=None, video_vae=None, audio_vae=None, cache=None, library=None, attn="i8"):
+        """The four ComfyUI checkpoints as they are (h3pipe_loom.DIT / REF2VA / TE / VIDEO_VAE / AUDIO_VAE are the defaults under
+        $H3_MODELS or ~/comfy-models); attn: the DiT attention's QK^T operands, "f16", "i8" (the parity path) or "i4" (int4 ghosts conditioned clips, docs/notes.md)."""
         native = ctypes.CDLL(str(library or os.environ.get("H3PIPE_LIB") or ROOT / "build/libh3pipe.so"))   # H3PIPE_LIB=build/libh3pipe_hrx.so: the libhrx build
         native.h3pipe_abi_version.restype = ctypes.c_uint32
         if native.h3pipe_abi_version() != _ABI: raise H3PipeError("ABI mismatch; rebuild with scripts/build_host.sh")
@@ -79,10 +88,8 @@ class H3Pipe:
         native.h3pipe_vision_embed.argtypes = [ctypes.c_void_p, _F32P, ctypes.c_int, ctypes.c_int, _F32P, ctypes.c_size_t, _F32P, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_size_t]
         native.h3pipe_encode_audio.argtypes = [ctypes.c_void_p, _F32P, ctypes.c_int, _F32P, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_size_t]
         self._native = native
-        cfg = Config(os.fsencode(glue or ROOT / "build/weights_glue"), os.fsencode(blocks or ROOT / "build/weights_i8"), os.fsencode(te or ROOT / "build/weights_te"),
-                     os.fsencode(vae or ROOT / ("build/weights_vae_i8" if vae_bits == 8 else "build/weights_vae_gptq")), os.fsencode(ROOT / "kernels"),
-                     os.fsencode(cache or ROOT / "build/kernel_cache"), os.fsencode(default_loom_compile()), vae_bits, os.fsencode(aenc or ROOT / "build/weights_aenc"), os.fsencode(vision or ROOT / "build/weights_vision"), os.fsencode(venc or ROOT / "build/weights_venc"), {"i4": 4, "i8": 8, "f16": 16}[attn])
-        if vae_bits not in (4, 8): raise ValueError("vae_bits must be 4 or 8")
+        cfg = Config(os.fsencode(dit or DIT), os.fsencode(te or TE), os.fsencode(video_vae or VIDEO_VAE), os.fsencode(audio_vae or AUDIO_VAE),
+                     os.fsencode(ROOT / "kernels"), os.fsencode(cache or ROOT / "build/kernel_cache"), os.fsencode(default_loom_compile()), {"i4": 4, "i8": 8, "f16": 16}[attn])
         handle = ctypes.c_void_p(); err = ctypes.create_string_buffer(_ERR)
         if native.h3pipe_create(ctypes.byref(cfg), ctypes.byref(handle), err, _ERR): raise H3PipeError(err.value.decode())
         self._handle = handle

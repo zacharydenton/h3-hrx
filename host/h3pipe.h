@@ -11,23 +11,19 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define H3PIPE_ABI_VERSION 6u
+#define H3PIPE_ABI_VERSION 7u
 enum { H3PIPE_OK = 0, H3PIPE_ERROR = 1, H3PIPE_CANCELLED = 2, H3PIPE_INVALID_ARGUMENT = 64 };
 typedef struct h3pipe_session h3pipe_session;
 
 typedef struct {
-    const char *glue_dir;        // tools/export_glue.py: conditioning tables, embedders, refiner, VAE heads, audio decoder, embedding table
-    const char *blocks_dir;      // tools/gptq_export.py (int4 GPTQ) or tools/export_weights.py: the 50 DiT blocks
-    const char *te_dir;          // tools/export_te.py: the text encoder's 50 layers (int8)
-    const char *vae_dir;         // tools/export_vae.py --bits 8 (or gptq_export_vae.py with vae_bits 4): the video decoder's 36 blocks
+    const char *dit_file;        // ComfyUI's minimax_h3_{fl2va,ref2va}_pruned_int8_convrot.safetensors (Comfy-Org/MiniMax-H3), read as it is; NULL -> denoise unavailable
+    const char *te_file;         // qwen3vl_32b_minimax_h3_int8_convrot.safetensors: the text encoder's layers, its embedding table, the vision tower
+    const char *video_vae_file;  // minimax_h3_video_vae_fp16.safetensors: the video decoder and encoder
+    const char *audio_vae_file;  // minimax_h3_audio_vae_fp32.safetensors: the vocoder and the audio encoder
     const char *kernel_sources;  // the repo's kernels/ directory (.loom files)
     const char *cache_dir;       // where compiled .hsaco files live (created)
     const char *loom_compile;    // path to the loom-compile binary
-    int vae_bits;                // 8 or 4, matching vae_dir
-    const char *aenc_dir;        // tools/export_audio_encoder.py: the audio VAE's encoder (reference audio); NULL -> h3pipe_encode_audio unavailable
-    const char *vision_dir;      // tools/export_vision.py: Qwen3-VL's vision tower (reference images in the prompt); NULL -> unavailable
-    const char *venc_dir;        // tools/export_vae_encoder.py: the video VAE's encoder (reference images/videos, keyframes); NULL -> unavailable
-    int attn_qk_bits;            // the DiT attention's QK^T: 16 (f16), 8 (int8 operands: parity quality, less operand traffic) or 4 (int4, ghosts conditioned clips); 0 -> 4. blocks_dir's width (int4 or int8 rows) is read from its manifest
+    int attn_qk_bits;            // the DiT attention's QK^T operands: 16 (f16), 8 (int8: the parity path, less operand traffic) or 4 (int4, ghosts conditioned clips); 0 -> 8
 } h3pipe_config;
 
 typedef struct {

@@ -22,24 +22,26 @@ def run(args) -> list:
 
 def main() -> int:
     require = "--require" in sys.argv[1:] or os.environ.get("H3_REQUIRE_PARITY") == "1"
-    missing = [str(f) for f in (ROOT / "build/comfy_t2va_blocks/blocks/blk_49.npy", ROOT / "build/comfy_fl2va/x_19.npy", ROOT / "build/weights_i8/manifest.txt") if not f.exists()]
+    sys.path.insert(0, str(ROOT))
+    from h3pipe_loom import DIT
+    missing = [str(f) for f in (ROOT / "build/comfy_t2va_blocks/blocks/blk_49.npy", ROOT / "build/comfy_fl2va/x_19.npy", DIT) if not f.exists()]
     if missing:
-        print(f"{'FAIL' if require else 'SKIP'}: missing {', '.join(missing)} (tools/comfy_clip.py --dump-steps --dump-blocks 0,1,2,5,10,20,30,40,49 --steps 2 --out build/comfy_t2va_blocks; tools/export_weights.py --bits 8)")
+        print(f"{'FAIL' if require else 'SKIP'}: missing {', '.join(missing)} (tools/comfy_clip.py --dump-steps --dump-blocks 0,1,2,5,10,20,30,40,49 --steps 2 --out build/comfy_t2va_blocks; README, Weights)")
         return 1 if require else 0
     ok = True
-    cases = [("build/comfy_t2va_blocks", "build/weights_i8", "f16"), ("build/comfy_t2va_blocks", "build/weights_i8", "i8")]   # int8 QK^T operands are the parity path too
-    for truth, blocks, attn in cases:
-        lines = run(["--case", "t2va", "--mode", "blocks", "--truth", truth, "--blocks", blocks, "--attn", attn])
+    cases = [("build/comfy_t2va_blocks", "f16"), ("build/comfy_t2va_blocks", "i8")]   # int8 QK^T operands are the parity path too
+    for truth, attn in cases:
+        lines = run(["--case", "t2va", "--mode", "blocks", "--truth", truth, "--attn", attn])
         if lines is None: ok = False; continue
         seen = set()
         for line in lines:
             if line.startswith("blk_"):
                 blk = int(line.split(":")[0][4:]); video = float(line.split("video ")[1].rstrip("]")); seen.add(blk)
                 good = video >= (0.999 if blk <= 20 else 0.99)   # measured 0.9990 / 0.9988 at block 30 (f16 / int8), 0.9935 at 40, 0.9992 at 49
-                ok &= good; print(f"  {'PASS' if good else 'FAIL'} {Path(blocks).name} + {attn} attention {line.split(':')[0]} video rows {video:.4f}")
+                ok &= good; print(f"  {'PASS' if good else 'FAIL'} the checkpoint's int8 rows + {attn} attention {line.split(':')[0]} video rows {video:.4f}")
         absent = [b for b in REQUIRED_BLOCKS if b not in seen]
-        if absent: ok = False; print(f"  FAIL {Path(blocks).name} + {attn} attention: no result for blocks {absent}")
-    lines = run(["--case", "fl2va", "--mode", "trajectory", "--truth", "build/comfy_fl2va", "--blocks", "build/weights_i8", "--attn", "f16"])
+        if absent: ok = False; print(f"  FAIL {attn} attention: no result for blocks {absent}")
+    lines = run(["--case", "fl2va", "--mode", "trajectory", "--truth", "build/comfy_fl2va", "--attn", "f16"])
     if lines is None: ok = False
     else:
         x05 = [line for line in lines if line.startswith("x_05")]

@@ -60,9 +60,9 @@ if [ "$tier" = full ]; then
     step "audio encoder vs ComfyUI" ref tests/test_audio_encoder.py
     step "vision tower vs ComfyUI" ref tests/test_vision.py
     step "video VAE encoder vs ComfyUI" ref tests/test_vae_encoder.py
-    if [ -f build/weights_i8_ref2va/manifest.txt ] && [ -f build/weights_glue_ref2va/manifest.txt ]; then
-    step "ref2va step vs ComfyUI (the ref2va int8 exports)" ref tests/test_ref2va.py --blocks build/weights_i8_ref2va --glue build/weights_glue_ref2va
-    else skip "ref2va step vs ComfyUI" "no build/weights_i8_ref2va and build/weights_glue_ref2va (README, Weights)"; fi
+    if [ -f "${H3_MODELS:-$HOME/comfy-models}/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors" ]; then
+    step "ref2va step vs ComfyUI (the ref2va checkpoint)" ref tests/test_ref2va.py
+    else skip "ref2va step vs ComfyUI" "no ref2va checkpoint (README, Weights)"; fi
   else skip "encoder and ref2va checks vs ComfyUI" "no build/ref_truth (tools/ref_truth_comfy.py)"; fi
   step "C host vs ComfyUI's own run (int8 rows + f16 attention)" ref tests/test_comfy_parity.py
 fi
