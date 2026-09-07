@@ -1,6 +1,7 @@
 """attention_mha_lds_f16_wmma vs torch SDPA: 56 heads of 128, contiguous q/k/v [tokens][7168],
 one workgroup of four query tiles per head."""
 import math
+import argparse
 import sys
 from pathlib import Path
 
@@ -23,7 +24,8 @@ NS, SYM = "h3." + STEM, "h3_" + STEM
 
 
 def capacity_for(tokens: int) -> int:
-    return max((tokens + 16 + 31) // 32 * 32, (tokens + 16 * WAVES - 1) // (16 * WAVES) * (16 * WAVES))
+    query_block = 16 * WAVES
+    return max((tokens + 16 + 31) // 32 * 32, (tokens + query_block - 1) // query_block * query_block)
 
 
 def run(tmp: Path, tokens: int, heads=HEADS) -> bool:
@@ -34,12 +36,19 @@ def run(tmp: Path, tokens: int, heads=HEADS) -> bool:
     want = torch.nn.functional.scaled_dot_product_attention(qf.transpose(0, 1)[None], kf.transpose(0, 1)[None], vf.transpose(0, 1)[None], is_causal=GQA == 8, enable_gqa=True)[0].transpose(0, 1).reshape(tokens, heads * D).cpu().numpy()
     capacity = capacity_for(tokens)
     def pad(t):
-        out = np.zeros((capacity, t.shape[1] * D), np.float16); out[:tokens] = t.reshape(tokens, -1).numpy(); return out
+        out = np.zeros((capacity, t.shape[1] * D), np.float16)
+        out[:tokens] = t.reshape(tokens, -1).numpy()
+        if STEM == "attention_mha64hm32_lds_f16_wmma":
+            out = out.reshape(capacity, t.shape[1], D).transpose(1, 0, 2).copy()
+        return out
     hs = tmp / f"{STEM}_{heads}.hsaco"
     cfg = {f"{NS}.q_stride": heads * D, f"{NS}.kv_stride": kv_heads * D, f"{NS}.tokens": tokens, f"{NS}.token_capacity": capacity,
            f"{NS}.scale": 1.0 / math.sqrt(D), f"{NS}.out_stride": heads * D}
-    compile_kernel(ROOT / "kernels" / f"{STEM}.loom", SYM, cfg, hs)
-    grid = ((tokens + 15) // 16, kv_heads, 1) if GQA == 8 else ((tokens + 16 * WAVES - 1) // (16 * WAVES), heads, 1)
+    source = ROOT / "kernels" / f"{STEM}.loom"
+    if not source.exists(): source = ROOT / "experiments" / f"{STEM}.loom"
+    compile_kernel(source, SYM, cfg, hs)
+    query_block = 16 * WAVES
+    grid = ((tokens + 15) // 16, kv_heads, 1) if GQA == 8 else ((tokens + query_block - 1) // query_block, heads, 1)
     (out,), t = launch(hs, SYM, grid, (32 * WAVES, 1, 1),
                        [("i32", tokens), ("i32", kv_heads), ("in_f16", pad(q)), ("in_f16", pad(k)), ("in_f16", pad(v)),
                         ("out_f16", ((tokens, heads * D), np.float16))], tmp, repeat=3)
@@ -48,10 +57,14 @@ def run(tmp: Path, tokens: int, heads=HEADS) -> bool:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tokens", type=int, nargs="+")
+    args = parser.parse_args()
+    if args.tokens and any(n < 1 or n > 65536 for n in args.tokens): parser.error("tokens must be 1..65536")
     ok = True
     with workdir() as tmp:
         tmp = Path(tmp)
-        for tokens in ((13, 28, 100, 512, 1000) if GQA == 8 else (13, 100, 1000, 5504)):
+        for tokens in (args.tokens or ((13, 28, 100, 512, 1000) if GQA == 8 else (13, 100, 1000, 5504))):
             ok &= run(tmp, tokens)
     return 0 if ok else 1
 

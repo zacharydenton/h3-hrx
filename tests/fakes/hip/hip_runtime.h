@@ -8,6 +8,7 @@ using hipError_t = int;
 using hipDeviceptr_t = void *;
 using hipModule_t = void *;
 using hipFunction_t = void *;
+using hipEvent_t = void *;
 constexpr hipError_t hipSuccess = 0;
 #define HIP_LAUNCH_PARAM_BUFFER_POINTER ((void *)1)
 #define HIP_LAUNCH_PARAM_BUFFER_SIZE ((void *)2)
@@ -17,8 +18,10 @@ inline bool fake_copy_failure = false;
 inline int fake_allocation_count = 0;
 inline bool fake_module_load_failure = true, fake_symbol_failure = true;
 inline std::unordered_set<void *> fake_modules;
+inline int fake_init_count = 0;
+inline hipError_t (*fake_launch_hook)(void **) = nullptr;
 inline const char *hipGetErrorString(hipError_t) { return "injected HIP failure"; }
-inline hipError_t hipInit(unsigned) { return hipSuccess; }
+inline hipError_t hipInit(unsigned) { ++fake_init_count; return hipSuccess; }
 inline hipError_t hipMalloc(void **p, size_t n) {
     if (n > 1024 * 1024) return 1;       // tests cannot accidentally allocate a model
     *p = std::malloc(n ? n : 1);
@@ -50,4 +53,12 @@ inline hipError_t hipModuleUnload(hipModule_t module) {
     if (!fake_modules.erase(module)) std::abort();
     std::free(module); return hipSuccess;
 }
-inline hipError_t hipModuleLaunchKernel(...) { return 1; }
+inline hipError_t hipModuleLaunchKernel(hipFunction_t, unsigned, unsigned, unsigned,
+                                       unsigned, unsigned, unsigned, unsigned,
+                                       void *, void **, void **extra) {
+    return fake_launch_hook ? fake_launch_hook(extra) : 1;
+}
+inline hipError_t hipEventCreate(hipEvent_t *event) { *event = std::malloc(1); return *event ? hipSuccess : 1; }
+inline hipError_t hipEventDestroy(hipEvent_t event) { std::free(event); return hipSuccess; }
+inline hipError_t hipEventRecord(hipEvent_t, void *) { return hipSuccess; }
+inline hipError_t hipEventElapsedTime(float *ms, hipEvent_t, hipEvent_t) { *ms = 1.0f; return hipSuccess; }

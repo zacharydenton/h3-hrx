@@ -6,6 +6,9 @@
 //
 //   loomrun --hsaco k.hsaco --kernel name --grid 201 --block 256 \
 //           --i32 201 --in x.bin --in gamma.bin --in beta.bin --out y.bin:308736
+// --rotate-input INDEX:COUNT uses COUNT separately allocated copies of one input
+// (zero-based ABI argument index), cycling addresses between timed launches.
+// This measures streaming weight traffic instead of repeatedly hitting one matrix.
 //
 // Built against real ROCm HIP on purpose: it keeps "is the kernel correct"
 // independent of whether the HRX runtime is behaving.
@@ -63,6 +66,7 @@ int main(int argc, char **argv) {
     unsigned grid[3] = {1, 1, 1}, block[3] = {1, 1, 1};
     arg_t args[MAX_ARGS]; int arg_count = 0;
     int repeat = 1, verbose = 0;
+    int rotate_arg = -1, rotate_count = 0;
 
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
@@ -76,6 +80,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--grid"))   sscanf(NEXT(), "%u,%u,%u", &grid[0], &grid[1], &grid[2]);
         else if (!strcmp(a, "--block"))  sscanf(NEXT(), "%u,%u,%u", &block[0], &block[1], &block[2]);
         else if (!strcmp(a, "--repeat")) repeat = atoi(NEXT());
+        else if (!strcmp(a, "--rotate-input")) {
+            char trailing;
+            if (sscanf(NEXT(), "%d:%d%c", &rotate_arg, &rotate_count, &trailing) != 2 ||
+                rotate_arg < 0 || rotate_count < 2 || rotate_count > 64) {
+                fprintf(stderr, "--rotate-input wants INDEX:COUNT (COUNT 2..64)\n"); return 64;
+            }
+        }
         else if (!strcmp(a, "--verbose")) verbose = 1;
         else if (!strcmp(a, "--i32")) {
             args[SLOT()].kind = ARG_I32;
@@ -109,6 +120,10 @@ int main(int argc, char **argv) {
         } else { fprintf(stderr, "unknown option %s\n", a); return 64; }
     }
     if (!hsaco || !kernel) { fprintf(stderr, "need --hsaco and --kernel\n"); return 64; }
+    if (repeat < 1) { fprintf(stderr, "--repeat must be positive\n"); return 64; }
+    if (rotate_count && (rotate_arg >= arg_count || args[rotate_arg].kind != ARG_BUFFER || args[rotate_arg].is_output)) {
+        fprintf(stderr, "--rotate-input must name an --in buffer argument\n"); return 64;
+    }
 
     HIP_CHECK(hipInit(0));
     hipModule_t module;
@@ -118,6 +133,7 @@ int main(int argc, char **argv) {
 
     unsigned char kernarg[512] = {0};
     size_t kernarg_size = 0;
+    size_t rotate_offset = 0;
     for (int i = 0; i < arg_count; ++i) {
         arg_t *arg = &args[i];
         if (arg->kind == ARG_I32) {
@@ -137,7 +153,18 @@ int main(int argc, char **argv) {
                 free(host);
             }
             kernarg_size = kernarg_append(kernarg, kernarg_size, &arg->device_ptr, 8, 8);
+            if (i == rotate_arg) rotate_offset = kernarg_size - 8;
         }
+    }
+    void *rotated[64] = {};
+    if (rotate_count) {
+        const arg_t &arg = args[rotate_arg];
+        rotated[0] = arg.device_ptr;
+        for (int i = 1; i < rotate_count; ++i) {
+            HIP_CHECK(hipMalloc(&rotated[i], arg.bytes ? arg.bytes : 4));
+            HIP_CHECK(hipMemcpyDtoD((hipDeviceptr_t)rotated[i], (hipDeviceptr_t)arg.device_ptr, arg.bytes));
+        }
+        HIP_CHECK(hipDeviceSynchronize());
     }
     if (verbose) fprintf(stderr, "kernarg_size=%zu grid=%u,%u,%u block=%u,%u,%u\n",
                          kernarg_size, grid[0], grid[1], grid[2], block[0], block[1], block[2]);
@@ -157,6 +184,10 @@ int main(int argc, char **argv) {
     }
     HIP_CHECK(hipEventRecord(start, NULL));
     for (int r = 0; r < repeat; ++r) {
+        if (rotate_count) {
+            const int slot = (r + (repeat > 1 ? 1 : 0)) % rotate_count;
+            memcpy(kernarg + rotate_offset, &rotated[slot], 8);
+        }
         HIP_CHECK(hipModuleLaunchKernel(function, grid[0], grid[1], grid[2],
                                         block[0], block[1], block[2], 0, NULL, NULL, config));
     }
@@ -164,8 +195,8 @@ int main(int argc, char **argv) {
     HIP_CHECK(hipDeviceSynchronize());
     float elapsed_ms = 0.0f;
     HIP_CHECK(hipEventElapsedTime(&elapsed_ms, start, stop));
-    printf("{\"launches\": %d, \"total_ms\": %.6f, \"per_launch_us\": %.3f}\n",
-           repeat, elapsed_ms, 1000.0 * elapsed_ms / repeat);
+    printf("{\"launches\": %d, \"total_ms\": %.6f, \"per_launch_us\": %.3f, \"input_copies\": %d}\n",
+           repeat, elapsed_ms, 1000.0 * elapsed_ms / repeat, rotate_count ? rotate_count : 1);
 
     for (int i = 0; i < arg_count; ++i) {
         arg_t *arg = &args[i];
@@ -179,5 +210,8 @@ int main(int argc, char **argv) {
     }
     for (int i = 0; i < arg_count; ++i)
         if (args[i].kind == ARG_BUFFER) (void)hipFree(args[i].device_ptr);
+    for (int i = 1; i < rotate_count; ++i) (void)hipFree(rotated[i]);
+    (void)hipEventDestroy(start); (void)hipEventDestroy(stop);
+    (void)hipModuleUnload(module);
     return 0;
 }

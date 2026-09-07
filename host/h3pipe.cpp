@@ -23,6 +23,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include <functional>
 #include <map>
 #include <memory>
@@ -91,6 +94,29 @@ float f16_to_f32(uint16_t h) {
     else if (exp == 31) x = sign | 0x7f800000 | (mant << 13);
     else x = sign | ((exp + 112) << 23) | (mant << 13);
     float f; memcpy(&f, &x, 4); return f;
+}
+void half_row_scalar(const uint16_t *src, float *dst) {
+    for (int i = 0; i < 16; ++i) dst[i] = f16_to_f32(src[i]);
+}
+#if defined(__x86_64__)
+__attribute__((target("avx,f16c"))) void half_row_f16c(const uint16_t *src, float *dst) {
+    _mm256_storeu_ps(dst, _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(src))));
+    _mm256_storeu_ps(dst + 8, _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(src + 8))));
+}
+#endif
+using HalfRow = void (*)(const uint16_t *, float *);
+HalfRow half_row_converter() {
+#if defined(__x86_64__)
+    if (__builtin_cpu_supports("avx") && __builtin_cpu_supports("f16c")) return half_row_f16c;
+#endif
+    return half_row_scalar;
+}
+uint8_t unit_to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    const float scaled = std::min(std::max(v, 0.0f), 1.0f) * 255.0f;
+    // Round the already-rounded f32 product, as lround does. Adding in double
+    // avoids rounding a float immediately below an integer's halfway point up.
+    return uint8_t(double(scaled) + 0.5);
 }
 float bf16_to_f32(uint16_t b) { const uint32_t x = uint32_t(b) << 16; float f; memcpy(&f, &x, 4); return f; }
 
@@ -402,8 +428,8 @@ int lanes_for(int width) {
     for (int l : {320, 256, 160, 128, 96, 64, 32}) if (width % (8 * l) == 0 && (width / 4) % l == 0) return l;
     throw std::runtime_error("no prepare lane count for width " + std::to_string(width));
 }
-unsigned m_group_for(size_t tokens) {          // the raster group rule shared with scripts/build_kernels*.py
-    const size_t tiles = (tokens + 255) / 256;
+unsigned m_group_for(size_t tokens, size_t tile = 256) {          // the raster group rule shared with scripts/build_kernels*.py
+    const size_t tiles = (tokens + tile - 1) / tile;
     if (tiles == 1) return 1;
     unsigned best = 4; size_t best_pad = (tiles + 3) / 4 * 4;
     for (unsigned g : {3u, 2u}) { const size_t pad = (tiles + g - 1) / g * g; if (pad < best_pad) { best = g; best_pad = pad; } }
@@ -415,6 +441,15 @@ unsigned gemm_m_group_for(size_t tokens, int k, int n, int bits) {
     if (bits == 8 && k == FFN && n == HID && tokens >= 32768) return 2;
     return m_group_for(tokens);
 }
+unsigned vae_fast_m_group_for(size_t tokens, int k, int n) {
+    // Measured on the full 7x16x16 tile plus five special tokens. Keep the
+    // choices specific to these projections; smaller tiles retain their rule.
+    if (tokens == 1797) {
+        if (k == 8192 && n == 2048) return 1;
+        if (k == 2048 && (n == 2048 || n == 6144 || n == 16384)) return 15;
+    }
+    return m_group_for(tokens, 128);
+}
 // GEMM operand row pitch in k elements: K itself unless the row's byte pitch is a multiple of 1024, when the 384 rows a k step touches alias in
 // the cache (int8 out projection K = 7168: 36.7 -> 41.2 TOPS, K = 21504 benchmark: 33.4 -> 41.4 with the pad; the video VAE decoder's 16-bit
 // down projection K = 8192: 15.3 -> 26.0 TFLOP/s, its qkv K = 2048: 23.5 -> 26.0); the pad is one k step (64 elements at 8 and 16 bits,
@@ -423,7 +458,7 @@ size_t gemm_pitch(size_t k, int bits) {
     const size_t row_bytes = bits == 4 ? k / 2 : bits == 8 ? k : k * 2;
     return row_bytes % 1024 == 0 ? k + (bits == 8 ? 64 : 128) : k;
 }
-unsigned gemm_grid_y(size_t tokens, unsigned group) { return unsigned(((tokens + 255) / 256 + group - 1) / group * group); }
+unsigned gemm_grid_y(size_t tokens, unsigned group, size_t tile = 256) { return unsigned(((tokens + tile - 1) / tile + group - 1) / group * group); }
 
 // The GEMM operand element types the stacks run: the checkpoint's int8 ConvRot rows (rotated activations, per-token
 // scales), or its f16 / bf16 rows as stored (unrotated activations narrowed to the same type, no scales).
@@ -456,22 +491,30 @@ struct Prepare {
 // A GEMM of the int8 / f16 / bf16 family for one (K, N, m_group).
 struct Gemm {
     std::shared_ptr<Kernel> k; int n = 0; bool resid = false, bias = false; std::string elem = "i8";
-    unsigned m_group = 1;
-    void build(Compiler &c, const std::string &mode, const std::string &elem_, bool bias_, bool gate_first, int k_size, int n_size, size_t tokens, int classes = 1, int k_stride = 0) {
+    unsigned m_group = 1, m_tile = 256, n_tile = 128, threads = THREADS;
+    void build(Compiler &c, const std::string &mode, const std::string &elem_, bool bias_, bool gate_first, int k_size, int n_size, size_t tokens, int classes = 1, int k_stride = 0, int tile_mode = 0, int out_stride = 0) {
+        const bool wide = tile_mode == 1, fast = tile_mode == 2;
         resid = mode == "resid"; bias = bias_; n = n_size; elem = elem_;
-        m_group = gemm_m_group_for(tokens, k_size, n_size, elem_bits(elem));
-        std::string stem = "gemm_" + elem + (mode == "plain" ? "" : "_" + mode) + "_256" + (bias ? "b" : "") + (mode == "swiglu" && !gate_first ? "_gs" : "");
+        if ((wide || fast) && (elem != "f16" || !bias || n_size % 256 || (mode == "swiglu" && gate_first))) throw std::runtime_error("decoder GEMM requires the biased f16 family and N divisible by 256");
+        m_tile = fast ? 128 : 256; n_tile = (wide || fast) ? 256 : 128; threads = wide ? 512 : THREADS;
+        m_group = fast ? vae_fast_m_group_for(tokens, k_size, n_size) : gemm_m_group_for(tokens, k_size, n_size, elem_bits(elem));
+        std::string stem = "gemm_" + elem + (wide ? "_wide" : fast ? "_fast" : "") + (mode == "plain" ? "" : "_" + mode) + "_256" + (bias ? "b" : "") + (mode == "swiglu" && !gate_first ? "_gs" : "");
         const std::string ns = "h3." + stem + ".";
         Cfg cfg = {{ns + "k_size", std::to_string(k_size)}, {ns + "n_size", std::to_string(n_size)}, {ns + "m_group", std::to_string(m_group)}};
         if (resid) cfg.push_back({ns + "classes", std::to_string(classes)});
         cfg.push_back({ns + "k_stride", std::to_string(k_stride ? k_stride : k_size)});   // operand row pitch (see gemm_pitch)
+        if ((wide || fast) && mode == "swiglu") {
+            const int stride = out_stride ? out_stride : n_size / 2;
+            if (stride < n_size / 2 || stride > 65536 || stride % 128) throw std::runtime_error("invalid wide SwiGLU output stride");
+            cfg.push_back({ns + "out_stride", std::to_string(stride)});
+        }
         k = c.get(stem, "h3_" + stem, cfg);
     }
     void run(Profile *p, const char *stage, unsigned tokens, const void *a_q, const void *w_q, const void *w_s, const void *a_s, void *out, const void *gate = nullptr, const void *cls = nullptr, const void *b = nullptr) {
         KernArgs a; a.i32(int(tokens)).ptr(a_q).ptr(w_q); if (quantised(elem)) a.ptr(w_s).ptr(a_s); a.ptr(out);   // float operands carry no scales
         if (resid) a.ptr(gate).ptr(cls);
         if (bias) a.ptr(b);
-        launch(*k, p, stage, unsigned(n / 128), gemm_grid_y(tokens, m_group), THREADS, a);
+        launch(*k, p, stage, unsigned(n / n_tile), gemm_grid_y(tokens, m_group, m_tile), threads, a);
     }
 };
 
@@ -492,6 +535,11 @@ public:
     Stack(Compiler &c, const StackDims &d, size_t tokens, int layers, const Weights &w, const std::string &prefix_fmt, bool qk_weights, const float *ones_head, const std::string &tag = "stack")
         : d_(d), tokens_(tokens), layers_(layers), tag_(tag) {
         const std::string elem = d.elem(); const int bits = d.wbits; const bool quant = quantised(elem);
+        const char *wide_env = std::getenv("H3_VAE_WIDE");
+        const bool wide = elem == "f16" && d.head_dim == 64 && d.bias && !d.gate_first && wide_env && std::string(wide_env) == "1";
+        const char *fast_env = std::getenv("H3_VAE_FAST");
+        const bool fast = !wide && elem == "f16" && d.head_dim == 64 && d.bias && !d.gate_first && (!fast_env || std::string(fast_env) != "0");
+        const int tile_mode = wide ? 1 : fast ? 2 : 0;
         auto wbytes = [&](size_t n, size_t k) { return quant ? n * k : n * k * 2; };
         auto scale = [&](const std::string &name, size_t n) -> char * { return quant ? w.at(name, n * 4) : nullptr; };
         auto pitch = [&](size_t k) { return gemm_pitch(k, bits); };
@@ -515,16 +563,25 @@ public:
         }
         prep_norm_.build(c, "norm", elem, d.hidden, d.eps, d.classes, int(pitch(d.hidden)));
         // f16 rows: the attention output is the out projection's operand as it is (the kernel writes it at the padded pitch), but the
-        // gate|up product is written at ffn, so the down operand still goes through a prepare when that pitch is padded
+        // wide gate|up kernel also writes the padded pitch; the original kernel needs a prepare when padding is present
         direct_attn_ = elem == "f16";
-        direct_down_ = elem == "f16" && pitch(d.ffn) == size_t(d.ffn);
+        direct_down_ = elem == "f16" && (wide || fast || pitch(d.ffn) == size_t(d.ffn));
         if (!direct_attn_) prep_attn_.build(c, "plain", elem, d.inner(), 1e-5f, 1, int(pitch(d.inner())));
         if (!direct_down_) prep_down_.build(c, "plain", elem, d.ffn, 1e-5f, 1, int(pitch(d.ffn)));
-        gemm_qkv_.build(c, "plain", elem, d.bias, true, d.hidden, d.qkv(), tokens, 1, int(pitch(d.hidden)));
-        gemm_gu_.build(c, "swiglu", elem, d.bias, d.gate_first, d.hidden, 2 * d.ffn, tokens, 1, int(pitch(d.hidden)));
-        gemm_out_.build(c, "resid", elem, d.bias, true, d.inner(), d.hidden, tokens, d.classes, int(pitch(d.inner())));
-        gemm_down_.build(c, "resid", elem, d.bias, true, d.ffn, d.hidden, tokens, d.classes, int(pitch(d.ffn)));
-        {
+        const bool fused_qkv = fast && !d.causal && waves_ == 4 && d.hidden == 2048 && d.heads == 32 && d.kv_heads == 32 && d.head_dim == 64 && d.rope_dim == 48;
+        if (fused_qkv) {
+            qkv_group_ = vae_fast_m_group_for(tokens, d.hidden, 3 * d.hidden);
+            const std::string stem = "gemm_f16_qkvropehm_256b", ns = "h3." + stem + ".";
+            qkv_rope_ = c.get(stem, "h3_" + stem, {{ns + "k_size", "2048"}, {ns + "n_size", "6144"},
+                {ns + "k_stride", std::to_string(pitch(d.hidden))}, {ns + "m_group", std::to_string(qkv_group_)},
+                {ns + "token_capacity", std::to_string(capacity_)}, {ns + "eps", num(d.eps)}});
+        } else {
+            gemm_qkv_.build(c, "plain", elem, d.bias, true, d.hidden, d.qkv(), tokens, 1, int(pitch(d.hidden)), tile_mode);
+        }
+        gemm_gu_.build(c, "swiglu", elem, d.bias, d.gate_first, d.hidden, 2 * d.ffn, tokens, 1, int(pitch(d.hidden)), tile_mode, int(pitch(d.ffn)));
+        gemm_out_.build(c, "resid", elem, d.bias, true, d.inner(), d.hidden, tokens, d.classes, int(pitch(d.inner())), tile_mode);
+        gemm_down_.build(c, "resid", elem, d.bias, true, d.ffn, d.hidden, tokens, d.classes, int(pitch(d.ffn)), tile_mode);
+        if (!fused_qkv) {
             const std::string stem = d.head_dim == 64 ? "rope64_qknorm_f16" : (d.rope_dim == 128 ? "rope128_qknorm_f16" : "rope_qknorm_f16");
             const std::string ns = "h3." + stem + ".";
             rope_ = c.get(stem, "h3_" + stem, {{ns + "row_stride", std::to_string(d.qkv())}, {ns + "heads", std::to_string(d.heads)}, {ns + "kv_heads", std::to_string(d.kv_heads)}, {ns + "k_offset", std::to_string(d.inner())}, {ns + "eps", num(d.eps)}});
@@ -546,6 +603,8 @@ public:
         }
         {
             std::string stem = d.causal ? "attention_gqa8c_lds_f16_wmma" : (d.head_dim == 64 ? (waves_ == 8 ? "attention_mha648_lds_f16_wmma" : "attention_mha64_lds_f16_wmma") : (waves_ == 8 ? "attention_mha8_lds_f16_wmma" : "attention_mha_lds_f16_wmma"));
+            if (fused_qkv) stem = "attention_mha64hm32_lds_f16_wmma";
+            else if (fast && waves_ == 4) stem = "attention_mha64t32_lds_f16_wmma";
             if (qk_int) {
                 if (qk_head_major) {
                     // Head-major operands; 64 shared keys amortize softmax and loop overhead.
@@ -573,12 +632,25 @@ public:
         a_q_ = memory_.alloc(T * std::max(pitch(d.ffn), std::max(pitch(d.hidden), pitch(d.inner()))) * (quant ? 1 : 2));
         a_s_ = memory_.alloc(T * 4);
         fused_ = memory_.alloc(T * size_t(d.qkv()) * 2);
-        q_ = memory_.alloc(T * size_t(d.inner()) * 2);
-        k_ = memory_.alloc(T * size_t(d.kv_inner()) * 2);
-        v_ = memory_.alloc(T * size_t(d.kv_inner()) * 2);
+        if (fused_qkv) {
+            // One allocation holds [Q/K/V][head][capacity][64]. The attention
+            // kernel receives the three component bases and the same capacity.
+            q_ = fused_;
+            k_ = (char *)fused_ + T * size_t(d.inner()) * 2;
+            v_ = (char *)k_ + T * size_t(d.kv_inner()) * 2;
+        } else {
+            q_ = memory_.alloc(T * size_t(d.inner()) * 2);
+            k_ = memory_.alloc(T * size_t(d.kv_inner()) * 2);
+            v_ = memory_.alloc(T * size_t(d.kv_inner()) * 2);
+        }
         attn_ = memory_.alloc(T * (direct_attn_ ? pitch(d.inner()) : size_t(d.inner())) * 2);
-        gu_ = memory_.alloc(T * size_t(d.ffn) * 2);
-        for (auto p : {fused_, q_, k_, v_, attn_}) rt().memset(p, 0, T * (p == fused_ ? size_t(d.qkv()) : p == attn_ ? (direct_attn_ ? pitch(d.inner()) : size_t(d.inner())) : p == q_ ? size_t(d.inner()) : size_t(d.kv_inner())) * 2);
+        gu_ = memory_.alloc(T * (direct_down_ ? pitch(d.ffn) : size_t(d.ffn)) * 2);
+        rt().memset(fused_, 0, T * size_t(d.qkv()) * 2);
+        rt().memset(attn_, 0, T * (direct_attn_ ? pitch(d.inner()) : size_t(d.inner())) * 2);
+        if (!fused_qkv) {
+            rt().memset(q_, 0, T * size_t(d.inner()) * 2);
+            for (auto p : {k_, v_}) rt().memset(p, 0, T * size_t(d.kv_inner()) * 2);
+        }
         if (d.attn_i4 || d.attn_qk_bits == 8) {
             const size_t code_bytes = d.attn_i4 ? 64 : 128; qi_ = memory_.alloc(T * size_t(d.heads) * code_bytes); ki_ = memory_.alloc(T * size_t(d.heads) * code_bytes); qs_ = memory_.alloc(T * size_t(d.heads) * 4); ks_ = memory_.alloc(T * size_t(d.heads) * 4);
             kmean_ = memory_.alloc(size_t(d.inner()) * 4); zmean_ = memory_.alloc(size_t(d.inner()) * 4); rt().memset(zmean_, 0, size_t(d.inner()) * 4);
@@ -609,8 +681,13 @@ public:
         for (int i = first; i < last; ++i) {
             const Block &b = blocks_[i]; const LayerCond lc = cond(i);
             prep_norm_.run(prof, "prepare norm", T, x, b.norm1, lc.table_msa, cls, a_q_, a_s_);
-            gemm_qkv_.run(prof, "gemm qkv", T, a_q_, b.qkv_q, b.qkv_s, a_s_, fused_, nullptr, nullptr, b.qkv_b);
-            { KernArgs a; a.i32(int(T)).ptr(fused_).ptr(b.qnorm).ptr(b.knorm).ptr(cos).ptr(sin).ptr(q_).ptr(k_).ptr(v_); launch(*rope_, prof, "qk norm + rope", T, 1, THREADS, a); }
+            if (qkv_rope_) {
+                KernArgs a; a.i32(int(T)).ptr(a_q_).ptr(b.qkv_q).ptr(fused_).ptr(b.qkv_b).ptr(b.qnorm).ptr(b.knorm).ptr(cos).ptr(sin);
+                launch(*qkv_rope_, prof, "gemm qkv + rope", unsigned(d_.qkv() / 256), gemm_grid_y(T, qkv_group_, 128), THREADS, a);
+            } else {
+                gemm_qkv_.run(prof, "gemm qkv", T, a_q_, b.qkv_q, b.qkv_s, a_s_, fused_, nullptr, nullptr, b.qkv_b);
+                KernArgs a; a.i32(int(T)).ptr(fused_).ptr(b.qnorm).ptr(b.knorm).ptr(cos).ptr(sin).ptr(q_).ptr(k_).ptr(v_); launch(*rope_, prof, "qk norm + rope", T, 1, THREADS, a);
+            }
             if (d_.attn_i4 || d_.attn_qk_bits == 8) {
                 static const bool smooth = std::getenv("H3_KSMOOTH") && std::string(std::getenv("H3_KSMOOTH")) == "1";   // K mean smoothing: off by default (measured worse)
                 if (smooth) { KernArgs a; a.i32(int(T)).ptr(k_).ptr(kmean_); launch(*colmean_, prof, "attention operands", unsigned(d_.inner() / 256), 1, THREADS, a); }
@@ -638,6 +715,8 @@ private:
     std::vector<Block> blocks_;
     Prepare prep_norm_, prep_attn_, prep_down_;
     Gemm gemm_qkv_, gemm_gu_, gemm_out_, gemm_down_;
+    std::shared_ptr<Kernel> qkv_rope_;
+    unsigned qkv_group_ = 1;
     std::shared_ptr<Kernel> rope_, attention_, colmean_, prep_q_, prep_k_, transpose_;
     void *a_q_ = nullptr, *a_s_ = nullptr, *fused_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *attn_ = nullptr, *gu_ = nullptr,
          *qi_ = nullptr, *ki_ = nullptr, *qs_ = nullptr, *ks_ = nullptr, *kmean_ = nullptr, *zmean_ = nullptr, *vt_ = nullptr;
@@ -1675,11 +1754,12 @@ public:
     // --- the audio decoder: BigVGAN in f32 SIMT Loom kernels ---
     struct Conv { std::shared_ptr<Kernel> k; int cin, cout, ksize, dil, pad; };
     Conv conv_kernel(int cin, int cout, int ksize, int dil, int pad, bool accumulate, size_t len_bound) {
-        const std::string ns = "h3.conv1d_f32.";
-        return Conv{comp_.get("conv1d_f32", "h3_conv1d_f32", {{ns + "cin", std::to_string(cin)}, {ns + "cout", std::to_string(cout)}, {ns + "ksize", std::to_string(ksize)}, {ns + "dilation", std::to_string(dil)}, {ns + "pad", std::to_string(pad)}, {ns + "accumulate", accumulate ? "1" : "0"}, {ns + "len_bound", std::to_string(len_bound)}}), cin, cout, ksize, dil, pad};
+        const std::string ns = "h3.conv1d4_f32.";
+        return Conv{comp_.get("conv1d4_f32", "h3_conv1d4_f32", {{ns + "cin", std::to_string(cin)}, {ns + "cout", std::to_string(cout)}, {ns + "ksize", std::to_string(ksize)}, {ns + "dilation", std::to_string(dil)}, {ns + "pad", std::to_string(pad)}, {ns + "accumulate", accumulate ? "1" : "0"}, {ns + "len_bound", std::to_string(len_bound)}}), cin, cout, ksize, dil, pad};
     }
     void conv_run(const Conv &c, const char *stage, size_t len, const void *x, const void *w, const void *b, void *out) {
-        KernArgs a; a.i32(int(len)).ptr(x).ptr(w).ptr(b).ptr(out); launch(*c.k, &prof, stage, unsigned((len + 255) / 256), unsigned(c.cout), THREADS, a);
+        // Four independent samples per lane retain the original 256-sample workgroup span.
+        KernArgs a; a.i32(int(len)).ptr(x).ptr(w).ptr(b).ptr(out); launch(*c.k, &prof, stage, unsigned((len + 255) / 256), unsigned(c.cout), 64, a);
     }
     static size_t round256(size_t n) { return (n + 255) / 256 * 256; }
     void axpy(float av, float bv, size_t count, const void *x, void *y) {
@@ -1792,10 +1872,12 @@ public:
         // unpatchify: token (t, y, x) holds [3][4][16][16] -> frames [3][ft*4][h*16][w*16]
         const size_t FH = size_t(h) * VAE_PS, FW = size_t(w) * VAE_PS, FT = size_t(ft) * VAE_PT;
         frames.assign(size_t(3) * FT * FH * FW, 0.0f);
+        const HalfRow convert_row = half_row_converter();
         for (int t = 0; t < ft; ++t) for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
             const uint16_t *tok = out16.data() + ((size_t(t) * h + y) * w + x) * VAE_OUT;
-            for (int c = 0; c < 3; ++c) for (int pt = 0; pt < VAE_PT; ++pt) for (int py = 0; py < VAE_PS; ++py) for (int px = 0; px < VAE_PS; ++px)
-                frames[((size_t(c) * FT + size_t(t) * VAE_PT + pt) * FH + size_t(y) * VAE_PS + py) * FW + size_t(x) * VAE_PS + px] = f16_to_f32(tok[((size_t(c) * VAE_PT + pt) * VAE_PS + py) * VAE_PS + px]);
+            for (int c = 0; c < 3; ++c) for (int pt = 0; pt < VAE_PT; ++pt) for (int py = 0; py < VAE_PS; ++py)
+                convert_row(tok + ((size_t(c) * VAE_PT + pt) * VAE_PS + py) * VAE_PS,
+                            frames.data() + ((size_t(c) * FT + size_t(t) * VAE_PT + pt) * FH + size_t(y) * VAE_PS + py) * FW + size_t(x) * VAE_PS);
         }
     }
 
@@ -1854,7 +1936,7 @@ public:
             const size_t take = dec_frames < size_t(F) ? std::min(nf, size_t(F) - dec_frames) : 0;
             for (size_t f = 0; f < take; ++f) for (size_t q = 0; q < plane; ++q) for (int c = 0; c < 3; ++c) {
                 const float v = chunk[(size_t(c) * src_ft + f) * plane + q] * IMAGENET_STD[c] + IMAGENET_MEAN[c];
-                out[((dec_frames + f) * plane + q) * 3 + c] = uint8_t(std::lround(std::min(std::max(v, 0.0f), 1.0f) * 255.0f));
+                out[((dec_frames + f) * plane + q) * 3 + c] = unit_to_byte(v);
             }
             dec_frames += nf;
         };

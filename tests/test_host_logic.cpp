@@ -6,7 +6,32 @@
 Rt &rt() { throw std::logic_error("no runtime in this test: every call here must be refused before it reaches the session"); }
 
 int main() {
+    // Check every half bit pattern, including signed zero and subnormals. F16C
+    // may quiet signaling NaNs, but all finite values must be bit-identical.
+    const HalfRow convert = half_row_converter();
+    for (unsigned first = 0; first < 65536; first += 16) {
+        uint16_t in[16]; float scalar[16], actual[16];
+        for (unsigned i = 0; i < 16; ++i) in[i] = uint16_t(first + i);
+        half_row_scalar(in, scalar); convert(in, actual);
+        for (int i = 0; i < 16; ++i) {
+            if (std::isnan(scalar[i])) assert(std::isnan(actual[i]));
+            else assert(std::memcmp(scalar + i, actual + i, sizeof(float)) == 0);
+            if (std::isfinite(scalar[i]))
+                assert(unit_to_byte(scalar[i]) == uint8_t(std::lround(std::min(std::max(scalar[i], 0.0f), 1.0f) * 255.0f)));
+        }
+    }
+    // Exercise both neighboring floats at every pixel rounding boundary.
+    for (int i = 0; i < 255; ++i) {
+        const float midpoint = float((double(i) + 0.5) / 255.0);
+        for (float v : {std::nextafter(midpoint, 0.0f), midpoint, std::nextafter(midpoint, 1.0f)})
+            assert(unit_to_byte(v) == uint8_t(std::lround(v * 255.0f)));
+    }
     assert(gemm_m_group_for(37723, FFN, HID, 8) == 2);
+    assert(vae_fast_m_group_for(1797, 8192, 2048) == 1);
+    for (int n : {2048, 6144, 16384}) assert(vae_fast_m_group_for(1797, 2048, n) == 15);
+    for (size_t tokens : {size_t(1), size_t(517), size_t(1796), size_t(1798)})
+        assert(vae_fast_m_group_for(tokens, 2048, 16384) == m_group_for(tokens, 128));
+    assert(vae_fast_m_group_for(1797, 512, 1024) == m_group_for(1797, 128));
     assert(gemm_m_group_for(32768, FFN, HID, 8) == 2);
     for (int bits : {4, 8, 16}) {
         assert(gemm_m_group_for(16000, FFN, HID, bits) == m_group_for(16000));
@@ -16,7 +41,7 @@ int main() {
     // The launch must cover the entire final row group selected at compile time,
     // including when the runtime row count would have selected a different group.
     for (size_t tokens : {1u, 255u, 256u, 257u, 513u, 16000u, 32767u, 32768u, 37723u}) {
-        for (unsigned group : {1u, 2u, 3u, 4u}) {
+        for (unsigned group : {1u, 2u, 3u, 4u, 15u}) {
             const size_t gy = gemm_grid_y(tokens, group);
             assert(gy % group == 0 && gy * 256 >= tokens);
             assert((gy - group) * 256 < tokens);

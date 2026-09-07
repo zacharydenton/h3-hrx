@@ -35,12 +35,15 @@ def from_bf16(u: np.ndarray) -> np.ndarray:
     return (np.ascontiguousarray(u, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
 
 
-def launch(hsaco: Path, kernel: str, grid, block, args, workdir: Path, repeat: int = 1):
+def launch(hsaco: Path, kernel: str, grid, block, args, workdir: Path, repeat: int = 1, rotate_input=None):
     """args: list of ('i32'|'f32', value) or ('in'|'in_f16'|'in_bf16'|'in_u8', ndarray) or ('out'|'out_f16'|'out_bf16', shape/dtype tuple).
     bf16 arrays travel as uint16 bit patterns (in_bf16 takes f32 values and rounds them; out_bf16 comes back as uint16: from_bf16 widens)."""
     cmd = [str(LOOMRUN), "--hsaco", str(hsaco), "--kernel", kernel,
            "--grid", ",".join(map(str, grid)), "--block", ",".join(map(str, block)),
            "--repeat", str(repeat)]
+    if rotate_input is not None:
+        index, copies = rotate_input
+        cmd += ["--rotate-input", f"{index}:{copies}"]
     outputs = []
     for index, (kind, value) in enumerate(args):
         if kind in ("i32", "f32"):

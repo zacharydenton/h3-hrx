@@ -143,6 +143,12 @@ synchronises every launch; `--attn f16` restores f16 attention, `--attn i4` is a
 QK^T that ghosts keyframe and reference clips (do not use it for conditioned generation);
 `--base-weights` runs reference files on the base checkpoint when the ref2va one is absent;
 `--models`, `--dit`, `--te`, `--video-vae` and `--audio-vae` choose the checkpoints ($H3_MODELS).
+`H3_VAE_FAST=0` restores the original video decoder GPU kernels for comparison;
+the default uses 128x256 GEMMs, padded SwiGLU output, fused QKV normalization/rotary
+embedding and head-major 32-key attention staging
+([measurements and the 30-second target](docs/vae-30s.md)).
+The audio decoder computes four samples per thread in f32, preserving each
+sample's accumulation order and output bits.
 Unknown options, missing values and out-of-range numbers are errors, as are `--audio-only` with
 `--still` and `--no-decode` with either.
 

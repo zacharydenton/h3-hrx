@@ -22,6 +22,9 @@ QBLOCK = 16 * WAVES                                     # query rows per workgro
 STEM = os.environ.get("ATTN_STEM", ({4: "attention_mha_lds_f16_wmma", 8: "attention_mha8_lds_f16_wmma", 16: "attention_mha16_lds_f16_wmma"}[WAVES].replace("mha", f"mha{D}" if D != 128 else "mha")) if GQA == 1 else ("attention_gqa8c_lds_f16_wmma" if GQA == 8 else "attention_gqa_lds_f16_wmma"))
 assert TILE in (16, 32)
 OUT = ROOT / ("kernels" if STEM in ("attention_gqa_lds_f16_wmma", "attention_mha_lds_f16_wmma", "attention_mha8_lds_f16_wmma", "attention_mha64_lds_f16_wmma", "attention_mha648_lds_f16_wmma", "attention_gqa8c_lds_f16_wmma") else "experiments") / f"{STEM}.loom"   # 16 waves lost (0.92x): experiments/
+if STEM in ("attention_mha64t32_lds_f16_wmma", "attention_mha64hm32_lds_f16_wmma"):
+    assert D == 64 and TILE == 32 and WAVES == 4 and GQA == 1
+    OUT = ROOT / "kernels" / f"{STEM}.loom"
 NS, SYM = "h3." + STEM, "h3_" + STEM
 ROW = D + 8   # LDS row length in halves for a D-channel tile
 import os
@@ -505,5 +508,74 @@ def eight_waves(text: str) -> str:
 
 if WAVES >= 8:
     K = eight_waves(K)
+if STEM in ("attention_mha64t32_lds_f16_wmma", "attention_mha64hm32_lds_f16_wmma") or os.environ.get("ATTN_COOPERATIVE32", "0") == "1":
+    assert D == 64 and TILE == 32 and WAVES == 4 and GQA == 1
+    # All 128 lanes stage one K packet and one V packet for the whole 32-key
+    # tile. The original 16-key mapping duplicates both halves in two waves.
+    K = K.replace("%st_lane = index.rem %workitem, %c_klanes", "%st_lane = index.rem %workitem, %c128")
+    K = K.replace("%st_key_v = index.rem %st_lane, %c16", "%st_key_v = index.rem %st_lane, %c32")
+    K = K.replace("%st_chunk_v0 = index.div %st_lane, %c16", "%st_chunk_v0 = index.div %st_lane, %c32")
+    start = K.index("    %st_row_hi0 =")
+    end = K.index("    %ve0 =", start)
+    K = K[:start] + K[end:]
+def prefetch_decoder_tiles(text):
+    """Carry the next K/V packets in registers while the current tile computes.
+
+    The last iteration safely reloads tile zero; those unused packets are never
+    staged. Preserve all existing barriers and the online-softmax arithmetic.
+    """
+    assert D == 64 and TILE == 32 and WAVES == 4 and GQA == 1
+    start = text.index("  %final_max,")
+    end = text.index("\n", start)
+    loop = text[start:end]
+    loop = loop.replace("%final3 = scf.for", "%final3, %final_k_packet, %final_v_packet = scf.for")
+    loop = loop.replace("%acc3 = %init : vector<8xf32>)", "%acc3 = %init : vector<8xf32>, %k_chunk = %initial_k : vector<16xf16>, %v_chunk = %initial_v : vector<16xf16>)")
+    assert loop.endswith(") {")
+    loop = loop[:-3] + ", vector<16xf16>, vector<16xf16>) {"
+    initial = """  %initial_kr = index.assume %st_key [lt(%st_key, %padded_tokens)] : index
+  %initial_vr = index.assume %st_key_v [lt(%st_key_v, %padded_tokens)] : index
+  %initial_k = vector.load %k_view[%initial_kr, %st_col] : view<[%padded_tokens]x[%kv_stride0]xf16> -> vector<16xf16>
+  %initial_v = vector.load %v_view[%initial_vr, %st_col_v] : view<[%padded_tokens]x[%kv_stride0]xf16> -> vector<16xf16>
+"""
+    text = text[:start] + initial + loop + text[end:]
+    for line in (
+        "    %k_chunk = vector.load %k_view[%st_row, %st_col] : view<[%padded_tokens]x[%kv_stride0]xf16> -> vector<16xf16>\n",
+        "    %v_chunk = vector.load %v_view[%st_row_v, %st_col_v] : view<[%padded_tokens]x[%kv_stride0]xf16> -> vector<16xf16>\n",
+    ):
+        assert text.count(line) == 1
+        text = text.replace(line, "")
+    pos = text.index("    %local_key =")
+    prefetch = """    %next_key_tile = index.add %key_tile, %c1 : index
+    %has_next_tile = index.cmp ult, %next_key_tile, %key_tile_count : index
+    %next_key_origin = index.add %key_origin0, %c32 : index
+    %safe_key_origin = scf.select %has_next_tile, %next_key_origin, %c0 : index
+    %next_krow0 = index.add %safe_key_origin, %st_key : index
+    %next_vrow0 = index.add %safe_key_origin, %st_key_v : index
+    %next_krow = index.assume %next_krow0 [lt(%next_krow0, %padded_tokens)] : index
+    %next_vrow = index.assume %next_vrow0 [lt(%next_vrow0, %padded_tokens)] : index
+    %next_k_packet = vector.load %k_view[%next_krow, %st_col] : view<[%padded_tokens]x[%kv_stride0]xf16> -> vector<16xf16>
+    %next_v_packet = vector.load %v_view[%next_vrow, %st_col_v] : view<[%padded_tokens]x[%kv_stride0]xf16> -> vector<16xf16>
+    scf.schedule.fence
+"""
+    text = text[:pos] + prefetch + text[pos:]
+    start = text.index("    scf.yield %next_max,")
+    end = text.index("\n", start)
+    result = text[start:end].replace("%next3 :", "%next3, %next_k_packet, %next_v_packet :")
+    return text[:start] + result + ", vector<16xf16>, vector<16xf16>" + text[end:]
+
+
+if STEM in ("attention_mha64t32_lds_f16_wmma", "attention_mha64hm32_lds_f16_wmma"):
+    import re
+    from gen_attention_f16_transposed import convert, head_major
+    K = convert(prefetch_decoder_tiles(K), STEM)
+    if STEM == "attention_mha64hm32_lds_f16_wmma":
+        K = head_major(K)
+    K = re.sub(r"^\s*//[^\n]*\n", "", K, flags=re.M)
+    K = ("// Head-64 MHA: four waves own 64 query rows and share a 32-key LDS tile.\n"
+         "// Transposed K Q^T and V^T P^T; scalar online statistics, packed f16 exchange.\n"
+         "// All 128 lanes stage distinct K/V packets and prefetch the next tile.\n"
+         "// Online softmax, f32 accumulators, f16 output.\n"
+         "// Generated by tools/gen_attention_lds.py with ATTN_D=64 ATTN_TILE=32\n"
+         f"// ATTN_STEM={STEM}.\n" + K)
 OUT.write_text(K)
 print("wrote", OUT)

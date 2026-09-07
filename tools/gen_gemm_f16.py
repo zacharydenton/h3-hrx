@@ -28,8 +28,10 @@ def gemm(K: str, elem: str = "f16") -> str:
                  "  %i4_schema = encoding.define #encoding.operand<element_format=i8, payload_elements=16, payload_registers=4> : encoding<schema>\n"):
         sub(line, "")
     # LDS geometry: 144-byte rows
-    sub("  %lds_bytes = index.constant 30720 : offset\n", "  %lds_bytes = index.constant 55296 : offset\n")
-    sub("  %w_stage_offset = index.constant 20480 : offset\n", "  %w_stage_offset = index.constant 36864 : offset\n")
+    for name in ("lds_bytes", "w_stage_offset"):
+        match = re.search(rf"%{name} = index.constant (\d+) : offset", K)
+        assert match and int(match[1]) % 80 == 0, name
+        sub(match[0], f"%{name} = index.constant {int(match[1]) // 80 * 144} : offset", 1)
     # global operand views and loads: f16 elements, 16 per lane per row
     # the operand views carry the padded row pitch (k_stride, as the int8 kernel's k_quads = k_stride / 4); the loads stay within k_size
     sub("  %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<[%m_bounded]x[%k_quads]xi32>\n", "  %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<[%m_bounded]x[%k_stride]xf16>\n  %k_last16 = index.sub %k_size, %c16 : index\n")
