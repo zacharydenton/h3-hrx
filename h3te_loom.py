@@ -61,7 +61,8 @@ class H3TeBlocks:
         if cos is None: cos, sin = rope_tables(self.tokens)
         xa = np.array(x.detach().to(torch.float32).cpu().numpy(), dtype=np.float32, order="C", copy=True)   # a copy: the session writes the result back into it, and a CPU input would otherwise be overwritten
         ca = np.ascontiguousarray(cos.detach().float().cpu().numpy()); sa = np.ascontiguousarray(sin.detach().float().cpu().numpy())
-        assert xa.shape == (self.tokens, HIDDEN) and ca.shape == sa.shape == (self.tokens, ROPE_HALF)
+        if not (xa.shape == (self.tokens, HIDDEN) and ca.shape == sa.shape == (self.tokens, ROPE_HALF)):   # explicit, not assert: python -O
+            raise ValueError(f"x {tuple(xa.shape)}, cos {tuple(ca.shape)}, sin {tuple(sa.shape)}: expected [{self.tokens}][{HIDDEN}] and [{self.tokens}][{ROPE_HALF}] x2")
         err = ctypes.create_string_buffer(_ERR)
         if self._native.h3te_run(self._handle, xa.ctypes.data_as(_F32P), xa.size, ca.ctypes.data_as(_F32P), sa.ctypes.data_as(_F32P), ca.size, err, _ERR):
             raise H3TeError(err.value.decode())

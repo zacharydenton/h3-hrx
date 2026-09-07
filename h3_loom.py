@@ -81,7 +81,8 @@ class H3Blocks:
         ma = np.ascontiguousarray(mods.detach().float().cpu().numpy()[: self.layers])
         ca = np.ascontiguousarray(cos.detach().float().cpu().numpy()); sa = np.ascontiguousarray(sin.detach().float().cpu().numpy())
         t1 = time.time()
-        assert xa.shape == (self.tokens, R.HIDDEN) and ca_.shape == (self.tokens,) and ma.shape == (self.layers, 6 * _CLASSES, R.HIDDEN) and ca.shape == sa.shape == (self.tokens, 48)
+        if not (xa.shape == (self.tokens, R.HIDDEN) and ca_.shape == (self.tokens,) and ma.shape == (self.layers, 6 * _CLASSES, R.HIDDEN) and ca.shape == sa.shape == (self.tokens, 48)):   # explicit, not assert: python -O
+            raise ValueError(f"x {tuple(xa.shape)}, rows {tuple(ca_.shape)}, mods {tuple(ma.shape)}, cos {tuple(ca.shape)}, sin {tuple(sa.shape)}: expected [{self.tokens}][{R.HIDDEN}], [{self.tokens}], [{self.layers}][{6 * _CLASSES}][{R.HIDDEN}], [{self.tokens}][48] x2")
         err = ctypes.create_string_buffer(_ERR)
         rc = self._native.h3_run(self._handle, xa.ctypes.data_as(_F32P), xa.size, ca_.ctypes.data_as(_I32P), ca_.size, ma.ctypes.data_as(_F32P), ma.size,
                                  ca.ctypes.data_as(_F32P), sa.ctypes.data_as(_F32P), ca.size, err, _ERR)

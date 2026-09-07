@@ -50,9 +50,10 @@ Kernel-level, 56 heads x 128, measured in `docs/`:
   (`scripts/env.sh` points at the build directory). Kernels are compiled on first use for each
   shape into `build/kernel_cache`.
 - **ffmpeg** for the `h3` command (input decoding, output muxing).
-- **Python 3 with NumPy** for the kernel tests and generators; **ROCm PyTorch, diffusers, transformers
-  and safetensors** only for exporting the weights and the reference tier of the tests
-  (`H3_REFERENCE_PYTHON` names that interpreter). The clip itself never touches Python.
+- **Python 3 with NumPy** for the kernel generators and the CPU tier of the tests (`H3_PYTHON`);
+  **ROCm PyTorch, diffusers, transformers and safetensors** for exporting the weights and for the
+  GPU and reference tiers of the tests, whose float64 references are torch (`H3_REFERENCE_PYTHON`).
+  The clip itself never touches Python.
 - Optional, for the toy ComfyUI comparison in the test suite: **podman** and the
   `docker.io/kyuz0/amd-strix-halo-comfyui` image (skipped when podman is absent).
 
@@ -249,8 +250,9 @@ python3 tests/test_comfy_parity.py --require   # the ComfyUI parity gate alone (
 ```
 
 `bash scripts/test_host.sh` is the CPU tier's host part: bounded C++ and Python regressions without
-weights or a GPU. `H3_PYTHON` names the interpreter for the kernel tests (NumPy), `H3_REFERENCE_PYTHON`
-the one with torch, diffusers and transformers for the reference tier.
+weights or a GPU. `H3_PYTHON` names the NumPy interpreter for the CPU tier, `H3_REFERENCE_PYTHON`
+the one with torch, diffusers and transformers for the GPU kernel tests and the reference tier
+(both default to `python3`).
 
 ## Limitations
 

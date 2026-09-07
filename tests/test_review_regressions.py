@@ -97,6 +97,29 @@ class ReviewRegressions(unittest.TestCase):
         self.assertEqual(calls[0][1][2:5], (1, 32, 32)); self.assertEqual(calls[2][1][2], 801)
         refs = calls[4][1][6]; self.assertEqual((refs[0].latent_t, refs[0].lat_h, refs[0].lat_w, refs[0].height, refs[0].width, refs[1].audio_t), (1, 4, 6, 64, 96, 5))
 
+    def test_block_bindings_check_shapes_without_assert(self):
+        """h3_loom, h3te_loom and h3vae_loom hand raw pointers to the native block stacks: a wrong x/rows/mods/cos/sin shape must raise under python -O too."""
+        try: import torch
+        except ImportError: self.skipTest("torch is not installed in this interpreter (the block bindings take torch tensors)")
+        import h3_loom, h3te_loom, h3vae_loom
+        calls = []
+        class Native:
+            def __getattr__(self, name):
+                def call(*args): calls.append(name); return 0
+                return call
+        tokens, layers = 8, 2
+        for cls, good in [
+            (h3te_loom.H3TeBlocks, {"x": torch.ones(tokens, h3te_loom.HIDDEN), "cos": torch.ones(tokens, h3te_loom.ROPE_HALF), "sin": torch.ones(tokens, h3te_loom.ROPE_HALF)}),
+            (h3vae_loom.H3VaeBlocks, {"x": torch.ones(tokens, h3vae_loom.HIDDEN), "cos": torch.ones(tokens, h3vae_loom.ROPE_HALF), "sin": torch.ones(tokens, h3vae_loom.ROPE_HALF)}),
+            (h3_loom.H3Blocks, {"x": torch.ones(tokens, h3_loom.R.HIDDEN), "cls": torch.zeros(tokens, dtype=torch.int32), "mods": torch.ones(layers, 6 * h3_loom._CLASSES, h3_loom.R.HIDDEN), "cos": torch.ones(tokens, 48), "sin": torch.ones(tokens, 48)}),
+        ]:
+            obj = cls.__new__(cls); obj.tokens, obj.layers, obj._native, obj._handle = tokens, layers, Native(), None
+            for key in good:
+                bad = dict(good); bad[key] = torch.ones(1)
+                with self.subTest(binding=cls.__name__, arg=key), self.assertRaises(ValueError): obj.forward(**bad)
+            self.assertEqual(calls, [])
+            obj.forward(**good); self.assertEqual(len(calls), 1); calls.clear()
+
     def test_shape_failure_is_an_error(self):
         pipe = H3Pipe.__new__(H3Pipe)
         class Native:

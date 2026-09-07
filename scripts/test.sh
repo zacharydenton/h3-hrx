@@ -3,9 +3,9 @@
 #   bash scripts/test.sh --cpu     no GPU, weights or containers: Python parses, CPU host regressions, generated kernels vs their generators
 #   bash scripts/test.sh --quick   plus the host build, the kernel tests on the GPU, the tokenizer, the ComfyUI toy comparison
 #   bash scripts/test.sh           plus the reference tier: decoder, encoder, block, text encoder, pipeline and ComfyUI parity checks
-# Python: H3_PYTHON (default python3) runs everything but the reference tier, which needs torch, diffusers and transformers and
-# takes H3_REFERENCE_PYTHON (default: H3_PYTHON). The ComfyUI toy comparison needs podman and its image; it is skipped when
-# podman is absent unless H3_REQUIRE_COMFY=1.
+# Python: H3_PYTHON (default python3, NumPy) runs the CPU tier; the GPU kernel tests (torch float64 references) and the
+# reference tier (torch, diffusers, transformers) take H3_REFERENCE_PYTHON (default: H3_PYTHON). The ComfyUI toy comparison
+# needs podman and its image; it is skipped when podman is absent unless H3_REQUIRE_COMFY=1.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 source scripts/env.sh
@@ -14,7 +14,7 @@ PY="${H3_PYTHON:-python3}"; REF_PY="${H3_REFERENCE_PYTHON:-$PY}"
 status=0
 step() { local name="$1"; shift; printf '\n=== %s ===\n' "$name"; if "$@"; then printf '  ok\n'; else printf '  FAILED: %s\n' "$name"; status=1; fi; }
 skip() { printf '\n=== %s ===\n  skipped: %s\n' "$1" "$2"; }
-gpu() { env -u LD_LIBRARY_PATH "$PY" "$@"; }        # the kernel tests drive the GPU through the Python harness (tools/kernel_test.py)
+gpu() { env -u LD_LIBRARY_PATH "$REF_PY" "$@"; }    # the kernel tests drive the GPU through the Python harness (tools/kernel_test.py) against torch references
 ref() { env -u LD_LIBRARY_PATH "$REF_PY" "$@"; }
 step "tracked Python parses" bash -c 'git ls-files "*.py" | xargs "$0" -m py_compile' "$PY"
 if [ -x "${LOOM_FORMAT:-}" ] && ls kernels/*.loom >/dev/null 2>&1; then step "loom sources are canonically formatted" bash -c '"$LOOM_FORMAT" --check kernels/*.loom'; else skip "loom sources are canonically formatted" "no loom-format (scripts/env.sh)"; fi
@@ -38,9 +38,9 @@ step "small kernel regressions" gpu tests/test_kernel_regressions.py
 step "prepare kernels"   gpu tests/test_prepare.py
 step "prepare Q/K, int8 head-major (the production attention operands)" gpu tests/test_prepare_qk_i8_head_major.py
 step "qk norm + rope"    gpu tests/test_rope_qknorm.py
-step "qk norm + rope (text encoder: 128 channels, 8 kv heads)" env -u LD_LIBRARY_PATH ROPE_D=128 ROPE_R=128 ROPE_KV=8 "$PY" tests/test_rope_qknorm.py
+step "qk norm + rope (text encoder: 128 channels, 8 kv heads)" env -u LD_LIBRARY_PATH ROPE_D=128 ROPE_R=128 ROPE_KV=8 "$REF_PY" tests/test_rope_qknorm.py
 step "attention"         gpu tests/test_attention.py
-step "attention (text encoder: causal, 8 query heads per kv head)" env -u LD_LIBRARY_PATH ATTN_GQA=8 "$PY" tests/test_attention.py
+step "attention (text encoder: causal, 8 query heads per kv head)" env -u LD_LIBRARY_PATH ATTN_GQA=8 "$REF_PY" tests/test_attention.py
 step "attention, int8 QK^T head-major (the production long-sequence kernel)" gpu tests/test_attention_i8_head_major.py
 step "gemm family (M=512)" gpu tests/test_gemm.py 512
 step "gemm int8 family (text encoder, M=300)" gpu tests/test_gemm.py 300 i8
@@ -56,7 +56,9 @@ if [ "$tier" = full ]; then
     step "audio encoder vs ComfyUI" ref tests/test_audio_encoder.py
     step "vision tower vs ComfyUI" ref tests/test_vision.py
     step "video VAE encoder vs ComfyUI" ref tests/test_vae_encoder.py
-    step "ref2va step vs ComfyUI" ref tests/test_ref2va.py
+    if [ -f build/weights_i8_ref2va/manifest.txt ] && [ -f build/weights_glue_ref2va/manifest.txt ]; then
+    step "ref2va step vs ComfyUI (the ref2va int8 exports)" ref tests/test_ref2va.py --blocks build/weights_i8_ref2va --glue build/weights_glue_ref2va
+    else skip "ref2va step vs ComfyUI" "no build/weights_i8_ref2va and build/weights_glue_ref2va (README, Weights)"; fi
   else skip "encoder and ref2va checks vs ComfyUI" "no build/ref_truth (tools/ref_truth_comfy.py)"; fi
   step "C host vs ComfyUI's own run (int8 rows + f16 attention)" ref tests/test_comfy_parity.py
 fi
