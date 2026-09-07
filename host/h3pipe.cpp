@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
@@ -189,6 +190,7 @@ public:
                 if (staged) flush();
                 if (written != r.rows) throw std::runtime_error("a recipe's segments do not add up to its rows");
             }
+            for (const Segment &sg : r.segments) file_->done_with(sg.src, sg.rows * r.row_bytes);   // the bytes are on the device; the file's pages are not needed again
             tensors_.emplace(name, p);
         } catch (...) { memory_.free(p); throw; }
         return p;
@@ -371,7 +373,9 @@ struct Compiler {
         for (auto &c : cfg) args.push_back("--config=" + c.first + "=" + c.second);
         std::vector<char *> argv; for (auto &a : args) argv.push_back(const_cast<char *>(a.c_str())); argv.push_back(nullptr);
         pid_t pid; if (posix_spawnp(&pid, exe.c_str(), nullptr, nullptr, argv.data(), environ) != 0) throw std::runtime_error("cannot spawn " + exe);
-        int status = 0; waitpid(pid, &status, 0);
+        int status = 0; pid_t waited;
+        do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+        if (waited < 0) { const int saved = errno; unlink(tmp.c_str()); throw std::runtime_error("cannot wait for loom-compile: " + std::string(strerror(saved))); }
         struct stat st; const bool produced = stat(tmp.c_str(), &st) == 0 && st.st_size > 0;
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || !produced) {
             unlink(tmp.c_str());
@@ -412,11 +416,12 @@ unsigned gemm_m_group_for(size_t tokens, int k, int n, int bits) {
     return m_group_for(tokens);
 }
 // GEMM operand row pitch in k elements: K itself unless the row's byte pitch is a multiple of 1024, when the 384 rows a k step touches alias in
-// the cache (int8 out projection K = 7168: 36.7 -> 41.2 TOPS, K = 21504 benchmark: 33.4 -> 41.4 with the pad); the pad is
-// one k step (64 int8, 128 int4) so the kernels' step constraints hold. f16 GEMMs take no pitch.
+// the cache (int8 out projection K = 7168: 36.7 -> 41.2 TOPS, K = 21504 benchmark: 33.4 -> 41.4 with the pad; the video VAE decoder's 16-bit
+// down projection K = 8192: 15.3 -> 26.0 TFLOP/s, its qkv K = 2048: 23.5 -> 26.0); the pad is one k step (64 elements at 8 and 16 bits,
+// 128 at 4 and 16, which the f16 attention's out_stride also requires) so the kernels' step constraints hold.
 size_t gemm_pitch(size_t k, int bits) {
-    const bool aliases = bits == 8 ? k % 1024 == 0 : bits == 4 ? k % 2048 == 0 : false;   // the byte pitch (int4 rows are k/2 bytes) a multiple of 1024
-    return aliases ? k + (bits == 4 ? 128 : 64) : k;
+    const size_t row_bytes = bits == 4 ? k / 2 : bits == 8 ? k : k * 2;
+    return row_bytes % 1024 == 0 ? k + (bits == 8 ? 64 : 128) : k;
 }
 unsigned gemm_grid_y(size_t tokens, unsigned group) { return unsigned(((tokens + 255) / 256 + group - 1) / group * group); }
 
@@ -509,8 +514,12 @@ public:
             blocks_.push_back(b);
         }
         prep_norm_.build(c, "norm", elem, d.hidden, d.eps, d.classes, int(pitch(d.hidden)));
-        direct_ = elem == "f16";   // f16 rows: the f16 attention output and gate|up product are the out / down operands as they are
-        if (!direct_) { prep_attn_.build(c, "plain", elem, d.inner(), 1e-5f, 1, int(pitch(d.inner()))); prep_down_.build(c, "plain", elem, d.ffn, 1e-5f, 1, int(pitch(d.ffn))); }
+        // f16 rows: the attention output is the out projection's operand as it is (the kernel writes it at the padded pitch), but the
+        // gate|up product is written at ffn, so the down operand still goes through a prepare when that pitch is padded
+        direct_attn_ = elem == "f16";
+        direct_down_ = elem == "f16" && pitch(d.ffn) == size_t(d.ffn);
+        if (!direct_attn_) prep_attn_.build(c, "plain", elem, d.inner(), 1e-5f, 1, int(pitch(d.inner())));
+        if (!direct_down_) prep_down_.build(c, "plain", elem, d.ffn, 1e-5f, 1, int(pitch(d.ffn)));
         gemm_qkv_.build(c, "plain", elem, d.bias, true, d.hidden, d.qkv(), tokens, 1, int(pitch(d.hidden)));
         gemm_gu_.build(c, "swiglu", elem, d.bias, d.gate_first, d.hidden, 2 * d.ffn, tokens, 1, int(pitch(d.hidden)));
         gemm_out_.build(c, "resid", elem, d.bias, true, d.inner(), d.hidden, tokens, d.classes, int(pitch(d.inner())));
@@ -555,7 +564,8 @@ public:
             const bool skip = d.attn_i4 && tau > 0.0;   // the skip twins exist for int4 only
             if (skip) { const size_t at = stem.find("i4qk"); stem.replace(at, 4, "i4qks"); }
             const std::string ns = "h3." + stem + ".";
-            Cfg acfg = {{ns + "q_stride", std::to_string(d.inner())}, {ns + "kv_stride", std::to_string(d.kv_inner())}, {ns + "tokens", std::to_string(tokens)}, {ns + "token_capacity", std::to_string(capacity_)}, {ns + "scale", num(1.0 / std::sqrt(double(d.head_dim)))}, {ns + "out_stride", std::to_string(d.inner())}};
+            Cfg acfg = {{ns + "q_stride", std::to_string(d.inner())}, {ns + "kv_stride", std::to_string(d.kv_inner())}, {ns + "tokens", std::to_string(tokens)}, {ns + "token_capacity", std::to_string(capacity_)}, {ns + "scale", num(1.0 / std::sqrt(double(d.head_dim)))},
+                        {ns + "out_stride", std::to_string(direct_attn_ ? pitch(d.inner()) : size_t(d.inner()))}};   // the out projection reads it as its A operand
             if (skip) acfg.push_back({ns + "skip_tau", num(tau)});
             attention_ = c.get(stem, "h3_" + stem, acfg);
         }
@@ -566,9 +576,9 @@ public:
         q_ = memory_.alloc(T * size_t(d.inner()) * 2);
         k_ = memory_.alloc(T * size_t(d.kv_inner()) * 2);
         v_ = memory_.alloc(T * size_t(d.kv_inner()) * 2);
-        attn_ = memory_.alloc(T * size_t(d.inner()) * 2);
+        attn_ = memory_.alloc(T * (direct_attn_ ? pitch(d.inner()) : size_t(d.inner())) * 2);
         gu_ = memory_.alloc(T * size_t(d.ffn) * 2);
-        for (auto p : {fused_, q_, k_, v_, attn_}) rt().memset(p, 0, T * size_t(p == fused_ ? d.qkv() : (p == q_ || p == attn_ ? d.inner() : d.kv_inner())) * 2);
+        for (auto p : {fused_, q_, k_, v_, attn_}) rt().memset(p, 0, T * (p == fused_ ? size_t(d.qkv()) : p == attn_ ? (direct_attn_ ? pitch(d.inner()) : size_t(d.inner())) : p == q_ ? size_t(d.inner()) : size_t(d.kv_inner())) * 2);
         if (d.attn_i4 || d.attn_qk_bits == 8) {
             const size_t code_bytes = d.attn_i4 ? 64 : 128; qi_ = memory_.alloc(T * size_t(d.heads) * code_bytes); ki_ = memory_.alloc(T * size_t(d.heads) * code_bytes); qs_ = memory_.alloc(T * size_t(d.heads) * 4); ks_ = memory_.alloc(T * size_t(d.heads) * 4);
             kmean_ = memory_.alloc(size_t(d.inner()) * 4); zmean_ = memory_.alloc(size_t(d.inner()) * 4); rt().memset(zmean_, 0, size_t(d.inner()) * 4);
@@ -613,18 +623,18 @@ public:
               KernArgs a; a.i32(int(T)).ptr(q_).ptr(k_).ptr(v_).ptr(attn_);
               if (d_.causal) launch(*attention_, prof, "attention", (T + 15) / 16, unsigned(d_.kv_heads), THREADS, a);
               else { const unsigned qb = 16 * unsigned(waves_); launch(*attention_, prof, "attention", (T + qb - 1) / qb, unsigned(d_.heads), 32 * unsigned(waves_), a); } }
-            if (!direct_) prep_attn_.run(prof, "prepare out input", T, attn_, nullptr, nullptr, nullptr, a_q_, a_s_);
-            gemm_out_.run(prof, "gemm out + residual", T, direct_ ? attn_ : a_q_, b.out_q, b.out_s, a_s_, x, lc.gate_msa, cls, b.out_b);
+            if (!direct_attn_) prep_attn_.run(prof, "prepare out input", T, attn_, nullptr, nullptr, nullptr, a_q_, a_s_);
+            gemm_out_.run(prof, "gemm out + residual", T, direct_attn_ ? attn_ : a_q_, b.out_q, b.out_s, a_s_, x, lc.gate_msa, cls, b.out_b);
             prep_norm_.run(prof, "prepare norm", T, x, b.norm2, lc.table_mlp, cls, a_q_, a_s_);
             gemm_gu_.run(prof, "gemm ff + swiglu", T, a_q_, b.gu_q, b.gu_s, a_s_, gu_, nullptr, nullptr, b.gu_b);
-            if (!direct_) prep_down_.run(prof, "prepare down input", T, gu_, nullptr, nullptr, nullptr, a_q_, a_s_);
-            gemm_down_.run(prof, "gemm down + residual", T, direct_ ? gu_ : a_q_, b.down_q, b.down_s, a_s_, x, lc.gate_mlp, cls, b.down_b);
+            if (!direct_down_) prep_down_.run(prof, "prepare down input", T, gu_, nullptr, nullptr, nullptr, a_q_, a_s_);
+            gemm_down_.run(prof, "gemm down + residual", T, direct_down_ ? gu_ : a_q_, b.down_q, b.down_s, a_s_, x, lc.gate_mlp, cls, b.down_b);
             dump_x(fmt("blk_%02d", i));
         }
     }
 
 private:
-    StackDims d_; size_t tokens_, capacity_ = 0; int layers_, waves_ = 4; std::string tag_; int calls_ = 0; bool direct_ = false;
+    StackDims d_; size_t tokens_, capacity_ = 0; int layers_, waves_ = 4; std::string tag_; int calls_ = 0; bool direct_attn_ = false, direct_down_ = false;
     std::vector<Block> blocks_;
     Prepare prep_norm_, prep_attn_, prep_down_;
     Gemm gemm_qkv_, gemm_gu_, gemm_out_, gemm_down_;
@@ -770,6 +780,7 @@ void dit_plan(const Checkpoint &ck, Weights &w) {
 // rows with their scales, the bf16 vision tower as stored (zero-padded where a kernel's K or N demands it), the norms
 // widened to f32. The embedding table is not a recipe: text_in reads one row per token straight from the mapping.
 void te_plan(const Checkpoint &ck, Weights &w) {
+    ck.at("model.embed_tokens.weight", "BF16", {-1, TEXT_DIM});   // validate before Weights::open commits the mapping
     auto I8 = [&](const std::string &n, int64_t rows, int64_t cols) -> const Entry & { return ck.at(n + ".weight", "I8", {rows, cols}); };
     auto S = [&](const std::string &n, int64_t rows) -> const Entry & { return ck.at(n + ".weight_scale", "F32", {rows, 1}); };
     auto bf = [&](const std::string &n, std::initializer_list<int64_t> shape) -> const Entry & { return ck.at(n, "BF16", shape); };
@@ -818,18 +829,19 @@ void te_plan(const Checkpoint &ck, Weights &w) {
 void vvae_plan(const Checkpoint &ck, Weights &w) {
     auto f16 = [&](const std::string &n, std::initializer_list<int64_t> shape) -> const Entry & { return ck.at(n, "F16", shape); };
     const int inner = VAE_HEADS * VAE_D;
+    const size_t hid_pitch = gemm_pitch(VAE_HID, 16) * 2, inner_pitch = gemm_pitch(inner, 16) * 2, ffn_pitch = gemm_pitch(VAE_FFN, 16) * 2;   // operand row pitches in bytes
     for (int i = 0; i < 36; ++i) {
         const std::string p = fmt("blocks.%d.", i), src = fmt("decoder.transformer_blocks.%d.", i);
         // to_qkv holds [q | k | v] per head of 64; the rope kernel wants [Q | K | V]
         std::vector<Run> qkv_rows; for (int part = 0; part < 3; ++part) for (int head = 0; head < VAE_HEADS; ++head) qkv_rows.push_back({size_t(head * 3 + part) * VAE_D, VAE_D});
-        w.add(p + "qkv.q", rows_permuted(ck, f16(src + "attn.to_qkv.weight", {3 * inner, VAE_HID}), qkv_rows));
+        w.add(p + "qkv.q", rows_permuted(ck, f16(src + "attn.to_qkv.weight", {3 * inner, VAE_HID}), qkv_rows, hid_pitch));
         w.add(p + "qkv.b", widen_runs(ck, f16(src + "attn.to_qkv.bias", {3 * inner}), qkv_rows));
-        w.add(p + "out.q", rows_of(ck, {&f16(src + "attn.to_out.weight", {VAE_HID, inner})}));   w.add(p + "out.b", widen_f32(ck, {&f16(src + "attn.to_out.bias", {VAE_HID})}));
+        w.add(p + "out.q", rows_of(ck, {&f16(src + "attn.to_out.weight", {VAE_HID, inner})}, inner_pitch));   w.add(p + "out.b", widen_f32(ck, {&f16(src + "attn.to_out.bias", {VAE_HID})}));
         // w1 is gate | linear (comfy/ldm/minimax/vae.py: gate, x = w1(x).chunk(2)); the epilogue takes the linear half first
         const std::vector<Run> gu = interleaved_runs(VAE_FFN, 0, VAE_FFN, 16);
-        w.add(p + "gu.q", rows_permuted(ck, f16(src + "ff.w1.weight", {2 * VAE_FFN, VAE_HID}), gu));
+        w.add(p + "gu.q", rows_permuted(ck, f16(src + "ff.w1.weight", {2 * VAE_FFN, VAE_HID}), gu, hid_pitch));
         w.add(p + "gu.b", widen_runs(ck, f16(src + "ff.w1.bias", {2 * VAE_FFN}), gu));
-        w.add(p + "down.q", rows_of(ck, {&f16(src + "ff.w2.weight", {VAE_HID, VAE_FFN})}));      w.add(p + "down.b", widen_f32(ck, {&f16(src + "ff.w2.bias", {VAE_HID})}));
+        w.add(p + "down.q", rows_of(ck, {&f16(src + "ff.w2.weight", {VAE_HID, VAE_FFN})}, ffn_pitch));      w.add(p + "down.b", widen_f32(ck, {&f16(src + "ff.w2.bias", {VAE_HID})}));
         for (const char *n : {"norm1", "norm2"}) w.add(p + n, widen_f32(ck, {&f16(src + n + ".weight", {VAE_HID})}));
         for (const char *n : {"scale1", "scale2"}) w.add(p + n, widen_f32(ck, {&f16(src + n, {VAE_HID})}));
     }
@@ -1878,7 +1890,7 @@ public:
             keep = dec_frames - pad_frames;
         }
         if (keep != size_t(F)) throw std::runtime_error("decoded " + std::to_string(keep) + " frames, expected " + std::to_string(F));
-
+        if (prof.on) { double tot = 0; for (auto &kv : prof.us) tot += kv.second; fprintf(stderr, "  video decode stages (%.1f s):", tot * 1e-6); for (auto &kv : prof.us) if (kv.second > 0.01 * tot) fprintf(stderr, "  %s %.2fs", kv.first.c_str(), kv.second * 1e-6); fprintf(stderr, "\n"); prof.us.clear(); }
     }
 
 private:

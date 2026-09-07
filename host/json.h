@@ -54,7 +54,9 @@ struct Parser {
         if (s.compare(i, 4, "true") == 0) { v.kind = Json::Bool; v.number = 1; i += 4; return v; }
         if (s.compare(i, 5, "false") == 0) { v.kind = Json::Bool; i += 5; return v; }
         if (s.compare(i, 4, "null") == 0) { i += 4; return v; }
-        { char *end = nullptr; v.number = strtod(s.c_str() + i, &end); if (end == s.c_str() + i) fail("bad token"); i = size_t(end - s.c_str()); v.kind = Json::Number; return v; }
+        { char *end = nullptr; v.number = strtod(s.c_str() + i, &end); if (end == s.c_str() + i) fail("bad token");
+          v.str = s.substr(i, size_t(end - (s.c_str() + i)));   // retain the spelling for exact integer validation (checkpoint sizes)
+          i = size_t(end - s.c_str()); v.kind = Json::Number; return v; }
     }
 };
 

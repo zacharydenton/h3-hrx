@@ -3,6 +3,7 @@
 #include "../host/h3pipe.cpp"
 #include <cassert>
 #include <filesystem>
+#include <signal.h>
 #include <thread>
 
 struct RtKernel { std::string path; };
@@ -56,5 +57,15 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 2; ++i) threads.emplace_back([&, i] { got[i] = binary(); });
     for (auto &t : threads) t.join();
     assert(got[0] == "v3" && got[1] == "v3" && count() == 6);
+    // A host signal while the child is still writing must not publish a partial code object.
+    struct sigaction action{}, old_action{}; action.sa_handler = +[](int) {}; sigemptyset(&action.sa_mask);
+    assert(sigaction(SIGUSR1, &action, &old_action) == 0);   // deliberately omit SA_RESTART
+    { std::ofstream out(dir + "/compiler");
+      out << "#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in --output=*) output=${arg#--output=};; esac; done\n"
+             "printf partial > \"$output\"\nsleep 0.05\nkill -USR1 \"$PPID\"\nsleep 0.05\nexit 1\n"; }
+    failed = false; try { binary(); } catch (const std::runtime_error &e) { failed = std::string(e.what()).find("loom-compile failed") != std::string::npos; }
+    assert(sigaction(SIGUSR1, &old_action, nullptr) == 0);
+    assert(failed && count() == 6);
+    for (auto &e : std::filesystem::directory_iterator(cache)) assert(e.path().string().find(".tmp.") == std::string::npos);
     puts("PASS kernel cache identity (source, symbol, config, compiler), failure cleanup and locked publication");
 }

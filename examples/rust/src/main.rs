@@ -50,13 +50,17 @@ fn main() {
     let c = |s: String| CString::new(s).unwrap();
     let mut err = vec![0 as c_char; 4096];
     unsafe {
-        assert_eq!(h3pipe_abi_version(), 6, "libh3pipe ABI");
+        assert_eq!(h3pipe_abi_version(), 7, "libh3pipe ABI");
         let tok = h3tok_create(std::ptr::null(), err.as_mut_ptr(), err.len());   // the tokenizer compiled into libh3pipe
         if tok.is_null() { eprintln!("tokenizer: {}", err_text(&err)); std::process::exit(1); }
         let mut ids = vec![0i32; 4096];
         let n = h3tok_encode(tok, c(args[1].clone()).as_ptr(), ids.as_mut_ptr(), ids.len());
         h3tok_destroy(tok);
         assert!(n >= 0 && n as usize <= ids.len(), "cannot tokenize the prompt"); ids.truncate(n as usize);
+
+        let p = H3pipeParams { height: 480, width: 864, frames: args.get(2).map_or(124, |v| v.parse().unwrap()), steps: args.get(3).map_or(31, |v| v.parse().unwrap()), seed: 0, video_shift: 0.0, audio_shift: 0.0, sampler: 1, cache_threshold: 0.0 };
+        let mut sh = H3pipeShape::default();
+        if h3pipe_shape_for(&p, &mut sh) != 0 { eprintln!("invalid parameters"); std::process::exit(64); }
 
         let models = std::env::var("H3_MODELS").unwrap_or(format!("{home}/comfy-models"));
         let files: Vec<CString> = ["diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors", "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
@@ -68,8 +72,6 @@ fn main() {
         let mut s: *mut H3pipeSession = std::ptr::null_mut();
         if h3pipe_create(&cfg, &mut s, err.as_mut_ptr(), err.len()) != 0 { eprintln!("create: {}", err_text(&err)); std::process::exit(1); }
 
-        let p = H3pipeParams { height: 480, width: 864, frames: args.get(2).map_or(124, |v| v.parse().unwrap()), steps: args.get(3).map_or(31, |v| v.parse().unwrap()), seed: 0, video_shift: 0.0, audio_shift: 0.0, sampler: 1, cache_threshold: 0.0 };
-        let mut sh = H3pipeShape::default(); h3pipe_shape_for(&p, &mut sh);
         let mut video = vec![0f32; 24 * sh.latent_t as usize * sh.lat_h as usize * sh.lat_w as usize]; let mut audio = vec![0f32; 64 * sh.audio_t as usize];
         eprintln!("{} frames, {}x{}x{} latents, {} audio latents, {} prompt tokens", sh.frames, sh.latent_t, sh.lat_h, sh.lat_w, sh.audio_t, ids.len());
         if h3pipe_denoise(s, ids.as_ptr(), ids.len() as c_int, &p, std::ptr::null(), std::ptr::null(), video.as_mut_ptr(), video.len(), audio.as_mut_ptr(), audio.len(), Some(progress), std::ptr::null_mut(), err.as_mut_ptr(), err.len()) != 0 {

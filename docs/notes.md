@@ -1415,3 +1415,35 @@ tower's four matmuls, and `matmul_f32` bounded at 1048576 rows rather than 32768
 
 Qwen's `tokenizer.json` is compiled into the library (`assets/`, `host/tokenizer_blob.S`), so `h3tok_create(NULL)`
 needs no file and a clip needs nothing beyond the four checkpoints.
+
+### The operand pitch, at 16 bits (2026-09-07)
+
+The int8 GEMMs pad an operand row whose byte pitch is a multiple of 1024 (the 384 rows a k step touches otherwise alias
+in the cache); the f16 twins never did, because until now no f16 weights were loaded. The video VAE decoder's rows are
+exactly that case: K 2048 is 4096 bytes and K 8192 is 16384. Padding by one k step (128 elements at 16 bits, which the
+f16 attention's `out_stride` also requires) on an idle box, 124 frames at 864x480, the decode stages under `H3_PROFILE=1`:
+
+| stage | no pad | padded |
+| --- | ---: | ---: |
+| gemm ff + swiglu | 31.63 s | 18.51 s |
+| gemm down + residual | 17.53 s | 10.35 s |
+| gemm qkv | 12.00 s | 7.77 s |
+| gemm out + residual | 5.49 s | 3.47 s |
+| attention | 8.32 s | 7.29 s |
+| prepare down input | — | 1.80 s |
+| **total** | **77.9 s** | **51.6 s** |
+
+The gate|up product is written at `ffn`, so padding the down operand costs a `prepare_plain_f16` back (1.80 s) and buys
+7.2 s; the attention writes its output at the padded pitch directly, so the out projection's operand is free. The
+decoder's frames are unchanged (62.51 dB against diffusers, as before): the pad only moves rows in memory.
+
+The mapped checkpoints are also released page by page as each tensor lands on the device (`Checkpoint::done_with`,
+`MADV_DONTNEED`). Left mapped, 53 GB of checkpoint competes with the device allocations for the same memory on an APU;
+under pressure the kernel evicts them and the next stage faults them back from disk, which is what a contended run
+showed as `folio_wait_bit_common` with the GPU at 6%.
+
+For the record, the step itself is at parity with the exported path: 25.4 s against 25.2 s per evaluation at 480p,
+measured back to back on an idle box (the DiT's int8 rows and their pitches are unchanged; the f32 embedders and final
+layer cost about 0.5 s and the exact-dtype refiner gives some of it back). The decoder's remaining gap to the int8
+export (51.6 s of stages against 41.7 s) is the f16 weights' bytes: these GEMMs are memory-bound, and f16 is exactly
+twice int8.

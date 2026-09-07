@@ -101,22 +101,11 @@ def embed_tokens(ids: torch.Tensor) -> torch.Tensor:
     return table[ids].float()
 
 
-def encode_loom(ids: torch.Tensor) -> torch.Tensor:
-    """The 50 layers in Loom (W8A8, the same int8 file): [L, 5120] f32 after layer 50, no norm."""
-    sys.path.insert(0, str(ROOT))
-    from h3te_loom import H3TeBlocks
-    session = H3TeBlocks(int(ids.shape[0]))
-    try:
-        return session.forward(embed_tokens(ids))
-    finally:
-        session.close()
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("prompt")
     ap.add_argument("--out", default=str(ROOT / "build/prompts"))
-    ap.add_argument("--torch", action="store_true", help="the transformers bf16 path instead of the Loom session")
+    ap.add_argument("--torch", action="store_true", help="compatibility flag; the transformers bf16 encoder is now the default")
     a = ap.parse_args()
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     path = prompt_path(a.prompt, out)
@@ -125,15 +114,12 @@ def main() -> None:
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(str(TOK))
     ids = tok(a.prompt, add_special_tokens=False, return_tensors="pt")["input_ids"]
-    if a.torch:
-        device = "cuda"
-        model = load_encoder(device)
-        rotate_inputs(model, device)
-        with torch.no_grad():
-            outputs = model.model.language_model(input_ids=ids.to(device), output_hidden_states=True)
-            embeds = outputs.hidden_states[LAYERS][0].float().cpu()            # [L, 5120], after layer 50, no norm
-    else:
-        embeds = encode_loom(ids[0])
+    device = "cuda"
+    model = load_encoder(device)
+    rotate_inputs(model, device)
+    with torch.no_grad():
+        outputs = model.model.language_model(input_ids=ids.to(device), output_hidden_states=True)
+        embeds = outputs.hidden_states[LAYERS][0].float().cpu()            # [L, 5120], after layer 50, no norm
     torch.save(dict(prompt=a.prompt, ids=ids[0], embeds=embeds, tags=torch.ones(embeds.shape[0], dtype=torch.long)), path)
     print(f"{path}: {embeds.shape[0]} tokens, rms {embeds.pow(2).mean().sqrt():.3f}")
 

@@ -58,6 +58,43 @@ int main(int argc, char **argv) {
       f.write((const char *)&n, 8); f.write(h.data(), std::streamsize(h.size())); f.write("0123", 4); }
     fails([&] { Checkpoint c(dir + "/past.safetensors"); }, "tensor span past the data");
 
+    auto raw = [&](const std::string &header, const std::string &data = "") {
+        std::ofstream f(path, std::ios::binary); const uint64_t n = header.size();
+        f.write((const char *)&n, 8); f.write(header.data(), std::streamsize(header.size())); f.write(data.data(), std::streamsize(data.size()));
+    };
+    for (const std::string &shape : {"[4096]", "[]", "[1,4]"}) {
+        raw("{\"w\":{\"dtype\":\"F32\",\"shape\":" + shape + ",\"data_offsets\":[0,0]}}");
+        fails([&] { Checkpoint c(path); }, "byte count does not match");
+    }
+    raw("{\"w\":{\"dtype\":\"F16\",\"shape\":[2],\"data_offsets\":[0,8]}}", "12345678");
+    fails([&] { Checkpoint c(path); }, "byte count does not match");
+    for (const std::string &dim : {"-1", "1.5", "true", "null", "\"2\"", "1e999", "NaN", "9223372036854775808", "18446744073709551616"}) {
+        raw("{\"w\":{\"dtype\":\"F32\",\"shape\":[" + dim + "],\"data_offsets\":[0,0]}}");
+        fails([&] { Checkpoint c(path); }, "invalid integer dimension");
+    }
+    for (const std::string &offset : {"-1", "0.5", "false", "null", "\"0\"", "1e999", "NaN", "18446744073709551616"}) {
+        raw("{\"w\":{\"dtype\":\"U8\",\"shape\":[0],\"data_offsets\":[" + offset + ",0]}}");
+        fails([&] { Checkpoint c(path); }, "invalid integer offset");
+    }
+    raw("{\"w\":{\"dtype\":\"F32\",\"shape\":[4611686018427387904,4],\"data_offsets\":[0,0]}}");
+    fails([&] { Checkpoint c(path); }, "tensor size overflow");
+    raw("{\"w\":{\"dtype\":\"unknown\",\"shape\":[0],\"data_offsets\":[0,0]}}");
+    fails([&] { Checkpoint c(path); }, "unsupported checkpoint dtype");
+    // Scalars, empty tensors, and quantisation metadata remain valid.
+    write_file(path, {{"scalar", {"F32", {}, std::vector<char>(4)}}, {"empty", {"BF16", {2, 0, 3}, {}}}, {"metadata", {"U8", {3}, {'a', 'b', 'c'}}}});
+    { Checkpoint c(path); assert(c.at("scalar").elements() == 1 && c.at("empty").elements() == 0 && c.at("metadata").bytes == 3); }
+
+    // An invalid embedding must be rejected on every retry, before committing the text checkpoint.
+    const std::string te_path = dir + "/te.safetensors";
+    h3pipe_config cfg{}; cfg.te_file = te_path.c_str(); cfg.kernel_sources = "unused"; cfg.cache_dir = "unused"; cfg.loom_compile = "unused";
+    for (bool missing : {true, false}) {
+        if (missing) write_file(te_path, {});
+        else write_file(te_path, {{"model.embed_tokens.weight", {"F16", {1, TEXT_DIM}, std::vector<char>(TEXT_DIM * 2)}}});
+        Pipe pipe(cfg);
+        for (int retry = 0; retry < 2; ++retry) fails([&] { pipe.ensure_te(); }, missing ? "missing tensor model.embed_tokens.weight" : "expected BF16");
+    }
+    assert(fake.bytes == 0);
+
     write_file(path, {{"gate", i8_rows(32, 8, 0)}, {"up", i8_rows(32, 8, 100)}, {"gs", f32_vec(std::vector<float>(32, 1.5f))}, {"us", f32_vec(std::vector<float>(32, 2.5f))},
                       {"q", i8_rows(2, 8, 10)}, {"k", i8_rows(3, 8, 20)}, {"half", f16_vec({1.0f, -2.5f, 0.125f})}, {"brain", bf16_vec({3.0f, -0.5f})}, {"metadata_free", f32_vec({7.0f})}});
     Checkpoint ck(path);

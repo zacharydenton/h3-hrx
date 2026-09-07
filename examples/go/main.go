@@ -54,6 +54,11 @@ func main() {
 	C.h3tok_destroy(tok)
 	if n < 0 || n > len(ids) { fmt.Fprintln(os.Stderr, "cannot tokenize the prompt"); os.Exit(1) }
 
+	// Validate sizes before creating a session or allocating output buffers.
+	p := C.h3pipe_params{height: 480, width: 864, frames: C.int(atoi(2, 124)), steps: C.int(atoi(3, 31)), seed: 0, sampler: 1}
+	var sh C.h3pipe_shape
+	if C.h3pipe_shape_for(&p, &sh) != 0 { fmt.Fprintln(os.Stderr, "invalid parameters"); os.Exit(64) }
+
 	// a session
 	cs := func(s string) *C.char { return C.CString(s) }
 	loom := "loom-compile"
@@ -65,10 +70,6 @@ func main() {
 	var s *C.h3pipe_session
 	if C.h3pipe_create(&cfg, &s, &err[0], C.size_t(len(err))) != 0 { fail("create", err) }
 
-	// sizes from the parameters
-	p := C.h3pipe_params{height: 480, width: 864, frames: C.int(atoi(2, 124)), steps: C.int(atoi(3, 31)), seed: 0, sampler: 1}
-	var sh C.h3pipe_shape
-	C.h3pipe_shape_for(&p, &sh)
 	video := make([]C.float, 24*int(sh.latent_t)*int(sh.lat_h)*int(sh.lat_w))
 	audio := make([]C.float, 64*int(sh.audio_t))
 	fmt.Fprintf(os.Stderr, "%d frames, %dx%dx%d latents, %d audio latents, %d prompt tokens\n", int(sh.frames), int(sh.latent_t), int(sh.lat_h), int(sh.lat_w), int(sh.audio_t), n)

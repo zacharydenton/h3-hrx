@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -33,6 +33,30 @@ def spy_pipe(shape=Shape(22, 7, 4, 6, 37, 4096)):
 
 
 class ReviewRegressions(unittest.TestCase):
+    def test_prompt_encoder_defaults_to_transformers(self):
+        """Run the uncached CLI path with fake dependencies; no torch import or GPU context."""
+        torch = MagicMock(); torch.nn.Module = object
+        transformers = MagicMock()
+        ids, embeds = MagicMock(), MagicMock()
+        embeds.shape = (3, 5120); embeds.pow.return_value.mean.return_value.sqrt.return_value = 1.0
+        transformers.AutoTokenizer.from_pretrained.return_value.return_value = {"input_ids": ids}
+        model = MagicMock()
+        model.model.language_model.return_value.hidden_states = [None] * 50 + [[embeds]]
+        embeds.float.return_value.cpu.return_value = embeds
+        spec = importlib.util.spec_from_file_location("review_encode_prompt", ROOT / "tools/encode_prompt.py")
+        encoder = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {"torch": torch, "transformers": transformers}):
+            spec.loader.exec_module(encoder)
+            for flags in ([], ["--torch"]):
+                with tempfile.TemporaryDirectory() as tmp, patch.object(sys, "argv", ["encode_prompt.py", "a fox", "--out", tmp] + flags), \
+                     patch.object(encoder, "load_encoder", return_value=model) as load, patch.object(encoder, "rotate_inputs") as rotate, \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    encoder.main()
+                    load.assert_called_once_with("cuda"); rotate.assert_called_once_with(model, "cuda")
+                    saved, path = torch.save.call_args.args
+                    self.assertIs(saved["embeds"], embeds)
+                    self.assertEqual(path, encoder.prompt_path("a fox", Path(tmp)))
+
     def test_keyframe_shapes_are_rejected_before_native_call(self):
         pipe = H3Pipe.__new__(H3Pipe)
         pipe.shape = lambda p: Shape(22, 7, 4, 6, 37, 4096)
