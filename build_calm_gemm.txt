@@ -1,3 +1,0 @@
-  PASS gemm_i4_256          2097x5376x21504    6.372 ms  76.1 TOPS: max_abs=4.869e-04 max_
-  PASS gemm_i4_resid_256    2097x7168x5376    2.244 ms  72.0 TOPS: max_abs=1.953e-03 max_r
-  PASS gemm_i4_swiglu_256   2097x5376x28672    8.867 ms  72.9 TOPS: max_abs=1.505e-04 max_
