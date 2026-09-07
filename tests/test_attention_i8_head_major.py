@@ -7,15 +7,15 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-STEM = "attention_i8qkhm_mha8_lds_f16_wmma"
+STEM = "attention_i8qkhm_mha8_k64_lds_f16_wmma"
 
 
 def main():
     env = dict(os.environ, OPENBLAS_NUM_THREADS="4", OMP_NUM_THREADS="4")
-    shapes = [1, 15, 16, 17, 31, 32, 33, 127, 128, 129, 255, 256, 257, 1001]
+    shapes = [1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1001]
     cases = [(n, 1.0) for n in shapes] + [(257, scale) for scale in (0.0, 32.0, 256.0)]
     for n, scale in cases:
-        output = ROOT / "build/attention30/loom-correctness" / f"scale{scale:g}"
+        output = ROOT / "build/attention45/loom-correctness" / f"scale{scale:g}"
         command = [
             sys.executable,
             str(ROOT / "tools/bench_attention_i8.py"),

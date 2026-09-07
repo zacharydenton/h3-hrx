@@ -1,5 +1,9 @@
 # INT8 attention above 30 TFLOP/s in Loom
 
+The current 64-key follow-up reaches 37.5 TFLOP/s-equivalent and is selected by
+the C host. See [the 45-target results](attention-int8-45.md). The measurements
+below describe the earlier 32-key implementation.
+
 On the Radeon 8060S (`gfx1151`), the Loom-compiled head-major kernel exceeds
 30 TFLOP/s-equivalent on both tested sequence lengths. Both matrix products,
 softmax, and output normalization execute in one Loom kernel. No HIP-compiled

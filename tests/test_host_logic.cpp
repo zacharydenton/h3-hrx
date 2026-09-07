@@ -3,6 +3,22 @@
 #include <cassert>
 
 int main() {
+    assert(gemm_m_group_for(37723, FFN, HID, 8) == 2);
+    assert(gemm_m_group_for(32768, FFN, HID, 8) == 2);
+    for (int bits : {4, 8, 16}) {
+        assert(gemm_m_group_for(16000, FFN, HID, bits) == m_group_for(16000));
+        assert(gemm_m_group_for(37723, HID, 3 * HEADS * HEAD_DIM, bits) == m_group_for(37723));
+        if (bits != 8) assert(gemm_m_group_for(37723, FFN, HID, bits) == m_group_for(37723));
+    }
+    // The launch must cover the entire final row group selected at compile time,
+    // including when the runtime row count would have selected a different group.
+    for (size_t tokens : {1u, 255u, 256u, 257u, 513u, 16000u, 32767u, 32768u, 37723u}) {
+        for (unsigned group : {1u, 2u, 3u, 4u}) {
+            const size_t gy = gemm_grid_y(tokens, group);
+            assert(gy % group == 0 && gy * 256 >= tokens);
+            assert((gy - group) * 256 < tokens);
+        }
+    }
     int counts[3] = {};
     for (int j = 0; j < 64; ++j) ++counts[mrope_axis(j)];
     assert(counts[0] == 24 && counts[1] == 20 && counts[2] == 20);

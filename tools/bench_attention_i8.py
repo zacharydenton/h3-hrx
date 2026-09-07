@@ -65,6 +65,7 @@ def main():
     p.add_argument("stems", nargs="+")
     p.add_argument("--rounds", type=int, default=3)
     p.add_argument("--repeat", type=int, default=3)
+    p.add_argument("--wave-size", type=int, default=32, choices=[32, 64])
     p.add_argument("--heads", type=int, default=56)
     p.add_argument("--keys", type=int, default=16, choices=[16, 32, 64])
     p.add_argument(
@@ -134,11 +135,13 @@ def main():
             "seed": args.seed,
             "score_scale": args.score_scale,
             "head_major": args.head_major,
+            "wave_size": args.wave_size,
             "hip_options": hip_options,
         }.items():
-            assert previous.get(key, False if key == "head_major" else None) == value, (
-                f"Reuse configuration mismatch: {key}"
-            )
+            assert (
+                previous.get(key, {"head_major": False, "wave_size": 32}.get(key))
+                == value
+            ), f"Reuse configuration mismatch: {key}"
     rng = np.random.default_rng(args.seed)
     # Rounded Gaussian codes and positive scales approximate rotated H3 Q/K.
     paths = []
@@ -221,6 +224,9 @@ def main():
                 "scale": 1.0,
             }.items()
         }
+        assert src.suffix != ".cpp" or args.wave_size == 32, (
+            "HIP variants require wave32"
+        )
         if args.reuse:
             assert hsaco.exists(), hsaco
             assert (
@@ -270,7 +276,7 @@ def main():
             "--grid",
             f"{(n + query_block - 1) // query_block},{h},1",
             "--block",
-            f"{32 * waves},1,1",
+            f"{args.wave_size * waves},1,1",
             "--repeat",
             str(args.repeat),
             "--i32",
@@ -348,6 +354,7 @@ def main():
         "score_scale": args.score_scale,
         "full_check": args.full_check,
         "head_major": args.head_major,
+        "wave_size": args.wave_size,
         "hip_options": hip_options,
         "timestamp": time.time(),
         "metric": "4*N*N*heads*D / kernel seconds / 1e12",
