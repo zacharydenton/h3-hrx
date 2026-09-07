@@ -17,19 +17,18 @@ def main():
     ap.add_argument("--ref-image", action="append", default=[], help="reference image (png/jpg) for ref2va: presented as <Picture i> and encoded by the VAE encoder; repeatable")
     ap.add_argument("--ref-audio", action="append", default=[], help="reference wav (32 kHz stereo/mono) for ref2va: <Audio j>; repeatable")
     ap.add_argument("--first-frame", default=None, help="keyframe image for fl2va (resized to the canvas)")
-    ap.add_argument("--precision", choices=["int8", "int4", "bf16"], default="int8", help="int8: the checkpoint's int8 rows + int8 QK^T attention (ComfyUI parity); bf16: f16 rows of the pruned bf16 checkpoint (export_weights.py --bits 16) + f16 attention; int4: GPTQ int4 blocks + int4 QK^T (2x per step, ghosts keyframe/reference clips)")
-    ap.add_argument("--blocks", default=None, help="override the block weights directory"); ap.add_argument("--attn", choices=["f16", "i8", "i4"], default=None, help="override the attention QK^T precision"); ap.add_argument("--glue", default=None)
+    ap.add_argument("--blocks", default=None, help="override the block weights directory"); ap.add_argument("--attn", choices=["f16", "i8", "i4"], default="i8", help="the DiT attention's QK^T operands (i8: the parity path; i4 ghosts keyframe/reference clips)"); ap.add_argument("--glue", default=None)
     ap.add_argument("--base-weights", action="store_true", help="run reference files on the base checkpoint when the ref2va exports are absent (otherwise an error)")
     a = ap.parse_args()
     from h3tok_ids import encode_presentation
     # reference runs take the ref2va checkpoint's exports (README, Weights: export_weights.py --ckpt <ref2va> --out build/weights_i8_ref2va, export_glue.py --ckpt <ref2va> --out build/weights_glue_ref2va)
-    wdir = {"int8": "weights_i8", "bf16": "weights_f16", "int4": "weights_gptq"}[a.precision]
+    wdir = "weights_i8"   # the checkpoint's int8 rows
     want_refs = bool(a.ref_image or a.ref_audio)
     have_ref2va = (ROOT / f"build/{wdir}_ref2va/manifest.txt").exists() and (ROOT / "build/weights_glue_ref2va/manifest.txt").exists()
     if want_refs and not have_ref2va and not a.base_weights and not (a.blocks and a.glue):
         raise SystemExit(f"references need the ref2va exports, build/{wdir}_ref2va and build/weights_glue_ref2va (README, Weights); --base-weights runs the base checkpoint anyway, or give --blocks and --glue")
     suffix = "_ref2va" if want_refs and have_ref2va and not a.base_weights else ""
-    blocks = a.blocks or str(ROOT / ("build/" + wdir + suffix)); attn = a.attn or {"int8": "i8", "bf16": "f16", "int4": "i4"}[a.precision]
+    blocks = a.blocks or str(ROOT / ("build/" + wdir + suffix)); attn = a.attn
     glue = a.glue or (str(ROOT / "build/weights_glue_ref2va") if suffix else None)
     t0 = time.time(); pipe = H3Pipe(vae_bits=a.vae_bits, blocks=blocks, glue=glue, attn=attn); print(f"session in {time.time() - t0:.1f} s ({os.path.basename(blocks)}, {attn} attention{', ref2va glue' if glue else ''})", flush=True)
     p = H3Pipe.params(height=a.height, width=a.width, frames=a.frames, steps=a.steps, seed=a.seed, cache_threshold=a.cache_threshold, sampler=a.sampler); sh = pipe.shape(p)

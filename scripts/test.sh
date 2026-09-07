@@ -23,8 +23,8 @@ step "generated kernels match their generators" bash -c '
   tmpdir=$(mktemp -d); trap "rm -rf $tmpdir" EXIT
   cp -r kernels "$tmpdir/kernels" && cp -r tools "$tmpdir/tools" && cp -r experiments "$tmpdir/experiments" && cp -r scripts "$tmpdir/scripts" && cd "$tmpdir" &&
   "$0" tools/gen_prepare.py >/dev/null && "$0" tools/gen_attention_lds.py >/dev/null && ATTN_WAVES=8 "$0" tools/gen_attention_lds.py >/dev/null && ATTN_GQA=8 ATTN_WAVES=8 ATTN_CAUSAL=1 "$0" tools/gen_attention_lds.py >/dev/null && "$0" tools/gen_gemm.py >/dev/null && "$0" tools/gen_rope.py >/dev/null && sh scripts/gen_attention_i4.sh >/dev/null &&
-  "$0" tools/gen_attention_i8_head_major.py >/dev/null && "$0" tools/gen_attention_i8_head_major_64.py >/dev/null &&
-  for f in attention_i4qk_mha8_lds_f16_wmma attention_i4qk_mha_lds_f16_wmma attention_i4qkl_mha8_lds_f16_wmma attention_i4qks_mha8_lds_f16_wmma attention_i4qks_mha_lds_f16_wmma attention_i4qksl_mha8_lds_f16_wmma prepare_norm_i4 prepare_plain_i4 prepare_norm_i8 prepare_plain_i8 prepare_plain16_i8 prepare_lnorm_i8 attention_mha_lds_f16_wmma attention_mha8_lds_f16_wmma attention_gqa8c_lds_f16_wmma gemm_i4_256 gemm_i4_resid_256 gemm_i4_swiglu_256 gemm_i8_256b gemm_i8_resid_256b gemm_i8_swiglu_256b_gs gemm_i8_256 gemm_i8_resid_256 gemm_i8_swiglu_256 rope_qknorm_f16 rope64_qknorm_f16 rope128_qknorm_f16 attention_i8qkhm_mha8_lds_f16_wmma attention_i8qkhm_mha8_k64_lds_f16_wmma prepare_qk_i8hm; do "$LOOM_FORMAT" --in-place "kernels/$f.loom" >/dev/null && cmp -s "kernels/$f.loom" "$OLDPWD/kernels/$f.loom" || { echo "  $f differs"; exit 1; }; done' "$PY"
+  "$0" tools/gen_attention_i8_head_major.py >/dev/null && "$0" tools/gen_attention_i8_head_major_64.py >/dev/null && "$0" tools/gen_gemm_f16.py >/dev/null && "$0" tools/gen_matmul_bf16.py >/dev/null &&
+  for f in attention_i4qk_mha8_lds_f16_wmma attention_i4qk_mha_lds_f16_wmma attention_i4qkl_mha8_lds_f16_wmma attention_i4qks_mha8_lds_f16_wmma attention_i4qks_mha_lds_f16_wmma attention_i4qksl_mha8_lds_f16_wmma prepare_norm_i4 prepare_plain_i4 prepare_norm_i8 prepare_plain_i8 prepare_plain16_i8 prepare_lnorm_i8 prepare_norm_f16 prepare_lnorm_f16 prepare_plain_f16 prepare_norm_bf16 prepare_lnorm_bf16 prepare_plain_bf16 attention_mha_lds_f16_wmma attention_mha8_lds_f16_wmma attention_gqa8c_lds_f16_wmma gemm_i4_256 gemm_i4_resid_256 gemm_i4_swiglu_256 gemm_i8_256b gemm_i8_resid_256b gemm_i8_swiglu_256b_gs gemm_i8_256 gemm_i8_resid_256 gemm_i8_swiglu_256 gemm_f16_256 gemm_f16_256b gemm_f16_resid_256 gemm_f16_resid_256b gemm_f16_swiglu_256 gemm_f16_swiglu_256b_gs gemm_bf16_256 gemm_bf16_256b gemm_bf16_resid_256 gemm_bf16_resid_256b gemm_bf16_swiglu_256 gemm_bf16_swiglu_256b_gs matmul_bias_bf16_wmma matmul_resid_bf16_wmma matmul_gelu_bf16_wmma matmul_gelu_erf_bf16_wmma rope_qknorm_f16 rope64_qknorm_f16 rope128_qknorm_f16 attention_i8qkhm_mha8_lds_f16_wmma attention_i8qkhm_mha8_k64_lds_f16_wmma prepare_qk_i8hm; do "$LOOM_FORMAT" --in-place "kernels/$f.loom" >/dev/null && cmp -s "kernels/$f.loom" "$OLDPWD/kernels/$f.loom" || { echo "  $f differs"; exit 1; }; done' "$PY"
 else skip "generated kernels match their generators" "no loom-format (scripts/env.sh)"; fi
 step "CPU host regressions" env H3_PYTHON="$PY" bash scripts/test_host.sh
 if [ "$tier" = cpu ]; then printf '\n'; [ "$status" = 0 ] && printf 'all checks passed\n' || printf 'SOME CHECKS FAILED\n'; exit $status; fi
@@ -44,6 +44,10 @@ step "attention (text encoder: causal, 8 query heads per kv head)" env -u LD_LIB
 step "attention, int8 QK^T head-major (the production long-sequence kernel)" gpu tests/test_attention_i8_head_major.py
 step "gemm family (M=512)" gpu tests/test_gemm.py 512
 step "gemm int8 family (text encoder, M=300)" gpu tests/test_gemm.py 300 i8
+step "gemm f16 family (the video VAE decoder, M=512)" gpu tests/test_gemm_f16.py 512
+step "gemm bf16 family (the token refiner, M=512)" env -u LD_LIBRARY_PATH GEMM_ELEM=bf16 "$REF_PY" tests/test_gemm_f16.py 512
+step "prepare kernels, f16 and bf16 unrotated" gpu tests/test_prepare_float.py
+step "vision matmuls, bf16; matmul_f32 past 32768 rows" gpu tests/test_matmul_bf16.py
 step "C tokenizer vs transformers" ref tests/test_tokenizer.py
 if [ "$tier" = full ]; then
   # the reference tier: model weights, exports and the reference dumps (README, Weights and Tests)

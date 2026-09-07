@@ -28,8 +28,6 @@ def main() -> int:
         return 1 if require else 0
     ok = True
     cases = [("build/comfy_t2va_blocks", "build/weights_i8", "f16"), ("build/comfy_t2va_blocks", "build/weights_i8", "i8")]   # int8 QK^T operands are the parity path too
-    if (ROOT / "build/comfy_t2va_bf16_blocks/blocks/blk_49.npy").exists() and (ROOT / "build/weights_f16/manifest.txt").exists():
-        cases.append(("build/comfy_t2va_bf16_blocks", "build/weights_f16", "f16"))   # the pruned bf16 checkpoint's rows in f16 against ComfyUI's bf16 run
     for truth, blocks, attn in cases:
         lines = run(["--case", "t2va", "--mode", "blocks", "--truth", truth, "--blocks", blocks, "--attn", attn])
         if lines is None: ok = False; continue

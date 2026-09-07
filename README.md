@@ -100,10 +100,6 @@ python3 tools/export_weights.py --bits 8 --ckpt ~/comfy-models/diffusion_models/
 python3 tools/export_glue.py --ckpt ~/comfy-models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors --out build/weights_glue_ref2va
 ```
 
-Optional: `tools/export_weights.py --bits 16` for the pruned bf16 checkpoint's rows in f16
-(`build/weights_f16`, 36 GB, `--precision bf16`), `tools/gptq_export.py` for GPTQ int4 blocks
-(`build/weights_gptq`, 9 GB, `--precision int4`, preview quality only).
-
 The weights are under the MiniMax H3 Community License, which permits open-weight use in the USA,
 EU, UK and South Korea; other regions apply to MiniMax for a licence. Nothing in this repository is
 derived from ComfyUI's code, which is GPL; ComfyUI is used only as the measurement oracle inside
@@ -133,7 +129,7 @@ h3 --help
 
 Defaults are the stock ComfyUI workflow settings: `res_multistep` on the `simple` schedule, 30
 evaluations (`--steps 31` sigma grid points; ComfyUI's workflows use 20), no CFG, shifts 12/3,
-`--precision int8`. The clip lands as `<out>.mp4` with `<out>.wav` beside it. Sizes are multiples
+the checkpoint's int8 rows with int8 QK^T attention. The clip lands as `<out>.mp4` with `<out>.wav` beside it. Sizes are multiples
 of 32; frame counts snap to 17n + 5 (22, 39, ..., 124).
 
 **From Python.** `tools/pipeline_c.py` drives the same library through ctypes
@@ -155,9 +151,8 @@ into an image generator and, with reference images, an image editor. `docs/trick
 modes, their costs, and the pieces of this repository worth taking elsewhere.
 
 **Knobs.** `H3_PROFILE=1` prints per-stage times after every step; `H3_TRACE=1` prints and
-synchronises every launch; `--precision bf16` runs the pruned bf16 checkpoint's rows in f16 at
-about the int8 speed; `--precision int4` is a 2x-per-step preview path that ghosts keyframe and
-reference clips (do not use it for conditioned generation); `--attn f16` restores f16 attention;
+synchronises every launch; `--attn f16` restores f16 attention, `--attn i4` is a faster int4
+QK^T that ghosts keyframe and reference clips (do not use it for conditioned generation);
 `--base-weights` runs reference files on the base checkpoint when the ref2va exports are absent.
 Unknown options, missing values and out-of-range numbers are errors, as are `--audio-only` with
 `--still` and `--no-decode` with either.
@@ -168,13 +163,13 @@ The gate is ComfyUI's own run of the same step, dumped from inside its image
 (`tools/comfy_clip.py --dump-blocks`, `tests/test_comfy_parity.py`): the residual stream after
 each block, video rows only, cosine against ComfyUI.
 
-| block | int8 rows, int8 QK^T attention (default) | int8 rows, f16 attention | bf16 rows, f16 attention |
-| ---: | ---: | ---: | ---: |
-| 0 to 10 | 1.0000 | 1.0000 | 1.0000 |
-| 20 | 0.9999 | 0.9999 | 0.9999 |
-| 30 | 0.9988 | 0.9990 | 0.9995 |
-| 40 | 0.9929 | 0.9935 | 0.9968 |
-| 49 | 0.9991 | 0.9992 | 0.9996 |
+| block | int8 rows, int8 QK^T attention (default) | int8 rows, f16 attention |
+| ---: | ---: | ---: |
+| 0 to 10 | 1.0000 | 1.0000 |
+| 20 | 0.9999 | 0.9999 |
+| 30 | 0.9988 | 0.9990 |
+| 40 | 0.9929 | 0.9935 |
+| 49 | 0.9991 | 0.9992 |
 
 The 20-evaluation trajectory matches ComfyUI's to a relative error of 0.01 after five
 evaluations; the final latents end at a cosine of about 0.90, the same figure ComfyUI's own bf16

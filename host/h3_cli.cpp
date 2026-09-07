@@ -10,7 +10,7 @@
 //
 //   --first-frame img   fl2va keyframe          --out clip.mp4    (default h3_out.mp4; <out>.wav is kept next to it)
 //   --frames 124        --steps 31 (= 30 evaluations)   --width 864  --height 480   --seed 0
-//   --precision int8|bf16|int4  (int8: the checkpoint's int8 rows, int8 QK^T)   --attn f16|i8|i4   --sampler res_multistep|euler
+//   --attn f16|i8|i4    the DiT attention's QK^T operands (i8: the parity path)   --sampler res_multistep|euler
 //   --root DIR          the repository (default: the binary's parent's parent)   --no-decode   --audio-only (voice/sound: 32x32 canvas, wav only)   --still frame.png [--still-frame N] (one frame as an image)   --latents prefix
 //   --base-weights      run reference files on the base checkpoint when the ref2va exports are absent (otherwise an error)
 #include <algorithm>
@@ -44,7 +44,7 @@ struct Options {
     const char *get(const char *name, const char *dflt = nullptr) const { auto it = values.find(name); return it == values.end() ? dflt : it->second.c_str(); }
     bool has(const char *name) const { return flags.count(name) || values.count(name); }
 };
-const std::set<std::string> VALUED = {"-p", "--first-frame", "--out", "--frames", "--steps", "--width", "--height", "--seed", "--precision", "--attn", "--sampler", "--root", "--still", "--still-frame", "--latents"};
+const std::set<std::string> VALUED = {"-p", "--first-frame", "--out", "--frames", "--steps", "--width", "--height", "--seed", "--attn", "--sampler", "--root", "--still", "--still-frame", "--latents"};
 const std::set<std::string> FLAGS = {"--no-decode", "--audio-only", "--base-weights", "-h", "--help"};
 bool parse_options(int argc, char **argv, Options *o, std::string *error) {
     for (int i = 1; i < argc; ++i) {
@@ -202,7 +202,7 @@ int main(int argc, char **argv) {
     if (!parse_options(argc, argv, &opt, &perr)) { fprintf(stderr, "h3: %s (h3 --help)\n", perr.c_str()); return 64; }
     if (opt.has("-h") || opt.has("--help")) {
         fprintf(stderr, "usage: h3 [ref.jpg ... ref.wav ...] [-p \"prompt\" | < prompt] [--first-frame img] [--out clip.mp4] [--frames 124] [--steps 31]\n"
-                        "          [--width 864] [--height 480] [--seed 0] [--precision int8|bf16|int4] [--attn f16|i8|i4] [--sampler res_multistep|euler]\n"
+                        "          [--width 864] [--height 480] [--seed 0] [--attn f16|i8|i4] [--sampler res_multistep|euler]\n"
                         "          [--root DIR] [--no-decode] [--audio-only] [--still frame.png [--still-frame N]] [--latents prefix] [--base-weights]\n"); return 0;
     }
     std::vector<std::string> image_files, audio_files;
@@ -218,9 +218,8 @@ int main(int argc, char **argv) {
     if (prompt.empty()) { fprintf(stderr, "h3: no prompt (give -p \"...\" or pipe it on stdin)\n"); return 64; }
 
     // the options, validated before anything expensive
-    std::string precision, attn, sampler; int height, width, n_frames, steps, still_frame;
-    if (!parse_choice(opt, "--precision", "int8", {"int8", "bf16", "int4"}, &precision, &perr) ||
-        !parse_choice(opt, "--attn", precision == "bf16" ? "f16" : precision == "int4" ? "i4" : "i8", {"f16", "i8", "i4"}, &attn, &perr) ||
+    std::string attn, sampler; int height, width, n_frames, steps, still_frame;
+    if (!parse_choice(opt, "--attn", "i8", {"f16", "i8", "i4"}, &attn, &perr) ||
         !parse_choice(opt, "--sampler", "res_multistep", {"res_multistep", "euler"}, &sampler, &perr) ||
         !parse_int(opt, "--height", 480, 32, 8192, &height, &perr) || !parse_int(opt, "--width", 864, 32, 8192, &width, &perr) ||
         !parse_int(opt, "--frames", 124, 1, 1 << 20, &n_frames, &perr) || !parse_int(opt, "--steps", 31, 2, 1000, &steps, &perr) ||
@@ -240,8 +239,7 @@ int main(int argc, char **argv) {
     if (!no_decode && !dir_writable(out)) { fprintf(stderr, "h3: cannot write %s: the directory is missing or not writable\n", out.c_str()); return 64; }
     if (latents_prefix && !dir_writable(latents_prefix)) { fprintf(stderr, "h3: cannot write %s.video.f32: the directory is missing or not writable\n", latents_prefix); return 64; }
     if (still && !dir_writable(still)) { fprintf(stderr, "h3: cannot write %s: the directory is missing or not writable\n", still); return 64; }
-    const int bits = precision == "bf16" ? 16 : precision == "int4" ? 4 : 8;
-    const std::string wdir = bits == 16 ? "weights_f16" : bits == 4 ? "weights_gptq" : "weights_i8";
+    const std::string wdir = "weights_i8";   // the checkpoint's int8 rows
     // references (ref2va) need the reference-conditioned checkpoint's exports; the base checkpoint only on request
     const bool want_refs = !image_files.empty() || !audio_files.empty();
     const bool have_ref2va = exists(root + "/build/" + wdir + "_ref2va/manifest.txt") && exists(root + "/build/weights_glue_ref2va/manifest.txt");

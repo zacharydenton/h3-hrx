@@ -1,10 +1,15 @@
-"""kernels/prepare_*_i4.loom: the GEMM-input preparation kernels, one workgroup of `lanes`
-lanes per token (96 for 5376, 128 for 7168, 256 for 14336), 8 elements per lane per step (16-byte loads, 4-byte packed stores). Every variant ends the same way -- group-256 Hadamard (Kronecker
-power of H4, normalised by 1/16), per-token absmax, symmetric int4 (q = round(x / s),
-s = absmax/7), nibbles packed low first, f32 scale beside -- and differs in how the
-row is formed first:
+"""kernels/prepare_*.loom: the GEMM-input preparation kernels, one workgroup of `lanes`
+lanes per token (96 for 5376, 128 for 7168, 256 for 14336), 8 elements per lane per step (16-byte loads, 4-byte packed stores).
+The row is formed first, in one of three ways:
   norm   : rmsnorm(h) * norm_weight * (1 + scale[class]) + shift[class]  (block inputs; class = (timestep, modality) row)
-  swiglu : silu(g) * u                                                     (the down input)
+  lnorm  : the same with a LayerNorm (mean and variance)
+  plain  : the f16 row as produced (the gate|up GEMM's fused silu(g)*u output, the attention output)
+and then written as one of two operands:
+  int4 / int8 (prepare_{form}_i{4,8}): group-256 Hadamard (Kronecker power of H4, normalised by 1/16), per-token absmax,
+      symmetric codes (q = round(x / s), s = absmax / 7 or / 127), packed, f32 scale beside -- what the ConvRot int8 rows
+      of ComfyUI's checkpoint (rotated along K at quantisation) and the int4 GEMMs consume
+  f16 / bf16 (prepare_{form}_{f16,bf16}): the row as formed, narrowed, no rotation and no scale -- the operand for the
+      checkpoint's unrotated f16 / bf16 rows (the video VAE decoder, the token refiner) on the f16 / bf16 GEMMs
 """
 import re
 from pathlib import Path
@@ -198,27 +203,93 @@ def pack_tail(bits: int) -> str:
     return out
 
 
-def kernel(name: str, bits: int = 4, lds: str = "f32") -> str:
+def kernel(name: str, bits: int = 4, lds: str = "f32", out: str | None = None) -> str:
     """lds: "f32" stages the row in f32 (H3's gate|up products reach 5e4 and the unnormalised
     Hadamard stages grow 4x each, so f16 would overflow); "f16" (the plain form only, for rows
     too wide for 64 KB of f32: the text encoder's 25600) pre-scales the f16 input by 1/16 at
     staging, so the four unnormalised stages land exactly on the normalised rotation and the
-    1/16 no longer folds into the scale."""
+    1/16 no longer folds into the scale.
+    out: None quantises (bits 4 or 8, rotated); "f16" or "bf16" writes the formed row narrowed to that type,
+    unrotated and without a scale (the operand of the unrotated float rows)."""
     f = FORM[name]
     assert lds == "f32" or name == "plain"
+    assert out in (None, "f16", "bf16")
+    quant = out is None
     lds_bytes = 2 if lds == "f16" else 4
     tag = f"{name}16" if lds == "f16" else name
-    ns, sym = f"h3.prepare_{tag}_i{bits}", f"h3_prepare_{tag}_i{bits}"
+    ns, sym = (f"h3.prepare_{tag}_i{bits}", f"h3_prepare_{tag}_i{bits}") if quant else (f"h3.prepare_{tag}_{out}", f"h3_prepare_{tag}_{out}")
     extra_cfg = "" if name in ("norm", "lnorm", "plain") else f"\nconfig.decl @{ns}.gate_stride : %value: index where [range(%value, 256, 65536), mul(%value, 256)]\n"
     extra_get = "" if name in ("norm", "lnorm", "plain") else f"  %gate_stride = config.get @{ns}.gate_stride : index\n"
     gate_last = "" if name in ("norm", "lnorm", "plain") else "  %gate_last = index.sub %gate_stride, %c8 : index\n"
     eps_cfg = f"\nconfig.decl @{ns}.eps : f32\n\nconfig.decl @{ns}.classes : %value: index where [range(%value, 1, 64)]\n" if name in ("norm", "lnorm") else ""
     eps_get = f"  %eps = config.get @{ns}.eps : f32\n  %classes = config.get @{ns}.classes : index\n" if name in ("norm", "lnorm") else ""
-    return f"""// GEMM input preparation ({name}), one workgroup of `lanes` lanes per token: form the
+    head = (f"""// GEMM input preparation ({name}), one workgroup of `lanes` lanes per token: form the
 // row in f32 in LDS, rotate it by the group-256 Hadamard (H4 (x) H4 (x) H4 (x) H4 as four
 // radix-4 stages of strides 1, 4, 16, 64; the 1/16 folds into the scale), take the
-// token's absmax, and write symmetric int4 (q = round(x / s), s = absmax / 7, nibbles
-// low first) with the f32 scale beside it -- the operand the int4 GEMM consumes.
+// token's absmax, and write symmetric int{bits} (q = round(x / s), s = absmax / {7 if bits == 4 else 127}{", nibbles low first" if bits == 4 else ""}) with the f32 scale beside it -- the operand the int{bits} GEMM consumes.""" if quant else
+            f"""// GEMM input preparation ({name}), one workgroup of `lanes` lanes per token: form the
+// row in f32 in LDS and write it narrowed to {out}, unrotated and unscaled -- the operand the {out} GEMM consumes
+// against the checkpoint's unrotated {out} rows (no Hadamard: the rotation only serves quantisation).""")
+    q_args = ", %q: buffer, %q_scale: buffer" if quant else ", %q: buffer"
+    q_views = ("""  %qs_global = buffer.assume.memory_space<global> %q_scale : buffer
+  %qw_view = buffer.view %q_global[%c0_offset] : buffer -> view<[%tokens_b]x[%out_words]xi32>
+  %qs_view = buffer.view %qs_global[%c0_offset] : buffer -> view<[%tokens_b]xf32>
+""" if quant else f"""  %o_view = buffer.view %q_global[%c0_offset] : buffer -> view<[%tokens_b]x[%out_stride]x{out}>
+  %out_last = index.sub %out_stride, %c8 : index
+""")
+    tail = (f"""  // Hadamard: four radix-4 stages; each lane owns whole quads, so no barrier inside a stage.
+{stage(1, lds)}{stage(4, lds)}{stage(16, lds)}{stage(64, lds)}
+  // absmax (the 1/16 normalisation folded into the scale), quantise, pack 8 codes per lane per step
+  %amax_v = scf.for %a_j = [%c0 to %chunks_per_lane step %c1](%a_acc = %zero8 : vector<8xf32>) -> (vector<8xf32>) {{
+    %a_lane_step = index.mul %a_j, %lanes : index
+    %a_chunk = index.add %a_lane_step, %lane : index
+    %a_i0 = index.mul %a_chunk, %c8 : index
+    %a_i = index.assume %a_i0 [le(%a_i0, %width_last), mul(%a_i0, 8)] : index
+    %a_x = vector.load %x_view[%a_i] : view<[%width]xf32> -> vector<8xf32>
+    %a_abs = vector.absf %a_x : vector<8xf32>
+    %a_next = vector.maxnumf %a_acc, %a_abs : vector<8xf32>
+    scf.yield %a_next : vector<8xf32>
+  }}
+  %amax = vector.reduce<maxnumf> %amax_v, %zero : vector<8xf32>, f32
+  %row_max0 = kernel.workgroup.reduce<maxnumf> %amax : f32
+  %row_max = scalar.mulf %row_max0, %{"one" if lds == "f16" else "sixteenth"} : f32
+  %row_max_safe = scalar.maxnumf %row_max, %tiny : f32
+  %s = scalar.divf %row_max_safe, %{"seven" if bits == 4 else "qmax"} : f32
+  %inv_s = scalar.divf %{"one" if lds == "f16" else "sixteenth"}, %s : f32
+  %inv_s8 = vector.splat %inv_s : vector<8xf32>
+  scf.for %q_j = [%c0 to %chunks_per_lane step %c1] {{
+    %q_lane_step = index.mul %q_j, %lanes : index
+    %q_chunk = index.add %q_lane_step, %lane : index
+    %q_i0 = index.mul %q_chunk, %c8 : index
+    %q_i = index.assume %q_i0 [le(%q_i0, %width_last), mul(%q_i0, 8)] : index
+    %q_w = index.assume %q_chunk [lt(%q_chunk, %word_width)] : index
+    %q_x = vector.load %x_view[%q_i] : view<[%width]xf32> -> vector<8xf32>
+    %q_r = vector.mulf %q_x, %inv_s8 : vector<8xf32>
+    %q_f = vector.roundevenf %q_r : vector<8xf32>
+    %q_c = vector.maxnumf %q_f, %{"neg_seven8" if bits == 4 else "neg_qmax8"} : vector<8xf32>
+    %q_d = vector.minnumf %q_c, %{"seven8" if bits == 4 else "qmax8"} : vector<8xf32>
+    %q_q = vector.fptosi %q_d : vector<8xf32> to vector<8xi32>
+    %q_n = vector.andi %q_q, %{"fifteen8" if bits == 4 else "mask8"} : vector<8xi32>
+{pack_tail(bits)}  }}
+  // the token scale, by one lane, after the last loop (a divergent region before a
+  // loop is rejected by the branch lowering)
+  %is_first = index.cmp eq, %lane, %c0 : index
+  scf.if %is_first {{
+    view.store %s, %qs_view[%row] : f32, view<[%tokens_b]xf32>
+  }}
+""" if quant else f"""  // the row as formed, narrowed to {out}: no rotation, no scale (8 elements per lane per step)
+  scf.for %q_j = [%c0 to %chunks_per_lane step %c1] {{
+    %q_lane_step = index.mul %q_j, %lanes : index
+    %q_chunk = index.add %q_lane_step, %lane : index
+    %q_i0 = index.mul %q_chunk, %c8 : index
+    %q_i = index.assume %q_i0 [le(%q_i0, %width_last), mul(%q_i0, 8)] : index
+    %q_o = index.assume %q_i [le(%q_i, %out_last), mul(%q_i, 8)] : index
+    %q_x = vector.load %x_view[%q_i] : view<[%width]xf32> -> vector<8xf32>
+    %q_h = vector.fptrunc %q_x : vector<8xf32> to vector<8x{out}>
+    vector.store %q_h, %o_view[%row, %q_o] : vector<8x{out}>, view<[%tokens_b]x[%out_stride]x{out}>
+  }}
+""")
+    return head + f"""
 //
 // GENERATED by tools/gen_prepare.py; edit the generator.
 amdgpu.target<gfx11-generic> @{sym}_gfx11 {{subgroup_size = 32}}
@@ -233,7 +304,7 @@ kernel.def target(@{sym}_gfx11) export("{sym}") @{sym}(%tokens: index) {{
   %c1 = index.constant 1 : index
   %lanes = config.get @{ns}.lanes : index
   kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%lanes, %c1, %c1) : index
-}} launch(%tokens: index, {f["args"]}, %q: buffer, %q_scale: buffer) {{
+}} launch(%tokens: index, {f["args"]}{q_args}) {{
   %width = config.get @{ns}.width : index
   %lanes = config.get @{ns}.lanes : index
 {eps_get}{extra_get}  %c0 = index.constant 0 : index
@@ -286,57 +357,14 @@ kernel.def target(@{sym}_gfx11) export("{sym}") @{sym}(%tokens: index) {{
   %width_last = index.sub %width, %c8 : index
 {gate_last}  %quads = index.div %width, %c4 : index
 {f["views"]}  %q_global = buffer.assume.memory_space<global> %q : buffer
-  %qs_global = buffer.assume.memory_space<global> %q_scale : buffer
-  %qw_view = buffer.view %q_global[%c0_offset] : buffer -> view<[%tokens_b]x[%out_words]xi32>
-  %qs_view = buffer.view %qs_global[%c0_offset] : buffer -> view<[%tokens_b]xf32>
-  %row_bytes0 = index.mul %width, %c{lds_bytes} : index
+{q_views}  %row_bytes0 = index.mul %width, %c{lds_bytes} : index
   %row_bytes = index.cast %row_bytes0 : index to offset
   %lds = buffer.alloca<workgroup> align(16) %row_bytes : buffer
   %x_view = buffer.view %lds[%c0_offset] : buffer -> view<[%width]x{lds}>
 
 {f["form"]}  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
-  // Hadamard: four radix-4 stages; each lane owns whole quads, so no barrier inside a stage.
-{stage(1, lds)}{stage(4, lds)}{stage(16, lds)}{stage(64, lds)}
-  // absmax (the 1/16 normalisation folded into the scale), quantise, pack 8 nibbles per lane per step
-  %amax_v = scf.for %a_j = [%c0 to %chunks_per_lane step %c1](%a_acc = %zero8 : vector<8xf32>) -> (vector<8xf32>) {{
-    %a_lane_step = index.mul %a_j, %lanes : index
-    %a_chunk = index.add %a_lane_step, %lane : index
-    %a_i0 = index.mul %a_chunk, %c8 : index
-    %a_i = index.assume %a_i0 [le(%a_i0, %width_last), mul(%a_i0, 8)] : index
-    %a_x = vector.load %x_view[%a_i] : view<[%width]xf32> -> vector<8xf32>
-    %a_abs = vector.absf %a_x : vector<8xf32>
-    %a_next = vector.maxnumf %a_acc, %a_abs : vector<8xf32>
-    scf.yield %a_next : vector<8xf32>
-  }}
-  %amax = vector.reduce<maxnumf> %amax_v, %zero : vector<8xf32>, f32
-  %row_max0 = kernel.workgroup.reduce<maxnumf> %amax : f32
-  %row_max = scalar.mulf %row_max0, %{"one" if lds == "f16" else "sixteenth"} : f32
-  %row_max_safe = scalar.maxnumf %row_max, %tiny : f32
-  %s = scalar.divf %row_max_safe, %{"seven" if bits == 4 else "qmax"} : f32
-  %inv_s = scalar.divf %{"one" if lds == "f16" else "sixteenth"}, %s : f32
-  %inv_s8 = vector.splat %inv_s : vector<8xf32>
-  scf.for %q_j = [%c0 to %chunks_per_lane step %c1] {{
-    %q_lane_step = index.mul %q_j, %lanes : index
-    %q_chunk = index.add %q_lane_step, %lane : index
-    %q_i0 = index.mul %q_chunk, %c8 : index
-    %q_i = index.assume %q_i0 [le(%q_i0, %width_last), mul(%q_i0, 8)] : index
-    %q_w = index.assume %q_chunk [lt(%q_chunk, %word_width)] : index
-    %q_x = vector.load %x_view[%q_i] : view<[%width]xf32> -> vector<8xf32>
-    %q_r = vector.mulf %q_x, %inv_s8 : vector<8xf32>
-    %q_f = vector.roundevenf %q_r : vector<8xf32>
-    %q_c = vector.maxnumf %q_f, %{"neg_seven8" if bits == 4 else "neg_qmax8"} : vector<8xf32>
-    %q_d = vector.minnumf %q_c, %{"seven8" if bits == 4 else "qmax8"} : vector<8xf32>
-    %q_q = vector.fptosi %q_d : vector<8xf32> to vector<8xi32>
-    %q_n = vector.andi %q_q, %{"fifteen8" if bits == 4 else "mask8"} : vector<8xi32>
-{pack_tail(bits)}  }}
-  // the token scale, by one lane, after the last loop (a divergent region before a
-  // loop is rejected by the branch lowering)
-  %is_first = index.cmp eq, %lane, %c0 : index
-  scf.if %is_first {{
-    view.store %s, %qs_view[%row] : f32, view<[%tokens_b]xf32>
-  }}
-  kernel.return
+{tail}  kernel.return
 }}
 """
 
@@ -392,9 +420,13 @@ def uniform_loops(text: str) -> str:
                         "  %quads = index.div %width, %c4 : index\n  %width_per_lane = index.div %width, %lanes : index\n"
                         "  %quads_per_lane = index.div %quads, %lanes : index\n  %chunk_count = index.div %width, %c8 : index\n  %chunks_per_lane = index.div %chunk_count, %lanes : index\n")
 
-for name in FORM:
-    for bits in ((8,) if name == "lnorm" else (4, 8)):
-        (OUT / f"prepare_{name}_i{bits}.loom").write_text(uniform_loops(lds_type(kernel(name, bits), "f32")))
-        print("wrote", f"prepare_{name}_i{bits}.loom")
-(OUT / "prepare_plain16_i8.loom").write_text(uniform_loops(lds_type(kernel("plain", 8, "f16"), "f16")))   # the text encoder's 25600-wide row
-print("wrote prepare_plain16_i8.loom")
+if __name__ == "__main__":
+    for name in FORM:
+        for bits in ((8,) if name == "lnorm" else (4, 8)):
+            (OUT / f"prepare_{name}_i{bits}.loom").write_text(uniform_loops(lds_type(kernel(name, bits), "f32")))
+            print("wrote", f"prepare_{name}_i{bits}.loom")
+        for out in ("f16", "bf16"):   # the unrotated float operands (the VAE decoder's f16 rows, the refiner's bf16 rows)
+            (OUT / f"prepare_{name}_{out}.loom").write_text(uniform_loops(lds_type(kernel(name, 8, out=out), "f32")))
+            print("wrote", f"prepare_{name}_{out}.loom")
+    (OUT / "prepare_plain16_i8.loom").write_text(uniform_loops(lds_type(kernel("plain", 8, "f16"), "f16")))   # the text encoder's 25600-wide row
+    print("wrote prepare_plain16_i8.loom")

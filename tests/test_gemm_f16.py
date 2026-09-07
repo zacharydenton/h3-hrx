@@ -1,25 +1,33 @@
-"""The f16 block GEMMs (tools/gen_gemm_f16.py) against a float64 reference: plain (+bias), resid (f32 residual += gate[cls] * out)
-and swiglu (interleaved gate/up rows), on the 256x128 tile with f16 A [M][K] and W [N][K] rows.
-    python3 tests/test_gemm_f16.py [M]"""
-import sys
+"""The f16 and bf16 block GEMMs (tools/gen_gemm_f16.py) against a float64 reference: plain (+bias), resid (f32 residual += gate[cls] * out)
+and swiglu (interleaved gate/up rows), on the 256x128 tile with 16-bit float A [M][K] and W [N][K] rows (f32 accumulation, f16 out).
+    python3 tests/test_gemm_f16.py [M]        GEMM_ELEM=bf16 python3 tests/test_gemm_f16.py [M]"""
+import os, sys
 from pathlib import Path
 import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools")); sys.path.insert(0, str(ROOT / "tests"))
-from kernel_test import compile_kernel, launch, report, workdir
+from kernel_test import compile_kernel, launch, report, workdir, to_bf16, from_bf16
 from test_gemm import m_group, interleave, CLASSES
+ELEM = os.environ.get("GEMM_ELEM", "f16")
 
 
-def run(tmp, mode, M, K, N, rng, bias=False):
-    stem = {"plain": "gemm_f16_256", "resid": "gemm_f16_resid_256", "swiglu": "gemm_f16_swiglu_256"}[mode] + ("b" if bias else "") + ("_gs" if (bias and mode == "swiglu") else "")
+def narrow(x):
+    """The operand as the kernel sees it: f16 values, or f32 values rounded to bf16 (the bit patterns travel as uint16)."""
+    return x.astype(np.float16) if ELEM == "f16" else from_bf16(to_bf16(x))
+
+
+def run(tmp, mode, M, K, N, rng, bias=False, kpad=0):
+    stem = {"plain": f"gemm_{ELEM}_256", "resid": f"gemm_{ELEM}_resid_256", "swiglu": f"gemm_{ELEM}_swiglu_256"}[mode] + ("b" if bias else "") + ("_gs" if (bias and mode == "swiglu") else "")
     ns, sym = "h3." + stem, "h3_" + stem
-    a = (rng.standard_normal((M, K)) * 0.5).astype(np.float16); w = (rng.standard_normal((N, K)) / np.sqrt(K)).astype(np.float16)
+    a = narrow(rng.standard_normal((M, K)) * 0.5); w = narrow(rng.standard_normal((N, K)) / np.sqrt(K))
     full = a.astype(np.float64) @ w.astype(np.float64).T
     b_vec = (rng.standard_normal(N) * 0.1).astype(np.float32) if bias else None
     if bias: full = full + b_vec[None]
     g = m_group(M, 256); gy = ((M + 255) // 256 + g - 1) // g * g
-    cfg = {f"{ns}.k_size": K, f"{ns}.n_size": N, f"{ns}.m_group": g}
-    args = [("i32", M), ("in_f16", a), ("in_f16", w if mode != "swiglu" else interleave(w))]
+    cfg = {f"{ns}.k_size": K, f"{ns}.n_size": N, f"{ns}.m_group": g, f"{ns}.k_stride": K + kpad}   # kpad: extra pitch columns the kernel never reads (gemm_pitch)
+    operand = "in_f16" if ELEM == "f16" else "in_bf16"
+    pad = lambda x: np.concatenate([x, np.zeros((x.shape[0], kpad), x.dtype)], 1) if kpad else x
+    args = [("i32", M), (operand, pad(a)), (operand, pad(w if mode != "swiglu" else interleave(w)))]
     if mode == "plain":
         args.append(("out_f16", ((M, N), np.float16))); want = full
     elif mode == "resid":
@@ -48,6 +56,8 @@ def main() -> int:
         for mode in ("plain", "resid", "swiglu"):
             ok &= run(tmp, mode, M, *shapes[mode], rng)
             ok &= run(tmp, mode, M, *shapes[mode], rng, bias=True)
+        ok &= run(tmp, "resid", M, 7168, 5376, rng, kpad=64)                  # the padded pitch the out projection runs at
+        ok &= run(tmp, "resid", M, 64, 2048, rng, bias=True)                  # the VAE decoder's x_embedder: K 24 zero-padded to 64
     return 0 if ok else 1
 
 

@@ -13,6 +13,8 @@ config.decl @h3.gemm_f16_256.k_size : %value: index where [range(%value, 64, 655
 
 config.decl @h3.gemm_f16_256.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
 
+config.decl @h3.gemm_f16_256.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+
 config.decl @h3.gemm_f16_256.m_group : %value: index where [range(%value, 1, 4)]
 
 kernel.def target(@h3_gemm_f16_256_gfx11) export("h3_gemm_f16_256") @h3_gemm_f16_256(%m_size: index) {
@@ -36,6 +38,10 @@ kernel.def target(@h3_gemm_f16_256_gfx11) export("h3_gemm_f16_256") @h3_gemm_f16
   %k_size0 = config.get @h3.gemm_f16_256.k_size : index
   %n_size0 = config.get @h3.gemm_f16_256.n_size : index
   %k_size = index.assume %k_size0 [range(%k_size0, 64, 65536), mul(%k_size0, 64)] : index
+  // the operand rows' pitch (k elements); K itself when it is not a multiple of 1024, else K + 64,
+  // so that the 384 rows a step touches do not alias in the cache (K = 7168: 36.7 -> 41.2 TOPS, K = 21504: 33.4 -> 41.4)
+  %k_stride0 = config.get @h3.gemm_f16_256.k_stride : index
+  %k_stride = index.assume %k_stride0 [range(%k_stride0, 64, 65536), mul(%k_stride0, 64)] : index
   %n_size = index.assume %n_size0 [range(%n_size0, 128, 65536), mul(%n_size0, 128)] : index
 
   %c0 = index.constant 0 : index
@@ -109,14 +115,14 @@ kernel.def target(@h3_gemm_f16_256_gfx11) export("h3_gemm_f16_256") @h3_gemm_f16
   %wave_col = index.mul %wave_n, %c64 : index
   %base_m = index.mul %tile_m_id, %c256 : index
   %base_n = index.mul %tile_n_id, %c128 : index
-  %k_quads = index.div %k_size, %c4 : index
+  %k_quads = index.div %k_stride, %c4 : index
 
   %a_global = buffer.assume.memory_space<global> %a : buffer
   %w_global = buffer.assume.memory_space<global> %w : buffer
   %c_global = buffer.assume.memory_space<global> %c : buffer
-  %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<[%m_bounded]x[%k_size]xf16>
+  %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<[%m_bounded]x[%k_stride]xf16>
   %k_last16 = index.sub %k_size, %c16 : index
-  %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%n_size]x[%k_size]xf16>
+  %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%n_size]x[%k_stride]xf16>
   %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_bounded]x[%n_size]xf16>
 
   %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
@@ -175,32 +181,12 @@ kernel.def target(@h3_gemm_f16_256_gfx11) export("h3_gemm_f16_256") @h3_gemm_f16
   %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), mul(%st_quad, 4)] : index
   %ke_first0 = index.mul %kq_first, %c4 : index
   %ke_first = index.assume %ke_first0 [le(%ke_first0, %k_last16), mul(%ke_first0, 16)] : index
-  %ga0 = scf.if %a_ok0 -> (vector<16xf16>) {
-    %v = vector.load %a_view[%a_row0, %ke_first] : view<[%m_bounded]x[%k_size]xf16> -> vector<16xf16>
-    scf.yield %v : vector<16xf16>
-  } else {
-    scf.yield %zero_i32x4 : vector<16xf16>
-  }
-  %ga1 = scf.if %a_ok1 -> (vector<16xf16>) {
-    %v = vector.load %a_view[%a_row1, %ke_first] : view<[%m_bounded]x[%k_size]xf16> -> vector<16xf16>
-    scf.yield %v : vector<16xf16>
-  } else {
-    scf.yield %zero_i32x4 : vector<16xf16>
-  }
-  %ga2 = scf.if %a_ok2 -> (vector<16xf16>) {
-    %v = vector.load %a_view[%a_row2, %ke_first] : view<[%m_bounded]x[%k_size]xf16> -> vector<16xf16>
-    scf.yield %v : vector<16xf16>
-  } else {
-    scf.yield %zero_i32x4 : vector<16xf16>
-  }
-  %ga3 = scf.if %a_ok3 -> (vector<16xf16>) {
-    %v = vector.load %a_view[%a_row3, %ke_first] : view<[%m_bounded]x[%k_size]xf16> -> vector<16xf16>
-    scf.yield %v : vector<16xf16>
-  } else {
-    scf.yield %zero_i32x4 : vector<16xf16>
-  }
-  %gw0 = vector.load %w_view[%w_row0, %ke_first] : view<[%n_size]x[%k_size]xf16> -> vector<16xf16>
-  %gw1 = vector.load %w_view[%w_row1, %ke_first] : view<[%n_size]x[%k_size]xf16> -> vector<16xf16>
+  %ga0 = vector.load %a_view[%a_row0, %ke_first] : view<[%m_bounded]x[%k_stride]xf16> -> vector<16xf16>
+  %ga1 = vector.load %a_view[%a_row1, %ke_first] : view<[%m_bounded]x[%k_stride]xf16> -> vector<16xf16>
+  %ga2 = vector.load %a_view[%a_row2, %ke_first] : view<[%m_bounded]x[%k_stride]xf16> -> vector<16xf16>
+  %ga3 = vector.load %a_view[%a_row3, %ke_first] : view<[%m_bounded]x[%k_stride]xf16> -> vector<16xf16>
+  %gw0 = vector.load %w_view[%w_row0, %ke_first] : view<[%n_size]x[%k_stride]xf16> -> vector<16xf16>
+  %gw1 = vector.load %w_view[%w_row1, %ke_first] : view<[%n_size]x[%k_stride]xf16> -> vector<16xf16>
 
   %acc00, %acc01, %acc02, %acc03, %acc10, %acc11, %acc12, %acc13, %acc20, %acc21, %acc22, %acc23, %acc30, %acc31, %acc32, %acc33, %a_last0, %a_last1, %a_last2, %a_last3, %w_last0, %w_last1 = scf.for %k_base = [%c0 to %k_size step %c64](%r00 = %acc_init : vector<8xf32>, %r01 = %acc_init : vector<8xf32>, %r02 = %acc_init : vector<8xf32>, %r03 = %acc_init : vector<8xf32>, %r10 = %acc_init : vector<8xf32>, %r11 = %acc_init : vector<8xf32>, %r12 = %acc_init : vector<8xf32>, %r13 = %acc_init : vector<8xf32>, %r20 = %acc_init : vector<8xf32>, %r21 = %acc_init : vector<8xf32>, %r22 = %acc_init : vector<8xf32>, %r23 = %acc_init : vector<8xf32>, %r30 = %acc_init : vector<8xf32>, %r31 = %acc_init : vector<8xf32>, %r32 = %acc_init : vector<8xf32>, %r33 = %acc_init : vector<8xf32>, %ca0 = %ga0 : vector<16xf16>, %ca1 = %ga1 : vector<16xf16>, %ca2 = %ga2 : vector<16xf16>, %ca3 = %ga3 : vector<16xf16>, %cw0 = %gw0 : vector<16xf16>, %cw1 = %gw1 : vector<16xf16>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<16xf16>, vector<16xf16>, vector<16xf16>, vector<16xf16>, vector<16xf16>, vector<16xf16>) {
     // Stage what we were handed.
@@ -221,46 +207,12 @@ kernel.def target(@h3_gemm_f16_256_gfx11) export("h3_gemm_f16_256") @h3_gemm_f16
     %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), mul(%kq_safe, 4)] : index
     %ke_next0 = index.mul %kq_next, %c4 : index
     %ke_next = index.assume %ke_next0 [le(%ke_next0, %k_last16), mul(%ke_next0, 16)] : index
-    %load_a0 = scalar.andi %in_k, %a_ok0 : i1
-    %na0 = scf.if %load_a0 -> (vector<16xf16>) {
-      %v = vector.load %a_view[%a_row0, %ke_next] : view<[%m_bounded]x[%k_size]xf16> -> vector<16xf16>
-      scf.yield %v : vector<16xf16>
-    } else {
-      scf.yield %zero_i32x4 : vector<16xf16>
-    }
-    %load_a1 = scalar.andi %in_k, %a_ok1 : i1
-    %na1 = scf.if %load_a1 -> (vector<16xf16>) {
-      %v = vector.load %a_view[%a_row1, %ke_next] : view<[%m_bounded]x[%k_size]xf16> -> vector<16xf16>
-      scf.yield %v : vector<16xf16>
-    } else {
-      scf.yield %zero_i32x4 : vector<16xf16>
-    }
-    %load_a2 = scalar.andi %in_k, %a_ok2 : i1
-    %na2 = scf.if %load_a2 -> (vector<16xf16>) {
-      %v = vector.load %a_view[%a_row2, %ke_next] : view<[%m_bounded]x[%k_size]xf16> -> vector<16xf16>
-      scf.yield %v : vector<16xf16>
-    } else {
-      scf.yield %zero_i32x4 : vector<16xf16>
-    }
-    %load_a3 = scalar.andi %in_k, %a_ok3 : i1
-    %na3 = scf.if %load_a3 -> (vector<16xf16>) {
-      %v = vector.load %a_view[%a_row3, %ke_next] : view<[%m_bounded]x[%k_size]xf16> -> vector<16xf16>
-      scf.yield %v : vector<16xf16>
-    } else {
-      scf.yield %zero_i32x4 : vector<16xf16>
-    }
-    %nw0 = scf.if %in_k -> (vector<16xf16>) {
-      %v = vector.load %w_view[%w_row0, %ke_next] : view<[%n_size]x[%k_size]xf16> -> vector<16xf16>
-      scf.yield %v : vector<16xf16>
-    } else {
-      scf.yield %zero_i32x4 : vector<16xf16>
-    }
-    %nw1 = scf.if %in_k -> (vector<16xf16>) {
-      %v = vector.load %w_view[%w_row1, %ke_next] : view<[%n_size]x[%k_size]xf16> -> vector<16xf16>
-      scf.yield %v : vector<16xf16>
-    } else {
-      scf.yield %zero_i32x4 : vector<16xf16>
-    }
+    %na0 = vector.load %a_view[%a_row0, %ke_next] : view<[%m_bounded]x[%k_stride]xf16> -> vector<16xf16>
+    %na1 = vector.load %a_view[%a_row1, %ke_next] : view<[%m_bounded]x[%k_stride]xf16> -> vector<16xf16>
+    %na2 = vector.load %a_view[%a_row2, %ke_next] : view<[%m_bounded]x[%k_stride]xf16> -> vector<16xf16>
+    %na3 = vector.load %a_view[%a_row3, %ke_next] : view<[%m_bounded]x[%k_stride]xf16> -> vector<16xf16>
+    %nw0 = vector.load %w_view[%w_row0, %ke_next] : view<[%n_size]x[%k_stride]xf16> -> vector<16xf16>
+    %nw1 = vector.load %w_view[%w_row1, %ke_next] : view<[%n_size]x[%k_stride]xf16> -> vector<16xf16>
 
     // 4 16-wide sub-steps over the staged 64 bytes: 4 A + 4 W runs, 16 WMMAs each.
     %da0_0 = vector.load %a_stage[%fa0, %c0] : view<256x72xf16> -> vector<16xf16>

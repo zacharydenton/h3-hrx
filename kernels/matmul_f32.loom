@@ -20,7 +20,7 @@ kernel.def target(@h3_matmul_f32_gfx11) export("h3_matmul_f32") @h3_matmul_f32(%
   %c1 = index.constant 1 : index
   %c256 = index.constant 256 : index
   %c0_offset = index.constant 0 : offset
-  %m_b = index.assume %m [range(%m, 1, 32768)] : index
+  %m_b = index.assume %m [range(%m, 1, 1048576)] : index
   %wg = kernel.workgroup.id<x> : index
   %row0 = kernel.workgroup.id<y> : index
   %row = index.assume %row0 [lt(%row0, %m_b)] : index

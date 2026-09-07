@@ -24,8 +24,20 @@ def compile_kernel(source: Path, root_symbol: str, config: dict, out: Path) -> N
     subprocess.run(cmd, check=True, capture_output=True, text=True)
 
 
+def to_bf16(x) -> np.ndarray:
+    """f32 -> bf16 bit patterns (uint16), round to nearest even, as torch's .to(bfloat16)."""
+    u = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    rounded = (u + 0x7FFF + ((u >> 16) & 1)) >> 16
+    return rounded.astype(np.uint16)
+
+
+def from_bf16(u: np.ndarray) -> np.ndarray:
+    return (np.ascontiguousarray(u, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
+
+
 def launch(hsaco: Path, kernel: str, grid, block, args, workdir: Path, repeat: int = 1):
-    """args: list of ('i32'|'f32', value) or ('in'|'in_f16'|'in_u8', ndarray) or ('out', shape/dtype tuple)."""
+    """args: list of ('i32'|'f32', value) or ('in'|'in_f16'|'in_bf16'|'in_u8', ndarray) or ('out'|'out_f16'|'out_bf16', shape/dtype tuple).
+    bf16 arrays travel as uint16 bit patterns (in_bf16 takes f32 values and rounds them; out_bf16 comes back as uint16: from_bf16 widens)."""
     cmd = [str(LOOMRUN), "--hsaco", str(hsaco), "--kernel", kernel,
            "--grid", ",".join(map(str, grid)), "--block", ",".join(map(str, block)),
            "--repeat", str(repeat)]
@@ -40,6 +52,10 @@ def launch(hsaco: Path, kernel: str, grid, block, args, workdir: Path, repeat: i
         elif kind == "in_f16":
             path = workdir / f"in{index}.bin"
             np.ascontiguousarray(value, dtype=np.float16).tofile(path)
+            cmd += ["--in", str(path)]
+        elif kind == "in_bf16":
+            path = workdir / f"in{index}.bin"
+            to_bf16(value).tofile(path)
             cmd += ["--in", str(path)]
         elif kind == "in_i32":
             path = workdir / f"in{index}.bin"
@@ -67,6 +83,12 @@ def launch(hsaco: Path, kernel: str, grid, block, args, workdir: Path, repeat: i
             nbytes = int(np.prod(shape)) * 2
             cmd += ["--out", f"{path}:{nbytes}"]
             outputs.append((path, shape, np.float16))
+        elif kind == "out_bf16":
+            shape, _ = value
+            path = workdir / f"out{index}.bin"
+            nbytes = int(np.prod(shape)) * 2
+            cmd += ["--out", f"{path}:{nbytes}"]
+            outputs.append((path, shape, np.uint16))
         elif kind == "out":
             shape, dtype = value
             path = workdir / f"out{index}.bin"

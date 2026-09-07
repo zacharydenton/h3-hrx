@@ -1,9 +1,9 @@
-"""f16 twins of the int8 block GEMMs (kernels/gemm_i8_*_256*.loom -> gemm_f16_*_256*.loom) and of the two int8
-prepare kernels (prepare_norm_f16, prepare_plain_f16): the same 256x128 workgroup tile, 64x64 wave tiles and
-one-step-ahead register packets, with f16 operands (vector<16xf16> fragments, f32 accumulation, no scales).
-The stage rows grow from 80 to 144 bytes (64 f16 + 8 pad): 55296 B of LDS, one workgroup per CU.
-A rows come from prepare_*_f16 (the Hadamard-rotated, 1/16-scaled activations in f16); W rows are the
-checkpoint's rows rotated along K (tools/export_weights.py --bits 16).
+"""f16 and bf16 twins of the int8 block GEMMs (kernels/gemm_i8_*_256*.loom -> gemm_f16_*_256*.loom and
+gemm_bf16_*_256*.loom): the same 256x128 workgroup tile, 64x64 wave tiles and one-step-ahead register packets,
+with 16-bit float operands (vector<16xf16> / vector<16xbf16> fragments, f32 accumulation, no scales, f16 output).
+The stage rows grow from 80 to 144 bytes (64 elements + 8 pad): 55296 B of LDS, one workgroup per CU.
+A rows come from prepare_*_{f16,bf16} (the formed row narrowed, unrotated); W rows are the checkpoint's f16 / bf16
+rows as stored (the video VAE decoder, the token refiner).
     python3 tools/gen_gemm_f16.py"""
 import re
 from pathlib import Path
@@ -11,7 +11,10 @@ ROOT = Path(__file__).resolve().parent.parent
 GEMMS = ["gemm_i8_256", "gemm_i8_256b", "gemm_i8_resid_256", "gemm_i8_resid_256b", "gemm_i8_swiglu_256", "gemm_i8_swiglu_256b_gs"]
 
 
-def gemm(K: str) -> str:
+def gemm(K: str, elem: str = "f16") -> str:
+    """The int8 kernel text -> the f16 twin; elem "bf16" then swaps the operand side (views, loads, stage, fragments, MMA)
+    to bf16, leaving the f16 output and its saturation as they are."""
+    assert elem in ("f16", "bf16")
     def sub(old, new, count=None):
         nonlocal K
         n = K.count(old); assert n > 0 and (count is None or n == count), (old[:80], n)
@@ -28,14 +31,15 @@ def gemm(K: str) -> str:
     sub("  %lds_bytes = index.constant 30720 : offset\n", "  %lds_bytes = index.constant 55296 : offset\n")
     sub("  %w_stage_offset = index.constant 20480 : offset\n", "  %w_stage_offset = index.constant 36864 : offset\n")
     # global operand views and loads: f16 elements, 16 per lane per row
-    sub("  %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<[%m_bounded]x[%k_quads]xi32>\n", "  %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<[%m_bounded]x[%k_size]xf16>\n  %k_last16 = index.sub %k_size, %c16 : index\n")
-    sub("  %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%n_size]x[%k_quads]xi32>\n", "  %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%n_size]x[%k_size]xf16>\n")
+    # the operand views carry the padded row pitch (k_stride, as the int8 kernel's k_quads = k_stride / 4); the loads stay within k_size
+    sub("  %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<[%m_bounded]x[%k_quads]xi32>\n", "  %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<[%m_bounded]x[%k_stride]xf16>\n  %k_last16 = index.sub %k_size, %c16 : index\n")
+    sub("  %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%n_size]x[%k_quads]xi32>\n", "  %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%n_size]x[%k_stride]xf16>\n")
     sub("  %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), mul(%st_quad, 4)] : index\n",
         "  %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), mul(%st_quad, 4)] : index\n  %ke_first0 = index.mul %kq_first, %c4 : index\n  %ke_first = index.assume %ke_first0 [le(%ke_first0, %k_last16), mul(%ke_first0, 16)] : index\n")
     sub("    %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), mul(%kq_safe, 4)] : index\n",
         "    %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), mul(%kq_safe, 4)] : index\n    %ke_next0 = index.mul %kq_next, %c4 : index\n    %ke_next = index.assume %ke_next0 [le(%ke_next0, %k_last16), mul(%ke_next0, 16)] : index\n")
-    K = re.sub(r"vector\.load %a_view\[(%a_row\d), %kq_(first|next)\] : view<\[%m_bounded\]x\[%k_quads\]xi32> -> vector<4xi32>", r"vector.load %a_view[\1, %ke_\2] : view<[%m_bounded]x[%k_size]xf16> -> vector<16xf16>", K)
-    K = re.sub(r"vector\.load %w_view\[(%w_row\d), %kq_(first|next)\] : view<\[%n_size\]x\[%k_quads\]xi32> -> vector<4xi32>", r"vector.load %w_view[\1, %ke_\2] : view<[%n_size]x[%k_size]xf16> -> vector<16xf16>", K)
+    K = re.sub(r"vector\.load %a_view\[(%a_row\d), %kq_(first|next)\] : view<\[%m_bounded\]x\[%k_quads\]xi32> -> vector<4xi32>", r"vector.load %a_view[\1, %ke_\2] : view<[%m_bounded]x[%k_stride]xf16> -> vector<16xf16>", K)
+    K = re.sub(r"vector\.load %w_view\[(%w_row\d), %kq_(first|next)\] : view<\[%n_size\]x\[%k_quads\]xi32> -> vector<4xi32>", r"vector.load %w_view[\1, %ke_\2] : view<[%n_size]x[%k_stride]xf16> -> vector<16xf16>", K)
     # stage: element columns
     sub("  %st_quad = index.mul %st_sub, %c4 : index\n", "  %st_quad = index.mul %st_sub, %c4 : index\n  %st_col0 = index.mul %st_sub, %c16 : index\n  %st_col = index.assume %st_col0 [lt(%st_col0, %c64), mul(%st_col0, 16)] : index\n")
     K = re.sub(r"vector\.store (%c[aw]\d), (%[aw]_stage)\[(%st_[aw]row\d), %st_quad\] : vector<4xi32>, view<(\d+)x20xi32>", r"vector.store \1, \2[\3, %st_col] : vector<16xf16>, view<\4x72xf16>", K)
@@ -70,39 +74,19 @@ def gemm(K: str) -> str:
     assert "xi32" not in K.replace("view<[%m_bounded]xi32>", "").replace("-> i32", "").replace(": i32", ""), [l for l in K.splitlines() if "xi32" in l][:5]
     left = [l for l in K.splitlines() if "scale" in l and "scaled" not in l and "index.scale" not in l and not l.strip().startswith("//")]
     assert not left, left[:5]
-    return K
-
-
-def prepare(K: str, name: str) -> str:
-    K = K.replace(f"{name}_i8", f"{name}_f16")
-    K = K.replace(", %q_scale: buffer) {", ") {")
-    K = re.sub(r" *%qs_global = buffer\.assume\.memory_space<global> %q_scale : buffer\n", "", K)
-    K = re.sub(r" *%qs_view = buffer\.view %qs_global\[%c0_offset\] : buffer -> view<\[%tokens_b\]xf32>\n", "", K)
-    K = re.sub(r"  %qw_view = buffer\.view %q_global\[%c0_offset\] : buffer -> view<\[%tokens_b\]x\[%word_width\]xi32>\n", "  %o_view = buffer.view %q_global[%c0_offset] : buffer -> view<[%tokens_b]x[%width]xf16>\n", K)
-    assert "%o_view" in K
-    K = K.replace("  %sixteenth = scalar.constant 0.0625 : f32\n", "  %sixteenth = scalar.constant 0.0625 : f32\n  %sixteenth8 = vector.splat %sixteenth : vector<8xf32>\n")
-    assert "%sixteenth8" in K
-    i = K.index("  %amax_v = scf.for"); j = K.rindex("  kernel.return")
-    tail = """  scf.for %q_j = [%c0 to %chunks_per_lane step %c1] {
-    %q_lane_step = index.mul %q_j, %lanes : index
-    %q_chunk = index.add %q_lane_step, %lane : index
-    %q_i0 = index.mul %q_chunk, %c8 : index
-    %q_i = index.assume %q_i0 [le(%q_i0, %width_last), mul(%q_i0, 8)] : index
-    %q_x = vector.load %x_view[%q_i] : view<[%width]xf32> -> vector<8xf32>
-    %q_r = vector.mulf %q_x, %sixteenth8 : vector<8xf32>
-    %q_h = vector.fptrunc %q_r : vector<8xf32> to vector<8xf16>
-    vector.store %q_h, %o_view[%row, %q_i] : vector<8xf16>, view<[%tokens_b]x[%width]xf16>
-  }
-"""
-    K = K[:i] + tail + K[j:]
+    if elem == "bf16":
+        for old in ("view<[%m_bounded]x[%k_stride]xf16>", "view<[%n_size]x[%k_stride]xf16>", "view<256x72xf16>", "view<128x72xf16>", "vector<16xf16>"):
+            sub(old, old.replace("f16", "bf16"))
+        sub("gemm_f16_", "gemm_bf16_")
+        sub("// f16 GEMM on the gfx11 WMMA", "// bf16 GEMM on the gfx11 WMMA"); sub("W [N][K] f16 rows", "W [N][K] bf16 rows")
+        assert K.count("xbf16") >= 20 and "vector<16xf16>" not in K, "every operand-side f16 became bf16"
     return K
 
 
 def main():
     for stem in GEMMS:
-        out = ROOT / "kernels" / f"{stem.replace('gemm_i8_', 'gemm_f16_')}.loom"; out.write_text(gemm((ROOT / "kernels" / f"{stem}.loom").read_text())); print("wrote", out.name)
-    for name in ("prepare_norm", "prepare_plain"):
-        out = ROOT / "kernels" / f"{name}_f16.loom"; out.write_text(prepare((ROOT / "kernels" / f"{name}_i8.loom").read_text(), name)); print("wrote", out.name)
+        for elem in ("f16", "bf16"):
+            out = ROOT / "kernels" / f"{stem.replace('gemm_i8_', f'gemm_{elem}_')}.loom"; out.write_text(gemm((ROOT / "kernels" / f"{stem}.loom").read_text(), elem)); print("wrote", out.name)
 
 
 if __name__ == "__main__":
