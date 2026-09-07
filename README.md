@@ -115,7 +115,9 @@ directories, kernel sources, cache, the `loom-compile` path), `h3tok_encode` (te
 Qwen2 byte-level BPE in C), `h3pipe_encode_video` / `h3pipe_encode_audio` / `h3pipe_vision_embed`
 (references), `h3pipe_denoise` and `h3pipe_denoise_refs` (ids and references to model-space
 latents, with a progress callback), `h3pipe_decode_video` and `h3pipe_decode_audio`.
-`host/h3_cli.cpp` is a 300-line example of using all of it.
+`docs/abi.md` is the contract (sizes, layouts, references, errors, threading); `examples/` has the same
+minimal client in C, Rust (no bindgen) and Go (cgo), which produce byte-identical clips; `host/h3_cli.cpp`
+is the complete client.
 
 **Knobs.** `H3_PROFILE=1` prints per-stage times after every step; `H3_TRACE=1` prints and
 synchronises every launch; `--precision bf16` runs the pruned bf16 checkpoint's rows in f16 at
@@ -196,7 +198,8 @@ attention form.
 | `tools/` | kernel generators (`gen_*.py`), weight exports (`export_*.py`, `gptq_export.py`), the Python driver, benches, the ComfyUI harness |
 | `tests/` | kernel tests against float64 references, host tests, the ComfyUI parity gate |
 | `reference/` | a NumPy/torch reference of the block stack and the VAE decoder |
-| `docs/` | `notes.md` (every measured lever, won or lost), the attention and GEMM reports, the reference-conditioning plan |
+| `docs/` | `abi.md` (the C ABI contract), `notes.md` (every measured lever, won or lost), the attention and GEMM reports, the reference-conditioning plan |
+| `examples/` | the minimal client in C, Rust and Go |
 | `scripts/` | `env.sh`, `build_host.sh`, `test.sh`, `download.sh` |
 
 ## Tests

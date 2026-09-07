@@ -1,0 +1,4 @@
+c/minimal
+go/minimal
+rust/target/
+rust/Cargo.lock

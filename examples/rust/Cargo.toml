@@ -1,0 +1,12 @@
+[package]
+name = "h3-minimal"
+version = "0.1.0"
+edition = "2021"
+description = "libh3pipe from Rust without bindgen: prompt -> frames + samples"
+
+[[bin]]
+name = "minimal"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
