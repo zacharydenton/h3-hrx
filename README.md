@@ -119,6 +119,11 @@ latents, with a progress callback), `h3pipe_decode_video` and `h3pipe_decode_aud
 minimal client in C, Rust (no bindgen) and Go (cgo), which produce byte-identical clips; `host/h3_cli.cpp`
 is the complete client.
 
+**Beyond video.** A 32x32 canvas and `--audio-only` turn H3 into a voice cloner and text-to-sound
+model (5 s of cloned speech in 22 to 33 s of GPU time); `--still frame.png` turns a 22-frame clip
+into an image generator and, with reference images, an image editor. `docs/tricks.md` has the
+modes, their costs, and the pieces of this repository worth taking elsewhere.
+
 **Knobs.** `H3_PROFILE=1` prints per-stage times after every step; `H3_TRACE=1` prints and
 synchronises every launch; `--precision bf16` runs the pruned bf16 checkpoint's rows in f16 at
 about the int8 speed; `--precision int4` is a 2x-per-step preview path that ghosts keyframe and
@@ -198,7 +203,7 @@ attention form.
 | `tools/` | kernel generators (`gen_*.py`), weight exports (`export_*.py`, `gptq_export.py`), the Python driver, benches, the ComfyUI harness |
 | `tests/` | kernel tests against float64 references, host tests, the ComfyUI parity gate |
 | `reference/` | a NumPy/torch reference of the block stack and the VAE decoder |
-| `docs/` | `abi.md` (the C ABI contract), `notes.md` (every measured lever, won or lost), the attention and GEMM reports, the reference-conditioning plan |
+| `docs/` | `abi.md` (the C ABI contract), `tricks.md` (voice, sound, stills, reusable pieces), `notes.md` (every measured lever, won or lost), the attention and GEMM reports, the reference-conditioning plan |
 | `examples/` | the minimal client in C, Rust and Go |
 | `scripts/` | `env.sh`, `build_host.sh`, `test.sh`, `download.sh` |
 

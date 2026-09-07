@@ -268,14 +268,20 @@ unsigned m_group_for(size_t tokens) {          // the raster group rule shared w
     for (unsigned g : {3u, 2u}) { const size_t pad = (tiles + g - 1) / g * g; if (pad < best_pad) { best = g; best_pad = pad; } }
     return best;
 }
+unsigned gemm_m_group_for(size_t tokens, int k, int n, int bits) {
+    // The long H3 INT8 down projection benefits from a smaller row group.
+    // Keep this shape-specific: the one-row group and a wider tile both lost.
+    if (bits == 8 && k == FFN && n == HID && tokens >= 32768) return 2;
+    return m_group_for(tokens);
+}
 // GEMM operand row pitch in k elements: K itself unless the row's byte pitch is a multiple of 1024, when the 384 rows a k step touches alias in
-// the cache (int8 out projection K = 7168: 36.7 -> 41.2 TOPS, down projection K = 21504: 33.4 -> 41.4 with the pad); the pad is
+// the cache (int8 out projection K = 7168: 36.7 -> 41.2 TOPS, K = 21504 benchmark: 33.4 -> 41.4 with the pad); the pad is
 // one k step (64 int8, 128 int4) so the kernels' step constraints hold. f16 GEMMs take no pitch.
 size_t gemm_pitch(size_t k, int bits) {
     const bool aliases = bits == 8 ? k % 1024 == 0 : bits == 4 ? k % 2048 == 0 : false;   // the byte pitch (int4 rows are k/2 bytes) a multiple of 1024
     return aliases ? k + (bits == 4 ? 128 : 64) : k;
 }
-unsigned gemm_grid_y(size_t tokens) { const unsigned g = m_group_for(tokens); return unsigned(((tokens + 255) / 256 + g - 1) / g * g); }
+unsigned gemm_grid_y(size_t tokens, unsigned group) { return unsigned(((tokens + 255) / 256 + group - 1) / group * group); }
 
 // A prepare kernel (norm / lnorm / plain) for one width, ready to launch.
 struct Prepare {
@@ -303,11 +309,13 @@ struct Prepare {
 // A GEMM of the int4/int8 family for one (K, N, m_group).
 struct Gemm {
     std::shared_ptr<Kernel> k; int n = 0; bool resid = false, bias = false; int bits = 8;
+    unsigned m_group = 1;
     void build(Compiler &c, const std::string &mode, int bits_, bool bias_, bool gate_first, int k_size, int n_size, size_t tokens, int classes = 1, int k_stride = 0) {
         resid = mode == "resid"; bias = bias_; n = n_size; bits = bits_;
+        m_group = gemm_m_group_for(tokens, k_size, n_size, bits);
         std::string stem = (bits == 16 ? std::string("gemm_f16") : "gemm_i" + std::to_string(bits)) + (mode == "plain" ? "" : "_" + mode) + "_256" + (bias ? "b" : "") + (mode == "swiglu" && !gate_first ? "_gs" : "");
         const std::string ns = "h3." + stem + ".";
-        Cfg cfg = {{ns + "k_size", std::to_string(k_size)}, {ns + "n_size", std::to_string(n_size)}, {ns + "m_group", std::to_string(m_group_for(tokens))}};
+        Cfg cfg = {{ns + "k_size", std::to_string(k_size)}, {ns + "n_size", std::to_string(n_size)}, {ns + "m_group", std::to_string(m_group)}};
         if (resid) cfg.push_back({ns + "classes", std::to_string(classes)});
         if (bits != 16) cfg.push_back({ns + "k_stride", std::to_string(k_stride ? k_stride : k_size)});   // operand row pitch (see gemm_pitch)
         k = c.get(stem, "h3_" + stem, cfg);
@@ -316,7 +324,7 @@ struct Gemm {
         KernArgs a; a.i32(int(tokens)).ptr(a_q).ptr(w_q); if (bits != 16) a.ptr(w_s).ptr(a_s); a.ptr(out);   // f16 operands carry no scales
         if (resid) a.ptr(gate).ptr(cls);
         if (bias) a.ptr(b);
-        launch(*k, p, stage, unsigned(n / 128), gemm_grid_y(tokens), THREADS, a);
+        launch(*k, p, stage, unsigned(n / 128), gemm_grid_y(tokens, m_group), THREADS, a);
     }
 };
 
@@ -387,8 +395,8 @@ public:
             std::string stem = d.causal ? "attention_gqa8c_lds_f16_wmma" : (d.head_dim == 64 ? (waves_ == 8 ? "attention_mha648_lds_f16_wmma" : "attention_mha64_lds_f16_wmma") : (waves_ == 8 ? "attention_mha8_lds_f16_wmma" : "attention_mha_lds_f16_wmma"));
             if (qk_int) {
                 if (qk_head_major) {
-                    // Head-major Q/K/scales keep each head's streaming operands contiguous.
-                    stem = "attention_i8qkhm_mha8_lds_f16_wmma";
+                    // Head-major operands; 64 shared keys amortize softmax and loop overhead.
+                    stem = "attention_i8qkhm_mha8_k64_lds_f16_wmma";
                 } else if (d.attn_i4) {
                     stem = tokens >= 20000 ? "attention_i4qkl_mha8_lds_f16_wmma" :
                            (waves_ == 8 ? "attention_i4qk_mha8_lds_f16_wmma" : "attention_i4qk_mha_lds_f16_wmma");
@@ -746,7 +754,7 @@ public:
 
     // --- denoising ---
     void denoise(const int32_t *ids, int n, const h3pipe_params &p, const float *noise_video, const float *noise_audio, float *video_out, float *audio_out, h3pipe_progress progress, void *user, const std::vector<h3pipe_ref> &refs = {}, const std::vector<h3pipe_keyframe> &kfs = {}) {
-        if (p.height % 32 || p.width % 32 || p.height < 64 || p.width < 64) throw std::invalid_argument("height and width must be multiples of 32");
+        if (p.height % 32 || p.width % 32 || p.height < 32 || p.width < 32) throw std::invalid_argument("height and width must be multiples of 32");   // 32 = one 2x2 latent patch: the audio-only canvas
         if (p.steps < 2 || p.steps > 1000) throw std::invalid_argument("steps must be 2..1000");
         h3pipe_shape sh; h3pipe_shape_for(&p, &sh);
         ensure_conditioning();

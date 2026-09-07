@@ -11,7 +11,7 @@
 //   --first-frame img   fl2va keyframe          --out clip.mp4    (default h3_out.mp4; <out>.wav is kept next to it)
 //   --frames 124        --steps 31 (= 30 evaluations)   --width 864  --height 480   --seed 0
 //   --precision int8|bf16|int4  (int8: the checkpoint's int8 rows, int8 QK^T)   --attn f16|i8|i4   --sampler res_multistep|euler
-//   --root DIR          the repository (default: the binary's parent's parent)   --no-decode   --latents prefix
+//   --root DIR          the repository (default: the binary's parent's parent)   --no-decode   --audio-only (voice/sound: 32x32 canvas, wav only)   --still frame.png [--still-frame N] (one frame as an image)   --latents prefix
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -143,7 +143,7 @@ struct Tok {
 int main(int argc, char **argv) {
     std::vector<std::string> image_files, audio_files;
     for (int i = 1; i < argc; ++i) {
-        if (argv[i][0] == '-') { if (strcmp(argv[i], "--no-decode") && strcmp(argv[i], "-h") && strcmp(argv[i], "--help")) ++i; continue; }
+        if (argv[i][0] == '-') { if (strcmp(argv[i], "--no-decode") && strcmp(argv[i], "--audio-only") && strcmp(argv[i], "-h") && strcmp(argv[i], "--help")) ++i; continue; }
         const std::string e = lower_ext(argv[i]);
         if (is_image(e)) image_files.push_back(argv[i]);
         else if (is_audio(e)) audio_files.push_back(argv[i]);
@@ -152,7 +152,7 @@ int main(int argc, char **argv) {
     if (flag(argc, argv, "-h") || flag(argc, argv, "--help")) {
         fprintf(stderr, "usage: h3 [ref.jpg ... ref.wav ...] [-p \"prompt\" | < prompt] [--first-frame img] [--out clip.mp4] [--frames 124] [--steps 31]\n"
                         "          [--width 864] [--height 480] [--seed 0] [--precision int8|bf16|int4] [--attn f16|i8|i4] [--sampler res_multistep|euler]\n"
-                        "          [--root DIR] [--no-decode] [--latents prefix]\n"); return 64;
+                        "          [--root DIR] [--no-decode] [--audio-only] [--still frame.png [--still-frame N]] [--latents prefix]\n"); return 64;
     }
     std::string prompt = arg(argc, argv, "-p", "");
     if (prompt.empty()) { char buf[1 << 16]; size_t n; while ((n = fread(buf, 1, sizeof buf, stdin)) > 0) prompt.append(buf, n); }
@@ -261,9 +261,10 @@ int main(int argc, char **argv) {
     }
     if (flag(argc, argv, "--no-decode")) { h3pipe_destroy(s); return 0; }
 
+    const bool audio_only = flag(argc, argv, "--audio-only");   // voice and sound: skip the video decoder, write <out>.wav only (use a 32x32 canvas)
     t0 = std::chrono::steady_clock::now();
-    std::vector<uint8_t> frames(size_t(sh.frames) * p.height * p.width * 3);
-    if (h3pipe_decode_video(s, &p, video.data(), video.size(), frames.data(), frames.size(), err, sizeof err)) { fprintf(stderr, "h3: decode video: %s\n", err); return 1; }
+    std::vector<uint8_t> frames(audio_only ? 0 : size_t(sh.frames) * p.height * p.width * 3);
+    if (!audio_only && h3pipe_decode_video(s, &p, video.data(), video.size(), frames.data(), frames.size(), err, sizeof err)) { fprintf(stderr, "h3: decode video: %s\n", err); return 1; }
     std::vector<float> samples(size_t(2) * sh.audio_t * 800);
     if (h3pipe_decode_audio(s, audio.data(), audio.size(), sh.audio_t, samples.data(), samples.size(), err, sizeof err)) { fprintf(stderr, "h3: decode audio: %s\n", err); return 1; }
     h3pipe_destroy(s);
@@ -277,6 +278,16 @@ int main(int argc, char **argv) {
         for (uint32_t i = 0; i < n; ++i) for (int c = 0; c < 2; ++c) { float v = samples[size_t(c) * n + i]; v = v < -1 ? -1 : (v > 1 ? 1 : v); u16(uint16_t(int16_t(v * 32767.0f))); }
         fclose(f);
     }
+    if (const char *still = arg(argc, argv, "--still", nullptr)) {   // one frame as an image (any format ffmpeg writes by extension): H3 as an image generator or editor
+        const int idx = std::min(sh.frames - 1, std::max(0, atoi(arg(argc, argv, "--still-frame", "0"))));
+        char size[32]; snprintf(size, sizeof size, "%dx%d", p.width, p.height);
+        const std::string cmd = "ffmpeg -y -loglevel error -f rawvideo -pix_fmt rgb24 -s " + std::string(size) + " -i - -frames:v 1 " + shell_quote(still);
+        FILE *ff = popen(cmd.c_str(), "w"); if (!ff) { perror("ffmpeg"); return 1; }
+        const size_t fb = size_t(p.height) * p.width * 3; fwrite(frames.data() + size_t(idx) * fb, 1, fb, ff);
+        if (pclose(ff) != 0) { fprintf(stderr, "h3: ffmpeg failed writing %s\n", still); return 1; }
+        fprintf(stderr, "wrote %s (frame %d)\n", still, idx);
+    }
+    if (audio_only) { fprintf(stderr, "wrote %s.wav (%.2f s, 32 kHz stereo)\n", out_stem.c_str(), double(sh.audio_t) * 800 / RATE); printf("%s.wav\n", out_stem.c_str()); return 0; }
     {   // frames straight into ffmpeg's stdin
         char size[32]; snprintf(size, sizeof size, "%dx%d", p.width, p.height);
         const std::string cmd = "ffmpeg -y -loglevel error -f rawvideo -pix_fmt rgb24 -s " + std::string(size) + " -r " + std::to_string(FPS) + " -i - -i " + shell_quote(out_stem + ".wav") +
