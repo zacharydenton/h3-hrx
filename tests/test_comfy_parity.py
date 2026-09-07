@@ -2,7 +2,7 @@
 int8 rows + f16 attention must reproduce ComfyUI's residual stream (video rows cosine >= 0.999 through block 30, >= 0.99 at blocks 40 and 49)
 and its 20-evaluation trajectory to rel err <= 0.02 after five evaluations.
 
-Without the dumps or build/weights_i8 this is a skip (exit 0), so the routine suite passes on a machine without them;
+Without the dumps or the DiT checkpoint this is a skip (exit 0), so the routine suite passes on a machine without them;
 --require (or H3_REQUIRE_PARITY=1) turns the skip into a failure for a release gate. A comparison that crashes, is missing an
 expected block or the x_05 line, or exits nonzero is a failure, never a pass."""
 import os, subprocess, sys

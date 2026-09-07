@@ -1,4 +1,4 @@
-// Failure injection without HIP, real weights, or a compiler.
+// Session failure injection without HIP, checkpoints, or a compiler (the loader's own cases are tests/test_weights.cpp).
 #include "../host/h3pipe.cpp"
 #include <cassert>
 #include <filesystem>
@@ -33,25 +33,6 @@ Rt &rt() { return fake; }
 
 int main(int argc, char **argv) {
     assert(argc == 2); const std::string dir = argv[1];
-    const float values[] = {1, 2, 3, 4};
-    std::ofstream(dir + "/weights.bin", std::ios::binary).write((const char *)values, sizeof values);
-    std::ofstream(dir + "/manifest.txt") << "te.embed 0 8 torch.float32 2\nsmall 8 8 torch.float32 2\n";
-    {
-        Blob b; b.open(dir); assert(fake.bytes == 0); // metadata only
-        assert(b.host_f32("small", 2)[0] == 3 && fake.bytes == 0);
-        fake.fail_copy = true;
-        try { b.at("small", 8); assert(false); } catch (const std::runtime_error &) {}
-        assert(fake.bytes == 0 && b.tensors.empty());
-        fake.fail_copy = false;
-        const void *p = b.at("small", 8); assert(fake.bytes == 8);
-        assert(b.at("small", 8) == p && fake.bytes == 8); // never allocates te.embed
-        assert(((float *)p)[1] == 4);
-        std::filesystem::resize_file(dir + "/weights.bin", 8);
-        try { b.open(dir); assert(false); } catch (const std::runtime_error &) {}
-        assert(b.at("small", 8) == p); // failed reopen keeps the valid state
-    }
-    assert(fake.allocations.empty());
-    std::ofstream(dir + "/weights.bin", std::ios::binary).write((const char *)values, sizeof values);
     h3pipe_config cfg{}; cfg.dit_file = "/missing/dit.safetensors"; cfg.te_file = "/missing/te.safetensors";
     cfg.kernel_sources = "/missing/kernels"; cfg.cache_dir = dir.c_str(); cfg.loom_compile = "/missing/compiler";
     for (int failure = 0; failure < 2; ++failure) {
@@ -80,5 +61,5 @@ int main(int argc, char **argv) {
     try { DeviceBuffers stage; stage.alloc(64); stage.alloc(128); throw std::runtime_error("stage failed"); }
     catch (const std::runtime_error &) {}
     assert(fake.allocations.empty());
-    puts("PASS lazy tensor loading, failed uploads/constructors/resizes, retry, scoped cleanup");
+    puts("PASS failed session constructors and resizes, retry, scoped cleanup");
 }

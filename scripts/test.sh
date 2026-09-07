@@ -51,11 +51,9 @@ step "vision matmuls, bf16; matmul_f32 past 32768 rows" gpu tests/test_matmul_bf
 step "C tokenizer vs transformers" ref tests/test_tokenizer.py
 if [ "$tier" = full ]; then
   # the reference tier: model weights, exports and the reference dumps (README, Weights and Tests)
-  step "tiled decoder parity (decoder weights only)" ref tests/test_decoder_tiles.py
-  step "native blocks vs reference (fixture)" ref tests/test_blocks.py --curve 1,50
-  step "text encoder layers vs transformers" ref tests/test_te_blocks.py --curve 1,50
-  step "video VAE decoder blocks vs diffusers (W8A8)" ref tests/test_vae_blocks.py --curve 36 --bits 8
-  step "C pipeline (libh3pipe) vs the Python stages" ref tests/test_pipe.py --step --decode --audio
+  step "DiT blocks vs the reference (the checkpoint's int8 rows)" ref tests/test_stack_parity.py --stack dit
+  step "text encoder layers vs transformers" ref tests/test_stack_parity.py --stack te
+  step "C pipeline (libh3pipe) vs the Python stages" ref tests/test_pipe.py --decode --audio
   if [ -d build/ref_truth ]; then
     step "audio encoder vs ComfyUI" ref tests/test_audio_encoder.py
     step "vision tower vs ComfyUI" ref tests/test_vision.py

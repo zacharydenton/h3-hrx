@@ -52,8 +52,8 @@ Kernel-level, 56 heads x 128, measured in `docs/`:
 - **ffmpeg** for the `h3` command (input decoding, output muxing).
 - **Python 3 with NumPy** for the kernel generators and the CPU tier of the tests (`H3_PYTHON`);
   **ROCm PyTorch, diffusers and transformers** only for the GPU and reference tiers of the tests,
-  whose float64 references are torch (`H3_REFERENCE_PYTHON`). Generating a clip never touches
-  Python: the host reads the checkpoints itself.
+  whose oracles are torch and diffusers (`H3_REFERENCE_PYTHON`). Generating a clip never touches
+  Python, and there is no export step: the host reads ComfyUI's checkpoints itself.
 - Optional, for the toy ComfyUI comparison in the test suite: **podman** and the
   `docker.io/kyuz0/amd-strix-halo-comfyui` image (skipped when podman is absent).
 
@@ -179,13 +179,15 @@ rows: 50 blocks of hidden 5376, 56 attention heads of 128 with no key-value shar
 Qwen3-VL-32B is the text and image encoder; a causal 24-channel video VAE and a 40 Hz audio VAE
 are the tokenizers.
 
-**In Loom** (84 kernels in `kernels/`, most written by generators in `tools/gen_*.py`):
-the DiT blocks (int8, f16 and int4 GEMM families with fused SwiGLU and class-gated residual
-epilogues; the AdaLN prepare kernels with the ConvRot Hadamard and row quantisation; RoPE with
-q/k RMSNorm; attention), the text encoder's 50 layers, the token refiner, embedders and final
-layer, the video VAE decoder's 36 blocks and heads, the three reference encoders, and the audio
-vocoder. **On the host in C++:** layout, the AdaLN curve tables, the sampler, noise, patching,
-chunk blending and the pixel mapping, together well under a second per clip.
+**In Loom** (kernels in `kernels/`, most written by generators in `tools/gen_*.py`):
+the DiT blocks and the text encoder's 50 layers on the checkpoints' int8 ConvRot rows (int8 GEMM
+families with fused SwiGLU and class-gated residual epilogues; the AdaLN prepare kernels with the
+ConvRot Hadamard and row quantisation; RoPE with q/k RMSNorm; attention), the token refiner and
+the vision tower on their bf16 rows, the video VAE decoder's 36 blocks and heads on its f16 rows,
+the patch embedders and the final layer on their f32 rows, the three reference encoders, and the
+audio vocoder. **On the host in C++:** reading the checkpoints, layout, the AdaLN curve tables,
+the sampler, noise, patching, chunk blending and the pixel mapping, together well under a second
+per clip.
 
 The design decisions that carry the numbers, each with its measurement in `docs/notes.md`:
 
@@ -199,6 +201,9 @@ The design decisions that carry the numbers, each with its measurement in `docs/
   operand pitch whenever a row's byte pitch is a multiple of 1024 (rows at such a pitch alias in
   the cache: the out and down projections gained 12% and 24%). Row-group selection per token
   count ([docs/gemm-int8-tuning.md](docs/gemm-int8-tuning.md)).
+- **The checkpoints' own dtypes**, with no export step and no conversion at load: int8 rows keep
+  their stored scales, bf16 and f16 rows run on kernels of their type, and the loader only ever
+  changes layout (concatenation, the 16-row gate/up interleave, zero padding).
 - **ComfyUI's sampler and layout**, reproduced exactly: `res_multistep` on the `simple` schedule,
   the audio carried as (sigma_v / sigma_a) x_a, keyframes and references packed between the text
   and target streams.
@@ -219,7 +224,7 @@ attention form.
 | `kernels/` | the Loom kernels; `experiments/` the measured losers, kept with their numbers |
 | `tools/` | kernel generators (`gen_*.py`), weight exports (`export_*.py`, the reference tier's oracles), the Python driver, benches, the ComfyUI harness |
 | `tests/` | kernel tests against float64 references, host tests, the ComfyUI parity gate |
-| `reference/` | a NumPy/torch reference of the block stack and the VAE decoder |
+| `reference/` | the torch reference of the block stack and the VAE decoder, the reference tier's oracles |
 | `docs/` | `abi.md` (the C ABI contract), `tricks.md` (voice, sound, stills, reusable pieces), `notes.md` (every measured lever, won or lost), the attention and GEMM reports, the reference-conditioning plan |
 | `examples/` | the minimal client in C, Rust and Go |
 | `assets/` | Qwen's `tokenizer.json`, compiled into `libh3pipe.so` |

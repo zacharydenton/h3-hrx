@@ -21,6 +21,14 @@ class DecoderWeights:
             value = f.get_tensor(name)
             return value.clone() if str(device) == "cpu" else value.to(device)
 
+    def full(self, device="cuda"):
+        """The whole decoder in f32 (the independent oracle: diffusers' own blocks, not this repository's)."""
+        vae = AutoencoderKLMiniMaxH3.from_config(self.config)
+        state = {name: self.tensor(name, device) for name in self.index if name.startswith("post_quant_conv.") or name.startswith("decoder.")}
+        del vae.encoder, vae.quant_conv
+        vae.load_state_dict(state, strict=True, assign=True)
+        return vae.to(device).eval()
+
     def heads(self, device="cuda"):
         with torch.device("meta"):
             vae = AutoencoderKLMiniMaxH3.from_config(self.config)

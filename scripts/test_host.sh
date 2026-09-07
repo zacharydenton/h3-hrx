@@ -18,9 +18,5 @@ g++ -std=c++17 -O1 -Wno-subobject-linkage -ffunction-sections -fdata-sections te
 "$tmpdir/pipe_memory" "$tmpdir"
 g++ -std=c++17 -O1 -Itests/fakes tests/test_runtime_cleanup.cpp -o "$tmpdir/runtime_cleanup"
 "$tmpdir/runtime_cleanup"
-for variant in DIT TE VAE; do
-  g++ -std=c++17 -O1 -Wno-subobject-linkage -Itests/fakes -D"TEST_$variant" tests/test_session_cleanup.cpp -o "$tmpdir/cleanup"
-  "$tmpdir/cleanup" "$tmpdir"
-done
 "$PY" tests/test_review_regressions.py
 "$PY" -O tests/test_review_regressions.py
