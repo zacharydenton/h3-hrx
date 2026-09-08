@@ -50,6 +50,11 @@ if command -v podman >/dev/null 2>&1 || [ "${H3_REQUIRE_COMFY:-}" = 1 ]; then
 step "reference vs ComfyUI's MiniMaxH3Model (toy)" podman run --rm -v "$HOME:$HOME" -w "$PWD" -e PYTHONPATH=/opt/ComfyUI --entrypoint /opt/venv/bin/python docker.io/kyuz0/amd-strix-halo-comfyui:latest tests/test_ref_vs_comfy.py
 else skip "reference vs ComfyUI's MiniMaxH3Model (toy)" "no podman (H3_REQUIRE_COMFY=1 makes this a failure)"; fi
 step "build host"        ./scripts/build_host.sh
+# the h3 command's own tests: option table, WAV writer, the PIL resampler's invariants. They link
+# libh3pipe, so they run after the host build rather than in the CPU tier.
+if command -v cargo >/dev/null 2>&1; then
+step "h3 command (Rust) unit tests" cargo test --quiet --release --manifest-path cli/Cargo.toml
+else skip "h3 command (Rust) unit tests" "no cargo"; fi
 step "small kernel regressions" gpu tests/test_kernel_regressions.py
 step "prepare kernels"   gpu tests/test_prepare.py
 step "prepare Q/K, int8 head-major (the production attention operands)" gpu tests/test_prepare_qk_i8_head_major.py

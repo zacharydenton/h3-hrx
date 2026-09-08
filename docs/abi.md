@@ -3,7 +3,7 @@
 [`host/h3pipe.h`](../host/h3pipe.h) and [`host/h3tok.h`](../host/h3tok.h) declare the pipeline and tokenizer.
 Every language with a C foreign-function interface can drive it; `examples/` has working
 programs in C, Rust (no bindgen) and Go (cgo), and `h3pipe_loom.py` is the ctypes binding the
-Python tools use. `host/h3_cli.cpp` is the complete client: references, keyframes, decoding and
+Python tools use. `cli/` is the complete client: references, keyframes, decoding and
 muxing.
 
 ```
@@ -110,7 +110,7 @@ overrides it); passing a path reads that file instead.
 
 [Complete examples](../examples/README.md) cover C, Rust, Go, and Python,
 including error handling and output. The C++ CLI in
-[`host/h3_cli.cpp`](../host/h3_cli.cpp) also demonstrates reference preparation
+[`cli/src/main.rs`](../cli/src/main.rs) also demonstrates reference preparation
 and muxing. Use [structured prompts](prompting.md) for generation.
 
 Link with `-L build -lh3pipe` and put the library directory on the runtime

@@ -10,6 +10,8 @@ Run commands from the repository root unless stated otherwise.
 - ROCm with HIP headers, runtime, and `hipcc`; the tested installation is in
   `/opt/rocm`. Set `ROCM_PATH` or `HIPCC` for another installation.
 - `g++` for the host/tokenizer build and CPU tests; ffmpeg for input decoding
+- `cargo` (Rust) for the `h3` command in `cli/`; `scripts/build_host.sh` skips it
+  and still builds the library and `h3pipe` when cargo is missing
   and MP4/WAV output.
 - [Loom with the included compiler patches](../patches/loom/README.md).
 - For downloads, the Hugging Face CLI (`python3 -m pip install huggingface_hub`

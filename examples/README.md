@@ -17,4 +17,4 @@ five-second example at the normal evaluation count.
 
 The positional arguments are the prompt, the frame count, the sigma grid points (evaluations + 1)
 and the output prefix. `ffmpeg -f rawvideo -pix_fmt rgb24 -s 864x480 -r 24 -i out.rgb -i out.wav out.mp4`
-muxes the result; `host/h3_cli.cpp` (`h3`) does that and the reference inputs in C++.
+muxes the result; `cli/` (`h3`) does that and the reference inputs in Rust.

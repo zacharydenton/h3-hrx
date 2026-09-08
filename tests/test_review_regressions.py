@@ -158,7 +158,7 @@ class ReviewRegressions(unittest.TestCase):
                  "vae/minimax_h3_video_vae_fp16.safetensors", "vae/minimax_h3_audio_vae_fp32.safetensors"]
         for name, want in zip(("DIT", "TE", "VIDEO_VAE", "AUDIO_VAE"), files):
             self.assertTrue(str(getattr(h3pipe_loom, name)).endswith(want), name)
-        for path in ("host/h3_cli.cpp", "examples/c/minimal.c", "examples/rust/src/main.rs", "examples/go/main.go", "README.md"):
+        for path in ("cli/src/main.rs", "examples/c/minimal.c", "examples/rust/src/main.rs", "examples/go/main.go", "README.md"):
             text = (ROOT / path).read_text()
             for want in files: self.assertIn(want, text, f"{path} does not name {want}")
             self.assertIn("H3_MODELS", text, path)

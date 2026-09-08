@@ -10,7 +10,8 @@ timing boundary, and numerical comparison alongside the result.
 
 | Directory | Purpose |
 | --- | --- |
-| `host/` | C++ pipeline, checkpoint loader, tokenizer, CLI, HIP/HRX runtime bindings |
+| `host/` | C++ pipeline, checkpoint loader, tokenizer, HIP/HRX runtime bindings |
+| `cli/` | the `h3` command in Rust, and the worked example of the C API |
 | `kernels/` | Runtime Loom sources, mostly emitted by `tools/gen_*.py` |
 | `tools/` | Generators, Python client, benchmarks, and ComfyUI comparison tools |
 | `tests/` | CPU host regressions, kernel numerical checks, and pipeline comparisons |

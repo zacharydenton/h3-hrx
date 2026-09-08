@@ -34,7 +34,8 @@ measurements, and decoder timings.
 ## Setup
 
 You need Linux, ROCm with `gfx1151` support (tested with the 7.1 series), a C++
-compiler, ffmpeg, and a built Loom compiler. The measured kernels require
+compiler, Rust (the `h3` command is a Rust client of the C API; the library itself
+is C++), ffmpeg, and a built Loom compiler. The measured kernels require
 [two Loom patches included here](patches/loom/README.md).
 Python 3 and NumPy are needed for development and CPU tests.
 

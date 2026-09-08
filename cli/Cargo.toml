@@ -1,0 +1,16 @@
+[package]
+name = "h3-cli"
+version = "0.1.0"
+edition = "2021"
+description = "h3: the MiniMax H3 pipeline from the shell, through libh3pipe's C ABI"
+
+[[bin]]
+name = "h3"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 2

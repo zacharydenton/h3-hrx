@@ -8,8 +8,6 @@ g++ -std=c++17 -O2 -Wno-subobject-linkage -ffunction-sections -fdata-sections te
 build/test_host_logic
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
-g++ -std=c++17 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -ffunction-sections -fdata-sections tests/test_host_cli.cpp host/h3tok.cpp host/tokenizer_blob.S -Wl,--gc-sections -o "$tmpdir/host_cli"
-"$tmpdir/host_cli" "$tmpdir"
 g++ -std=c++17 -O1 -Wno-subobject-linkage -ffunction-sections -fdata-sections tests/test_weights.cpp -Wl,--gc-sections -o "$tmpdir/weights"
 "$tmpdir/weights" "$tmpdir"
 g++ -std=c++17 -O1 -Wno-subobject-linkage -ffunction-sections -fdata-sections tests/test_kernel_cache.cpp -Wl,--gc-sections -o "$tmpdir/kernel_cache" -pthread

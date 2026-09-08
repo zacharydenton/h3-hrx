@@ -10,9 +10,15 @@ g++ -c -fPIC -o build/tokenizer_blob.o host/tokenizer_blob.S
 "$HIPCC" -O2 -Wall -Werror -fPIC -shared -o build/libh3pipe.so host/h3pipe.cpp host/h3tok.cpp host/rt_hip.cpp -x none build/tokenizer_blob.o
 printf 'built build/libh3pipe.so\n'
 "$HIPCC" -O2 -Wall -Werror -o build/h3pipe host/h3pipe_cli.cpp -Lbuild -lh3pipe -Wl,-rpath,'$ORIGIN'
-"$HIPCC" -O2 -Wall -Werror -o build/h3 host/h3_cli.cpp -Lbuild -lh3pipe -Wl,-rpath,'$ORIGIN'
-printf 'built build/h3\n'
 printf 'built build/h3pipe\n'
+# h3 is Rust (cli/), linked against the library just built; build.rs sets the rpath to build/
+if command -v cargo >/dev/null 2>&1; then
+  (cd cli && cargo build --release --quiet)
+  cp cli/target/release/h3 build/h3
+  printf 'built build/h3\n'
+else
+  printf 'skipped build/h3: cargo not found (the CLI is Rust; docs/setup.md)\n' >&2
+fi
 # the same library on hrx-system's libhrx (no HIP in the process; needs the HSA runtime libhrx expects on LD_LIBRARY_PATH,
 # ~/.local/rocm-hrx on halo); plain g++, no ROCm headers
 HRX_SYSTEM="${HRX_SYSTEM:-$HOME/code/hrx-system}"; HRX_LIB="$HRX_SYSTEM/build-cuda/libhrx/src/libhrx"
