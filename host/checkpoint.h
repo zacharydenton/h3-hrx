@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <limits>
@@ -96,7 +97,13 @@ struct Checkpoint {
     void will_need(const Entry &e) const { will_need(data(e), e.bytes); }
     // Release a range's pages once its bytes are on the device: a tensor is read once, and 53 GB of checkpoint left
     // resident would compete with the device allocations for the same memory (this part's is the host's).
-    void done_with(const char *p, size_t bytes) const { advise(p, bytes, MADV_DONTNEED); }
+    // H3_KEEP_MAPPED=1 keeps them instead, which is what a repeated test or benchmark run wants: the page cache then
+    // serves the next run rather than re-reading ~48 GB of checkpoint at disk speed. Set it only when host memory is
+    // not the binding constraint; under pressure the kernel evicts the pages anyway, which is the default's whole point.
+    void done_with(const char *p, size_t bytes) const {
+        static const bool keep = [] { const char *v = getenv("H3_KEEP_MAPPED"); return v && *v && strcmp(v, "0") != 0; }();
+        if (!keep) advise(p, bytes, MADV_DONTNEED);
+    }
 
 private:
     // The whole pages a range covers, so a partial page at either end is never advised away under a neighbour's bytes

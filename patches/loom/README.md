@@ -1,8 +1,9 @@
 # Loom compiler used by this project
 
-The measured kernels use two local changes on top of
-`ROCm/hrx-system` commit `c9855b47e96e7eb1cbb5b81b1de973762982ae95`.
-The patches preserve those changes without requiring access to a local branch:
+This project uses three local changes on top of `ROCm/hrx-system` commit
+`c9855b47e96e7eb1cbb5b81b1de973762982ae95` — two in the compiler, which the
+measured kernels need, and one in the runtime, which the HRX backend needs on a
+stock ROCr. The patches preserve them without requiring access to a local branch:
 
 1. `0001-amdgpu-fragment-repack.patch` — `v_permlanex16` cross-lane lowering
    and an f32-to-f16 matrix-fragment repack in registers (original commit
@@ -10,6 +11,17 @@ The patches preserve those changes without requiring access to a local branch:
 2. `0002-preserve-fragment-read-order.patch` — keep reads feeding matrix
    fragments in source order (original commit
    `8b2d1e882d28eb386bccd65fe702bd87119266ce`).
+3. `0003-amdgpu-pm4-emulation-query-optional.patch` — a runtime fix, not a
+   compiler one. `iree_hal_amdgpu_query_aql_queue_execution_mode` queries
+   `HSA_AMD_AGENT_INFO_PM4_EMULATION` (0xA119) and propagates every failure, so
+   device initialization fails on any ROCr whose agent attribute enum ends at
+   0xA118 — which includes the distribution's HSA 1.18. `INVALID_ARGUMENT` from
+   that query means the attribute is unknown, and a runtime that does not know it
+   is not emulating PM4, so the patch answers that case from the already-`false`
+   default; every other status still propagates. It carries the regression test.
+   Needed only for the HRX backend. Not upstream: it is
+   [`pm4-emulation-query-optional`](https://github.com/zacharydenton/hrx-system/tree/pm4-emulation-query-optional)
+   on a fork of `ROCm/hrx-system`.
 
 From this project's root, create a separate compiler checkout:
 

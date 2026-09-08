@@ -45,10 +45,16 @@ ln -s "$PWD/build/h3" ~/.local/bin/h3
 
 The optional HRX backend is built when `libhrx.so` is available under
 `HRX_SYSTEM` (default `~/code/hrx-system`). The HIP backend is the normal CLI
-path. On the development Arch installation, the system HSA runtime aborted
-when HRX opened a queue. If your installation needs a replacement runtime,
-set `H3_ROCM_RUNTIME_DIR` to its directory before sourcing `env.sh`; no private
-runtime directory is added by default.
+path.
+
+An unpatched HRX runtime fails to initialize on a ROCr older than the
+`HSA_AMD_AGENT_INFO_PM4_EMULATION` attribute, including the distribution's
+HSA 1.18: `hrx_gpu_initialize` returns `INVALID_ARGUMENT` from
+`hsa_agent_get_info`. `patches/loom/0003-amdgpu-pm4-emulation-query-optional.patch`
+fixes that; with it applied the HRX backend runs on the stock system runtime and
+produces frames and samples bit-identical to the HIP backend. `H3_ROCM_RUNTIME_DIR`
+remains available to put a replacement runtime on `LD_LIBRARY_PATH` before
+sourcing `env.sh`, but is no longer required for this failure.
 
 ## Checkpoints
 
