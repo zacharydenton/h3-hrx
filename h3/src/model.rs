@@ -112,3 +112,143 @@ mod tests {
         assert_eq!(ROPE_DIM, 2 * ROPE_HALF);
     }
 }
+
+/// The prepare kernels' lane count for a row width: the widest that divides it both ways.
+pub fn lanes_for(width: usize) -> Option<usize> {
+    [320, 256, 160, 128, 96, 64, 32]
+        .into_iter()
+        .find(|&l| width.is_multiple_of(8 * l) && (width / 4).is_multiple_of(l))
+}
+
+/// The raster group rule, shared with the Python kernel harnesses: how many workgroup rows are grouped
+/// so the tail wastes as little as possible. Four unless three or two pad less.
+pub fn m_group_for(tokens: usize, tile: usize) -> u32 {
+    let tiles = tokens.div_ceil(tile);
+    if tiles == 1 {
+        return 1;
+    }
+    let (mut best, mut best_pad) = (4u32, tiles.div_ceil(4) * 4);
+    for g in [3u32, 2u32] {
+        let pad = tiles.div_ceil(g as usize) * g as usize;
+        if pad < best_pad {
+            best = g;
+            best_pad = pad;
+        }
+    }
+    best
+}
+
+/// The long int8 down projection benefits from a smaller row group. Kept shape-specific: the one-row
+/// group and a wider tile both lost when measured.
+pub fn gemm_m_group_for(tokens: usize, k: usize, n: usize, bits: usize) -> u32 {
+    if bits == 8 && k == FFN && n == HID && tokens >= 32768 {
+        return 2;
+    }
+    m_group_for(tokens, 256)
+}
+
+/// Measured on the decoder's full 7x16x16 tile plus its five special tokens. The choices are specific
+/// to these projections; smaller tiles keep the general rule.
+pub fn vae_fast_m_group_for(tokens: usize, k: usize, n: usize) -> u32 {
+    if tokens == 1797 {
+        if k == 8192 && n == 2048 {
+            return 1;
+        }
+        if k == 2048 && (n == 2048 || n == 6144 || n == 16384) {
+            return 15;
+        }
+    }
+    m_group_for(tokens, 128)
+}
+
+/// Workgroup rows for a GEMM, rounded up to a whole number of raster groups.
+pub fn gemm_grid_y(tokens: usize, group: u32, tile: usize) -> u32 {
+    (tokens.div_ceil(tile).div_ceil(group as usize) * group as usize) as u32
+}
+
+/// The GEMM operand element types the stacks run: the checkpoint's int8 ConvRot rows (rotated
+/// activations with per-token scales), or its f16 / bf16 rows as stored (unrotated, no scales).
+pub fn quantised(elem: &str) -> bool {
+    elem == "i8"
+}
+
+pub fn elem_bits(elem: &str) -> usize {
+    if quantised(elem) {
+        8
+    } else {
+        16
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn lane_counts_match_the_widths_the_model_uses() {
+        assert_eq!(lanes_for(2048), Some(256));
+        assert_eq!(lanes_for(8192), Some(256));
+        assert_eq!(lanes_for(25600), Some(320));
+        assert_eq!(lanes_for(5376), Some(96));
+        assert_eq!(lanes_for(HID), Some(96));
+        assert_eq!(lanes_for(7), None);
+    }
+
+    #[test]
+    fn the_row_group_rule_pads_as_little_as_it_can() {
+        // The values tests/test_host_logic.cpp pins.
+        assert_eq!(gemm_m_group_for(37723, FFN, HID, 8), 2);
+        assert_eq!(gemm_m_group_for(32768, FFN, HID, 8), 2);
+        // just below the threshold, and the wrong shape, both fall through to the general rule
+        assert_eq!(
+            gemm_m_group_for(32767, FFN, HID, 8),
+            m_group_for(32767, 256)
+        );
+        assert_eq!(
+            gemm_m_group_for(37723, FFN, HID, 16),
+            m_group_for(37723, 256)
+        );
+        assert_eq!(
+            gemm_m_group_for(37723, HID, FFN, 8),
+            m_group_for(37723, 256)
+        );
+        // one tile is its own group
+        assert_eq!(m_group_for(1, 256), 1);
+        assert_eq!(m_group_for(256, 256), 1);
+        assert_eq!(m_group_for(257, 256), 2);
+    }
+
+    #[test]
+    fn the_decoder_projections_keep_their_measured_groups() {
+        assert_eq!(vae_fast_m_group_for(1797, 8192, 2048), 1);
+        for n in [2048, 6144, 16384] {
+            assert_eq!(vae_fast_m_group_for(1797, 2048, n), 15, "n {n}");
+        }
+        // any other shape or token count falls through, at the 128 tile these kernels use
+        assert_eq!(
+            vae_fast_m_group_for(1797, 4096, 2048),
+            m_group_for(1797, 128)
+        );
+        assert_eq!(vae_fast_m_group_for(517, 2048, 2048), m_group_for(517, 128));
+    }
+
+    #[test]
+    fn grid_y_covers_the_tokens_and_is_a_whole_number_of_groups() {
+        for tokens in [1usize, 255, 256, 257, 513, 16000, 32767, 32768, 37723] {
+            for group in [1u32, 2, 3, 4, 15] {
+                let gy = gemm_grid_y(tokens, group, 256);
+                assert_eq!(gy % group, 0, "{tokens}/{group}");
+                assert!(gy as usize * 256 >= tokens, "{tokens}/{group}");
+                assert!((gy - group) as usize * 256 < tokens, "{tokens}/{group}");
+            }
+        }
+    }
+
+    #[test]
+    fn element_types_map_to_their_widths() {
+        assert!(quantised("i8") && !quantised("f16") && !quantised("bf16"));
+        assert_eq!(elem_bits("i8"), 8);
+        assert_eq!(elem_bits("f16"), 16);
+        assert_eq!(elem_bits("bf16"), 16);
+    }
+}
