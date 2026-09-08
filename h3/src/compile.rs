@@ -5,14 +5,12 @@
 //! ever reuses a stale binary. `tools/kernel_cache.py` keeps the same policy for the Python harnesses,
 //! and this must keep it too — the tag is the only thing that makes a cache entry reusable across
 //! implementations.
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const BACKEND: &str = "amdgpu-hal";
 pub const TARGET: &str = "gfx1151";
@@ -103,9 +101,9 @@ pub struct Compiler {
     sources: PathBuf,
     cache: PathBuf,
     compiler_id: OnceLock<String>,
-    /// Loaded once per process. A session is driven from one thread at a time — the C interface
-    /// serialises on its own mutex — so this needs no lock, and `hrx::Kernel` is not `Send` anyway.
-    loaded: RefCell<HashMap<String, Rc<hrx::Kernel>>>,
+    /// Loaded once per process. A loaded kernel is an immutable handle, so it is shared rather than
+    /// reloaded, and the map is behind a lock so a session can be moved between threads.
+    loaded: Mutex<HashMap<String, Arc<hrx::Kernel>>>,
 }
 
 impl Compiler {
@@ -119,7 +117,7 @@ impl Compiler {
             sources: sources.into(),
             cache: cache.into(),
             compiler_id: OnceLock::new(),
-            loaded: RefCell::new(HashMap::new()),
+            loaded: Mutex::new(HashMap::new()),
         }
     }
 
@@ -197,17 +195,20 @@ impl Compiler {
         stem: &str,
         symbol: &str,
         cfg: &Cfg,
-    ) -> Result<Rc<hrx::Kernel>> {
+    ) -> Result<Arc<hrx::Kernel>> {
         let tag = self.tag(stem, symbol, cfg)?;
-        if let Some(kernel) = self.loaded.borrow().get(&tag) {
+        if let Some(kernel) = self.loaded.lock().expect("not poisoned").get(&tag) {
             return Ok(kernel.clone());
         }
         let path = self.cache.join(format!("{tag}.hsaco"));
         if !path.exists() {
             self.compile(stem, symbol, cfg, &path)?;
         }
-        let kernel = Rc::new(gpu.load(&path, symbol)?);
-        self.loaded.borrow_mut().insert(tag, kernel.clone());
+        let kernel = Arc::new(gpu.load(&path, symbol)?);
+        self.loaded
+            .lock()
+            .expect("not poisoned")
+            .insert(tag, kernel.clone());
         Ok(kernel)
     }
 

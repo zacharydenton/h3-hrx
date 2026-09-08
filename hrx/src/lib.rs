@@ -48,11 +48,44 @@ fn check(status: sys::Status, what: &str) -> Result<()> {
     Err(Error(format!("{what}: {text}")))
 }
 
-/// The process's GPU device and its stream. libhrx initialises globally, so this is created once.
-pub struct Gpu {
+/// The device and stream themselves, released when the last thing referencing them goes away.
+///
+/// Buffers and kernels hold one of these, so the stream cannot be released while an allocation or an
+/// executable still names its device. The C implementation sidestepped the question by never tearing
+/// down at all — its runtime was a function-local static that lived to process exit — which is not
+/// something a safe API can leave to the caller to arrange.
+struct Inner {
     device: sys::Device,
     stream: sys::Stream,
 }
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // Only the stream is ours: `hrx_stream_create` hands back a reference, while
+        // `hrx_gpu_device_get` returns a borrowed pointer into libhrx's own device array
+        // (`*device = &g_gpu.devices[index]`) without retaining. Releasing that would be an
+        // over-release of the global registry, which aborts inside libhrx.
+        unsafe { sys::hrx_stream_release(self.stream) };
+    }
+}
+
+// Safety: this only holds handles. They carry atomic reference counts and no thread-local state, so
+// both moving one between threads and releasing it on another are sound. It is `Sync` because holding
+// the handle is not using it: every stream operation goes through `&Gpu`, and `Gpu` is deliberately not
+// `Sync`, so no two threads can drive one stream at once.
+unsafe impl Send for Inner {}
+unsafe impl Sync for Inner {}
+
+/// The process's GPU device and its stream. libhrx initialises globally, so this is created once.
+pub struct Gpu {
+    inner: std::sync::Arc<Inner>,
+    /// `Gpu` may be moved between threads but not shared between them: a stream's timepoint and
+    /// pending command buffer are ordinary mutable fields, so two threads dispatching through one
+    /// would race. `Cell` is `Send` and not `Sync`, which says exactly that.
+    _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
+}
+
+
 
 impl Gpu {
     pub fn open() -> Result<Self> {
@@ -69,12 +102,15 @@ impl Gpu {
             check(sys::hrx_gpu_device_get(0, &mut device), "hrx_gpu_device_get")?;
             let mut stream = std::ptr::null_mut();
             check(sys::hrx_stream_create(device, 0, &mut stream), "hrx_stream_create")?;
-            Ok(Self { device, stream })
+            Ok(Self {
+                inner: std::sync::Arc::new(Inner { device, stream }),
+                _not_sync: std::marker::PhantomData,
+            })
         }
     }
 
     pub fn sync(&self) -> Result<()> {
-        unsafe { check(sys::hrx_stream_synchronize(self.stream), "hrx_stream_synchronize") }
+        unsafe { check(sys::hrx_stream_synchronize(self.inner.stream), "hrx_stream_synchronize") }
     }
 
     /// A device-local allocation. Zero bytes is rounded to one so every argument has an address.
@@ -83,7 +119,7 @@ impl Gpu {
         unsafe {
             check(
                 sys::hrx_buffer_allocate(
-                    self.stream,
+                    self.inner.stream,
                     bytes.max(1),
                     sys::MEMORY_TYPE_DEVICE_LOCAL,
                     sys::BUFFER_USAGE_DEFAULT,
@@ -92,7 +128,7 @@ impl Gpu {
                 "hrx_buffer_allocate",
             )?;
         }
-        Ok(Buffer { raw: buffer, bytes: bytes.max(1) })
+        Ok(Buffer { raw: buffer, bytes: bytes.max(1), _device: self.inner.clone() })
     }
 
     /// Only the low byte of `value` is meaningful: the fill pattern is one byte wide.
@@ -100,7 +136,7 @@ impl Gpu {
         unsafe {
             check(
                 sys::hrx_stream_fill_buffer(
-                    self.stream,
+                    self.inner.stream,
                     dst.raw,
                     0,
                     bytes,
@@ -134,7 +170,7 @@ impl Gpu {
         unsafe {
             check(
                 sys::hrx_synchronous_h2d(
-                    self.device,
+                    self.inner.device,
                     src.as_ptr() as *const c_void,
                     dst.raw,
                     offset,
@@ -159,7 +195,7 @@ impl Gpu {
         self.sync()?;
         unsafe {
             check(
-                sys::hrx_synchronous_d2h(self.device, src.raw, 0, dst.as_mut_ptr() as *mut c_void, dst.len()),
+                sys::hrx_synchronous_d2h(self.inner.device, src.raw, 0, dst.as_mut_ptr() as *mut c_void, dst.len()),
                 "hrx_synchronous_d2h",
             )
         }
@@ -168,7 +204,7 @@ impl Gpu {
     pub fn d2d(&self, dst: &Buffer, src: &Buffer, bytes: usize) -> Result<()> {
         unsafe {
             check(
-                sys::hrx_stream_copy_buffer(self.stream, src.raw, 0, dst.raw, 0, bytes),
+                sys::hrx_stream_copy_buffer(self.inner.stream, src.raw, 0, dst.raw, 0, bytes),
                 "hrx_stream_copy_buffer",
             )
         }
@@ -184,7 +220,7 @@ impl Gpu {
             let mut executable = std::ptr::null_mut();
             check(
                 sys::hrx_executable_load_file(
-                    self.device,
+                    self.inner.device,
                     c_path.as_ptr(),
                     c_family.as_ptr(),
                     c_key.as_ptr(),
@@ -203,7 +239,13 @@ impl Gpu {
                     sys::hrx_executable_export_info(executable, ordinal, &mut info),
                     &format!("export info for {symbol}"),
                 )?;
-                Ok(Kernel { executable, ordinal, info, symbol: symbol.to_string() })
+                Ok(Kernel {
+                    executable,
+                    ordinal,
+                    info,
+                    symbol: symbol.to_string(),
+                    _device: self.inner.clone(),
+                })
             })();
             if kernel.is_err() {
                 sys::hrx_executable_release(executable);
@@ -265,7 +307,7 @@ impl Gpu {
         unsafe {
             check(
                 sys::hrx_stream_dispatch(
-                    self.stream,
+                    self.inner.stream,
                     kernel.executable,
                     kernel.ordinal,
                     &config,
@@ -286,7 +328,17 @@ impl Gpu {
 pub struct Buffer {
     raw: sys::Buffer,
     bytes: usize,
+    /// Keeps the device alive: releasing a buffer after its device is gone would be a use-after-free.
+    _device: std::sync::Arc<Inner>,
 }
+
+// Safety: `hrx_buffer_s` is an immutable handle after allocation — a HAL buffer pointer, its device and
+// its length — behind an atomic reference count, so moving one to another thread and releasing it there
+// is sound. It is `Sync` as well because nothing mutates it through a shared reference: every transfer
+// and fill goes through `&Gpu`, which is deliberately not `Sync`, so two threads cannot reach the same
+// allocation concurrently through this API.
+unsafe impl Send for Buffer {}
+unsafe impl Sync for Buffer {}
 
 impl Buffer {
     pub fn bytes(&self) -> usize {
@@ -316,7 +368,15 @@ pub struct Kernel {
     ordinal: u32,
     info: sys::ExportInfo,
     symbol: String,
+    /// As for a buffer: the executable names its device.
+    _device: std::sync::Arc<Inner>,
 }
+
+// Safety: `hrx_executable_s` is fixed once loaded — a retained HAL executable, its device and a
+// snapshot of its export names — behind an atomic reference count. Everything this type exposes is
+// read-only, and dispatching with it needs `&Gpu`.
+unsafe impl Send for Kernel {}
+unsafe impl Sync for Kernel {}
 
 impl Kernel {
     pub fn info(&self) -> &sys::ExportInfo {

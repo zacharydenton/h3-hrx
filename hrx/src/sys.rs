@@ -60,6 +60,7 @@ extern "C" {
     pub fn hrx_gpu_device_get(index: c_int, device: *mut Device) -> Status;
 
     pub fn hrx_stream_create(device: Device, flags: u32, out_stream: *mut Stream) -> Status;
+    pub fn hrx_stream_release(stream: Stream);
     pub fn hrx_stream_synchronize(stream: Stream) -> Status;
 
     pub fn hrx_buffer_allocate(

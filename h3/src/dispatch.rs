@@ -8,7 +8,7 @@ use crate::compile::{num, Cfg, Compiler};
 use crate::model::*;
 use hrx::sys::BufferRef;
 use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 pub type Result<T> = std::result::Result<T, crate::compile::Error>;
@@ -64,7 +64,7 @@ fn launch(
 /// `plain` narrows an existing f16 row. The int8 forms also write a per-token scale; the float ones
 /// write rows and nothing else.
 pub struct Prepare {
-    kernel: Rc<hrx::Kernel>,
+    kernel: Arc<hrx::Kernel>,
     lanes: usize,
     form: String,
     elem: String,
@@ -153,7 +153,7 @@ impl Prepare {
 
 /// A GEMM of the int8, f16 or bf16 family for one (K, N, row group).
 pub struct Gemm {
-    kernel: Rc<hrx::Kernel>,
+    kernel: Arc<hrx::Kernel>,
     n: usize,
     resid: bool,
     bias: bool,

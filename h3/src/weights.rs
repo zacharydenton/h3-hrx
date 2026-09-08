@@ -9,9 +9,8 @@
 use crate::checkpoint::{Checkpoint, Entry};
 use half::{bf16, f16};
 use safetensors::tensor::Dtype;
-use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -118,8 +117,9 @@ impl Recipe {
 pub struct Weights {
     file: Checkpoint,
     recipes: BTreeMap<String, Recipe>,
-    /// Uploaded on first use and kept for the session. Not a lock: a session runs on one thread.
-    uploaded: RefCell<BTreeMap<String, Rc<hrx::Buffer>>>,
+    /// Uploaded on first use and kept for the session, behind a lock so the session can be moved
+    /// between threads.
+    uploaded: Mutex<BTreeMap<String, Arc<hrx::Buffer>>>,
 }
 
 /// Bytes staged per transfer. Large enough that the per-call overhead disappears, small enough that a
@@ -139,7 +139,7 @@ impl Weights {
         Ok(Self {
             file,
             recipes,
-            uploaded: RefCell::new(BTreeMap::new()),
+            uploaded: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -173,8 +173,8 @@ impl Weights {
     /// between rows stays zero. Either way the file's pages are released once their bytes are on the
     /// device: a tensor is read once, and tens of gigabytes of resident checkpoint would compete with
     /// the device allocations for the same memory on this part.
-    pub fn at(&self, gpu: &hrx::Gpu, name: &str, expect_bytes: usize) -> Result<Rc<hrx::Buffer>> {
-        if let Some(buffer) = self.uploaded.borrow().get(name) {
+    pub fn at(&self, gpu: &hrx::Gpu, name: &str, expect_bytes: usize) -> Result<Arc<hrx::Buffer>> {
+        if let Some(buffer) = self.uploaded.lock().expect("not poisoned").get(name) {
             return Ok(buffer.clone());
         }
         let recipe = self.recipe(name)?;
@@ -184,13 +184,14 @@ impl Weights {
                 recipe.device_bytes()
             ));
         }
-        let buffer = Rc::new(
+        let buffer = Arc::new(
             gpu.alloc(expect_bytes.max(1))
                 .map_err(|e| Error::Device(e.to_string()))?,
         );
         self.fill(gpu, recipe, &buffer)?;
         self.uploaded
-            .borrow_mut()
+            .lock()
+            .expect("not poisoned")
             .insert(name.to_string(), buffer.clone());
         Ok(buffer)
     }
@@ -203,7 +204,7 @@ impl Weights {
         rows: usize,
         row_bytes: usize,
         pitch_bytes: usize,
-    ) -> Result<Rc<hrx::Buffer>> {
+    ) -> Result<Arc<hrx::Buffer>> {
         match self.recipe(name)? {
             Recipe::Rows {
                 rows: r,
