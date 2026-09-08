@@ -129,7 +129,11 @@ const CHUNK: usize = 16 << 20;
 impl Weights {
     /// Maps the file and builds its recipe table. The plan validates every source tensor's dtype and
     /// shape, so a checkpoint that does not match fails here rather than mid-generation.
-    pub fn open(
+    /// # Safety
+    ///
+    /// The checkpoint is mapped, not copied. See [`crate::Session::new`] for what that requires of
+    /// the file for as long as the returned `Weights` lives.
+    pub unsafe fn open(
         path: impl AsRef<std::path::Path>,
         plan: impl FnOnce(&Checkpoint, &mut BTreeMap<String, Recipe>) -> Result<()>,
     ) -> Result<Self> {
@@ -1014,14 +1018,17 @@ mod tests {
             let ck = checkpoint(dir.path(), &[("present", "I8", vec![1, 4], vec![0; 4])]);
             drop(ck);
         }
-        let result = Weights::open(&path, |ck, out| {
-            out.insert("kept".into(), rows_of(ck, &["present"], 0)?);
-            out.insert(
-                "lost".into(),
-                rows_of(ck, &["blocks.0.attn.qkv_proj.weight"], 0)?,
-            );
-            Ok(())
-        });
+        // Safety: a checkpoint this test wrote and nothing else touches.
+        let result = unsafe {
+            Weights::open(&path, |ck, out| {
+                out.insert("kept".into(), rows_of(ck, &["present"], 0)?);
+                out.insert(
+                    "lost".into(),
+                    rows_of(ck, &["blocks.0.attn.qkv_proj.weight"], 0)?,
+                );
+                Ok(())
+            })
+        };
         let message = result.err().unwrap().to_string();
         assert!(
             message.contains("blocks.0.attn.qkv_proj.weight"),
@@ -1037,10 +1044,13 @@ mod tests {
             let ck = checkpoint(dir.path(), &[("bias", "F16", vec![2], vec![0, 60, 0, 64])]);
             drop(ck);
         }
-        let w = Weights::open(&path, |ck, out| {
-            out.insert("b".into(), widen_f32(ck, &["bias"])?);
-            Ok(())
-        })
+        // Safety: a checkpoint this test wrote and nothing else touches.
+        let w = unsafe {
+            Weights::open(&path, |ck, out| {
+                out.insert("b".into(), widen_f32(ck, &["bias"])?);
+                Ok(())
+            })
+        }
         .unwrap();
         assert!(w.has("b") && !w.has("nope"));
         assert_eq!(w.host_f32("b", 2).unwrap(), vec![1.0, 2.0]);

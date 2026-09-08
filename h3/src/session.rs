@@ -56,7 +56,23 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(config: Config) -> Result<Self> {
+    /// Opens a session. Checkpoints are read lazily, on the first call that needs one.
+    ///
+    /// # Safety
+    ///
+    /// The checkpoint files named in `config` are memory-mapped, not copied — a 30 GB checkpoint has
+    /// to be — and stay mapped for as long as this session lives. The caller must ensure that none of
+    /// them is modified or truncated in that time:
+    ///
+    /// - Modifying one changes bytes already validated: the header said a tensor was `[5376][14336]`
+    ///   of bf16, and everything after trusts it.
+    /// - Truncating one turns a mapped page into `SIGBUS`, which no `Result` can carry. The process
+    ///   dies at the read.
+    ///
+    /// Nothing in the filesystem enforces this and nothing here can check it, which is why this
+    /// function is `unsafe` rather than documentation asking nicely. Point a session at files you
+    /// control.
+    pub unsafe fn new(config: Config) -> Result<Self> {
         let compiler = Compiler::new(
             config.loom_compile.clone(),
             config.kernel_sources.clone(),
@@ -103,7 +119,8 @@ impl Session {
             let Some(path) = &self.config.dit else {
                 return invalid("no DiT checkpoint was configured");
             };
-            self.dit = Some(Dit::open(&self.gpu, path)?);
+            // Safety: the caller's, taken at Session::new.
+            self.dit = Some(unsafe { Dit::open(&self.gpu, path) }?);
         }
         Ok(self.dit.as_mut().expect("opened above"))
     }
@@ -113,7 +130,8 @@ impl Session {
             let Some(path) = &self.config.te else {
                 return invalid("no text encoder checkpoint was configured");
             };
-            self.te = Some(TextEncoder::open(&self.gpu, path)?);
+            // Safety: the caller's, taken at Session::new.
+            self.te = Some(unsafe { TextEncoder::open(&self.gpu, path) }?);
         }
         Ok(self.te.as_mut().expect("opened above"))
     }
@@ -123,7 +141,8 @@ impl Session {
             let Some(path) = &self.config.video_vae else {
                 return invalid("no video VAE checkpoint was configured");
             };
-            self.vvae = Some(VideoVae::open(&self.gpu, path)?);
+            // Safety: the caller's, taken at Session::new.
+            self.vvae = Some(unsafe { VideoVae::open(&self.gpu, path) }?);
         }
         Ok(self.vvae.as_mut().expect("opened above"))
     }
@@ -133,7 +152,8 @@ impl Session {
             let Some(path) = &self.config.audio_vae else {
                 return invalid("no audio VAE checkpoint was configured");
             };
-            self.avae = Some(AudioVae::open(&self.gpu, path)?);
+            // Safety: the caller's, taken at Session::new.
+            self.avae = Some(unsafe { AudioVae::open(&self.gpu, path) }?);
         }
         Ok(self.avae.as_mut().expect("opened above"))
     }
@@ -197,12 +217,71 @@ impl Session {
         kfs: &[Keyframe<'_>],
         progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
     ) -> Result<Latents> {
+        // Everything cheap, before a checkpoint opens or a kernel compiles. This was written once,
+        // lost in a refactor, and not missed — because the tests called the validators rather than
+        // this path. There is a test below that calls `denoise` itself now.
+        let sh = self.validate(ids, p, noise, refs, kfs)?;
+        let _ = sh;
         // the attention width is the session's, set once at creation: the stack is built for it
         let qk_bits = self.config.attention.bits();
         let (gpu, c, prof, dit, te) = self.prompt_pair()?;
         dit.denoise(
             gpu, c, prof, te, ids, p, qk_bits, noise, refs, kfs, progress,
         )
+    }
+
+    /// Every cheap property of a request, checked before anything expensive happens.
+    ///
+    /// Separate so it can be tested directly, and so a caller can ask whether a request is well
+    /// formed without running it.
+    pub fn validate(
+        &self,
+        ids: &[i32],
+        p: &DenoiseParams,
+        noise: Noise<'_>,
+        refs: &[Reference<'_>],
+        kfs: &[Keyframe<'_>],
+    ) -> Result<Shape> {
+        if ids.is_empty() {
+            return invalid("ids must hold at least one token");
+        }
+        let Some(sh) = shape_for(p.height, p.width, p.frames) else {
+            return invalid(format!(
+                "no shape for {}x{} at {} frames",
+                p.height, p.width, p.frames
+            ));
+        };
+        if !(2..=1000).contains(&p.steps) {
+            return invalid(format!("steps must be 2..1000, not {}", p.steps));
+        }
+        let video = crate::model::LATENT_CH
+            * (sh.latent_t as usize)
+            * (sh.lat_h as usize)
+            * (sh.lat_w as usize);
+        let audio = 2 * crate::avae::AUDIO_CH * sh.audio_t as usize;
+        if let Some(z) = noise.video {
+            if z.len() < video {
+                return invalid(format!(
+                    "video noise needs {video} floats, {} given",
+                    z.len()
+                ));
+            }
+        }
+        if let Some(z) = noise.audio {
+            if z.len() < audio {
+                return invalid(format!(
+                    "audio noise needs {audio} floats, {} given",
+                    z.len()
+                ));
+            }
+        }
+        for (i, r) in refs.iter().enumerate() {
+            r.check(i)?;
+        }
+        for (i, k) in kfs.iter().enumerate() {
+            k.check(i, sh.lat_h, sh.lat_w)?;
+        }
+        Ok(sh)
     }
 
     /// The vision tower over one image.

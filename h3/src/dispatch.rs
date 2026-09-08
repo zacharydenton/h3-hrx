@@ -63,13 +63,11 @@ impl Profile {
 ///
 /// # Safety
 ///
-/// This is the crate's one call to [`hrx::Gpu::dispatch`], and it inherits its contract: `grid`,
-/// `block`, `scalars` and `bindings` must be what `kernel` was compiled for. It is not marked unsafe
-/// because every caller is a builder in this module, which compiles a kernel and launches it from one
-/// description — that pairing is the invariant, and it is why the builders exist rather than callers
-/// assembling launches by hand.
+/// Inherits [`hrx::Gpu::dispatch`]'s contract: `grid`, `block`, `scalars` and `bindings` must be what
+/// `kernel` was compiled for. Private to the crate, and every caller goes through [`checked`], which
+/// discharges the binding half of that contract against the extents the kernel was configured with.
 #[allow(clippy::too_many_arguments)]
-pub fn launch(
+pub(crate) unsafe fn launch(
     gpu: &hrx::Gpu,
     kernel: &hrx::Kernel,
     profile: Option<&mut Profile>,
@@ -93,6 +91,45 @@ pub fn launch(
     Ok(())
 }
 
+/// A launch whose bindings have been checked against the extents its kernel addresses.
+///
+/// This is what lets everything above it be safe. A kernel is compiled from a set of extents — widths,
+/// strides, token capacities — and `required` restates that same arithmetic in bytes per binding, so
+/// the check is not a guess about what the kernel does: it is the numbers the kernel was built from. A
+/// binding shorter than its entry is a caller's mistake, and it becomes an error here rather than an
+/// out-of-bounds access on the device.
+///
+/// The bound is the extent the kernel *addresses*, which is not always the extent it fills: a GEMM
+/// tiled 64 rows at a time reads its A operand at the compiled pitch, and an attention kernel indexes
+/// to its token capacity rather than to the tokens of the call. Where the two differ the padded number
+/// is the one that belongs here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn checked(
+    gpu: &hrx::Gpu,
+    kernel: &hrx::Kernel,
+    profile: Option<&mut Profile>,
+    stage: &str,
+    grid: [u32; 3],
+    block: [u32; 3],
+    scalars: &[u32],
+    bindings: &[View<'_>],
+    required: &[usize],
+) -> Result<()> {
+    debug_assert_eq!(bindings.len(), required.len(), "{stage}: a bound per binding");
+    for (i, (view, need)) in bindings.iter().zip(required).enumerate() {
+        if view.len() < *need {
+            return Err(crate::compile::Error::Io(format!(
+                "{stage}: binding {i} is {} bytes, the kernel addresses {need}",
+                view.len()
+            )));
+        }
+    }
+    // Safety: every binding is at least as long as the extent this kernel was compiled to address,
+    // checked immediately above, and the grid, block and scalars come from the same builder that
+    // compiled it.
+    unsafe { launch(gpu, kernel, profile, stage, grid, block, scalars, bindings) }
+}
+
 /// Produces a GEMM's A operand: `norm` and `lnorm` normalise and modulate the f32 residual stream,
 /// `plain` narrows an existing f16 row. The int8 forms also write a per-token scale; the float ones
 /// write rows and nothing else.
@@ -101,6 +138,10 @@ pub struct Prepare {
     lanes: usize,
     form: String,
     elem: String,
+    /// the extents the kernel was compiled from, kept so `run` can bound its bindings
+    width: usize,
+    out_stride: usize,
+    classes: usize,
 }
 
 impl Prepare {
@@ -144,6 +185,9 @@ impl Prepare {
             lanes,
             form: form.into(),
             elem: elem.into(),
+            width,
+            out_stride: if out_stride != 0 { out_stride } else { width },
+            classes,
         })
     }
 
@@ -161,17 +205,26 @@ impl Prepare {
         a_q: View<'_>,
         a_s: Option<View<'_>>,
     ) -> Result<()> {
+        let t = tokens as usize;
         let mut bindings = vec![x];
+        // the norm forms read the f32 residual stream; `plain` narrows an f16 row that a GEMM
+        // already wrote
+        let in_bytes = if self.form == "plain" { 2 } else { 4 };
+        let mut required = vec![t * self.width * in_bytes];
         if self.form != "plain" {
             let (weight, table, cls) =
                 norm.expect("a norm prepare needs its weight, table and class");
             bindings.extend([weight, table, cls]);
+            // the norm's weight, its (scale, shift) table per class, and a class per row
+            required.extend([self.width * 4, 2 * self.classes * self.width * 4, t * 4]);
         }
         bindings.push(a_q);
+        required.push(t * self.out_stride * elem_bits(&self.elem) / 8);
         if quantised(&self.elem) {
             bindings.push(a_s.expect("an int8 prepare writes a token scale"));
+            required.push(t * 4);
         }
-        launch(
+        checked(
             gpu,
             &self.kernel,
             profile,
@@ -180,6 +233,7 @@ impl Prepare {
             [self.lanes as u32, 1, 1],
             &[tokens],
             &bindings,
+            &required,
         )
     }
 }
@@ -195,6 +249,13 @@ pub struct Gemm {
     m_tile: usize,
     n_tile: usize,
     threads: u32,
+    /// the extents the kernel was compiled from, kept so `run` can bound its bindings. The output
+    /// is narrower than N in the SwiGLU forms, where the gate consumes half the columns, and it is
+    /// f32 only in the residual forms — every other form writes the f16 stream.
+    k_stride: usize,
+    classes: usize,
+    out_width: usize,
+    out_bytes: usize,
 }
 
 /// Which workgroup tile the decoder uses. `Plain` is the general 256x128; the other two are the
@@ -278,6 +339,7 @@ impl Gemm {
             format!("{ns}k_stride"),
             if k_stride != 0 { k_stride } else { k_size }.to_string(),
         ));
+        let mut out_width = if mode == "swiglu" { n_size / 2 } else { n_size };
         if (wide || fast) && mode == "swiglu" {
             let stride = if out_stride != 0 {
                 out_stride
@@ -290,6 +352,7 @@ impl Gemm {
                 ));
             }
             cfg.push((format!("{ns}out_stride"), stride.to_string()));
+            out_width = stride;
         }
         let kernel = c.get(gpu, &stem, &format!("h3_{stem}"), &cfg)?;
         Ok(Self {
@@ -302,6 +365,10 @@ impl Gemm {
             m_tile,
             n_tile,
             threads,
+            k_stride: if k_stride != 0 { k_stride } else { k_size },
+            classes,
+            out_width,
+            out_bytes: if resid { 4 } else { 2 },
         })
     }
 
@@ -320,32 +387,43 @@ impl Gemm {
         residual: Option<(View<'_>, View<'_>)>,
         bias: Option<View<'_>>,
     ) -> Result<()> {
+        let t = tokens as usize;
+        let bytes = elem_bits(&self.elem) / 8;
+        // Both operands are pitched to `k_stride` in the operand's element type, and every access is
+        // guarded to the token count, so the row extent is `t` rather than the grid's rounded-up
+        // cover. The int8 forms read the same rows as packed quads, which is the same byte count.
         let mut bindings = vec![a_q, w_q];
+        let mut required = vec![t * self.k_stride * bytes, self.n * self.k_stride * bytes];
         if quantised(&self.elem) {
             let (w_s, a_s) = scales.expect("an int8 GEMM needs its weight and token scales");
             bindings.extend([w_s, a_s]);
+            required.extend([self.n * 4, t * 4]);
         }
         bindings.push(out);
+        required.push(t * self.out_width * self.out_bytes);
         if self.resid {
             let (gate, cls) = residual.expect("a residual GEMM needs its gate and class rows");
             bindings.extend([gate, cls]);
+            required.extend([self.classes * self.n * 4, t * 4]);
         }
         if self.bias {
             bindings.push(bias.expect("a biased GEMM needs its bias"));
+            required.push(self.n * 4);
         }
-        launch(
+        checked(
             gpu,
             &self.kernel,
             profile,
             stage,
             [
                 (self.n / self.n_tile) as u32,
-                gemm_grid_y(tokens as usize, self.m_group, self.m_tile),
+                gemm_grid_y(t, self.m_group, self.m_tile),
                 1,
             ],
             [self.threads, 1, 1],
             &[tokens],
             &bindings,
+            &required,
         )
     }
 
@@ -363,6 +441,10 @@ impl Gemm {
 pub struct Conv3d {
     kernel: Arc<hrx::Kernel>,
     cout_pad: usize,
+    /// the extents the kernel was compiled from
+    in_rows: usize,
+    cin_stride: usize,
+    k_size: usize,
     /// the output extents, which the caller needs to drive the next layer
     pub tout: usize,
     pub ho: usize,
@@ -409,6 +491,9 @@ impl Conv3d {
         Ok(Self {
             kernel: c.get(gpu, stem, &format!("h3_{stem}"), &cfg)?,
             cout_pad,
+            in_rows: frames * h * w,
+            cin_stride,
+            k_size,
             tout: (frames - 1) / tstride + 1,
             ho: h / stride,
             wo: w / stride,
@@ -420,6 +505,7 @@ impl Conv3d {
         self.tout * self.ho * self.wo
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
@@ -433,9 +519,21 @@ impl Conv3d {
         residual: Option<View<'_>>,
     ) -> Result<()> {
         let m = self.rows();
+        // input rows at their channel pitch, the folded taps as [cout_pad][k_size], an f32 bias per
+        // output channel, and the output rows — all f16 but the bias
+        let plane = m * self.cout_pad * 2;
+        let mut required = vec![
+            self.in_rows * self.cin_stride * 2,
+            self.cout_pad * self.k_size * 2,
+            self.cout_pad * 4,
+            plane,
+        ];
         let mut bindings = vec![a, w, b, out];
-        bindings.extend(residual);
-        launch(
+        if let Some(r) = residual {
+            bindings.push(r);
+            required.push(plane);
+        }
+        checked(
             gpu,
             &self.kernel,
             profile,
@@ -444,6 +542,7 @@ impl Conv3d {
             [256, 1, 1],
             &[m as u32],
             &bindings,
+            &required,
         )
     }
 }
@@ -496,6 +595,7 @@ impl GroupNormSilu {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
         gpu: &hrx::Gpu,
@@ -507,7 +607,10 @@ impl GroupNormSilu {
         stats: View<'_>,
         out: View<'_>,
     ) -> Result<()> {
-        launch(
+        // f16 planes, an f32 gamma and beta per channel, and two f32 statistics per (frame, group)
+        let plane = self.rows * self.channels * 2;
+        let stats_bytes = self.frames * 32 * 2 * 4;
+        checked(
             gpu,
             &self.stats,
             profile.as_deref_mut(),
@@ -516,8 +619,9 @@ impl GroupNormSilu {
             [32, 1, 1],
             &[self.frames as u32],
             &[x, stats],
+            &[plane, stats_bytes],
         )?;
-        launch(
+        checked(
             gpu,
             &self.silu,
             profile,
@@ -526,6 +630,13 @@ impl GroupNormSilu {
             [256, 1, 1],
             &[self.frames as u32],
             &[x, stats, gamma, beta, out],
+            &[
+                plane,
+                stats_bytes,
+                self.channels * 4,
+                self.channels * 4,
+                plane,
+            ],
         )
     }
 }
@@ -533,6 +644,7 @@ impl GroupNormSilu {
 /// A biased f16 matmul with f16 in and out: the encoder's 1x1 shortcuts and its posterior head.
 pub struct Matmul {
     kernel: Arc<hrx::Kernel>,
+    k_size: usize,
     n_size: usize,
 }
 
@@ -546,6 +658,7 @@ impl Matmul {
         ];
         Ok(Self {
             kernel: c.get(gpu, stem, &format!("h3_{stem}"), &cfg)?,
+            k_size,
             n_size,
         })
     }
@@ -562,7 +675,7 @@ impl Matmul {
         b: View<'_>,
         out: View<'_>,
     ) -> Result<()> {
-        launch(
+        checked(
             gpu,
             &self.kernel,
             profile,
@@ -571,6 +684,12 @@ impl Matmul {
             [256, 1, 1],
             &[rows as u32],
             &[a, w, b, out],
+            &[
+                rows * self.k_size * 2,
+                self.n_size * self.k_size * 2,
+                self.n_size * 4,
+                rows * self.n_size * 2,
+            ],
         )
     }
 }
@@ -581,6 +700,7 @@ impl Matmul {
 /// arithmetic in the order the checkpoint stores it.
 pub struct MatmulF32 {
     kernel: Arc<hrx::Kernel>,
+    k: usize,
     n: usize,
 }
 
@@ -593,6 +713,7 @@ impl MatmulF32 {
         ];
         Ok(Self {
             kernel: c.get(gpu, "matmul_f32", "h3_matmul_f32", &cfg)?,
+            k,
             n,
         })
     }
@@ -609,7 +730,7 @@ impl MatmulF32 {
         b: View<'_>,
         out: View<'_>,
     ) -> Result<()> {
-        launch(
+        checked(
             gpu,
             &self.kernel,
             profile,
@@ -618,6 +739,12 @@ impl MatmulF32 {
             [THREADS, 1, 1],
             &[m as u32],
             &[x, w, b, out],
+            &[
+                m * self.k * 4,
+                self.n * self.k * 4,
+                self.n * 4,
+                m * self.n * 4,
+            ],
         )
     }
 }
@@ -642,7 +769,7 @@ pub fn axpy(
         (format!("{ns}b"), num(f64::from(b))),
     ];
     let kernel = c.get(gpu, "axpy_f32", "h3_axpy_f32", &cfg)?;
-    launch(
+    checked(
         gpu,
         &kernel,
         profile,
@@ -651,6 +778,7 @@ pub fn axpy(
         [THREADS, 1, 1],
         &[count as u32],
         &[x, y],
+        &[count * 4, count * 4],
     )
 }
 
@@ -662,6 +790,7 @@ pub fn axpy(
 /// the error function.
 pub struct Matmul16 {
     kernel: Arc<hrx::Kernel>,
+    k: usize,
     n: usize,
     resid: bool,
 }
@@ -676,6 +805,7 @@ impl Matmul16 {
         ];
         Ok(Self {
             kernel: c.get(gpu, &stem, &format!("h3_{stem}"), &cfg)?,
+            k,
             n,
             resid: kind == "resid",
         })
@@ -700,9 +830,15 @@ impl Matmul16 {
             lambda.is_some(),
             "only the resid form takes a lambda"
         );
+        // the activations are f16 and the weight rows bf16, both two bytes wide; the bias and the
+        // residual form's lambda are one f32 per output column
+        let mut required = vec![m * self.k * 2, self.n * self.k * 2, self.n * 4, m * self.n * 2];
         let mut bindings = vec![a, w, bias, out];
-        bindings.extend(lambda);
-        launch(
+        if let Some(l) = lambda {
+            bindings.push(l);
+            required.push(self.n * 4);
+        }
+        checked(
             gpu,
             &self.kernel,
             profile,
@@ -711,6 +847,7 @@ impl Matmul16 {
             [256, 1, 1],
             &[m as u32],
             &bindings,
+            &required,
         )
     }
 }
@@ -718,6 +855,7 @@ impl Matmul16 {
 /// LayerNorm reading an f16 stream and writing f32, which is what the vision tower's blocks take.
 pub struct LayerNorm16 {
     kernel: Arc<hrx::Kernel>,
+    width: usize,
 }
 
 impl LayerNorm16 {
@@ -729,6 +867,7 @@ impl LayerNorm16 {
         ];
         Ok(Self {
             kernel: c.get(gpu, "layernorm_f16_f32", "h3_layernorm_f16_f32", &cfg)?,
+            width,
         })
     }
 
@@ -743,7 +882,7 @@ impl LayerNorm16 {
         b: View<'_>,
         out32: View<'_>,
     ) -> Result<()> {
-        launch(
+        checked(
             gpu,
             &self.kernel,
             profile,
@@ -752,6 +891,12 @@ impl LayerNorm16 {
             [32, 1, 1],
             &[rows as u32],
             &[x16, w, b, out32],
+            &[
+                rows * self.width * 2,
+                self.width * 4,
+                self.width * 4,
+                rows * self.width * 4,
+            ],
         )
     }
 }

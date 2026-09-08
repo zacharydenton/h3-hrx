@@ -94,8 +94,11 @@ pub struct VideoVae {
 }
 
 impl VideoVae {
-    pub fn open(gpu: &hrx::Gpu, path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let weights = Weights::open(path, crate::plan::vvae::plan)?;
+    /// # Safety
+    ///
+    /// Maps the checkpoint; see [`crate::Session::new`].
+    pub unsafe fn open(gpu: &hrx::Gpu, path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let weights = unsafe { Weights::open(path, crate::plan::vvae::plan) }?;
         // the attention's per-head norms are ones for this stack, and its AdaLN tables are zero: it
         // modulates with a learned per-block scale alone
         Ok(Self {
@@ -561,9 +564,12 @@ impl Clip<'_> {
                 self.height, self.width
             ));
         }
-        let need = self
-            .frames
-            .checked_mul(self.plane())
+        // checked from the start: plane() multiplies height by width by three, and that product
+        // overflows on its own for a large enough side — checking only the last multiply lets an
+        // absurd height wrap to a small requirement that any buffer satisfies
+        let need = [self.frames, self.height, self.width, 3]
+            .into_iter()
+            .try_fold(1usize, |a, b| a.checked_mul(b))
             .ok_or_else(|| crate::error::Error::Invalid("clip dimensions overflow".into()))?;
         if self.pixels.len() < need {
             return crate::error::invalid(format!(
@@ -1054,21 +1060,20 @@ impl VideoVae {
     }
 }
 
-/// f32 has no padding and no invalid bit patterns, so its bytes are a plain reinterpretation.
+/// f32 and f16 have no padding and no invalid bit patterns, so their bytes are a plain
+/// reinterpretation — which is what `bytemuck` proves rather than asserts.
 pub fn as_bytes(v: &[f32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
+    bytemuck::cast_slice(v)
 }
 
 pub fn as_bytes_mut(v: &mut [f32]) -> &mut [u8] {
-    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
+    bytemuck::cast_slice_mut(v)
 }
 
 pub fn as_bytes_f16(v: &[half::f16]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
+    bytemuck::cast_slice(v)
 }
 
 fn bytes_mut(v: &mut [half::f16]) -> &mut [u8] {
-    // f16 is a plain two-byte value with no padding and no invalid patterns, so writing its bytes is
-    // the same as writing the values
-    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
+    bytemuck::cast_slice_mut(v)
 }

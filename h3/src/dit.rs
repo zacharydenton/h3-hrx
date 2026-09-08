@@ -7,7 +7,7 @@
 //! text encoder: the encoder produces 5120-wide rows, and it is the DiT that projects them to 5376 and
 //! refines them in place at the front of its own sequence.
 use crate::compile::{Cfg, Compiler};
-use crate::dispatch::{axpy, launch, Matmul16, Profile};
+use crate::dispatch::{axpy, checked, Matmul16, Profile};
 use crate::error::{invalid, Result};
 use crate::model::*;
 use crate::rope::VisionSpan;
@@ -82,9 +82,12 @@ pub struct Dit {
 }
 
 impl Dit {
-    pub fn open(gpu: &hrx::Gpu, path: impl AsRef<std::path::Path>) -> Result<Self> {
+    /// # Safety
+    ///
+    /// Maps the checkpoint; see [`crate::Session::new`].
+    pub unsafe fn open(gpu: &hrx::Gpu, path: impl AsRef<std::path::Path>) -> Result<Self> {
         Ok(Self {
-            weights: Weights::open(path, crate::plan::dit::plan)?,
+            weights: unsafe { Weights::open(path, crate::plan::dit::plan) }?,
             constants: Constants::new(gpu)?,
             seq: None,
             refiner: None,
@@ -215,7 +218,8 @@ impl Dit {
             0,
             None,
         )?;
-        launch(
+        // the refiner modulates with a single class, so its table is the two zero rows
+        checked(
             gpu,
             &r.norm,
             Some(prof),
@@ -231,6 +235,7 @@ impl Dit {
                 self.constants.zeros.binding(),
                 seq.cls0.binding(),
             ],
+            &[n * HID * 4, HID * 4, 2 * HID * 4, n * 4],
         )?;
         Ok(())
     }
@@ -367,8 +372,14 @@ pub struct LatentGrid {
 }
 
 impl LatentGrid {
-    pub fn elements(&self) -> usize {
-        LATENT_CH * self.frames * self.height * self.width
+    /// The latents this grid holds, or `None` if the extents overflow.
+    ///
+    /// Checked, because a validator that computes its requirement by wrapping accepts whatever it
+    /// wrapped to: a height of 2^63 becomes a small number of floats and any buffer passes.
+    pub fn elements(&self) -> Option<usize> {
+        [LATENT_CH, self.frames, self.height, self.width]
+            .into_iter()
+            .try_fold(1usize, |a, b| a.checked_mul(b))
     }
 }
 
@@ -451,7 +462,9 @@ impl Reference<'_> {
     pub fn check(&self, i: usize) -> crate::error::Result<()> {
         let at = |what: String| crate::error::Error::Invalid(format!("reference {i}: {what}"));
         if let Some(z) = self.video_latents() {
-            let need = self.grid().elements();
+            let Some(need) = self.grid().elements() else {
+                return Err(at(format!("latents for {:?} overflow a usize", self.grid())));
+            };
             if need == 0 || z.len() < need {
                 return Err(at(format!(
                     "latents for {:?} need {need} floats, {} given",
@@ -461,7 +474,9 @@ impl Reference<'_> {
             }
         }
         if let Some((z, frames)) = self.audio_latents() {
-            let need = 2 * crate::avae::AUDIO_CH * frames;
+            let Some(need) = frames.checked_mul(2 * crate::avae::AUDIO_CH) else {
+                return Err(at(format!("{frames} audio frames overflow a usize")));
+            };
             if need == 0 || z.len() < need {
                 return Err(at(format!(
                     "audio latents for {frames} frames need {need} floats, {} given",
@@ -470,7 +485,9 @@ impl Reference<'_> {
             }
         }
         if let Some(p) = self.presented() {
-            let need = p.height * p.width * 3;
+            let Some(need) = p.height.checked_mul(p.width).and_then(|n| n.checked_mul(3)) else {
+                return Err(at(format!("pixels of {}x{} overflow a usize", p.height, p.width)));
+            };
             if need == 0 || p.pixels.len() < need {
                 return Err(at(format!(
                     "pixels of {}x{} need {need} floats, {} given",
@@ -509,7 +526,9 @@ impl Keyframe<'_> {
             )));
         }
         if let Some((z, frames)) = self.audio {
-            let want = 2 * crate::avae::AUDIO_CH * frames;
+            let Some(want) = frames.checked_mul(2 * crate::avae::AUDIO_CH) else {
+                return Err(at(format!("{frames} audio frames overflow a usize")));
+            };
             if want == 0 || z.len() < want {
                 return Err(at(format!(
                     "audio latents for {frames} frames need {want} floats, {} given",
@@ -518,7 +537,9 @@ impl Keyframe<'_> {
             }
         }
         if let Some(p) = self.presented {
-            let want = p.height * p.width * 3;
+            let Some(want) = p.height.checked_mul(p.width).and_then(|n| n.checked_mul(3)) else {
+                return Err(at(format!("pixels of {}x{} overflow a usize", p.height, p.width)));
+            };
             if want == 0 || p.pixels.len() < want {
                 return Err(at(format!(
                     "pixels of {}x{} need {want} floats, {} given",
@@ -896,7 +917,8 @@ impl Dit {
                 let seq = self.seq.as_ref().expect("sized above");
                 let b = self.blocks.as_ref().expect("built above");
                 let cond = self.cond.as_ref().expect("ready");
-                launch(
+                // two classes here, the video and audio timesteps, so four table rows
+                checked(
                     gpu,
                     &b.final_norm,
                     Some(prof),
@@ -909,6 +931,12 @@ impl Dit {
                         self.weights.at(gpu, "h3.final.norm", HID * 4)?.binding(),
                         cond.final_table.binding(),
                         seq.tcls.slice(lr * 4, generated * 4),
+                    ],
+                    &[
+                        generated * HID * 4,
+                        HID * 4,
+                        4 * HID * 4,
+                        generated * 4,
                     ],
                 )?;
             }
@@ -1206,7 +1234,7 @@ impl Dit {
         let (mut d, mut m) = (0.0f64, 0.0f64);
         if step > 0 {
             let groups = crate::cache::groups(n);
-            launch(
+            checked(
                 gpu,
                 &cb.metric,
                 Some(prof),
@@ -1215,6 +1243,7 @@ impl Dit {
                 [THREADS, 1, 1],
                 &[n as u32],
                 &[x, cb.prev.binding(), cb.partials.binding()],
+                &[n * 4, n * 4, groups * 8],
             )?;
             let mut ps = vec![0.0f32; groups * 2];
             gpu.sync()?;
@@ -1289,7 +1318,7 @@ fn layer_cond(mods: &hrx::Buffer, i: usize) -> crate::stack::LayerCond<'_> {
 
 /// An i32 slice's bytes, for the per-row class tables.
 fn as_i32_bytes(v: &[i32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
+    bytemuck::cast_slice(v)
 }
 
 #[cfg(test)]

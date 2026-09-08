@@ -172,8 +172,9 @@ fn main() {
     let exe = std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into());
     let gpu = hrx::Gpu::open().expect("gpu");
     let compiler = Compiler::new(exe, root.join("kernels"), root.join("build/kernel_cache"));
-    let mut dit = Dit::open(&gpu, &a[0]).expect("DiT checkpoint");
-    let mut te = TextEncoder::open(&gpu, &a[1]).expect("text encoder checkpoint");
+    // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
+    let mut dit = unsafe { Dit::open(&gpu, &a[0]) }.expect("DiT checkpoint");
+    let mut te = unsafe { TextEncoder::open(&gpu, &a[1]) }.expect("text encoder checkpoint");
     let mut prof = Profile::from_env();
 
     for case in &cases {

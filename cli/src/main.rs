@@ -471,7 +471,9 @@ fn run(cli: Cli) -> Result<()> {
     };
 
     let t0 = Instant::now();
-    let mut session = Session::new(config)?;
+    // Safety: the checkpoints are the files this command was pointed at, and it does not write to
+    // them. A user who edits a checkpoint mid-run gets what the documentation says they get.
+    let mut session = unsafe { Session::new(config) }?;
     eprintln!(
         "session in {:.1} s ({}, {} attention)",
         t0.elapsed().as_secs_f64(),

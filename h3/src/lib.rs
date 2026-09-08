@@ -12,7 +12,8 @@
 //! # fn main() -> h3::Result<()> {
 //! use h3::{Config, DenoiseParams, Noise, Session, Tokenizer};
 //! let ids = Tokenizer::new()?.encode("a red fox in snow")?;
-//! let mut session = Session::new(Config::default())?;
+//! // Safety: the checkpoints are not written while this session lives.
+//! let mut session = unsafe { Session::new(Config::default()) }?;
 //! let latents = session.denoise(&ids, &DenoiseParams::default(), Noise::default(), &[], &[], None)?;
 //! # let _ = latents; Ok(()) }
 //! ```

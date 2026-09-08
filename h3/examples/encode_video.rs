@@ -21,7 +21,8 @@ fn main() {
     let exe = std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into());
     let gpu = hrx::Gpu::open().expect("gpu");
     let compiler = Compiler::new(exe, root.join("kernels"), root.join("build/kernel_cache"));
-    let mut vae = VideoVae::open(&gpu, &a[0]).expect("video VAE checkpoint");
+    // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
+    let mut vae = unsafe { VideoVae::open(&gpu, &a[0]) }.expect("video VAE checkpoint");
 
     let bytes = std::fs::read(&a[1]).expect("pixels");
     let pixels: Vec<f32> = bytes

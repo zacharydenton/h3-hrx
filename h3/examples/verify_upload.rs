@@ -35,7 +35,8 @@ fn main() {
         .unwrap_or(usize::MAX);
 
     let gpu = hrx::Gpu::open().expect("gpu");
-    let weights = Weights::open(&path, plan_for(&which)).expect("plan");
+    // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
+    let weights = unsafe { Weights::open(&path, plan_for(&which)) }.expect("plan");
 
     let names: Vec<String> = weights.names().cloned().collect();
     let (mut checked, mut skipped, mut bytes) = (0usize, 0usize, 0usize);

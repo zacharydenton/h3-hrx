@@ -9,7 +9,7 @@
 //! The output is two things: `merged`, the tower's own embedding of every 2x2 patch block, and
 //! `deepstack`, the same shape taken from blocks 8, 16 and 24 — the DiT consumes all four.
 use crate::compile::{Cfg, Compiler};
-use crate::dispatch::{launch, LayerNorm16, Matmul16, Profile};
+use crate::dispatch::{checked, LayerNorm16, Matmul16, Profile};
 use crate::error::{invalid, Result};
 use crate::model::*;
 use crate::weights::Weights;
@@ -197,7 +197,8 @@ pub fn embed(
             qkv.binding(),
             None,
         )?;
-        launch(
+        // rope reads the packed f32 q|k|v at its 72-deep heads and writes them out padded to 128
+        checked(
             gpu,
             &rope,
             Some(prof),
@@ -213,8 +214,18 @@ pub fn embed(
                 k16.binding(),
                 v16.binding(),
             ],
+            &[
+                n * qkv_width * 4,
+                n * (VHD / 2) * 4,
+                n * (VHD / 2) * 4,
+                n * VHEADS * VHDP * 2,
+                n * VHEADS * VHDP * 2,
+                n * VHEADS * VHDP * 2,
+            ],
         )?;
-        launch(
+        // the attention kernel was compiled to `cap` rows, which is what these hold
+        let pad = cap * VHEADS * VHDP * 2;
+        checked(
             gpu,
             &attn,
             Some(prof),
@@ -223,6 +234,7 @@ pub fn embed(
             [128, 1, 1],
             &[n as u32],
             &[q16.binding(), k16.binding(), v16.binding(), att16.binding()],
+            &[pad, pad, pad, pad],
         )?;
         // the residual GEMM takes its A operand as f16, which is what the attention already wrote
         g_proj.run(
@@ -256,7 +268,7 @@ pub fn embed(
             hid.binding(),
             None,
         )?;
-        launch(
+        checked(
             gpu,
             &cast,
             Some(prof),
@@ -265,6 +277,7 @@ pub fn embed(
             [256, 1, 1],
             &[(n * VMLP) as u32],
             &[hid.binding(), hid16.binding()],
+            &[n * VMLP * 4, n * VMLP * 2],
         )?;
         g_fc2.run(
             gpu,

@@ -17,7 +17,8 @@ internals = []
 hrx = { path = "../hrx" }
 memmap2 = "0.9"
 safetensors = "0.8"
-half = "2"
+half = { version = "2", features = ["bytemuck"] }
+bytemuck = "1"
 libc = "0.2"
 thiserror = "2"
 # fancy-regex, not onig: onig is a C library, and the point of this crate is that there is no C.

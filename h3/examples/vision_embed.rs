@@ -26,7 +26,9 @@ fn main() {
     let exe = std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into());
     let gpu = hrx::Gpu::open().expect("gpu");
     let compiler = Compiler::new(exe, root.join("kernels"), root.join("build/kernel_cache"));
-    let weights = Weights::open(&a[0], h3::plan::te::plan).expect("text encoder checkpoint");
+    // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
+    let weights =
+        unsafe { Weights::open(&a[0], h3::plan::te::plan) }.expect("text encoder checkpoint");
 
     let pixels: Vec<f32> = std::fs::read(&a[1])
         .expect("pixels")

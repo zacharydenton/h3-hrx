@@ -6,7 +6,7 @@
 //! three anti-aliased residual blocks whose outputs are *averaged*, not summed. Both run one channel of
 //! stereo at a time, since the model is mono and the two channels are independent.
 use crate::compile::{Cfg, Compiler};
-use crate::dispatch::{axpy, launch, MatmulF32, Profile};
+use crate::dispatch::{axpy, checked, MatmulF32, Profile};
 use crate::error::{other, Result};
 use crate::model::THREADS;
 use crate::weights::Weights;
@@ -65,7 +65,7 @@ fn conv_s(
         (format!("{ns}out_bound"), pow2_bound(out_len).to_string()),
     ];
     let k = c.get(gpu, "conv1d_s_f32", "h3_conv1d_s_f32", &cfg)?;
-    launch(
+    checked(
         gpu,
         &k,
         Some(prof),
@@ -74,6 +74,12 @@ fn conv_s(
         [THREADS, 1, 1],
         &[out_len as u32, in_len as u32],
         &[x, w, b, out],
+        &[
+            cin * in_len * 4,
+            cout * cin * ksize * 4,
+            cout * 4,
+            cout * out_len * 4,
+        ],
     )?;
     Ok(())
 }
@@ -96,7 +102,7 @@ fn snake_plain(
         (format!("{ns}len_bound"), pow2_bound(len).to_string()),
     ];
     let k = c.get(gpu, "snake_f32", "h3_snake_f32", &cfg)?;
-    launch(
+    checked(
         gpu,
         &k,
         Some(prof),
@@ -105,6 +111,7 @@ fn snake_plain(
         [THREADS, 1, 1],
         &[len as u32],
         &[x, alpha, out],
+        &[channels * len * 4, channels * 4, channels * len * 4],
     )?;
     Ok(())
 }
@@ -127,7 +134,7 @@ fn layernorm(
         (format!("{ns}eps"), crate::compile::num(1e-5)),
     ];
     let k = c.get(gpu, "layernorm_f32", "h3_layernorm_f32", &cfg)?;
-    launch(
+    checked(
         gpu,
         &k,
         Some(prof),
@@ -136,6 +143,7 @@ fn layernorm(
         [32, 1, 1],
         &[rows as u32],
         &[x, w, b, out],
+        &[rows * width * 4, width * 4, width * 4, rows * width * 4],
     )?;
     Ok(())
 }
@@ -153,7 +161,7 @@ fn transpose(
     let ns = "h3.transpose_f32.";
     let cfg: Cfg = vec![(format!("{ns}cols"), cols.to_string())];
     let k = c.get(gpu, "transpose_f32", "h3_transpose_f32", &cfg)?;
-    launch(
+    checked(
         gpu,
         &k,
         Some(prof),
@@ -162,6 +170,7 @@ fn transpose(
         [THREADS, 1, 1],
         &[rows as u32],
         &[x, out],
+        &[rows * cols * 4, rows * cols * 4],
     )?;
     Ok(())
 }
@@ -197,7 +206,7 @@ fn conv4(
     ];
     let k = c.get(gpu, "conv1d4_f32", "h3_conv1d4_f32", &cfg)?;
     // Four independent samples per lane retain the original 256-sample workgroup span.
-    launch(
+    checked(
         gpu,
         &k,
         Some(prof),
@@ -206,6 +215,12 @@ fn conv4(
         [64, 1, 1],
         &[len as u32],
         &[x, w, b, out],
+        &[
+            cin * len * 4,
+            cout * cin * ksize * 4,
+            cout * 4,
+            cout * len * 4,
+        ],
     )?;
     Ok(())
 }
@@ -235,8 +250,11 @@ struct DecBuffers {
 }
 
 impl AudioVae {
-    pub fn open(gpu: &hrx::Gpu, path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let weights = Weights::open(path, crate::plan::avae::plan)?;
+    /// # Safety
+    ///
+    /// Maps the checkpoint; see [`crate::Session::new`].
+    pub unsafe fn open(gpu: &hrx::Gpu, path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let weights = unsafe { Weights::open(path, crate::plan::avae::plan) }?;
         let zeros = gpu.alloc(2048 * 4)?;
         gpu.memset(&zeros, 0, 2048 * 4)?;
         Ok(Self {
@@ -277,7 +295,9 @@ impl AudioVae {
         let up = c.get(gpu, "up2_snake_f32", "h3_up2_snake_f32", &up_cfg)?;
         let down = c.get(gpu, "down2_f32", "h3_down2_f32", &down_cfg)?;
         let fir = self.weights.at(gpu, "audio.fir", 12 * 4)?;
-        launch(
+        // upsampling doubles the span, so `tmp2` carries `2 * len` samples per channel; the FIR is
+        // the same twelve taps both ways
+        checked(
             gpu,
             &up,
             Some(prof),
@@ -286,8 +306,15 @@ impl AudioVae {
             [THREADS, 1, 1],
             &[len as u32],
             &[x, fir.binding(), alpha, beta, tmp2],
+            &[
+                channels * len * 4,
+                12 * 4,
+                channels * 4,
+                channels * 4,
+                channels * 2 * len * 4,
+            ],
         )?;
-        launch(
+        checked(
             gpu,
             &down,
             Some(prof),
@@ -296,6 +323,7 @@ impl AudioVae {
             [THREADS, 1, 1],
             &[(2 * len) as u32],
             &[tmp2, fir.binding(), out],
+            &[channels * 2 * len * 4, 12 * 4, channels * len * 4],
         )?;
         Ok(())
     }
@@ -398,7 +426,7 @@ impl AudioVae {
                     ];
                     let kt = c.get(gpu, "convt1d_f32", "h3_convt1d_f32", &cfg)?;
                     let d = self.dec.as_ref().expect("sized above");
-                    launch(
+                    checked(
                         gpu,
                         &kt,
                         Some(prof),
@@ -415,6 +443,12 @@ impl AudioVae {
                                 .at(gpu, &format!("audio.ups.{i}.b"), cout * 4)?
                                 .binding(),
                             d.r.binding(),
+                        ],
+                        &[
+                            chan * len * 4,
+                            chan * cout * k * 4,
+                            cout * 4,
+                            cout * olen * 4,
                         ],
                     )?;
                 }
@@ -822,7 +856,8 @@ impl AudioVae {
                     (format!("{ns}scale"), crate::compile::num(1.0 / 16.0)),
                 ];
                 let k = c.get(gpu, "attn_scores_f32", "h3_attn_scores_f32", &cfg)?;
-                launch(
+                // eight heads of 256, packed q|k|v, against a per-head t-by-t score plane
+                checked(
                     gpu,
                     &k,
                     Some(prof),
@@ -831,6 +866,7 @@ impl AudioVae {
                     [THREADS, 1, 1],
                     &[t as u32],
                     &[qkv.binding(), pattn.binding()],
+                    &[t * 3 * 8 * 256 * 4, 8 * t * t * 4],
                 )?;
             }
             {
@@ -841,7 +877,8 @@ impl AudioVae {
                     (format!("{ns}pool"), "8".into()),
                 ];
                 let k = c.get(gpu, "attn_pv_pool_f32", "h3_attn_pv_pool_f32", &cfg)?;
-                launch(
+                // the pool of eight narrows each head's 256 to 32, which is AUDIO_CH
+                checked(
                     gpu,
                     &k,
                     Some(prof),
@@ -850,6 +887,7 @@ impl AudioVae {
                     [32, 1, 1],
                     &[t as u32],
                     &[qkv.binding(), pattn.binding(), pool.binding()],
+                    &[t * 3 * 8 * 256 * 4, 8 * t * t * 4, t * (256 / 8) * 4],
                 )?;
             }
             MatmulF32::build(c, gpu, AUDIO_CH, AUDIO_CH)?.run(
@@ -919,7 +957,7 @@ impl AudioVae {
             )?;
             {
                 let k = c.get(gpu, "geglu_tanh_f32", "h3_geglu_tanh_f32", &Cfg::new())?;
-                launch(
+                checked(
                     gpu,
                     &k,
                     Some(prof),
@@ -928,6 +966,7 @@ impl AudioVae {
                     [THREADS, 1, 1],
                     &[(t * 64) as u32],
                     &[a0.binding(), a1.binding(), g.binding()],
+                    &[t * 64 * 4, t * 64 * 4, t * 64 * 4],
                 )?;
             }
             MatmulF32::build(c, gpu, 64, AUDIO_CH)?.run(

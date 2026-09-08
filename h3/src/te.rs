@@ -64,9 +64,12 @@ pub struct TextEncoder {
 }
 
 impl TextEncoder {
-    pub fn open(gpu: &hrx::Gpu, path: impl AsRef<std::path::Path>) -> Result<Self> {
+    /// # Safety
+    ///
+    /// Maps the checkpoint; see [`crate::Session::new`].
+    pub unsafe fn open(gpu: &hrx::Gpu, path: impl AsRef<std::path::Path>) -> Result<Self> {
         Ok(Self {
-            weights: Weights::open(path, crate::plan::te::plan)?,
+            weights: unsafe { Weights::open(path, crate::plan::te::plan) }?,
             constants: Constants::new(gpu)?,
             built: None,
         })

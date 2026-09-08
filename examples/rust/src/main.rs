@@ -25,7 +25,8 @@ fn main() {
         .expect("cannot tokenize the prompt");
 
     let file = |p: &str| Some(std::path::PathBuf::from(format!("{models}/{p}")));
-    let mut session = Session::new(Config {
+    // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
+    let mut session = unsafe { Session::new(Config {
         dit: file("diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"),
         te: file("text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
         video_vae: file("vae/minimax_h3_video_vae_fp16.safetensors"),
@@ -35,7 +36,7 @@ fn main() {
         loom_compile: std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into()),
         attention: h3::Attention::I8,
     })
-    .expect("session");
+    .expect("session") };
 
     let p = DenoiseParams {
         height: 480,

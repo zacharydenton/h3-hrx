@@ -54,7 +54,8 @@ fn main() {
     let path = std::env::args()
         .nth(1)
         .expect("usage: cond_dump <dit checkpoint>");
-    let w = Weights::open(&path, h3::plan::dit::plan).expect("plan");
+    // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
+    let w = unsafe { Weights::open(&path, h3::plan::dit::plan) }.expect("plan");
     let curve = w.host_f32("h3.adaln_t_table", 1025 * 8).expect("curve");
     let adaln_w: Vec<Vec<f32>> = (0..BLOCKS)
         .map(|i| {

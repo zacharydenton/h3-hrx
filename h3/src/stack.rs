@@ -6,7 +6,7 @@
 //! count and the QK^T width, and whether a projection needs a `prepare` at all follows from whether the
 //! kernel before it already wrote its operand at the right pitch.
 use crate::compile::{num, Cfg, Compiler};
-use crate::dispatch::{launch, Gemm, Prepare, Profile, Tile};
+use crate::dispatch::{checked, Gemm, Prepare, Profile, Tile};
 use crate::model::*;
 use crate::weights::Weights;
 use hrx::View;
@@ -159,6 +159,11 @@ pub struct Stack {
     waves: usize,
     calls: usize,
     direct_attn: bool,
+    /// the row stride of `attn`, which is the inner width padded to the GEMM's pitch when the out
+    /// projection reads it directly
+    attn_width: usize,
+    /// the row stride of `a_q` in bytes, sized for the widest consumer in the stack
+    a_stride: usize,
     direct_down: bool,
     blocks: Vec<Block>,
 
@@ -656,6 +661,8 @@ impl Stack {
             waves,
             calls: 0,
             direct_attn,
+            attn_width,
+            a_stride: widest * if quant { 1 } else { 2 },
             direct_down,
             blocks,
             prep_norm,
@@ -742,6 +749,7 @@ impl Stack {
             self.calls += 1;
             this == dump_call && first == 0
         };
+        let (cap, rows) = (self.capacity, self.tokens);
         let (q, k, v) = self.qkv_views();
         if dumping {
             self.dump(gpu, dump_dir.unwrap(), "h_in", x)?;
@@ -776,7 +784,9 @@ impl Stack {
                     .as_ref()
                     .expect("the fused projection is biased")
                     .binding();
-                launch(
+                // the fused path is the 2048-wide, 32-head, 64-deep VAE stack alone, so its
+                // operands are that shape exactly
+                checked(
                     gpu,
                     kernel,
                     Some(prof),
@@ -798,6 +808,18 @@ impl Stack {
                         cos,
                         sin,
                     ],
+                    &[
+                        cap * self.a_stride,
+                        2048 * 6144,
+                        // the fused kernel addresses its output both as [t][6144] and as the
+                        // head-major [3][heads][capacity][64] the attention then reads
+                        cap * self.d.qkv() * 2,
+                        self.d.qkv() * 4,
+                        self.d.head_dim * 4,
+                        self.d.head_dim * 4,
+                        rows * (self.d.rope_dim / 2) * 4,
+                        rows * (self.d.rope_dim / 2) * 4,
+                    ],
                 )?;
             } else {
                 let b = &self.blocks[i];
@@ -814,7 +836,7 @@ impl Stack {
                     None,
                     b.qkv_b.as_ref().map(|x| x.binding()),
                 )?;
-                launch(
+                checked(
                     gpu,
                     self.rope.as_ref().expect("built when not fused"),
                     Some(prof),
@@ -823,6 +845,16 @@ impl Stack {
                     [THREADS, 1, 1],
                     &[t],
                     &[self.fused.binding(), qnorm, knorm, cos, sin, q, k, v],
+                    &[
+                        rows * self.d.qkv() * 2,
+                        self.d.head_dim * 4,
+                        self.d.head_dim * 4,
+                        rows * (self.d.rope_dim / 2) * 4,
+                        rows * (self.d.rope_dim / 2) * 4,
+                        rows * self.d.inner() * 2,
+                        rows * self.d.kv_inner() * 2,
+                        rows * self.d.kv_inner() * 2,
+                    ],
                 )?;
             }
 
@@ -941,6 +973,11 @@ impl Stack {
         v: View<'_>,
     ) -> Result<()> {
         let query_block = 16 * self.waves as u32;
+        // every operand here is one of the capacity-sized allocations made in `build`, at the same
+        // stride the kernel was compiled with
+        let cap = self.capacity;
+        let rows = t as usize;
+        let out = rows * self.attn_width * 2;
         let Some(int_qk) = &self.int_qk else {
             let grid = if self.d.causal {
                 [t.div_ceil(16), self.d.kv_heads as u32, 1]
@@ -952,7 +989,7 @@ impl Stack {
             } else {
                 [32 * self.waves as u32, 1, 1]
             };
-            return launch(
+            return checked(
                 gpu,
                 &self.attention,
                 Some(prof),
@@ -961,13 +998,19 @@ impl Stack {
                 block,
                 &[t],
                 &[q, k, v, self.attn.binding()],
+                &[
+                    cap * self.d.inner() * 2,
+                    cap * self.d.kv_inner() * 2,
+                    cap * self.d.kv_inner() * 2,
+                    out,
+                ],
             );
         };
 
         // K mean smoothing: off by default, having measured worse.
         let smooth = env_once("H3_KSMOOTH") == Some("1");
         if smooth {
-            launch(
+            checked(
                 gpu,
                 self.colmean.as_ref().expect("built with integer QK"),
                 Some(prof),
@@ -976,9 +1019,21 @@ impl Stack {
                 [THREADS, 1, 1],
                 &[t],
                 &[k, int_qk.kmean.binding()],
+                &[rows * self.d.inner() * 2, self.d.inner() * 4],
             )?;
         }
-        launch(
+        // integer QK^T is MHA with head 128 only, so q and k share the inner width; a code is 64
+        // bytes per head in int4 and 128 in int8
+        let codes = if self.d.attn_i4 { 64 } else { 128 };
+        // `prepare` writes the `t` rows of the call; the attention that follows indexes its whole
+        // capacity, so the two differ and both appear below
+        let operand = [
+            rows * self.d.inner() * 2,
+            self.d.inner() * 4,
+            rows * self.d.heads * codes,
+            rows * self.d.heads * 4,
+        ];
+        checked(
             gpu,
             self.prep_q.as_ref().expect("built with integer QK"),
             Some(prof),
@@ -992,8 +1047,9 @@ impl Stack {
                 int_qk.qi.binding(),
                 int_qk.qs.binding(),
             ],
+            &operand,
         )?;
-        launch(
+        checked(
             gpu,
             self.prep_k.as_ref().expect("built with integer QK"),
             Some(prof),
@@ -1011,8 +1067,9 @@ impl Stack {
                 int_qk.ki.binding(),
                 int_qk.ks.binding(),
             ],
+            &operand,
         )?;
-        launch(
+        checked(
             gpu,
             self.transpose.as_ref().expect("built with integer QK"),
             Some(prof),
@@ -1021,8 +1078,9 @@ impl Stack {
             [THREADS, 1, 1],
             &[t],
             &[v, int_qk.vt.binding()],
+            &[rows * self.d.inner() * 2, self.d.inner() * cap * 2],
         )?;
-        launch(
+        checked(
             gpu,
             &self.attention,
             Some(prof),
@@ -1037,6 +1095,14 @@ impl Stack {
                 int_qk.ks.binding(),
                 int_qk.vt.binding(),
                 self.attn.binding(),
+            ],
+            &[
+                cap * self.d.heads * codes,
+                cap * self.d.heads * 4,
+                cap * self.d.heads * codes,
+                cap * self.d.heads * 4,
+                self.d.inner() * cap * 2,
+                out,
             ],
         )
     }

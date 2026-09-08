@@ -316,24 +316,27 @@ pub unsafe extern "C" fn h3_create(
                 "kernel_sources, cache_dir and loom_compile are required".into(),
             ));
         };
-        let session = Session::new(Config {
-            dit: path(c.dit_file),
-            te: path(c.te_file),
-            video_vae: path(c.video_vae_file),
-            audio_vae: path(c.audio_vae_file),
-            kernel_sources,
-            cache_dir,
-            loom_compile: loom_compile.to_string_lossy().into_owned(),
-            // 0 means the default, and anything that is not a width with kernels is refused
-            attention: match c.attn_qk_bits {
-                0 => crate::dit::Attention::default(),
-                bits => {
-                    crate::dit::Attention::from_bits(bits.max(0) as usize).ok_or_else(|| {
-                        Error::Invalid(format!("attn_qk_bits {bits} is not 16, 8 or 4"))
-                    })?
-                }
-            },
-        })?;
+        // Safety: stated in the header — a checkpoint must not be modified while the
+        // session holds it. The C caller made that promise by calling h3_create.
+        let session =
+            unsafe {
+                Session::new(Config {
+                    dit: path(c.dit_file),
+                    te: path(c.te_file),
+                    video_vae: path(c.video_vae_file),
+                    audio_vae: path(c.audio_vae_file),
+                    kernel_sources,
+                    cache_dir,
+                    loom_compile: loom_compile.to_string_lossy().into_owned(),
+                    // 0 means the default, and anything that is not a width with kernels is refused
+                    attention: match c.attn_qk_bits {
+                        0 => crate::dit::Attention::default(),
+                        bits => crate::dit::Attention::from_bits(bits.max(0) as usize).ok_or_else(
+                            || Error::Invalid(format!("attn_qk_bits {bits} is not 16, 8 or 4")),
+                        )?,
+                    },
+                })
+            }?;
         *out_session = Box::into_raw(Box::new(h3_session {
             inner: std::sync::Mutex::new(session),
         }));
@@ -605,6 +608,7 @@ unsafe fn denoise_into(
             cb.as_mut()
                 .map(|c| c as &mut dyn FnMut(usize, usize, f64) -> bool),
         )?;
+        // both already established above, before the run began
         video_out.copy_from_slice(&latents.video);
         audio_out.copy_from_slice(&latents.audio);
         Ok(())
@@ -740,7 +744,8 @@ pub unsafe extern "C" fn h3_encode_video(
         with(s, |session| {
             let (z, t) = session.encode_video(clip)?;
             enough("video latents", latent_elements, z.len())?;
-            out_slice(latents, z.len(), "video latents")?.copy_from_slice(&z);
+            let out = out_slice(latents, z.len(), "video latents")?;
+            out.copy_from_slice(&z);
             if !latent_t.is_null() {
                 *latent_t = t as c_int;
             }
@@ -799,7 +804,8 @@ pub unsafe extern "C" fn h3_encode_audio(
         with(s, |session| {
             let (z, t) = session.encode_audio(&x, n)?;
             enough("audio latents", latent_elements, z.len())?;
-            out_slice(latents, z.len(), "audio latents")?.copy_from_slice(&z);
+            let out = out_slice(latents, z.len(), "audio latents")?;
+            out.copy_from_slice(&z);
             if !audio_t.is_null() {
                 *audio_t = t as c_int;
             }
@@ -829,10 +835,14 @@ pub unsafe extern "C" fn h3_vision_embed(
         let px = slice(pixels, h * w * 3, "pixels")?.to_vec();
         with(s, |session| {
             let e = session.vision_embed(&px, h, w)?;
+            // both outputs are established before either is written: returning a failure after
+            // having modified one would break the promise that a non-OK status touched nothing
             enough("merged", merged_elements, e.merged.len())?;
             enough("deepstack", deepstack_elements, e.deepstack.len())?;
-            out_slice(merged, e.merged.len(), "merged")?.copy_from_slice(&e.merged);
-            out_slice(deepstack, e.deepstack.len(), "deepstack")?.copy_from_slice(&e.deepstack);
+            let merged_out = out_slice(merged, e.merged.len(), "merged")?;
+            let deepstack_out = out_slice(deepstack, e.deepstack.len(), "deepstack")?;
+            merged_out.copy_from_slice(&e.merged);
+            deepstack_out.copy_from_slice(&e.deepstack);
             if !tokens.is_null() {
                 *tokens = e.tokens as c_int;
             }

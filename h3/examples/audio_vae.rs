@@ -35,7 +35,8 @@ fn main() {
     let exe = std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into());
     let gpu = hrx::Gpu::open().expect("gpu");
     let compiler = Compiler::new(exe, root.join("kernels"), root.join("build/kernel_cache"));
-    let mut vae = AudioVae::open(&gpu, &a[1]).expect("audio VAE checkpoint");
+    // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
+    let mut vae = unsafe { AudioVae::open(&gpu, &a[1]) }.expect("audio VAE checkpoint");
     let mut prof = Profile::from_env();
     let start = std::time::Instant::now();
 
