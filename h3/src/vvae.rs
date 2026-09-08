@@ -6,7 +6,7 @@
 //! to that grid — so a tile decoded on its own is not a crop of the whole frame decoded at once. That
 //! is why the tiling and the blends exist, and why the stack is rebuilt whenever the grid changes.
 use crate::compile::Compiler;
-use crate::dispatch::{Gemm, Prepare, Profile, Tile};
+use crate::dispatch::{Conv3d, Gemm, GroupNormSilu, Matmul, Prepare, Profile, Tile};
 use crate::error::{other, Result};
 use crate::model::*;
 use crate::stack::{LayerCond, Stack, StackDims};
@@ -90,6 +90,9 @@ pub struct VideoVae {
     pq_b: Vec<f32>,
     latents_mean: Vec<f32>,
     latents_std: Vec<f32>,
+    /// the encoder's copies, which the checkpoint stores separately from the decoder's
+    enc_mean: Vec<f32>,
+    enc_std: Vec<f32>,
 }
 
 impl VideoVae {
@@ -110,6 +113,8 @@ impl VideoVae {
             pq_b: weights.host_f32("vae.post_quant_conv.b", LATENT_CH)?,
             latents_mean: weights.host_f32("vae.latents_mean", LATENT_CH)?,
             latents_std: weights.host_f32("vae.latents_std", LATENT_CH)?,
+            enc_mean: weights.host_f32("venc.latents_mean", LATENT_CH)?,
+            enc_std: weights.host_f32("venc.latents_std", LATENT_CH)?,
             weights,
             ones,
             zeros,
@@ -530,6 +535,495 @@ impl VideoVae {
             return other(format!("decoded {kept} frames, expected {want_frames}"));
         }
         Ok(())
+    }
+}
+
+/// Pixels and the shape they are in: `[frames][height][width][3]` in `[0, 1]`.
+///
+/// One value rather than a slice and three integers, because passing a buffer that does not match its
+/// dimensions is the mistake worth making impossible here.
+#[derive(Clone, Copy)]
+pub struct Clip<'a> {
+    pub pixels: &'a [f32],
+    pub frames: usize,
+    pub height: usize,
+    pub width: usize,
+}
+
+impl Clip<'_> {
+    fn plane(&self) -> usize {
+        self.height * self.width * 3
+    }
+    /// The latent grid this clip encodes to, spatially.
+    fn latent(&self) -> (usize, usize) {
+        (self.height / VAE_PS, self.width / VAE_PS)
+    }
+}
+
+/// The encoder's residual stack: channels per level, spatial stride, temporal stride.
+const ENC_MID: [usize; 6] = [128, 256, 256, 512, 512, 1024];
+const ENC_SDOWN: [usize; 6] = [2, 2, 2, 2, 1, 1];
+const ENC_TDOWN: [usize; 6] = [1, 2, 2, 1, 1, 1];
+
+impl VideoVae {
+    /// One tile of `frames` frames to moment rows, then to model-space latents `[24][T][h][w]`.
+    ///
+    /// A still image and a clip use different weights and a different tap count — `.w2` with one
+    /// temporal tap against `.w3` with three — because the released encoder folds a single frame's
+    /// causal padding into the kernel rather than replicating the frame.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_tile(
+        &mut self,
+        gpu: &hrx::Gpu,
+        c: &Compiler,
+        prof: &mut Profile,
+        pixels: &[f32],
+        frames: usize,
+        height: usize,
+        y0: usize,
+        x0: usize,
+        th: usize,
+        tw: usize,
+        full_w: usize,
+    ) -> Result<(Vec<f32>, usize)> {
+        let image = frames == 1;
+        let taps_t = if image { 1 } else { 3 };
+        // K folds the taps in: 9 for an image, 27 for a clip, times the input channels, to a multiple
+        // of 32
+        let ksz = |cin_pad: usize| ((if image { 9 } else { 27 }) * cin_pad).div_ceil(32) * 32;
+        let suffix = if image { ".w2" } else { ".w3" };
+
+        // input rows [frames*th*tw][8] f16: ImageNet-normalised pixels, channels 3..7 left at zero
+        let rows0 = frames * th * tw;
+        let mut inrows = vec![half::f16::ZERO; rows0 * 8];
+        for t in 0..frames {
+            for y in 0..th {
+                for x in 0..tw {
+                    let src = ((t * height + y0 + y) * full_w + x0 + x) * 3;
+                    let dst = ((t * th + y) * tw + x) * 8;
+                    let n = crate::pixels::imagenet_normalise([
+                        pixels[src],
+                        pixels[src + 1],
+                        pixels[src + 2],
+                    ]);
+                    for ch in 0..3 {
+                        inrows[dst + ch] = half::f16::from_f32(n[ch]);
+                    }
+                }
+            }
+        }
+
+        let x = gpu.alloc(rows0 * 8 * 2)?;
+        gpu.h2d(&x, bytemuck_f16(&inrows))?;
+        // the widest [rows][channels] plane of the stack: rows fall as fast as channels rise
+        let plane_bytes = rows0 * 128 * 2;
+        let mut h = gpu.alloc(plane_bytes)?;
+        let y = gpu.alloc(plane_bytes)?;
+        let mut tmp = gpu.alloc(plane_bytes)?;
+        let sc = gpu.alloc(plane_bytes)?;
+        let stats = gpu.alloc(frames * 32 * 2 * 4)?;
+
+        let w3 = |gpu: &hrx::Gpu, nm: &str, cout_pad: usize, k: usize| {
+            self.weights
+                .at(gpu, &format!("{nm}{suffix}"), cout_pad * k * 2)
+        };
+
+        let (mut t_len, mut hh, mut ww, mut chan) = (frames, th, tw, 128usize);
+        let conv = Conv3d::build(
+            c,
+            gpu,
+            false,
+            t_len,
+            hh,
+            ww,
+            1,
+            1,
+            taps_t,
+            8,
+            8,
+            ksz(8),
+            128,
+        )?;
+        conv.run(
+            gpu,
+            Some(prof),
+            "venc conv_in",
+            x.binding(),
+            w3(gpu, "venc.conv_in", 128, ksz(8))?.binding(),
+            self.weights.at(gpu, "venc.conv_in.b", 128 * 4)?.binding(),
+            h.binding(),
+            None,
+        )?;
+
+        for l in 0..6 {
+            for r in 0..2 {
+                let b = format!("venc.l{l}.r{r}.");
+                let (cin, cout) = (chan, ENC_MID[l]);
+                GroupNormSilu::build(c, gpu, t_len, hh, ww, cin)?.run(
+                    gpu,
+                    Some(prof),
+                    "venc groupnorm",
+                    h.binding(),
+                    self.weights
+                        .at(gpu, &format!("{b}norm1.g"), cin * 4)?
+                        .binding(),
+                    self.weights
+                        .at(gpu, &format!("{b}norm1.b"), cin * 4)?
+                        .binding(),
+                    stats.binding(),
+                    y.binding(),
+                )?;
+                Conv3d::build(
+                    c,
+                    gpu,
+                    false,
+                    t_len,
+                    hh,
+                    ww,
+                    1,
+                    1,
+                    taps_t,
+                    cin,
+                    cin,
+                    ksz(cin),
+                    cout,
+                )?
+                .run(
+                    gpu,
+                    Some(prof),
+                    "venc conv",
+                    y.binding(),
+                    w3(gpu, &format!("{b}conv1"), cout, ksz(cin))?.binding(),
+                    self.weights
+                        .at(gpu, &format!("{b}conv1.b"), cout * 4)?
+                        .binding(),
+                    tmp.binding(),
+                    None,
+                )?;
+                GroupNormSilu::build(c, gpu, t_len, hh, ww, cout)?.run(
+                    gpu,
+                    Some(prof),
+                    "venc groupnorm",
+                    tmp.binding(),
+                    self.weights
+                        .at(gpu, &format!("{b}norm2.g"), cout * 4)?
+                        .binding(),
+                    self.weights
+                        .at(gpu, &format!("{b}norm2.b"), cout * 4)?
+                        .binding(),
+                    stats.binding(),
+                    y.binding(),
+                )?;
+                // a change of width needs the skip projected: a 1x1 convolution, which is a matmul
+                let resid = if cin != cout {
+                    let k = cin.div_ceil(32) * 32;
+                    Matmul::build(c, gpu, k, cout)?.run(
+                        gpu,
+                        Some(prof),
+                        "venc shortcut",
+                        t_len * hh * ww,
+                        h.binding(),
+                        self.weights
+                            .at(gpu, &format!("{b}nin.wm"), cout * k * 2)?
+                            .binding(),
+                        self.weights
+                            .at(gpu, &format!("{b}nin.b"), cout * 4)?
+                            .binding(),
+                        sc.binding(),
+                    )?;
+                    sc.binding()
+                } else {
+                    h.binding()
+                };
+                Conv3d::build(
+                    c,
+                    gpu,
+                    true,
+                    t_len,
+                    hh,
+                    ww,
+                    1,
+                    1,
+                    taps_t,
+                    cout,
+                    cout,
+                    ksz(cout),
+                    cout,
+                )?
+                .run(
+                    gpu,
+                    Some(prof),
+                    "venc conv",
+                    y.binding(),
+                    w3(gpu, &format!("{b}conv2"), cout, ksz(cout))?.binding(),
+                    self.weights
+                        .at(gpu, &format!("{b}conv2.b"), cout * 4)?
+                        .binding(),
+                    tmp.binding(),
+                    Some(resid),
+                )?;
+                std::mem::swap(&mut h, &mut tmp);
+                chan = cout;
+            }
+            if ENC_SDOWN[l] * ENC_TDOWN[l] > 1 {
+                let b = format!("venc.l{l}.down");
+                let down = Conv3d::build(
+                    c,
+                    gpu,
+                    false,
+                    t_len,
+                    hh,
+                    ww,
+                    ENC_SDOWN[l],
+                    if image { 1 } else { ENC_TDOWN[l] },
+                    taps_t,
+                    chan,
+                    chan,
+                    ksz(chan),
+                    chan,
+                )?;
+                down.run(
+                    gpu,
+                    Some(prof),
+                    "venc down",
+                    h.binding(),
+                    w3(gpu, &b, chan, ksz(chan))?.binding(),
+                    self.weights.at(gpu, &format!("{b}.b"), chan * 4)?.binding(),
+                    tmp.binding(),
+                    None,
+                )?;
+                std::mem::swap(&mut h, &mut tmp);
+                t_len = down.tout;
+                hh = down.ho;
+                ww = down.wo;
+            }
+        }
+
+        GroupNormSilu::build(c, gpu, t_len, hh, ww, chan)?.run(
+            gpu,
+            Some(prof),
+            "venc groupnorm",
+            h.binding(),
+            self.weights.at(gpu, "venc.norm_out.g", chan * 4)?.binding(),
+            self.weights.at(gpu, "venc.norm_out.b", chan * 4)?.binding(),
+            stats.binding(),
+            y.binding(),
+        )?;
+        Conv3d::build(
+            c,
+            gpu,
+            false,
+            t_len,
+            hh,
+            ww,
+            1,
+            1,
+            taps_t,
+            chan,
+            chan,
+            ksz(chan),
+            64,
+        )?
+        .run(
+            gpu,
+            Some(prof),
+            "venc conv_out",
+            y.binding(),
+            w3(gpu, "venc.conv_out", 64, ksz(chan))?.binding(),
+            self.weights.at(gpu, "venc.conv_out.b", 64 * 4)?.binding(),
+            tmp.binding(),
+            None,
+        )?;
+        let m = t_len * hh * ww;
+        Matmul::build(c, gpu, 64, 64)?.run(
+            gpu,
+            Some(prof),
+            "venc quant",
+            m,
+            tmp.binding(),
+            self.weights
+                .at(gpu, "venc.quant.wm", 64 * 64 * 2)?
+                .binding(),
+            self.weights.at(gpu, "venc.quant.b", 64 * 4)?.binding(),
+            y.binding(),
+        )?;
+
+        // the head emits 64 channels: the first 24 are the posterior's mean, the rest its log variance,
+        // which sampling would use and this does not
+        let mut mom = vec![half::f16::ZERO; m * 64];
+        gpu.sync()?;
+        gpu.d2h_ref(y.slice(0, mom.len() * 2), bytes_mut(&mut mom))?;
+        let mut latent = vec![0.0f32; LATENT_CH * m];
+        for t in 0..t_len {
+            for yy in 0..hh {
+                for xx in 0..ww {
+                    for ch in 0..LATENT_CH {
+                        let v = mom[((t * hh + yy) * ww + xx) * 64 + ch].to_f32();
+                        latent[((ch * t_len + t) * hh + yy) * ww + xx] =
+                            (v - self.enc_mean[ch]) / self.enc_std[ch];
+                    }
+                }
+            }
+        }
+        Ok((latent, t_len))
+    }
+
+    /// One clip, in 256-pixel tiles blended in latent space — ComfyUI's `tiled_encode`, in its order:
+    /// blend the tile above in over the y overlap, then the tile to the left over the x overlap of the
+    /// result, then crop the trailing overlaps and concatenate.
+    pub fn encode_clip(
+        &mut self,
+        gpu: &hrx::Gpu,
+        c: &Compiler,
+        prof: &mut Profile,
+        clip: Clip<'_>,
+    ) -> Result<(Vec<f32>, usize)> {
+        let (frames, height, width) = (clip.frames, clip.height, clip.width);
+        let (ys, yo) = tiles::split_tiles(height);
+        let (xs, xo) = tiles::split_tiles(width);
+        let (ny, nx) = (ys.len(), xs.len());
+        let mut tile_of: Vec<Vec<f32>> = vec![Vec::new(); ny * nx];
+        let (mut th_lat, mut tw_lat) = (vec![0usize; ny], vec![0usize; nx]);
+        let mut t_lat = 0usize;
+        for i in 0..ny {
+            for j in 0..nx {
+                let tile_h = if ny == 1 { height } else { 256 };
+                let tile_w = if nx == 1 { width } else { 256 };
+                th_lat[i] = tile_h / VAE_PS;
+                tw_lat[j] = tile_w / VAE_PS;
+                let (z, t) = self.encode_tile(
+                    gpu,
+                    c,
+                    prof,
+                    clip.pixels,
+                    frames,
+                    height,
+                    ys[i],
+                    xs[j],
+                    tile_h,
+                    tile_w,
+                    width,
+                )?;
+                tile_of[i * nx + j] = z;
+                t_lat = t;
+            }
+        }
+
+        let (lh, lw) = clip.latent();
+        let mut out = vec![0.0f32; LATENT_CH * t_lat * lh * lw];
+        let mut oy = 0usize;
+        for i in 0..ny {
+            let mut ox = 0usize;
+            let h = th_lat[i];
+            for j in 0..nx {
+                let w = tw_lat[j];
+                let mut tile = tile_of[i * nx + j].clone();
+                if i > 0 {
+                    tile = tiles::blend_latent(
+                        &tile_of[(i - 1) * nx + j],
+                        th_lat[i - 1],
+                        w,
+                        &tile,
+                        h,
+                        w,
+                        yo[i - 1] / VAE_PS,
+                        true,
+                        t_lat,
+                    );
+                }
+                if j > 0 {
+                    tile = tiles::blend_latent(
+                        &tile_of[i * nx + j - 1],
+                        h,
+                        tw_lat[j - 1],
+                        &tile,
+                        h,
+                        w,
+                        xo[j - 1] / VAE_PS,
+                        false,
+                        t_lat,
+                    );
+                }
+                let keep_y = if i < ny - 1 { h - yo[i] / VAE_PS } else { h };
+                let keep_x = if j < nx - 1 { w - xo[j] / VAE_PS } else { w };
+                for ch in 0..LATENT_CH {
+                    for t in 0..t_lat {
+                        for y in 0..keep_y {
+                            let dst = ((ch * t_lat + t) * lh + oy + y) * lw + ox;
+                            let src = ((ch * t_lat + t) * h + y) * w;
+                            out[dst..dst + keep_x].copy_from_slice(&tile[src..src + keep_x]);
+                        }
+                    }
+                }
+                ox += keep_x;
+            }
+            oy += if i < ny - 1 { h - yo[i] / VAE_PS } else { h };
+        }
+        Ok((out, t_lat))
+    }
+
+    /// Pixels `[frames][H][W][3]` in `[0, 1]` to model-space latents `[24][latent_t][H/16][W/16]`.
+    ///
+    /// A clip is encoded in seventeen-frame chunks, each giving five latent frames, and the last three
+    /// of the concatenation are dropped — the decoder's token drop, undone.
+    pub fn encode_video(
+        &mut self,
+        gpu: &hrx::Gpu,
+        c: &Compiler,
+        prof: &mut Profile,
+        clip: Clip<'_>,
+    ) -> Result<(Vec<f32>, usize)> {
+        let (lh, lw) = clip.latent();
+        let frames = clip.frames;
+        if frames == 1 {
+            let (z, t) = self.encode_clip(gpu, c, prof, clip)?;
+            if t != 1 {
+                return other("image encode produced more than one latent frame");
+            }
+            return Ok((z, 1));
+        }
+        let chunks = frames.div_ceil(17);
+        let tl = chunks * 5;
+        let plane = clip.plane();
+        let mut all = vec![0.0f32; LATENT_CH * tl * lh * lw];
+        let mut chunk = vec![0.0f32; 17 * plane];
+        for ch in 0..chunks {
+            for f in 0..17 {
+                // the tail repeats the last frame rather than padding with black
+                let src = (ch * 17 + f).min(frames - 1) * plane;
+                chunk[f * plane..(f + 1) * plane].copy_from_slice(&clip.pixels[src..src + plane]);
+            }
+            let (z, t) = self.encode_clip(
+                gpu,
+                c,
+                prof,
+                Clip {
+                    pixels: &chunk,
+                    frames: 17,
+                    ..clip
+                },
+            )?;
+            if t != 5 {
+                return other("a 17-frame chunk must give 5 latent frames");
+            }
+            for cc in 0..LATENT_CH {
+                for t in 0..5 {
+                    let dst = ((cc * tl + ch * 5 + t) * lh) * lw;
+                    let src = ((cc * 5 + t) * lh) * lw;
+                    all[dst..dst + lh * lw].copy_from_slice(&z[src..src + lh * lw]);
+                }
+            }
+        }
+        let latent_t = tl - VAE_TOKEN_DROP;
+        let mut out = vec![0.0f32; LATENT_CH * latent_t * lh * lw];
+        for cc in 0..LATENT_CH {
+            for t in 0..latent_t {
+                let dst = ((cc * latent_t + t) * lh) * lw;
+                let src = ((cc * tl + t) * lh) * lw;
+                out[dst..dst + lh * lw].copy_from_slice(&all[src..src + lh * lw]);
+            }
+        }
+        Ok((out, latent_t))
     }
 }
 

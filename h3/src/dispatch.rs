@@ -321,6 +321,227 @@ impl Gemm {
     }
 }
 
+/// A causal 3-D convolution as an implicit GEMM over channels-last f16.
+///
+/// The VAE encoder's whole stack is these: the taps are folded into the K dimension, so a 3x3x3
+/// convolution over 128 channels is a GEMM with K = 27*128 rounded up to a multiple of 32. The `add`
+/// form takes a residual as a fifth binding, which is how a ResNet block's second convolution and its
+/// skip are one dispatch.
+pub struct Conv3d {
+    kernel: Arc<hrx::Kernel>,
+    cout_pad: usize,
+    /// the output extents, which the caller needs to drive the next layer
+    pub tout: usize,
+    pub ho: usize,
+    pub wo: usize,
+}
+
+impl Conv3d {
+    #[allow(clippy::too_many_arguments)]
+    pub fn build(
+        c: &Compiler,
+        gpu: &hrx::Gpu,
+        add: bool,
+        frames: usize,
+        h: usize,
+        w: usize,
+        stride: usize,
+        tstride: usize,
+        taps_t: usize,
+        cin_pad: usize,
+        cin_stride: usize,
+        k_size: usize,
+        cout_pad: usize,
+    ) -> Result<Self> {
+        let stem = if add {
+            "conv3d_f16_wmma_add"
+        } else {
+            "conv3d_f16_wmma"
+        };
+        let ns = format!("h3.{stem}.");
+        let rows_bound = (frames * h * w).div_ceil(64) * 64;
+        let cfg: Cfg = vec![
+            (format!("{ns}frames"), frames.to_string()),
+            (format!("{ns}height"), h.to_string()),
+            (format!("{ns}width"), w.to_string()),
+            (format!("{ns}stride"), stride.to_string()),
+            (format!("{ns}tstride"), tstride.to_string()),
+            (format!("{ns}taps_t"), taps_t.to_string()),
+            (format!("{ns}cin_pad"), cin_pad.to_string()),
+            (format!("{ns}cin_stride"), cin_stride.to_string()),
+            (format!("{ns}rows_bound"), rows_bound.to_string()),
+            (format!("{ns}k_size"), k_size.to_string()),
+            (format!("{ns}n_size"), cout_pad.to_string()),
+        ];
+        Ok(Self {
+            kernel: c.get(gpu, stem, &format!("h3_{stem}"), &cfg)?,
+            cout_pad,
+            tout: (frames - 1) / tstride + 1,
+            ho: h / stride,
+            wo: w / stride,
+        })
+    }
+
+    /// Output rows, which is the next layer's `frames * h * w`.
+    pub fn rows(&self) -> usize {
+        self.tout * self.ho * self.wo
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        gpu: &hrx::Gpu,
+        profile: Option<&mut Profile>,
+        stage: &str,
+        a: BufferRef,
+        w: BufferRef,
+        b: BufferRef,
+        out: BufferRef,
+        residual: Option<BufferRef>,
+    ) -> Result<()> {
+        let m = self.rows();
+        let mut bindings = vec![a, w, b, out];
+        bindings.extend(residual);
+        launch(
+            gpu,
+            &self.kernel,
+            profile,
+            stage,
+            [(self.cout_pad / 64) as u32, m.div_ceil(64) as u32, 1],
+            [256, 1, 1],
+            &[m as u32],
+            &bindings,
+        )
+    }
+}
+
+/// GroupNorm over 32 groups followed by SiLU, in two dispatches: the statistics, then the scaling.
+///
+/// The split is not an optimisation detail — the statistics are over a whole (frame, group) plane, so
+/// they have to land before any element is scaled.
+pub struct GroupNormSilu {
+    stats: Arc<hrx::Kernel>,
+    silu: Arc<hrx::Kernel>,
+    frames: usize,
+    rows: usize,
+    channels: usize,
+}
+
+impl GroupNormSilu {
+    pub fn build(
+        c: &Compiler,
+        gpu: &hrx::Gpu,
+        frames: usize,
+        h: usize,
+        w: usize,
+        channels: usize,
+    ) -> Result<Self> {
+        let plane = h * w;
+        let rows = frames * plane;
+        let rows_bound = rows.div_ceil(64) * 64;
+        let (ns, na) = ("h3.gn_stats_f16.", "h3.gn_silu_f16.");
+        let stats_cfg: Cfg = vec![
+            (format!("{ns}channels"), channels.to_string()),
+            (format!("{ns}groups"), "32".into()),
+            (format!("{ns}plane"), plane.to_string()),
+            (format!("{ns}rows_bound"), rows_bound.to_string()),
+        ];
+        let silu_cfg: Cfg = vec![
+            (format!("{na}channels"), channels.to_string()),
+            (format!("{na}groups"), "32".into()),
+            (format!("{na}plane"), plane.to_string()),
+            (format!("{na}rows_bound"), rows_bound.to_string()),
+            (format!("{na}eps"), num(1e-6)),
+        ];
+        Ok(Self {
+            stats: c.get(gpu, "gn_stats_f16", "h3_gn_stats_f16", &stats_cfg)?,
+            silu: c.get(gpu, "gn_silu_f16", "h3_gn_silu_f16", &silu_cfg)?,
+            frames,
+            rows,
+            channels,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        gpu: &hrx::Gpu,
+        mut profile: Option<&mut Profile>,
+        stage: &str,
+        x: BufferRef,
+        gamma: BufferRef,
+        beta: BufferRef,
+        stats: BufferRef,
+        out: BufferRef,
+    ) -> Result<()> {
+        launch(
+            gpu,
+            &self.stats,
+            profile.as_deref_mut(),
+            stage,
+            [self.frames as u32, 32, 1],
+            [32, 1, 1],
+            &[self.frames as u32],
+            &[x, stats],
+        )?;
+        launch(
+            gpu,
+            &self.silu,
+            profile,
+            stage,
+            [(self.rows * self.channels).div_ceil(256) as u32, 1, 1],
+            [256, 1, 1],
+            &[self.frames as u32],
+            &[x, stats, gamma, beta, out],
+        )
+    }
+}
+
+/// A biased f16 matmul with f16 in and out: the encoder's 1x1 shortcuts and its posterior head.
+pub struct Matmul {
+    kernel: Arc<hrx::Kernel>,
+    n_size: usize,
+}
+
+impl Matmul {
+    pub fn build(c: &Compiler, gpu: &hrx::Gpu, k_size: usize, n_size: usize) -> Result<Self> {
+        let stem = "matmul_bias_f16_wmma_af16_cf16";
+        let ns = format!("h3.{stem}.");
+        let cfg: Cfg = vec![
+            (format!("{ns}k_size"), k_size.to_string()),
+            (format!("{ns}n_size"), n_size.to_string()),
+        ];
+        Ok(Self {
+            kernel: c.get(gpu, stem, &format!("h3_{stem}"), &cfg)?,
+            n_size,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        gpu: &hrx::Gpu,
+        profile: Option<&mut Profile>,
+        stage: &str,
+        rows: usize,
+        a: BufferRef,
+        w: BufferRef,
+        b: BufferRef,
+        out: BufferRef,
+    ) -> Result<()> {
+        launch(
+            gpu,
+            &self.kernel,
+            profile,
+            stage,
+            [(self.n_size / 64) as u32, rows.div_ceil(64) as u32, 1],
+            [256, 1, 1],
+            &[rows as u32],
+            &[a, w, b, out],
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

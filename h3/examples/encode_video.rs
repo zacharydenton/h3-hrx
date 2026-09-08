@@ -1,0 +1,61 @@
+//! Encodes pixels to model-space video latents with the Rust encoder.
+//!
+//!   encode_video <video_vae.safetensors> <pixels.f32> <out.f32> <frames> <height> <width>
+//!
+//! Pixels are `[frames][H][W][3]` f32 in `[0, 1]`; the output is `[24][latent_t][H/16][W/16]` f32, the
+//! same array `h3pipe_encode_video` writes. The companion script runs the C on the same pixels.
+use h3::compile::Compiler;
+use h3::dispatch::Profile;
+use h3::vvae::{Clip, VideoVae};
+use std::io::Write;
+
+fn main() {
+    let a: Vec<String> = std::env::args().skip(1).collect();
+    let (frames, height, width): (usize, usize, usize) = (
+        a[3].parse().unwrap(),
+        a[4].parse().unwrap(),
+        a[5].parse().unwrap(),
+    );
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let exe = std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into());
+    let gpu = hrx::Gpu::open().expect("gpu");
+    let compiler = Compiler::new(exe, root.join("kernels"), root.join("build/kernel_cache"));
+    let mut vae = VideoVae::open(&gpu, &a[0]).expect("video VAE checkpoint");
+
+    let bytes = std::fs::read(&a[1]).expect("pixels");
+    let pixels: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(
+        pixels.len(),
+        frames * height * width * 3,
+        "wrong pixel count"
+    );
+
+    let mut prof = Profile::from_env();
+    let start = std::time::Instant::now();
+    let (z, t) = vae
+        .encode_video(
+            &gpu,
+            &compiler,
+            &mut prof,
+            Clip {
+                pixels: &pixels,
+                frames,
+                height,
+                width,
+            },
+        )
+        .expect("encode");
+    eprintln!(
+        "encoded {frames} frames at {height}x{width} to {t} latent frames in {:.2}s",
+        start.elapsed().as_secs_f64()
+    );
+    let mut f = std::io::BufWriter::new(std::fs::File::create(&a[2]).expect("output"));
+    for v in &z {
+        f.write_all(&v.to_le_bytes()).unwrap();
+    }
+    f.flush().unwrap();
+}
