@@ -354,7 +354,7 @@ struct Compiler {
     // One kernel per (stem, source text, symbol, backend, target, config, compiler binary): the cache file name carries a hash
     // of all of them, so neither an edited kernel source nor a replaced loom-compile ever reuses a stale binary
     // (tools/kernel_cache.py keeps the same policy for the Python harnesses).
-    static uint64_t fnv(const std::string &text, uint64_t h = 1469598103934665603ull) { for (unsigned char c : text) { h ^= c; h *= 1099511628211ull; } return h; }
+    static uint64_t fnv(const std::string &text, uint64_t h = 14695981039346656037ull) { for (unsigned char c : text) { h ^= c; h *= 1099511628211ull; } return h; }
     static std::string hex(uint64_t h, size_t digits) { char buf[17]; snprintf(buf, sizeof buf, "%016llx", (unsigned long long)h); return std::string(buf, digits); }
     static std::string source_hash(const std::string &path) {
         std::ifstream f(path, std::ios::binary); if (!f) throw std::runtime_error("missing kernel source " + path);

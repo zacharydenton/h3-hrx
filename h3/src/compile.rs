@@ -83,10 +83,9 @@ fn trim(s: &str) -> String {
     t.strip_suffix('.').unwrap_or(t).to_string()
 }
 
-/// FNV-1a 64 as the C implementation has it. The offset basis below is one digit short of the
-/// canonical 14695981039346656037; it is kept because every cache tag on disk was computed with it.
+/// FNV-1a 64, with the canonical offset basis and prime.
 fn fnv(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 1469598103934665603;
+    let mut h: u64 = 14695981039346656037;
     for b in bytes {
         h ^= u64::from(*b);
         h = h.wrapping_mul(1099511628211);
@@ -306,18 +305,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fnv_matches_the_c_implementation_basis_and_all() {
-        // Note the offset basis is 1469598103934665603, not FNV-1a 64's canonical
-        // 14695981039346656037 — a digit went missing in the C source. It is kept exactly, because
-        // every cache tag on disk was computed with it; "fixing" it would orphan the whole cache.
-        // These are printf("%016llx") of the C function on the same inputs.
-        assert_eq!(format!("{:016x}", fnv(b"")), "14650fb0739d0383");
-        assert_eq!(format!("{:016x}", fnv(b"a")), "44bd8ad473cd9906");
-        assert_eq!(format!("{:016x}", fnv(b"foobar")), "88fad7c0a8ff07f2");
-        assert_eq!(
-            format!("{:016x}", fnv(b"amdgpu-hal\ngfx1151\n")),
-            "57bdb1be4ae3dabc"
-        );
+    fn fnv_is_the_standard_one() {
+        // The published FNV-1a 64 vectors. The C source had 1469598103934665603 as its offset basis,
+        // one digit short of the canonical 14695981039346656037; both implementations now use the real
+        // constant, which orphaned every cache entry built before the fix.
+        assert_eq!(fnv(b""), 0xcbf29ce484222325);
+        assert_eq!(fnv(b"a"), 0xaf63dc4c8601ec8c);
+        assert_eq!(fnv(b"foobar"), 0x85944171f73967e8);
     }
 
     #[test]

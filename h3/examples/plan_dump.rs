@@ -31,6 +31,5 @@ fn main() {
         let bytes = recipe.assemble(&ck).expect("assemble");
         let (sum, weighted) = digest(&bytes);
         println!("{name}\t{}\t{sum}\t{weighted}", bytes.len());
-        ck.done_with(&[]); // recipes hold no borrow; pages are released by the reader itself
     }
 }
