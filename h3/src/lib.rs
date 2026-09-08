@@ -2,6 +2,7 @@
 pub mod checkpoint;
 pub mod compile;
 pub mod dispatch;
+pub mod layout;
 pub mod model;
 pub mod models;
 pub mod plan;
