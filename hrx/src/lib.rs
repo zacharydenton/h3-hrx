@@ -114,13 +114,32 @@ impl Gpu {
 
     /// The synchronous transfers bypass the stream's pending commands, so the stream is drained first.
     pub fn h2d(&self, dst: &Buffer, src: &[u8]) -> Result<()> {
+        self.h2d_at(dst, 0, src)
+    }
+
+    /// As [`Gpu::h2d`], writing at an offset: a large weight is uploaded in chunks so the host never
+    /// stages more than one chunk of it.
+    pub fn h2d_at(&self, dst: &Buffer, offset: usize, src: &[u8]) -> Result<()> {
         if src.is_empty() {
             return Ok(());
+        }
+        if offset + src.len() > dst.bytes {
+            return Err(Error(format!(
+                "upload of {} bytes at {offset} overruns a {}-byte allocation",
+                src.len(),
+                dst.bytes
+            )));
         }
         self.sync()?;
         unsafe {
             check(
-                sys::hrx_synchronous_h2d(self.device, src.as_ptr() as *const c_void, dst.raw, 0, src.len()),
+                sys::hrx_synchronous_h2d(
+                    self.device,
+                    src.as_ptr() as *const c_void,
+                    dst.raw,
+                    offset,
+                    src.len(),
+                ),
                 "hrx_synchronous_h2d",
             )
         }
@@ -129,6 +148,13 @@ impl Gpu {
     pub fn d2h(&self, src: &Buffer, dst: &mut [u8]) -> Result<()> {
         if dst.is_empty() {
             return Ok(());
+        }
+        if dst.len() > src.bytes {
+            return Err(Error(format!(
+                "read of {} bytes from a {}-byte allocation",
+                dst.len(),
+                src.bytes
+            )));
         }
         self.sync()?;
         unsafe {
@@ -268,6 +294,14 @@ impl Buffer {
     }
     pub fn binding(&self) -> sys::BufferRef {
         sys::BufferRef { buffer: self.raw, offset: 0, length: self.bytes }
+    }
+
+    /// A binding into part of the allocation. The pipeline hands kernels views at row offsets, which
+    /// the C did with pointer arithmetic; a device buffer here has no host-visible address, so the
+    /// offset travels in the binding instead.
+    pub fn slice(&self, offset: usize, length: usize) -> sys::BufferRef {
+        assert!(offset + length <= self.bytes, "slice past the allocation");
+        sys::BufferRef { buffer: self.raw, offset, length }
     }
 }
 

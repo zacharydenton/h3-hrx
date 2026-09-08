@@ -9,7 +9,9 @@
 use crate::checkpoint::{Checkpoint, Entry};
 use half::{bf16, f16};
 use safetensors::tensor::Dtype;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -19,6 +21,8 @@ pub enum Error {
     NoRecipe(String),
     #[error("{0}")]
     Layout(String),
+    #[error("{0}")]
+    Device(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -110,11 +114,17 @@ impl Recipe {
     }
 }
 
-/// One checkpoint and the recipe table a plan built over it.
+/// One checkpoint, the recipe table a plan built over it, and whatever has reached the device.
 pub struct Weights {
     file: Checkpoint,
     recipes: BTreeMap<String, Recipe>,
+    /// Uploaded on first use and kept for the session. Not a lock: a session runs on one thread.
+    uploaded: RefCell<BTreeMap<String, Rc<hrx::Buffer>>>,
 }
+
+/// Bytes staged per transfer. Large enough that the per-call overhead disappears, small enough that a
+/// 27 GB tensor never needs a host copy of itself.
+const CHUNK: usize = 16 << 20;
 
 impl Weights {
     /// Maps the file and builds its recipe table. The plan validates every source tensor's dtype and
@@ -126,7 +136,11 @@ impl Weights {
         let file = Checkpoint::open(path)?;
         let mut recipes = BTreeMap::new();
         plan(&file, &mut recipes)?;
-        Ok(Self { file, recipes })
+        Ok(Self {
+            file,
+            recipes,
+            uploaded: RefCell::new(BTreeMap::new()),
+        })
     }
 
     pub fn file(&self) -> &Checkpoint {
@@ -147,6 +161,144 @@ impl Weights {
 
     pub fn assemble(&self, name: &str) -> Result<Vec<u8>> {
         self.recipe(name)?.assemble(&self.file)
+    }
+
+    /// The tensor on the device, uploaded on first use and memoised.
+    ///
+    /// `expect_bytes` is what the caller has sized its kernel arguments for; a recipe that does not
+    /// match is a wiring error and fails here rather than reading past an allocation later.
+    ///
+    /// Rows that are one straight run of the mapping at their own pitch go up chunk by chunk with no
+    /// host copy at all. Anything gathered at a wider pitch is staged a chunk at a time, so the pad
+    /// between rows stays zero. Either way the file's pages are released once their bytes are on the
+    /// device: a tensor is read once, and tens of gigabytes of resident checkpoint would compete with
+    /// the device allocations for the same memory on this part.
+    pub fn at(&self, gpu: &hrx::Gpu, name: &str, expect_bytes: usize) -> Result<Rc<hrx::Buffer>> {
+        if let Some(buffer) = self.uploaded.borrow().get(name) {
+            return Ok(buffer.clone());
+        }
+        let recipe = self.recipe(name)?;
+        if recipe.device_bytes() != expect_bytes {
+            return layout(format!(
+                "tensor {name} is {} bytes on the device, expected {expect_bytes}",
+                recipe.device_bytes()
+            ));
+        }
+        let buffer = Rc::new(
+            gpu.alloc(expect_bytes.max(1))
+                .map_err(|e| Error::Device(e.to_string()))?,
+        );
+        self.fill(gpu, recipe, &buffer)?;
+        self.uploaded
+            .borrow_mut()
+            .insert(name.to_string(), buffer.clone());
+        Ok(buffer)
+    }
+
+    /// As [`Weights::at`], additionally checking the shape the kernel will read it with.
+    pub fn rows(
+        &self,
+        gpu: &hrx::Gpu,
+        name: &str,
+        rows: usize,
+        row_bytes: usize,
+        pitch_bytes: usize,
+    ) -> Result<Rc<hrx::Buffer>> {
+        match self.recipe(name)? {
+            Recipe::Rows {
+                rows: r,
+                row_bytes: rb,
+                pitch_bytes: pb,
+                ..
+            } if *r == rows && *rb == row_bytes && *pb == pitch_bytes => {}
+            _ => {
+                return layout(format!(
+                    "tensor {name} is not {rows} rows of {row_bytes} bytes at pitch {pitch_bytes}"
+                ))
+            }
+        }
+        self.at(gpu, name, rows * pitch_bytes)
+    }
+
+    fn fill(&self, gpu: &hrx::Gpu, recipe: &Recipe, buffer: &hrx::Buffer) -> Result<()> {
+        let device = |e: hrx::Error| Error::Device(e.to_string());
+        match recipe {
+            Recipe::Built { .. } => {
+                let bytes = recipe.assemble(&self.file)?;
+                gpu.h2d(buffer, &bytes).map_err(device)?;
+            }
+            Recipe::Rows {
+                rows,
+                row_bytes,
+                pitch_bytes,
+                segments,
+            } => {
+                if segments.len() == 1 && pitch_bytes == row_bytes {
+                    // one straight run: the mapping is the staging buffer
+                    let segment = &segments[0];
+                    let entry = self.file.at(&segment.tensor)?;
+                    let all = self.file.bytes(entry);
+                    let from = segment.row0 * row_bytes;
+                    let span = &all[from..from + segment.rows * row_bytes];
+                    self.file.will_need(span);
+                    for (i, chunk) in span.chunks(CHUNK).enumerate() {
+                        gpu.h2d_at(buffer, i * CHUNK, chunk).map_err(device)?;
+                    }
+                } else {
+                    // gathered at the pitch, through a zeroed staging buffer so the pad stays zero
+                    let per = (CHUNK / (*pitch_bytes).max(1)).max(1);
+                    let mut stage = vec![0u8; per * pitch_bytes];
+                    let (mut staged, mut written) = (0usize, 0usize);
+                    for segment in segments {
+                        let entry = self.file.at(&segment.tensor)?;
+                        let all = self.file.bytes(entry);
+                        let from = segment.row0 * row_bytes;
+                        self.file
+                            .will_need(&all[from..from + segment.rows * row_bytes]);
+                        for i in 0..segment.rows {
+                            let src = from + i * row_bytes;
+                            let dst = staged * pitch_bytes;
+                            stage[dst..dst + row_bytes].copy_from_slice(&all[src..src + row_bytes]);
+                            staged += 1;
+                            if staged == per {
+                                gpu.h2d_at(
+                                    buffer,
+                                    written * pitch_bytes,
+                                    &stage[..staged * pitch_bytes],
+                                )
+                                .map_err(device)?;
+                                written += staged;
+                                staged = 0;
+                                stage.fill(0);
+                            }
+                        }
+                    }
+                    if staged > 0 {
+                        gpu.h2d_at(
+                            buffer,
+                            written * pitch_bytes,
+                            &stage[..staged * pitch_bytes],
+                        )
+                        .map_err(device)?;
+                        written += staged;
+                    }
+                    if written != *rows {
+                        return layout(format!(
+                            "a recipe's segments add up to {written} rows, not {rows}"
+                        ));
+                    }
+                }
+                // the bytes are on the device; the file's pages are not needed again
+                for segment in segments {
+                    let entry = self.file.at(&segment.tensor)?;
+                    let all = self.file.bytes(entry);
+                    let from = segment.row0 * row_bytes;
+                    self.file
+                        .done_with(&all[from..from + segment.rows * row_bytes]);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// A recipe's bytes as f32, for the tables the host itself reads.
