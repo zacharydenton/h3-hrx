@@ -4,6 +4,10 @@ Every decision and every measurement, won or lost, in order. The sibling repos'
 conventions apply: ship only the measured-best configuration; losing variants go to
 `experiments/` with their number here.
 
+Several of the measurement scripts named below — the `ab_*`, `ablate_*` and `*_study`
+tools — were removed once the questions they were written for were settled. The numbers
+they produced are here; the scripts are in the history.
+
 ## Day 0: what the model is (2026-09-05)
 
 MiniMax H3 (Hailuo 3.0), open weights since 2026-08-03 (`MiniMaxAI/MiniMax-H3`,
