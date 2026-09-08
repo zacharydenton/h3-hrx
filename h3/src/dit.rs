@@ -7,9 +7,10 @@
 //! text encoder: the encoder produces 5120-wide rows, and it is the DiT that projects them to 5376 and
 //! refines them in place at the front of its own sequence.
 use crate::compile::{Cfg, Compiler};
-use crate::dispatch::{launch, Matmul16, Profile};
-use crate::error::Result;
+use crate::dispatch::{axpy, launch, Matmul16, Profile};
+use crate::error::{invalid, Result};
 use crate::model::*;
+use crate::rope::VisionSpan;
 use crate::stack::{Constants, Stack, StackDims};
 use crate::te::{Span, TextEncoder};
 use crate::weights::Weights;
@@ -46,7 +47,6 @@ pub fn seq_capacity(seq: usize) -> usize {
 /// Several of these are written only by the denoise loop; they are allocated together because they are
 /// all functions of the same capacity and reallocating them apart would be a way to get them out of
 /// step.
-#[allow(dead_code)]
 struct Seq {
     capacity: usize,
     x: hrx::Buffer,
@@ -76,6 +76,9 @@ pub struct Dit {
     constants: Constants,
     seq: Option<Seq>,
     refiner: Option<Refiner>,
+    cond: Option<Conditioning>,
+    blocks: Option<Blocks>,
+    cache: Option<CacheBuffers>,
 }
 
 impl Dit {
@@ -85,6 +88,9 @@ impl Dit {
             constants: Constants::new(gpu)?,
             seq: None,
             refiner: None,
+            cond: None,
+            blocks: None,
+            cache: None,
         })
     }
 
@@ -239,6 +245,830 @@ impl Dit {
         )?;
         Ok(())
     }
+}
+
+/// What a run asks for. The shifts and the sampler are the schedule's, the threshold the step cache's.
+#[derive(Clone, Copy, Debug)]
+pub struct DenoiseParams {
+    pub height: i32,
+    pub width: i32,
+    pub frames: i32,
+    pub steps: usize,
+    pub seed: u64,
+    /// 0 Euler, 1 res_multistep
+    pub sampler: i32,
+    pub video_shift: f64,
+    pub audio_shift: f64,
+    pub cache_threshold: f32,
+    /// the QK operands' width: 16, 8 or 4
+    pub attn_qk_bits: usize,
+}
+
+impl Default for DenoiseParams {
+    fn default() -> Self {
+        Self {
+            height: 480,
+            width: 864,
+            frames: 90,
+            steps: 30,
+            seed: 0,
+            sampler: 1,
+            video_shift: 12.0,
+            audio_shift: 3.0,
+            cache_threshold: 0.0,
+            attn_qk_bits: 8,
+        }
+    }
+}
+
+/// Explicit noise, so a run can be reproduced without depending on the generator.
+#[derive(Clone, Copy, Default)]
+pub struct Noise<'a> {
+    pub video: Option<&'a [f32]>,
+    pub audio: Option<&'a [f32]>,
+}
+
+/// The host-side conditioning tables, read once from the checkpoint.
+struct Conditioning {
+    curve: Vec<f32>,
+    inv_freq: Vec<f32>,
+    adaln_w: Vec<Vec<f32>>,
+    adaln_b: Vec<Vec<f32>>,
+    final_w: Vec<f32>,
+    final_b: Vec<f32>,
+    mods: hrx::Buffer,
+    final_table: hrx::Buffer,
+}
+
+/// The 50-block stack and the buffers that depend on the sequence length.
+struct Blocks {
+    stack: Stack,
+    tokens: usize,
+    qk_bits: usize,
+    final_norm: std::sync::Arc<hrx::Kernel>,
+    /// the text rows, kept so they can be restored each step
+    text_copy: hrx::Buffer,
+}
+
+/// The step cache's device side.
+struct CacheBuffers {
+    n: usize,
+    xb0: hrx::Buffer,
+    prev: hrx::Buffer,
+    resid: hrx::Buffer,
+    partials: hrx::Buffer,
+    metric: std::sync::Arc<hrx::Kernel>,
+}
+
+/// A reference the pack conditions on, in presentation order.
+pub struct RefInput<'a> {
+    /// 0 image, 1 audio, 2 video
+    pub kind: i32,
+    pub video_latent: Option<&'a [f32]>,
+    pub latent_t: i32,
+    pub lat_h: i32,
+    pub lat_w: i32,
+    pub audio_latent: Option<&'a [f32]>,
+    pub audio_t: i32,
+    /// pixels for the vision tower, when this reference is also presented to the text encoder
+    pub pixels: Option<&'a [f32]>,
+    pub height: i32,
+    pub width: i32,
+}
+
+/// A keyframe: one latent frame pinned at a frame index, optionally with audio and pixels.
+pub struct KeyframeInput<'a> {
+    pub frame_index: i32,
+    pub video_latent: &'a [f32],
+    pub audio_latent: Option<&'a [f32]>,
+    pub audio_t: i32,
+    pub pixels: Option<&'a [f32]>,
+    pub height: i32,
+    pub width: i32,
+}
+
+/// What a run produces.
+pub struct Latents {
+    /// `[24][latent_t][lat_h][lat_w]`
+    pub video: Vec<f32>,
+    /// `[2][32][audio_t]`
+    pub audio: Vec<f32>,
+}
+
+impl Dit {
+    /// The host-side conditioning tables and the two device tables they fill each step.
+    fn ensure_conditioning(&mut self, gpu: &hrx::Gpu) -> Result<()> {
+        if self.cond.is_some() {
+            return Ok(());
+        }
+        let w = &self.weights;
+        let mut adaln_w = Vec::with_capacity(BLOCKS);
+        let mut adaln_b = Vec::with_capacity(BLOCKS);
+        for i in 0..BLOCKS {
+            adaln_w.push(w.host_f32(&format!("h3.blocks.{i}.adaln.w"), MODALITIES * 6 * HID * 8)?);
+            adaln_b.push(w.host_f32(&format!("h3.blocks.{i}.adaln.b"), MODALITIES * 6 * HID)?);
+        }
+        self.cond = Some(Conditioning {
+            curve: w.host_f32("h3.adaln_t_table", 1025 * 8)?,
+            inv_freq: w.host_f32("h3.rope_inv_freq", 16)?,
+            adaln_w,
+            adaln_b,
+            final_w: w.host_f32("h3.final.adaln.w", 2 * HID * 8)?,
+            final_b: w.host_f32("h3.final.adaln.b", 2 * HID)?,
+            mods: gpu.alloc(BLOCKS * MODS_ROWS * HID * 4)?,
+            final_table: gpu.alloc(4 * HID * 4)?,
+        });
+        Ok(())
+    }
+
+    /// The 50 blocks and the final layer's norm, for one sequence length.
+    fn ensure_blocks(
+        &mut self,
+        gpu: &hrx::Gpu,
+        c: &Compiler,
+        tokens: usize,
+        qk_bits: usize,
+    ) -> Result<()> {
+        if self
+            .blocks
+            .as_ref()
+            .is_some_and(|b| b.tokens == tokens && b.qk_bits == qk_bits)
+        {
+            return Ok(());
+        }
+        self.blocks = None;
+        let mut d = StackDims {
+            hidden: HID,
+            heads: HEADS,
+            kv_heads: HEADS,
+            head_dim: HEAD_DIM,
+            ffn: FFN,
+            rope_dim: ROPE_DIM,
+            classes: CLASSES,
+            wbits: 8,
+            eps: 1e-5,
+            bias: false,
+            gate_first: true,
+            causal: false,
+            attn_i4: qk_bits == 4,
+            attn_qk_bits: qk_bits,
+            bf16: false,
+        };
+        // H3_ATTN_QK=f16|i8|i4 overrides the configured width
+        if let Some(v) = crate::stack::env_once("H3_ATTN_QK") {
+            let bits = match v {
+                "f16" => 16,
+                "i8" => 8,
+                _ => 4,
+            };
+            d.attn_qk_bits = bits;
+            d.attn_i4 = bits == 4;
+        }
+        let qk = d.attn_qk_bits;
+        let stack = Stack::new(
+            c,
+            gpu,
+            d,
+            tokens,
+            BLOCKS,
+            &self.weights,
+            |i| format!("blocks.{i}."),
+            true,
+            self.constants.ones.clone(),
+            "dit",
+        )?;
+        let ns = "h3.norm_mod_f32.";
+        let lanes = lanes_for(HID).expect("a lane count for the hidden width");
+        let cfg: Cfg = vec![
+            (format!("{ns}width"), HID.to_string()),
+            (format!("{ns}lanes"), lanes.to_string()),
+            (format!("{ns}eps"), crate::compile::num(1e-5)),
+            // the final head has only the video and audio timestep classes
+            (format!("{ns}classes"), "2".into()),
+        ];
+        self.blocks = Some(Blocks {
+            stack,
+            tokens,
+            qk_bits: qk,
+            final_norm: c.get(gpu, "norm_mod_f32", "h3_norm_mod_f32", &cfg)?,
+            text_copy: gpu.alloc(seq_capacity(tokens) * HID * 4)?,
+        });
+        Ok(())
+    }
+
+    /// The two modulation tables for one step's four timestep embeddings.
+    fn upload_mods(
+        &self,
+        gpu: &hrx::Gpu,
+        te: (&[f32; 8], &[f32; 8], &[f32; 8], &[f32; 8]),
+    ) -> Result<()> {
+        let cond = self.cond.as_ref().expect("conditioning is ready");
+        let (tv, ta, tcv, tca) = te;
+        let table = crate::conditioning::mods_table(&cond.adaln_w, &cond.adaln_b, tv, ta, tcv, tca);
+        gpu.h2d(&cond.mods, crate::vvae::as_bytes(&table))?;
+        let ft = crate::conditioning::final_table(&cond.final_w, &cond.final_b, tv, ta);
+        gpu.h2d(&cond.final_table, crate::vvae::as_bytes(&ft))?;
+        Ok(())
+    }
+
+    /// One layer's slice of the modulation table, in the row order the kernels index by class.
+    fn layer_cond(&self, i: usize) -> crate::stack::LayerCond {
+        let mods = &self.cond.as_ref().expect("conditioning is ready").mods;
+        let row = |r: usize| mods.slice((i * MODS_ROWS + r) * HID * 4, (MODS_ROWS - r) * HID * 4);
+        crate::stack::LayerCond {
+            table_msa: row(0),
+            gate_msa: row(2 * CLASSES),
+            table_mlp: row(3 * CLASSES),
+            gate_mlp: row(5 * CLASSES),
+        }
+    }
+
+    /// `x` rows `[row0, row0 + rows)` from the f32 patch projection the checkpoint stores.
+    #[allow(clippy::too_many_arguments)]
+    fn embed_f32(
+        &self,
+        gpu: &hrx::Gpu,
+        c: &Compiler,
+        prof: &mut Profile,
+        stage: &str,
+        row0: usize,
+        rows: usize,
+        k: usize,
+        name: &str,
+    ) -> Result<()> {
+        let seq = self.seq.as_ref().expect("a sequence has been sized");
+        Ok(crate::dispatch::MatmulF32::build(c, gpu, k, HID)?.run(
+            gpu,
+            Some(prof),
+            stage,
+            rows,
+            seq.in32.binding(),
+            self.weights
+                .at(gpu, &format!("{name}.w"), HID * k * 4)?
+                .binding(),
+            self.weights
+                .at(gpu, &format!("{name}.b"), HID * 4)?
+                .binding(),
+            seq.x.slice(row0 * HID * 4, rows * HID * 4),
+        )?)
+    }
+
+    /// The whole denoising run: prompt in, model-space latents out.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise(
+        &mut self,
+        gpu: &hrx::Gpu,
+        c: &Compiler,
+        prof: &mut Profile,
+        te: &mut TextEncoder,
+        ids: &[i32],
+        p: &DenoiseParams,
+        noise: Noise<'_>,
+        refs: &[RefInput<'_>],
+        kfs: &[KeyframeInput<'_>],
+        mut progress: Option<&mut dyn FnMut(usize, usize) -> bool>,
+    ) -> Result<Latents> {
+        let sh = crate::layout::shape_for(p.height, p.width, p.frames)
+            .ok_or_else(|| crate::error::Error::Invalid("no such shape".into()))?;
+        if !(2..=1000).contains(&p.steps) {
+            return invalid("steps must be 2..1000");
+        }
+        self.ensure_conditioning(gpu)?;
+
+        let n = ids.len();
+        let lay_refs: Vec<crate::layout::Ref> = refs
+            .iter()
+            .map(|r| crate::layout::Ref {
+                kind: r.kind,
+                latent_t: r.latent_t,
+                lat_h: r.lat_h,
+                lat_w: r.lat_w,
+                audio_t: r.audio_t,
+                has_audio: r.audio_latent.is_some(),
+            })
+            .collect();
+        let lay_kfs: Vec<crate::layout::Keyframe> = kfs
+            .iter()
+            .map(|k| crate::layout::Keyframe {
+                frame_index: k.frame_index,
+                audio_t: k.audio_t,
+                has_audio: k.audio_latent.is_some(),
+            })
+            .collect();
+        let mut lay = crate::layout::Layout::new(
+            n,
+            sh.latent_t as usize,
+            sh.lat_h as usize,
+            sh.lat_w as usize,
+            sh.audio_t as usize,
+            &lay_refs,
+            &lay_kfs,
+        )
+        .map_err(crate::error::Error::Invalid)?;
+
+        let (l, rr) = (n, lay.ref_rows);
+        let lr = l + rr;
+        let (na, nv, s) = (lay.audio_rows, lay.video_rows, lay.seq_len);
+        self.ensure_seq(gpu, s)?;
+
+        // the images this prompt presents, through the tower, in the order of the placeholder runs
+        let embeddings = self.vision_for(gpu, c, prof, te, ids, refs, kfs)?;
+        let spans: Vec<crate::te::Span<'_>> = embeddings
+            .iter()
+            .map(|(at, e)| crate::te::Span {
+                at: *at,
+                merged: &e.merged,
+                deepstack: &e.deepstack,
+            })
+            .collect();
+        for sp in &spans {
+            lay.mark_vision(sp.at.start, sp.at.count)
+                .map_err(crate::error::Error::Invalid)?;
+        }
+        self.text_in(gpu, c, prof, te, ids, &spans)?;
+
+        // the packed layout's per-row tables
+        {
+            let seq = self.seq.as_ref().expect("sized above");
+            gpu.h2d_at(&seq.cls, 0, as_i32_bytes(&lay.adaln_rows))?;
+            gpu.h2d_at(&seq.tcls, 0, as_i32_bytes(&lay.tclass))?;
+            let inv = &self.cond.as_ref().expect("ready").inv_freq;
+            let (mut cos, mut sin) = (vec![0.0f32; s * ROPE_HALF], vec![0.0f32; s * ROPE_HALF]);
+            crate::rope::dit(&lay.pos, inv, &mut cos, &mut sin);
+            gpu.h2d_at(&seq.cos, 0, crate::vvae::as_bytes(&cos))?;
+            gpu.h2d_at(&seq.sin, 0, crate::vvae::as_bytes(&sin))?;
+        }
+        self.ensure_blocks(gpu, c, s, p.attn_qk_bits)?;
+
+        // the latents, as rows
+        let generated = na + nv;
+        let (t_len, h, w, a) = (
+            sh.latent_t as usize,
+            sh.lat_h as usize,
+            sh.lat_w as usize,
+            sh.audio_t as usize,
+        );
+        let res = p.sampler == 1;
+        let (shift_v, shift_a) = (
+            if p.video_shift > 0.0 {
+                p.video_shift
+            } else {
+                12.0
+            },
+            if p.audio_shift > 0.0 {
+                p.audio_shift
+            } else {
+                3.0
+            },
+        );
+        let ascale = shift_v / shift_a;
+
+        let mut rng = crate::noise::Noise::new(p.seed);
+        let mut vrows = vec![0.0f32; nv * VIDEO_PATCH];
+        let mut arows = vec![0.0f32; na * AUDIO_CH];
+        match noise.video {
+            Some(z) => crate::sampler::tensor_to_rows(z, &mut vrows, t_len, h, w),
+            None => {
+                let mut lat = vec![0.0f32; LATENT_CH * t_len * h * w];
+                rng.fill(&mut lat);
+                crate::sampler::tensor_to_rows(&lat, &mut vrows, t_len, h, w);
+            }
+        }
+        match noise.audio {
+            Some(z) => crate::sampler::audio_tensor_to_rows(z, &mut arows, a),
+            None => rng.fill(&mut arows),
+        }
+        // carry = sigma_a / sigma_v is one at sigma_v = 1, so the carried variable starts as the noise
+        let mut yrows = if res { arows.clone() } else { Vec::new() };
+        let (mut old_v, mut old_a) = (Vec::new(), Vec::new());
+
+        let sv = crate::layout::Schedule::new(p.steps, shift_v);
+        let sa = crate::layout::Schedule::new(p.steps, shift_a);
+        if sv.timesteps.len() != sa.timesteps.len() {
+            return crate::error::other("the two schedules differ in length");
+        }
+        let mut cache = crate::cache::StepCache::new(p.cache_threshold);
+        if cache.is_some() {
+            self.ensure_cache(gpu, c, s * HID)?;
+        }
+
+        let mut in_rows = na.max(nv);
+        for sg in &lay.ref_segs {
+            in_rows = in_rows.max(sg.rows);
+        }
+        let mut in32 = vec![0.0f32; in_rows * VIDEO_PATCH];
+        let mut out32 = vec![0.0f32; generated * FINAL_N];
+        // the interpolation curve, taken once: upload_mods needs &self, so it cannot be borrowed
+        // across the call
+        let curve = self.cond.as_ref().expect("ready").curve.clone();
+
+        for step in 0..sv.timesteps.len() {
+            // the four timestep embeddings: video, audio, and the two conditioning classes, which
+            // sit at least at the augmentation timestep so a reference never reads as fully denoised
+            let tv = crate::conditioning::temb(&curve, sv.timesteps[step]);
+            let ta = crate::conditioning::temb(&curve, sa.timesteps[step]);
+            let tcv = crate::conditioning::temb(&curve, sv.timesteps[step].max(VISUAL_COND_AUG));
+            let tca = crate::conditioning::temb(&curve, sa.timesteps[step].max(1.0));
+            self.upload_mods(gpu, (&tv, &ta, &tcv, &tca))?;
+
+            // audio rows then video rows, each through its f32 patch projection
+            if res {
+                let carry = sa.sigmas[step] / sv.sigmas[step];
+                for (x, y) in arows.iter_mut().zip(&yrows) {
+                    *x = y * carry;
+                }
+            }
+            {
+                let seq = self.seq.as_ref().expect("sized above");
+                gpu.h2d_at(&seq.in32, 0, crate::vvae::as_bytes(&arows))?;
+            }
+            self.embed_f32(gpu, c, prof, "audio in", lr, na, AUDIO_CH, "h3.audio_in")?;
+            {
+                let seq = self.seq.as_ref().expect("sized above");
+                gpu.h2d_at(&seq.in32, 0, crate::vvae::as_bytes(&vrows))?;
+            }
+            self.embed_f32(
+                gpu,
+                c,
+                prof,
+                "video in",
+                lr + na,
+                nv,
+                VIDEO_PATCH,
+                "h3.video_in",
+            )?;
+
+            if step == 0 {
+                self.inject_references(gpu, c, prof, &lay, refs, kfs, p.seed, &mut in32)?;
+                let seq = self.seq.as_ref().expect("sized above");
+                let b = self.blocks.as_ref().expect("built above");
+                gpu.d2d(&b.text_copy, &seq.x, lr * HID * 4)?;
+            } else {
+                let seq = self.seq.as_ref().expect("sized above");
+                let b = self.blocks.as_ref().expect("built above");
+                // the blocks update x in place, so the text and reference rows are restored each step
+                gpu.d2d_at(&seq.x, 0, &b.text_copy, 0, lr * HID * 4)?;
+            }
+
+            self.run_blocks(gpu, c, prof, s, step, cache.as_mut())?;
+
+            // the final layer: the modulated norm on the generated rows, then the two f32 heads
+            {
+                let seq = self.seq.as_ref().expect("sized above");
+                let b = self.blocks.as_ref().expect("built above");
+                let cond = self.cond.as_ref().expect("ready");
+                launch(
+                    gpu,
+                    &b.final_norm,
+                    Some(prof),
+                    "final norm",
+                    [generated as u32, 1, 1],
+                    [lanes_for(HID).expect("a lane count") as u32, 1, 1],
+                    &[generated as u32],
+                    &[
+                        seq.x.slice(lr * HID * 4, generated * HID * 4),
+                        self.weights.at(gpu, "h3.final.norm", HID * 4)?.binding(),
+                        cond.final_table.binding(),
+                        seq.tcls.slice(lr * 4, generated * 4),
+                    ],
+                )?;
+            }
+            {
+                let seq = self.seq.as_ref().expect("sized above");
+                crate::dispatch::MatmulF32::build(c, gpu, HID, FINAL_N)?.run(
+                    gpu,
+                    Some(prof),
+                    "final out",
+                    generated,
+                    seq.x.slice(lr * HID * 4, generated * HID * 4),
+                    self.weights
+                        .at(gpu, "h3.final.out.w", FINAL_N * HID * 4)?
+                        .binding(),
+                    self.weights
+                        .at(gpu, "h3.final.out.b", FINAL_N * 4)?
+                        .binding(),
+                    seq.out32.binding(),
+                )?;
+                gpu.sync()?;
+                gpu.d2h_ref(
+                    seq.out32.slice(0, generated * FINAL_N * 4),
+                    crate::vvae::as_bytes_mut(&mut out32),
+                )?;
+            }
+
+            // the pack's rows are audio first, then video; the head emits both side by side
+            let vout: Vec<f32> = (0..nv * VIDEO_PATCH)
+                .map(|i| out32[(na + i / VIDEO_PATCH) * FINAL_N + i % VIDEO_PATCH])
+                .collect();
+            let aout: Vec<f32> = (0..na * AUDIO_CH)
+                .map(|i| out32[(i / AUDIO_CH) * FINAL_N + VIDEO_PATCH + i % AUDIO_CH])
+                .collect();
+            let (sg_v, sg_a) = (sv.sigmas[step], sa.sigmas[step]);
+            if !res {
+                crate::sampler::euler_update(&mut vrows, &vout, sg_v, sv.sigmas[step + 1] / sg_v);
+                crate::sampler::euler_update(&mut arows, &aout, sg_a, sa.sigmas[step + 1] / sg_a);
+            } else {
+                let den_v = crate::sampler::denoised_video(&vrows, &vout, sg_v);
+                let den_a =
+                    crate::sampler::denoised_audio(&yrows, &arows, &aout, sg_v, sg_a, ascale);
+                crate::sampler::advance(&mut vrows, &den_v, Some(&old_v), &sv.sigmas, step);
+                crate::sampler::advance(&mut yrows, &den_a, Some(&old_a), &sv.sigmas, step);
+                old_v = den_v;
+                old_a = den_a;
+            }
+            if let Some(cb) = progress.as_deref_mut() {
+                if cb(step + 1, sv.timesteps.len()) {
+                    return Err(crate::error::Error::Cancelled);
+                }
+            }
+        }
+
+        let mut video = vec![0.0f32; LATENT_CH * t_len * h * w];
+        let mut audio = vec![0.0f32; 2 * AUDIO_CH * a];
+        crate::sampler::rows_to_tensor(&vrows, &mut video, t_len, h, w);
+        crate::sampler::audio_rows_to_tensor(
+            if res { &yrows } else { &arows },
+            &mut audio,
+            a,
+            res.then_some(ascale),
+        );
+        Ok(Latents { video, audio })
+    }
+}
+
+impl Dit {
+    /// The tower's output for every image this prompt presents, paired with the rows it fills.
+    ///
+    /// A run of negative ids is a placeholder for an image; the images are matched to those runs in
+    /// presentation order — keyframes first, then image references — and each must be exactly the size
+    /// its run reserved.
+    #[allow(clippy::too_many_arguments)]
+    fn vision_for(
+        &self,
+        gpu: &hrx::Gpu,
+        c: &Compiler,
+        prof: &mut Profile,
+        te: &TextEncoder,
+        ids: &[i32],
+        refs: &[RefInput<'_>],
+        kfs: &[KeyframeInput<'_>],
+    ) -> Result<Vec<(VisionSpan, crate::vision::Embedding)>> {
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            if *id >= 0 {
+                continue;
+            }
+            match runs.last_mut() {
+                Some(r) if r.0 + r.1 == i => r.1 += 1,
+                _ => runs.push((i, 1)),
+            }
+        }
+        let mut pics: Vec<(&[f32], usize, usize)> = Vec::new();
+        for kf in kfs {
+            if let Some(px) = kf.pixels {
+                pics.push((px, kf.height as usize, kf.width as usize));
+            }
+        }
+        for rf in refs {
+            if rf.kind == 0 {
+                if let Some(px) = rf.pixels {
+                    pics.push((px, rf.height as usize, rf.width as usize));
+                }
+            }
+        }
+        if pics.len() > runs.len() {
+            return invalid("more images than placeholder runs in the ids");
+        }
+        if pics.len() < runs.len() {
+            return invalid("placeholder runs in the ids without an image reference with pixels");
+        }
+        let mut out = Vec::with_capacity(pics.len());
+        for (ri, (px, ph, pw)) in pics.into_iter().enumerate() {
+            let (mh, mw) = (ph / 32, pw / 32);
+            if runs[ri].1 != mh * mw {
+                return invalid(format!(
+                    "placeholder run {ri} has {} ids, the image needs {}",
+                    runs[ri].1,
+                    mh * mw
+                ));
+            }
+            let e = crate::vision::embed(gpu, c, prof, te.weights(), px, ph, pw)?;
+            out.push((
+                VisionSpan {
+                    start: runs[ri].0,
+                    count: runs[ri].1,
+                    merged_h: mh,
+                    merged_w: mw,
+                },
+                e,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// The reference rows, written once at the first step and restored from the copy thereafter.
+    ///
+    /// Visual references are mixed with seeded noise at 0.999 — ComfyUI's condition augmentation —
+    /// from a generator seeded per segment, so a reference's augmentation does not depend on how many
+    /// latents preceded it.
+    #[allow(clippy::too_many_arguments)]
+    fn inject_references(
+        &self,
+        gpu: &hrx::Gpu,
+        c: &Compiler,
+        prof: &mut Profile,
+        lay: &crate::layout::Layout,
+        refs: &[RefInput<'_>],
+        kfs: &[KeyframeInput<'_>],
+        seed: u64,
+        in32: &mut [f32],
+    ) -> Result<()> {
+        for sg in &lay.ref_segs {
+            // a keyframe presents as a one-frame image reference
+            let (video_latent, audio_latent) = if sg.kind == 3 {
+                let kf = &kfs[sg.index];
+                (Some(kf.video_latent), kf.audio_latent)
+            } else {
+                let rf = &refs[sg.index];
+                (rf.video_latent, rf.audio_latent)
+            };
+            if sg.audio {
+                let Some(al) = audio_latent else {
+                    return invalid("an audio reference segment without audio latents");
+                };
+                let at = sg.audio_t as usize;
+                for ch in 0..2 {
+                    for t in 0..at {
+                        for k in 0..AUDIO_CH {
+                            in32[(ch * at + t) * AUDIO_CH + k] = al[(ch * AUDIO_CH + k) * at + t];
+                        }
+                    }
+                }
+                let seq = self.seq.as_ref().expect("sized above");
+                gpu.h2d_at(
+                    &seq.in32,
+                    0,
+                    crate::vvae::as_bytes(&in32[..sg.rows * AUDIO_CH]),
+                )?;
+                self.embed_f32(
+                    gpu,
+                    c,
+                    prof,
+                    "ref audio in",
+                    sg.row0,
+                    sg.rows,
+                    AUDIO_CH,
+                    "h3.audio_in",
+                )?;
+            } else {
+                let Some(vl) = video_latent else {
+                    return invalid("a visual reference segment without video latents");
+                };
+                crate::noise::augment_ref(
+                    vl,
+                    &mut in32[..sg.rows * VIDEO_PATCH],
+                    sg.latent_t as usize,
+                    sg.lat_h as usize,
+                    sg.lat_w as usize,
+                    seed,
+                );
+                let seq = self.seq.as_ref().expect("sized above");
+                gpu.h2d_at(
+                    &seq.in32,
+                    0,
+                    crate::vvae::as_bytes(&in32[..sg.rows * VIDEO_PATCH]),
+                )?;
+                self.embed_f32(
+                    gpu,
+                    c,
+                    prof,
+                    "ref video in",
+                    sg.row0,
+                    sg.rows,
+                    VIDEO_PATCH,
+                    "h3.video_in",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_cache(&mut self, gpu: &hrx::Gpu, c: &Compiler, n: usize) -> Result<()> {
+        if self.cache.as_ref().is_some_and(|b| b.n >= n) {
+            return Ok(());
+        }
+        self.cache = None;
+        self.cache = Some(CacheBuffers {
+            n,
+            xb0: gpu.alloc(n * 4)?,
+            prev: gpu.alloc(n * 4)?,
+            resid: gpu.alloc(n * 4)?,
+            partials: gpu.alloc(crate::cache::groups(n) * 8)?,
+            metric: c.get(gpu, "absdiff_sum_f32", "h3_absdiff_sum_f32", &Cfg::new())?,
+        });
+        Ok(())
+    }
+
+    /// The 50 blocks, either straight through or with the first-block cache deciding.
+    fn run_blocks(
+        &mut self,
+        gpu: &hrx::Gpu,
+        c: &Compiler,
+        prof: &mut Profile,
+        s: usize,
+        step: usize,
+        cache: Option<&mut crate::cache::StepCache>,
+    ) -> Result<()> {
+        let conds: Vec<crate::stack::LayerCond> = (0..BLOCKS).map(|i| self.layer_cond(i)).collect();
+        let cond_fn = |i: usize| conds[i];
+        let Dit {
+            seq,
+            blocks,
+            cache: cbuf,
+            ..
+        } = self;
+        let seq = seq.as_ref().expect("sized above");
+        let b = blocks.as_mut().expect("built above");
+        let (x, cls, cos, sin) = (
+            seq.x.binding(),
+            seq.cls.binding(),
+            seq.cos.binding(),
+            seq.sin.binding(),
+        );
+        let Some(cache) = cache else {
+            b.stack
+                .forward(gpu, prof, x, cls, cos, sin, &cond_fn, 0, None)?;
+            return Ok(());
+        };
+
+        let cb = cbuf.as_ref().expect("cache buffers");
+        let n = s * HID;
+        b.stack
+            .forward(gpu, prof, x, cls, cos, sin, &cond_fn, 0, Some(1))?;
+        let (mut d, mut m) = (0.0f64, 0.0f64);
+        if step > 0 {
+            let groups = crate::cache::groups(n);
+            launch(
+                gpu,
+                &cb.metric,
+                Some(prof),
+                "cache metric",
+                [groups as u32, 1, 1],
+                [THREADS, 1, 1],
+                &[n as u32],
+                &[x, cb.prev.binding(), cb.partials.binding()],
+            )?;
+            let mut ps = vec![0.0f32; groups * 2];
+            gpu.sync()?;
+            gpu.d2h_ref(
+                cb.partials.slice(0, groups * 8),
+                crate::vvae::as_bytes_mut(&mut ps),
+            )?;
+            for i in 0..groups {
+                d += f64::from(ps[2 * i]);
+                m += f64::from(ps[2 * i + 1]);
+            }
+        }
+        let change = cache.consider(step, d, m);
+        gpu.d2d(&cb.prev, &seq.x, n * 4)?;
+        if change.skip {
+            axpy(
+                c,
+                gpu,
+                Some(prof),
+                "cache add",
+                1.0,
+                1.0,
+                n,
+                cb.resid.binding(),
+                x,
+            )?;
+        } else {
+            gpu.d2d(&cb.xb0, &seq.x, n * 4)?;
+            b.stack
+                .forward(gpu, prof, x, cls, cos, sin, &cond_fn, 1, None)?;
+            // the residual of blocks 1..49, which a skipped step adds instead of running them
+            gpu.d2d(&cb.resid, &seq.x, n * 4)?;
+            axpy(
+                c,
+                gpu,
+                Some(prof),
+                "cache resid",
+                -1.0,
+                1.0,
+                n,
+                cb.xb0.binding(),
+                cb.resid.binding(),
+            )?;
+            cache.recorded();
+        }
+        Ok(())
+    }
+}
+
+/// An i32 slice's bytes, for the per-row class tables.
+fn as_i32_bytes(v: &[i32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
 }
 
 #[cfg(test)]
