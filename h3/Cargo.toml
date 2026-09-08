@@ -16,6 +16,7 @@ libc = "0.2"
 thiserror = "2"
 # fancy-regex, not onig: onig is a C library, and the point of this crate is that there is no C.
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+hf-hub = { version = "1.0.0", default-features = false, features = ["blocking", "rustls-tls"] }
 
 [dev-dependencies]
 tempfile = "3"
