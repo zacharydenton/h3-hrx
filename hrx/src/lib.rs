@@ -203,15 +203,15 @@ impl Gpu {
 
     /// Reads back from a view rather than a whole allocation, which is how the pipeline inspects rows
     /// it handed a kernel at an offset.
-    pub fn d2h_ref(&self, src: sys::BufferRef, dst: &mut [u8]) -> Result<()> {
+    pub fn d2h_ref(&self, src: View<'_>, dst: &mut [u8]) -> Result<()> {
         if dst.is_empty() {
             return Ok(());
         }
-        if dst.len() > src.length {
+        if dst.len() > src.raw.length {
             return Err(Error(format!(
                 "read of {} bytes from a {}-byte view",
                 dst.len(),
-                src.length
+                src.raw.length
             )));
         }
         self.sync()?;
@@ -219,8 +219,8 @@ impl Gpu {
             check(
                 sys::hrx_synchronous_d2h(
                     self.inner.device,
-                    src.buffer,
-                    src.offset,
+                    src.raw.buffer,
+                    src.raw.offset,
                     dst.as_mut_ptr() as *mut c_void,
                     dst.len(),
                 ),
@@ -313,7 +313,7 @@ impl Gpu {
         grid: [u32; 3],
         block: [u32; 3],
         scalars: &[u32],
-        bindings: &[sys::BufferRef],
+        bindings: &[View<'_>],
     ) -> Result<()> {
         let info = &kernel.info;
         if bindings.len() != info.binding_count as usize {
@@ -361,7 +361,7 @@ impl Gpu {
                     &config,
                     constants.as_ptr() as *const c_void,
                     size,
-                    bindings.as_ptr(),
+                    bindings.as_ptr().cast::<sys::BufferRef>(),
                     bindings.len(),
                     0,
                 ),
@@ -388,20 +388,60 @@ pub struct Buffer {
 unsafe impl Send for Buffer {}
 unsafe impl Sync for Buffer {}
 
+/// A binding into a device allocation, borrowed from it.
+///
+/// The lifetime is the point. `hrx_buffer_s` is a raw handle, so a view carrying one is `Copy` and
+/// would happily outlive the allocation it names — safe code could drop the buffer and still dispatch
+/// against it. Borrowing the buffer makes that a compile error instead.
+/// `repr(transparent)` so an array of views is an array of `hrx_buffer_ref_t` and can be handed to
+/// the dispatch as it stands: the only non-zero-sized field is the binding itself.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct View<'a> {
+    raw: sys::BufferRef,
+    owner: std::marker::PhantomData<&'a Buffer>,
+}
+
+impl<'a> View<'a> {
+    fn new(raw: sys::BufferRef) -> Self {
+        Self {
+            raw,
+            owner: std::marker::PhantomData,
+        }
+    }
+    /// The bytes this view covers.
+    pub fn len(&self) -> usize {
+        self.raw.length
+    }
+    pub fn is_empty(&self) -> bool {
+        self.raw.length == 0
+    }
+}
+
 impl Buffer {
     pub fn bytes(&self) -> usize {
         self.bytes
     }
-    pub fn binding(&self) -> sys::BufferRef {
-        sys::BufferRef { buffer: self.raw, offset: 0, length: self.bytes }
+
+    /// The whole allocation.
+    pub fn binding(&self) -> View<'_> {
+        View::new(sys::BufferRef {
+            buffer: self.raw,
+            offset: 0,
+            length: self.bytes,
+        })
     }
 
     /// A binding into part of the allocation. The pipeline hands kernels views at row offsets, which
     /// the C did with pointer arithmetic; a device buffer here has no host-visible address, so the
     /// offset travels in the binding instead.
-    pub fn slice(&self, offset: usize, length: usize) -> sys::BufferRef {
+    pub fn slice(&self, offset: usize, length: usize) -> View<'_> {
         assert!(offset + length <= self.bytes, "slice past the allocation");
-        sys::BufferRef { buffer: self.raw, offset, length }
+        View::new(sys::BufferRef {
+            buffer: self.raw,
+            offset,
+            length,
+        })
     }
 }
 

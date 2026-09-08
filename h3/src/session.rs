@@ -58,6 +58,13 @@ impl Session {
         })
     }
 
+    /// The attention width this session was created with. The stack is built for it, so it is not a
+    /// per-run parameter — and a run that quietly ignored it would make a precision comparison
+    /// meaningless rather than wrong in any visible way.
+    pub fn attn_qk_bits(&self) -> usize {
+        self.config.attn_qk_bits
+    }
+
     /// The shapes a request produces, or `None` when it is not one this model serves.
     pub fn shape_for(height: i32, width: i32, frames: i32) -> Option<Shape> {
         shape_for(height, width, frames)
@@ -150,8 +157,12 @@ impl Session {
         kfs: &[KeyframeInput<'_>],
         progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
     ) -> Result<Latents> {
+        // the attention width is the session's, set once at creation: the stack is built for it
+        let qk_bits = self.config.attn_qk_bits;
         let (gpu, c, prof, dit, te) = self.prompt_pair()?;
-        dit.denoise(gpu, c, prof, te, ids, p, noise, refs, kfs, progress)
+        dit.denoise(
+            gpu, c, prof, te, ids, p, qk_bits, noise, refs, kfs, progress,
+        )
     }
 
     /// The vision tower over one image.
@@ -232,5 +243,34 @@ impl Session {
         avae.as_mut()
             .expect("opened")
             .encode(gpu, compiler, prof, samples, n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(bits: usize) -> Config {
+        Config {
+            dit: None,
+            te: None,
+            video_vae: None,
+            audio_vae: None,
+            kernel_sources: "kernels".into(),
+            cache_dir: "build/kernel_cache".into(),
+            loom_compile: "loom-compile".into(),
+            attn_qk_bits: bits,
+        }
+    }
+
+    #[test]
+    fn only_the_three_attention_widths_are_accepted() {
+        for bad in [0, 1, 2, 7, 9, 32] {
+            let e = Session::new(config(bad));
+            assert!(
+                matches!(e, Err(crate::error::Error::Invalid(_))),
+                "{bad} bits should be refused"
+            );
+        }
     }
 }

@@ -263,20 +263,27 @@ impl VideoVae {
 
         // every block modulates with its own learned scale and no shift
         let zeros = self.constants.zeros.binding();
-        let scales: Vec<(hrx::sys::BufferRef, hrx::sys::BufferRef)> = (0..b.stack.layers())
-            .map(|i| {
-                let blk = b.stack.block(i);
-                (
-                    blk.scale1
-                        .as_ref()
-                        .expect("a decoder block has scale1")
-                        .binding(),
-                    blk.scale2
-                        .as_ref()
-                        .expect("a decoder block has scale2")
-                        .binding(),
-                )
-            })
+        // The buffers first, not views of them: a view borrows its allocation, and one borrowed from
+        // the stack would conflict with the mutable borrow the forward pass takes.
+        let scale_buffers: Vec<(std::sync::Arc<hrx::Buffer>, std::sync::Arc<hrx::Buffer>)> =
+            (0..b.stack.layers())
+                .map(|i| {
+                    let blk = b.stack.block(i);
+                    (
+                        blk.scale1
+                            .as_ref()
+                            .expect("a decoder block has scale1")
+                            .clone(),
+                        blk.scale2
+                            .as_ref()
+                            .expect("a decoder block has scale2")
+                            .clone(),
+                    )
+                })
+                .collect();
+        let scales: Vec<(hrx::View<'_>, hrx::View<'_>)> = scale_buffers
+            .iter()
+            .map(|(one, two)| (one.binding(), two.binding()))
             .collect();
         let cond = |i: usize| LayerCond {
             table_msa: zeros,

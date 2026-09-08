@@ -2,8 +2,8 @@
 
 This project uses three local changes on top of `ROCm/hrx-system` commit
 `c9855b47e96e7eb1cbb5b81b1de973762982ae95` — two in the compiler, which the
-measured kernels need, and one in the runtime, which the HRX backend needs on a
-stock ROCr. The patches preserve them without requiring access to a local branch:
+measured kernels need, and one in the runtime, without which nothing here starts
+on a stock ROCr. The patches preserve them without requiring access to a local branch:
 
 1. `0001-amdgpu-fragment-repack.patch` — `v_permlanex16` cross-lane lowering
    and an f32-to-f16 matrix-fragment repack in registers (original commit
@@ -19,7 +19,8 @@ stock ROCr. The patches preserve them without requiring access to a local branch
    that query means the attribute is unknown, and a runtime that does not know it
    is not emulating PM4, so the patch answers that case from the already-`false`
    default; every other status still propagates. It carries the regression test.
-   Needed only for the HRX backend. Not upstream: it is
+   Everything in this project dispatches through libhrx, so this one is required,
+   not optional. Not upstream: it is
    [`pm4-emulation-query-optional`](https://github.com/zacharydenton/hrx-system/tree/pm4-emulation-query-optional)
    on a fork of `ROCm/hrx-system`.
 
@@ -42,14 +43,19 @@ python3 dev.py --cmake-build-dir "$PWD/build" cmake configure \
   -DCMAKE_BUILD_TYPE=Release -DLOOM_TARGET_AMDGPU=ON \
   -DLOOM_TARGET_AMDGPU_TARGETS=gfx1151
 python3 dev.py --cmake-build-dir "$PWD/build" cmake build \
-  loom-compile loom-format loom-check iree-test-loom iree-benchmark-loom
+  loom-compile loom-format loom-check iree-test-loom iree-benchmark-loom \
+  libhrx_src_libhrx_hrx
 export HRX_BUILD="$PWD/build"
 cd "$H3_SOURCE"
 source scripts/env.sh
 bash scripts/test.sh --cpu
 ```
 
-The patch pair reproduces the committed compiler source used for the recorded
+`libhrx_src_libhrx_hrx` builds `libhrx.so`, which is not optional: every
+executable in this project links it, and `scripts/env.sh` finds it at
+`$HRX_BUILD/libhrx/src/libhrx`. There is no HIP path any more.
+
+The three patches reproduce the committed compiler source used for the recorded
 measurements. The CPU suite checks this project's generated kernels with the
 selected compiler; it does not benchmark or initialize the GPU. A compiler
 rebuild from a fresh checkout has not been repeated as part of this documentation

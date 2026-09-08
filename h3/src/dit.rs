@@ -260,8 +260,6 @@ pub struct DenoiseParams {
     pub video_shift: f64,
     pub audio_shift: f64,
     pub cache_threshold: f32,
-    /// the QK operands' width: 16, 8 or 4
-    pub attn_qk_bits: usize,
 }
 
 impl Default for DenoiseParams {
@@ -276,7 +274,6 @@ impl Default for DenoiseParams {
             video_shift: 12.0,
             audio_shift: 3.0,
             cache_threshold: 0.0,
-            attn_qk_bits: 8,
         }
     }
 }
@@ -471,18 +468,6 @@ impl Dit {
         Ok(())
     }
 
-    /// One layer's slice of the modulation table, in the row order the kernels index by class.
-    fn layer_cond(&self, i: usize) -> crate::stack::LayerCond {
-        let mods = &self.cond.as_ref().expect("conditioning is ready").mods;
-        let row = |r: usize| mods.slice((i * MODS_ROWS + r) * HID * 4, (MODS_ROWS - r) * HID * 4);
-        crate::stack::LayerCond {
-            table_msa: row(0),
-            gate_msa: row(2 * CLASSES),
-            table_mlp: row(3 * CLASSES),
-            gate_mlp: row(5 * CLASSES),
-        }
-    }
-
     /// `x` rows `[row0, row0 + rows)` from the f32 patch projection the checkpoint stores.
     #[allow(clippy::too_many_arguments)]
     fn embed_f32(
@@ -523,6 +508,8 @@ impl Dit {
         te: &mut TextEncoder,
         ids: &[i32],
         p: &DenoiseParams,
+        // the QK operands' width, from the session's configuration: 16, 8 or 4
+        qk_bits: usize,
         noise: Noise<'_>,
         refs: &[RefInput<'_>],
         kfs: &[KeyframeInput<'_>],
@@ -598,7 +585,7 @@ impl Dit {
             gpu.h2d_at(&seq.cos, 0, crate::vvae::as_bytes(&cos))?;
             gpu.h2d_at(&seq.sin, 0, crate::vvae::as_bytes(&sin))?;
         }
-        self.ensure_blocks(gpu, c, s, p.attn_qk_bits)?;
+        self.ensure_blocks(gpu, c, s, qk_bits)?;
 
         // the latents, as rows
         let generated = na + nv;
@@ -985,14 +972,20 @@ impl Dit {
         step: usize,
         cache: Option<&mut crate::cache::StepCache>,
     ) -> Result<()> {
-        let conds: Vec<crate::stack::LayerCond> = (0..BLOCKS).map(|i| self.layer_cond(i)).collect();
-        let cond_fn = |i: usize| conds[i];
+        // The table is one field and the buffers another, so they are taken apart before the views
+        // are made: a view borrows its allocation, and borrowing all of `self` to build them would
+        // conflict with the mutable borrow the stack needs.
         let Dit {
             seq,
             blocks,
             cache: cbuf,
+            cond,
             ..
         } = self;
+        let mods = &cond.as_ref().expect("conditioning is ready").mods;
+        let conds: Vec<crate::stack::LayerCond> =
+            (0..BLOCKS).map(|i| layer_cond(mods, i)).collect();
+        let cond_fn = |i: usize| conds[i];
         let seq = seq.as_ref().expect("sized above");
         let b = blocks.as_mut().expect("built above");
         let (x, cls, cos, sin) = (
@@ -1069,6 +1062,18 @@ impl Dit {
             cache.recorded();
         }
         Ok(())
+    }
+}
+
+/// One layer's slice of the modulation table: rows [0, 2C) are (scale, shift) per class for the
+/// attention, [2C, 3C) its gate, [3C, 5C) and [5C, 6C) the same for the MLP.
+fn layer_cond(mods: &hrx::Buffer, i: usize) -> crate::stack::LayerCond<'_> {
+    let row = |r: usize| mods.slice((i * MODS_ROWS + r) * HID * 4, (MODS_ROWS - r) * HID * 4);
+    crate::stack::LayerCond {
+        table_msa: row(0),
+        gate_msa: row(2 * CLASSES),
+        table_mlp: row(3 * CLASSES),
+        gate_mlp: row(5 * CLASSES),
     }
 }
 

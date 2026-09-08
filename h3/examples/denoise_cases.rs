@@ -11,6 +11,7 @@
 //!   case <name>           starts a case, and names its outputs <name>.video / <name>.audio
 //!   size <h> <w> <frames>
 //!   steps <n> <sampler> <seed> <cache_threshold>
+//!   attn <16|8|4>         the QK operands' width, 8 by default
 //!   noise <video.f32> <audio.f32>
 //!   ref <kind> <video.f32|-> <t> <h> <w> <audio.f32|-> <audio_t> <pixels.f32|-> <ph> <pw>
 //!   keyframe <index> <video.f32> <audio.f32|-> <audio_t> <pixels.f32|-> <ph> <pw>
@@ -67,14 +68,28 @@ struct OwnedKeyframe {
     width: i32,
 }
 
-#[derive(Default)]
 struct Case {
     name: String,
     ids: Vec<i32>,
+    qk_bits: usize,
     p: DenoiseParams,
     noise: Option<(Vec<f32>, Vec<f32>)>,
     refs: Vec<OwnedRef>,
     kfs: Vec<OwnedKeyframe>,
+}
+
+impl Default for Case {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            ids: Vec::new(),
+            qk_bits: 8,
+            p: DenoiseParams::default(),
+            noise: None,
+            refs: Vec::new(),
+            kfs: Vec::new(),
+        }
+    }
 }
 
 fn main() {
@@ -102,6 +117,7 @@ fn main() {
                 }
             }
             "out" => out_dir = f[1].to_string(),
+            "attn" => cases.last_mut().expect("a case first").qk_bits = f[1].parse().unwrap(),
             "case" => cases.push(Case {
                 name: f[1].into(),
                 ids: ids.clone(),
@@ -203,7 +219,17 @@ fn main() {
         let start = std::time::Instant::now();
         let out = dit
             .denoise(
-                &gpu, &compiler, &mut prof, &mut te, &case.ids, &case.p, noise, &refs, &kfs, None,
+                &gpu,
+                &compiler,
+                &mut prof,
+                &mut te,
+                &case.ids,
+                &case.p,
+                case.qk_bits,
+                noise,
+                &refs,
+                &kfs,
+                None,
             )
             .unwrap_or_else(|e| panic!("{}: {e}", case.name));
         eprintln!(

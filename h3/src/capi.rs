@@ -220,7 +220,6 @@ impl From<&h3_params> for DenoiseParams {
             video_shift: f64::from(p.video_shift),
             audio_shift: f64::from(p.audio_shift),
             cache_threshold: p.cache_threshold,
-            attn_qk_bits: 8,
         }
     }
 }

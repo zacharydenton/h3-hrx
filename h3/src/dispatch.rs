@@ -6,7 +6,7 @@
 //! kernel reads agree on their pitch.
 use crate::compile::{num, Cfg, Compiler};
 use crate::model::*;
-use hrx::sys::BufferRef;
+use hrx::View;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -44,7 +44,7 @@ pub fn launch(
     grid: [u32; 3],
     block: [u32; 3],
     scalars: &[u32],
-    bindings: &[BufferRef],
+    bindings: &[View<'_>],
 ) -> Result<()> {
     match profile {
         Some(p) if p.on => {
@@ -123,10 +123,10 @@ impl Prepare {
         profile: Option<&mut Profile>,
         stage: &str,
         tokens: u32,
-        x: BufferRef,
-        norm: Option<(BufferRef, BufferRef, BufferRef)>,
-        a_q: BufferRef,
-        a_s: Option<BufferRef>,
+        x: View<'_>,
+        norm: Option<(View<'_>, View<'_>, View<'_>)>,
+        a_q: View<'_>,
+        a_s: Option<View<'_>>,
     ) -> Result<()> {
         let mut bindings = vec![x];
         if self.form != "plain" {
@@ -280,12 +280,12 @@ impl Gemm {
         profile: Option<&mut Profile>,
         stage: &str,
         tokens: u32,
-        a_q: BufferRef,
-        w_q: BufferRef,
-        scales: Option<(BufferRef, BufferRef)>,
-        out: BufferRef,
-        residual: Option<(BufferRef, BufferRef)>,
-        bias: Option<BufferRef>,
+        a_q: View<'_>,
+        w_q: View<'_>,
+        scales: Option<(View<'_>, View<'_>)>,
+        out: View<'_>,
+        residual: Option<(View<'_>, View<'_>)>,
+        bias: Option<View<'_>>,
     ) -> Result<()> {
         let mut bindings = vec![a_q, w_q];
         if quantised(&self.elem) {
@@ -393,11 +393,11 @@ impl Conv3d {
         gpu: &hrx::Gpu,
         profile: Option<&mut Profile>,
         stage: &str,
-        a: BufferRef,
-        w: BufferRef,
-        b: BufferRef,
-        out: BufferRef,
-        residual: Option<BufferRef>,
+        a: View<'_>,
+        w: View<'_>,
+        b: View<'_>,
+        out: View<'_>,
+        residual: Option<View<'_>>,
     ) -> Result<()> {
         let m = self.rows();
         let mut bindings = vec![a, w, b, out];
@@ -468,11 +468,11 @@ impl GroupNormSilu {
         gpu: &hrx::Gpu,
         mut profile: Option<&mut Profile>,
         stage: &str,
-        x: BufferRef,
-        gamma: BufferRef,
-        beta: BufferRef,
-        stats: BufferRef,
-        out: BufferRef,
+        x: View<'_>,
+        gamma: View<'_>,
+        beta: View<'_>,
+        stats: View<'_>,
+        out: View<'_>,
     ) -> Result<()> {
         launch(
             gpu,
@@ -524,10 +524,10 @@ impl Matmul {
         profile: Option<&mut Profile>,
         stage: &str,
         rows: usize,
-        a: BufferRef,
-        w: BufferRef,
-        b: BufferRef,
-        out: BufferRef,
+        a: View<'_>,
+        w: View<'_>,
+        b: View<'_>,
+        out: View<'_>,
     ) -> Result<()> {
         launch(
             gpu,
@@ -571,10 +571,10 @@ impl MatmulF32 {
         profile: Option<&mut Profile>,
         stage: &str,
         m: usize,
-        x: BufferRef,
-        w: BufferRef,
-        b: BufferRef,
-        out: BufferRef,
+        x: View<'_>,
+        w: View<'_>,
+        b: View<'_>,
+        out: View<'_>,
     ) -> Result<()> {
         launch(
             gpu,
@@ -600,8 +600,8 @@ pub fn axpy(
     a: f32,
     b: f32,
     count: usize,
-    x: BufferRef,
-    y: BufferRef,
+    x: View<'_>,
+    y: View<'_>,
 ) -> Result<()> {
     let ns = "h3.axpy_f32.";
     let cfg: Cfg = vec![
@@ -656,11 +656,11 @@ impl Matmul16 {
         profile: Option<&mut Profile>,
         stage: &str,
         m: usize,
-        a: BufferRef,
-        w: BufferRef,
-        bias: BufferRef,
-        out: BufferRef,
-        lambda: Option<BufferRef>,
+        a: View<'_>,
+        w: View<'_>,
+        bias: View<'_>,
+        out: View<'_>,
+        lambda: Option<View<'_>>,
     ) -> Result<()> {
         debug_assert_eq!(
             self.resid,
@@ -705,10 +705,10 @@ impl LayerNorm16 {
         gpu: &hrx::Gpu,
         profile: Option<&mut Profile>,
         rows: usize,
-        x16: BufferRef,
-        w: BufferRef,
-        b: BufferRef,
-        out32: BufferRef,
+        x16: View<'_>,
+        w: View<'_>,
+        b: View<'_>,
+        out32: View<'_>,
     ) -> Result<()> {
         launch(
             gpu,

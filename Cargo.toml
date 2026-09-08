@@ -1,0 +1,15 @@
+# One workspace: the crates share a lockfile, a target directory and one `cargo test`.
+#
+# examples/rust is deliberately excluded. It is a client, and building it the way someone outside this
+# repository would — its own lockfile, resolved against the crate as published — is the point of it.
+[workspace]
+resolver = "2"
+members = ["h3", "hrx", "cli", "loomrun"]
+exclude = ["examples/rust"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = 2

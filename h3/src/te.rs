@@ -178,7 +178,7 @@ impl TextEncoder {
         prof: &mut Profile,
         ids: &[i32],
         spans: &[Span<'_>],
-    ) -> Result<hrx::sys::BufferRef> {
+    ) -> Result<hrx::View<'_>> {
         for sp in spans {
             if sp.at.count > MAX_SPAN {
                 return invalid(format!("vision span of {} rows is too long", sp.at.count));

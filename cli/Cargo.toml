@@ -1,7 +1,7 @@
 [package]
 name = "h3-cli"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "h3: the MiniMax H3 pipeline from the shell"
 
 [[bin]]
@@ -12,6 +12,3 @@ path = "src/main.rs"
 anyhow = "1"
 h3 = { path = "../h3" }
 clap = { version = "4", features = ["derive"] }
-
-[profile.release]
-opt-level = 2

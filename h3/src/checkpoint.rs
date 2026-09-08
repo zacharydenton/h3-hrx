@@ -192,13 +192,23 @@ impl Checkpoint {
     /// The whole pages a range covers, so a partial page at either end is never advised away under a
     /// neighbouring tensor's bytes: WILLNEED rounds outward, DONTNEED inward. Dropping a shared page
     /// would cost the neighbour a re-read, not correctness, so the asymmetry is the safe direction.
+    ///
+    /// The range must lie inside this checkpoint's mapping, and anything else is ignored. Both
+    /// callers are safe functions taking a `&[u8]`, and `MADV_DONTNEED` on private anonymous memory
+    /// *zeroes* it — so without this check a caller could hand over an unrelated buffer and have it
+    /// silently erased. Every real call site slices `bytes()`, which is always inside.
     fn advise(&self, range: &[u8], how: i32) {
         if range.is_empty() {
             return;
         }
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let map_start = self.map.as_ptr() as usize;
+        let map_end = map_start + self.map.len();
         let first = range.as_ptr() as usize;
         let last = first + range.len();
+        if first < map_start || last > map_end {
+            return;
+        }
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         let (begin, end) = if how == libc::MADV_WILLNEED {
             (first & !(page - 1), (last + page - 1) & !(page - 1))
         } else {
@@ -445,5 +455,18 @@ mod tests {
         // An empty range is a no-op rather than a bad madvise call.
         ck.will_need(&[]);
         ck.done_with(&[]);
+
+        // A buffer that is not part of the mapping is left alone. MADV_DONTNEED on private anonymous
+        // memory zeroes it, so a range that is not checked is a way to erase a caller's data.
+        let foreign = vec![0xABu8; 256 * 1024];
+        ck.done_with(&foreign);
+        assert!(
+            foreign.iter().all(|b| *b == 0xAB),
+            "foreign memory was touched"
+        );
+        // and a range that starts inside the mapping but runs past its end is refused, not clamped
+        let inside = ck.bytes(ck.at("a").unwrap());
+        let past = unsafe { std::slice::from_raw_parts(inside.as_ptr(), 1 << 30) };
+        ck.done_with(past);
     }
 }

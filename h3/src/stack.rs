@@ -9,7 +9,7 @@ use crate::compile::{num, Cfg, Compiler};
 use crate::dispatch::{launch, Gemm, Prepare, Profile, Tile};
 use crate::model::*;
 use crate::weights::Weights;
-use hrx::sys::BufferRef;
+use hrx::View;
 use std::sync::{Arc, OnceLock};
 
 pub type Result<T> = std::result::Result<T, crate::compile::Error>;
@@ -70,11 +70,11 @@ impl StackDims {
 /// wrong answer rather than a fault — a stack whose blocks modulate with a scale alone still needs a
 /// `2 * hidden` zero table, not a `hidden` one.
 #[derive(Clone, Copy)]
-pub struct LayerCond {
-    pub table_msa: BufferRef,
-    pub gate_msa: BufferRef,
-    pub table_mlp: BufferRef,
-    pub gate_mlp: BufferRef,
+pub struct LayerCond<'a> {
+    pub table_msa: View<'a>,
+    pub gate_msa: View<'a>,
+    pub table_mlp: View<'a>,
+    pub gate_mlp: View<'a>,
 }
 
 /// The constant rows a stack modulates with when it does not really modulate.
@@ -104,7 +104,7 @@ impl Constants {
     }
 
     /// The layer conditioning of a stack that neither shifts nor gates: a zero table and a gate of one.
-    pub fn identity(&self) -> LayerCond {
+    pub fn identity(&self) -> LayerCond<'_> {
         LayerCond {
             table_msa: self.zeros.binding(),
             gate_msa: self.ones.binding(),
@@ -697,7 +697,7 @@ impl Stack {
     }
 
     /// Q, K and V, whether they are their own allocations or views into the fused one.
-    fn qkv_views(&self) -> (BufferRef, BufferRef, BufferRef) {
+    fn qkv_views(&self) -> (View<'_>, View<'_>, View<'_>) {
         match &self.qkv_split {
             Some((q, k, v)) => (q.binding(), k.binding(), v.binding()),
             None => {
@@ -715,24 +715,24 @@ impl Stack {
     /// `x`: f32 `[capacity][hidden]`, rows past `tokens` untouched. `cls`: i32 `[tokens]`.
     /// `cos`/`sin`: f32 `[tokens][rope_dim/2]`.
     #[allow(clippy::too_many_arguments)]
-    pub fn forward(
+    pub fn forward<'a>(
         &mut self,
         gpu: &hrx::Gpu,
         prof: &mut Profile,
-        x: BufferRef,
-        cls: BufferRef,
-        cos: BufferRef,
-        sin: BufferRef,
-        cond: &dyn Fn(usize) -> LayerCond,
+        x: View<'_>,
+        cls: View<'_>,
+        cos: View<'_>,
+        sin: View<'_>,
+        cond: &dyn Fn(usize) -> LayerCond<'a>,
         first: usize,
         last: Option<usize>,
     ) -> Result<()> {
         let t = self.tokens as u32;
         let last = last.unwrap_or(self.layers);
-        let (q, k, v) = self.qkv_views();
 
         // H3_DUMP_BLOCKS=<dir>: this stack's x before the first block and after every one, as
-        // [tokens][hidden] f32, on its H3_DUMP_CALL-th forward.
+        // [tokens][hidden] f32, on its H3_DUMP_CALL-th forward. The counter is bumped before the
+        // Q/K/V views are taken, since those borrow the fused allocation for the rest of the call.
         let dump_dir = env_once("H3_DUMP_BLOCKS");
         let dump_call: usize = env_once("H3_DUMP_CALL")
             .and_then(|v| v.parse().ok())
@@ -742,6 +742,7 @@ impl Stack {
             self.calls += 1;
             this == dump_call && first == 0
         };
+        let (q, k, v) = self.qkv_views();
         if dumping {
             self.dump(gpu, dump_dir.unwrap(), "h_in", x)?;
         }
@@ -935,9 +936,9 @@ impl Stack {
         gpu: &hrx::Gpu,
         prof: &mut Profile,
         t: u32,
-        q: BufferRef,
-        k: BufferRef,
-        v: BufferRef,
+        q: View<'_>,
+        k: View<'_>,
+        v: View<'_>,
     ) -> Result<()> {
         let query_block = 16 * self.waves as u32;
         let Some(int_qk) = &self.int_qk else {
@@ -1040,7 +1041,7 @@ impl Stack {
         )
     }
 
-    fn dump(&self, gpu: &hrx::Gpu, dir: &str, name: &str, x: BufferRef) -> Result<()> {
+    fn dump(&self, gpu: &hrx::Gpu, dir: &str, name: &str, x: View<'_>) -> Result<()> {
         let bytes = self.tokens * self.d.hidden * 4;
         let mut host = vec![0u8; bytes];
         gpu.d2h_ref(x, &mut host)?;

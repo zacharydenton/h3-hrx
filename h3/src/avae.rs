@@ -10,7 +10,7 @@ use crate::dispatch::{axpy, launch, MatmulF32, Profile};
 use crate::error::{other, Result};
 use crate::model::THREADS;
 use crate::weights::Weights;
-use hrx::sys::BufferRef;
+use hrx::View;
 
 /// Samples per latent frame, at 32 kHz.
 pub const HOP: usize = 800;
@@ -48,10 +48,10 @@ fn conv_s(
     (cin, cout, ksize, dil, pad, stride): (usize, usize, usize, usize, usize, usize),
     in_len: usize,
     out_len: usize,
-    x: BufferRef,
-    w: BufferRef,
-    b: BufferRef,
-    out: BufferRef,
+    x: View<'_>,
+    w: View<'_>,
+    b: View<'_>,
+    out: View<'_>,
 ) -> Result<()> {
     let ns = "h3.conv1d_s_f32.";
     let cfg: Cfg = vec![
@@ -86,9 +86,9 @@ fn snake_plain(
     prof: &mut Profile,
     channels: usize,
     len: usize,
-    x: BufferRef,
-    alpha: BufferRef,
-    out: BufferRef,
+    x: View<'_>,
+    alpha: View<'_>,
+    out: View<'_>,
 ) -> Result<()> {
     let ns = "h3.snake_f32.";
     let cfg: Cfg = vec![
@@ -116,10 +116,10 @@ fn layernorm(
     prof: &mut Profile,
     rows: usize,
     width: usize,
-    x: BufferRef,
-    w: BufferRef,
-    b: BufferRef,
-    out: BufferRef,
+    x: View<'_>,
+    w: View<'_>,
+    b: View<'_>,
+    out: View<'_>,
 ) -> Result<()> {
     let ns = "h3.layernorm_f32.";
     let cfg: Cfg = vec![
@@ -147,8 +147,8 @@ fn transpose(
     prof: &mut Profile,
     rows: usize,
     cols: usize,
-    x: BufferRef,
-    out: BufferRef,
+    x: View<'_>,
+    out: View<'_>,
 ) -> Result<()> {
     let ns = "h3.transpose_f32.";
     let cfg: Cfg = vec![(format!("{ns}cols"), cols.to_string())];
@@ -177,10 +177,10 @@ fn conv4(
     (cin, cout, ksize, dil, pad): (usize, usize, usize, usize, usize),
     accumulate: bool,
     len: usize,
-    x: BufferRef,
-    w: BufferRef,
-    b: BufferRef,
-    out: BufferRef,
+    x: View<'_>,
+    w: View<'_>,
+    b: View<'_>,
+    out: View<'_>,
 ) -> Result<()> {
     let ns = "h3.conv1d4_f32.";
     let cfg: Cfg = vec![
@@ -263,11 +263,11 @@ impl AudioVae {
         prof: &mut Profile,
         channels: usize,
         len: usize,
-        x: BufferRef,
-        alpha: BufferRef,
-        beta: BufferRef,
-        tmp2: BufferRef,
-        out: BufferRef,
+        x: View<'_>,
+        alpha: View<'_>,
+        beta: View<'_>,
+        tmp2: View<'_>,
+        out: View<'_>,
     ) -> Result<()> {
         let (nu, nd) = ("h3.up2_snake_f32.", "h3.down2_f32.");
         let up_cfg: Cfg = vec![
@@ -444,15 +444,23 @@ impl AudioVae {
                             d.r2.binding(),
                             d.tmp2.binding(),
                         );
-                        let a1 = self
-                            .weights
-                            .at(gpu, &format!("{act1}alpha"), chan * 4)?
-                            .binding();
-                        let b1 = self
-                            .weights
-                            .at(gpu, &format!("{act1}beta"), chan * 4)?
-                            .binding();
-                        self.snake_beta(c, gpu, prof, chan, len, hj, a1, b1, tmp2, rb)?;
+                        // held for the call: a view borrows the allocation it names
+                        let (a1, b1) = (
+                            self.weights.at(gpu, &format!("{act1}alpha"), chan * 4)?,
+                            self.weights.at(gpu, &format!("{act1}beta"), chan * 4)?,
+                        );
+                        self.snake_beta(
+                            c,
+                            gpu,
+                            prof,
+                            chan,
+                            len,
+                            hj,
+                            a1.binding(),
+                            b1.binding(),
+                            tmp2,
+                            rb,
+                        )?;
                         conv4(
                             c,
                             gpu,
@@ -474,15 +482,22 @@ impl AudioVae {
                                 .binding(),
                             r2b,
                         )?;
-                        let a2 = self
-                            .weights
-                            .at(gpu, &format!("{act2}alpha"), chan * 4)?
-                            .binding();
-                        let b2 = self
-                            .weights
-                            .at(gpu, &format!("{act2}beta"), chan * 4)?
-                            .binding();
-                        self.snake_beta(c, gpu, prof, chan, len, r2b, a2, b2, tmp2, rb)?;
+                        let (a2, b2) = (
+                            self.weights.at(gpu, &format!("{act2}alpha"), chan * 4)?,
+                            self.weights.at(gpu, &format!("{act2}beta"), chan * 4)?,
+                        );
+                        self.snake_beta(
+                            c,
+                            gpu,
+                            prof,
+                            chan,
+                            len,
+                            r2b,
+                            a2.binding(),
+                            b2.binding(),
+                            tmp2,
+                            rb,
+                        )?;
                         // the accumulating form closes the skip in place
                         conv4(
                             c,
@@ -540,12 +555,22 @@ impl AudioVae {
                 d.r2.binding(),
                 d.tmp2.binding(),
             );
-            let pa = self
-                .weights
-                .at(gpu, "audio.post.alpha", chan * 4)?
-                .binding();
-            let pb = self.weights.at(gpu, "audio.post.beta", chan * 4)?.binding();
-            self.snake_beta(c, gpu, prof, chan, len, hb, pa, pb, tmp2, rb)?;
+            let (pa, pb) = (
+                self.weights.at(gpu, "audio.post.alpha", chan * 4)?,
+                self.weights.at(gpu, "audio.post.beta", chan * 4)?,
+            );
+            self.snake_beta(
+                c,
+                gpu,
+                prof,
+                chan,
+                len,
+                hb,
+                pa.binding(),
+                pb.binding(),
+                tmp2,
+                rb,
+            )?;
             conv4(
                 c,
                 gpu,

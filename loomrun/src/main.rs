@@ -187,7 +187,7 @@ fn run(opt: Options) -> Result<(), String> {
         gpu.sync().map_err(|e| e.to_string())?;
     }
 
-    let mut bindings: Vec<hrx::sys::BufferRef> = buffers.iter().map(|b| b.binding()).collect();
+    let mut bindings: Vec<hrx::View<'_>> = buffers.iter().map(|b| b.binding()).collect();
     if opt.verbose {
         let info = kernel.info();
         eprintln!(

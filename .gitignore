@@ -7,4 +7,5 @@ __pycache__/
 *.log
 /examples/c/minimal
 /examples/go/minimal
+/target/
 /examples/rust/target/

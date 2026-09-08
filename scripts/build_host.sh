@@ -10,9 +10,11 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-(cd h3 && cargo build --release --quiet)
-cp h3/target/release/libh3.so build/libh3.so
-printf 'built build/libh3.so\n'
+cargo build --workspace --release --quiet
+cp target/release/libh3.so build/libh3.so
+cp target/release/h3 build/h3
+cp target/release/loomrun build/loomrun
+printf 'built build/libh3.so, build/h3, build/loomrun\n'
 
 # The header is generated from the code that implements it, so it cannot drift. scripts/test.sh
 # checks the committed copy still matches a fresh run.
@@ -22,11 +24,3 @@ if command -v cbindgen >/dev/null 2>&1; then
 else
   printf 'skipped include/h3.h: cbindgen not found (cargo install cbindgen)\n' >&2
 fi
-
-(cd cli && cargo build --release --quiet)
-cp cli/target/release/h3 build/h3
-printf 'built build/h3\n'
-
-(cd loomrun && cargo build --release --quiet)
-cp loomrun/target/release/loomrun build/loomrun
-printf 'built build/loomrun\n'
