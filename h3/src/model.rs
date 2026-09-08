@@ -84,6 +84,24 @@ pub fn gemm_pitch(k: usize, bits: usize) -> usize {
     }
 }
 
+// The vision tower: Qwen3-VL's ViT. 27 blocks, hidden 1152, 16 heads of 72 padded to 128 for the WMMA
+// attention. Four patches merge into one output row, so the merger reads the stream as [n/4][4608].
+pub const VHID: usize = 1152;
+pub const VHEADS: usize = 16;
+pub const VHD: usize = 72;
+pub const VHDP: usize = 128;
+pub const VMLP: usize = 4352;
+pub const VOUT: usize = 5120;
+pub const VBLOCKS: usize = 27;
+/// The blocks whose output feeds a DeepStack merger.
+pub const VDEEPSTACK: [usize; 3] = [8, 16, 24];
+/// The merged width, four patches of the hidden size.
+pub const VMERGE: usize = 4 * VHID;
+/// The learned position table's side: 48x48 rows, bilinearly resampled to the patch grid.
+pub const VPOS_GRID: usize = 48;
+/// One 16x16 patch as the tower takes it: three channels in two temporal slots.
+pub const VISION_PATCH: usize = 3 * 2 * 16 * 16;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +269,18 @@ mod selection_tests {
         assert_eq!(elem_bits("f16"), 16);
         assert_eq!(elem_bits("bf16"), 16);
     }
+
+    #[test]
+    fn the_vision_tower_merges_four_patches_into_one_row() {
+        assert_eq!(VMERGE, 4608);
+        assert_eq!(VISION_PATCH, 1536);
+        assert_eq!(
+            VHEADS * VHD,
+            1152,
+            "the heads cover the hidden width exactly"
+        );
+        // the head dimension is padded up to a power of two for the WMMA attention
+        assert!(VHDP.is_power_of_two() && VHDP >= VHD);
+        assert!(VDEEPSTACK.iter().all(|b| *b < VBLOCKS));
+    }
 }
-pub const VISION_PATCH: usize = 1536; // one 16x16 patch, three channels, two temporal slots

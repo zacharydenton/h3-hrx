@@ -17,5 +17,6 @@ pub mod sampler;
 pub mod stack;
 pub mod tiles;
 pub mod tokenizer;
+pub mod vision;
 pub mod vvae;
 pub mod weights;

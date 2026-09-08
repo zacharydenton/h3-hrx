@@ -621,6 +621,108 @@ pub fn axpy(
     )
 }
 
+/// The vision tower's GEMM family: `matmul_<kind>_bf16_wmma`, whose weight rows are bf16 as stored.
+///
+/// The kind decides what happens after the multiply — `bias` stops there, `gelu` and `gelu_erf` apply
+/// their activation, and `resid` adds into an existing f16 stream. The two GELUs are not the same
+/// function and are not interchangeable: the tower's MLP uses the tanh approximation and its mergers
+/// the error function.
+pub struct Matmul16 {
+    kernel: Arc<hrx::Kernel>,
+    n: usize,
+    resid: bool,
+}
+
+impl Matmul16 {
+    pub fn build(c: &Compiler, gpu: &hrx::Gpu, kind: &str, k: usize, n: usize) -> Result<Self> {
+        let stem = format!("matmul_{kind}_bf16_wmma");
+        let ns = format!("h3.{stem}.");
+        let cfg: Cfg = vec![
+            (format!("{ns}k_size"), k.to_string()),
+            (format!("{ns}n_size"), n.to_string()),
+        ];
+        Ok(Self {
+            kernel: c.get(gpu, &stem, &format!("h3_{stem}"), &cfg)?,
+            n,
+            resid: kind == "resid",
+        })
+    }
+
+    /// `lambda` is the residual form's per-column scale, and is required by exactly that form.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        gpu: &hrx::Gpu,
+        profile: Option<&mut Profile>,
+        stage: &str,
+        m: usize,
+        a: BufferRef,
+        w: BufferRef,
+        bias: BufferRef,
+        out: BufferRef,
+        lambda: Option<BufferRef>,
+    ) -> Result<()> {
+        debug_assert_eq!(
+            self.resid,
+            lambda.is_some(),
+            "only the resid form takes a lambda"
+        );
+        let mut bindings = vec![a, w, bias, out];
+        bindings.extend(lambda);
+        launch(
+            gpu,
+            &self.kernel,
+            profile,
+            stage,
+            [(self.n / 64) as u32, m.div_ceil(64) as u32, 1],
+            [256, 1, 1],
+            &[m as u32],
+            &bindings,
+        )
+    }
+}
+
+/// LayerNorm reading an f16 stream and writing f32, which is what the vision tower's blocks take.
+pub struct LayerNorm16 {
+    kernel: Arc<hrx::Kernel>,
+}
+
+impl LayerNorm16 {
+    pub fn build(c: &Compiler, gpu: &hrx::Gpu, width: usize, eps: f64) -> Result<Self> {
+        let ns = "h3.layernorm_f16_f32.";
+        let cfg: Cfg = vec![
+            (format!("{ns}width"), width.to_string()),
+            (format!("{ns}eps"), num(eps)),
+        ];
+        Ok(Self {
+            kernel: c.get(gpu, "layernorm_f16_f32", "h3_layernorm_f16_f32", &cfg)?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        gpu: &hrx::Gpu,
+        profile: Option<&mut Profile>,
+        rows: usize,
+        x16: BufferRef,
+        w: BufferRef,
+        b: BufferRef,
+        out32: BufferRef,
+    ) -> Result<()> {
+        launch(
+            gpu,
+            &self.kernel,
+            profile,
+            "vision layernorm",
+            [rows as u32, 1, 1],
+            [32, 1, 1],
+            &[rows as u32],
+            &[x16, w, b, out32],
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -247,7 +247,7 @@ impl VideoVae {
         }
 
         let b = self.built.as_mut().expect("built above");
-        gpu.h2d(&b.in16, bytemuck_f16(&in16))?;
+        gpu.h2d(&b.in16, as_bytes_f16(&in16))?;
         gpu.memset(&b.x, 0, nt * VAE_HID * 4)?;
 
         let w_in = self
@@ -614,7 +614,7 @@ impl VideoVae {
         }
 
         let x = gpu.alloc(rows0 * 8 * 2)?;
-        gpu.h2d(&x, bytemuck_f16(&inrows))?;
+        gpu.h2d(&x, as_bytes_f16(&inrows))?;
         // the widest [rows][channels] plane of the stack: rows fall as fast as channels rise
         let plane_bytes = rows0 * 128 * 2;
         let mut h = gpu.alloc(plane_bytes)?;
@@ -1036,7 +1036,7 @@ pub fn as_bytes_mut(v: &mut [f32]) -> &mut [u8] {
     unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
 }
 
-fn bytemuck_f16(v: &[half::f16]) -> &[u8] {
+pub fn as_bytes_f16(v: &[half::f16]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
 }
 
