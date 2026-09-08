@@ -252,3 +252,4 @@ mod selection_tests {
         assert_eq!(elem_bits("bf16"), 16);
     }
 }
+pub const VISION_PATCH: usize = 1536; // one 16x16 patch, three channels, two temporal slots
