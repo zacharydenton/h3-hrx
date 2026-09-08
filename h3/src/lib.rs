@@ -1,4 +1,5 @@
 //! MiniMax H3 inference against ComfyUI's checkpoints, with every GPU kernel in Loom.
+pub mod cache;
 pub mod checkpoint;
 pub mod compile;
 pub mod conditioning;
