@@ -31,7 +31,7 @@ fn main() {
         te: file("text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
         video_vae: file("vae/minimax_h3_video_vae_fp16.safetensors"),
         audio_vae: file("vae/minimax_h3_audio_vae_fp32.safetensors"),
-        kernel_sources: format!("{root}/kernels").into(),
+        kernel_sources: format!("{root}/h3/kernels").into(),
         cache_dir: format!("{root}/build/kernel_cache").into(),
         loom_compile: std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into()),
         attention: h3::Attention::I8,

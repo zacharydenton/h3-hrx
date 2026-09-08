@@ -34,18 +34,26 @@ measurements, and decoder timings.
 
 ## Setup
 
-You need Linux, a `gfx1151` device with its kernel driver, Rust, ffmpeg, and a
-built Loom compiler. The measured kernels require
-[two Loom patches included here](patches/loom/README.md).
-Python 3 and NumPy are needed for development and CPU tests.
+You need Linux, a `gfx1151` device with its kernel driver, Rust and ffmpeg.
+The shared `hrx.rs` crate provisions prebuilt Loom, HRX and compatible HSA.
+Python and NumPy are development/reference-test dependencies.
 
-From the repository root, after [building Loom](patches/loom/README.md):
+With the sibling `hrx.rs` checkout:
 
 ```sh
-export HRX_BUILD=/path/to/hrx-system/build
-source scripts/env.sh
+cargo install --locked --path ../hrx.rs --features runner
+hrx prepare ../hrx.rs/artifacts/hrx-linux-x86_64-gfx1151.tar.gz
+cargo install --locked --path cli
+# Build the C library and headers too:
 bash scripts/build_host.sh
 ```
+
+The native bundle is currently a tested local candidate. The automatic download
+path is implemented, but its public release has not been uploaded. See
+[shared HRX integration](docs/shared-hrx.md) for overrides, offline use, C ABI and
+Rustler. Kernel sources and the tokenizer are embedded in installed binaries;
+the default compiler cache is in the writable per-user HRX cache. `--root`
+selects a developer source/cache tree explicitly.
 
 ### Weights
 
@@ -87,7 +95,7 @@ H3 expects [structured prompts](docs/prompting.md). Start with the included one:
 ```
 
 This writes `clip.mp4` and `clip.wav`. `--steps 31` means 30 model evaluations.
-The first run of each shape compiles kernels into `build/kernel_cache`.
+The first run of each shape compiles kernels into the shared per-user HRX cache.
 For the demo's resolution, use `--width 1344 --height 768`.
 
 With prompts written for the corresponding conditioning mode:

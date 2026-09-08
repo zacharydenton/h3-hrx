@@ -1,8 +1,9 @@
 # Contributing
 
-Use [setup](docs/setup.md) to build the host and the
-[pinned Loom toolchain](patches/loom/README.md) for kernel work. Include a
-description of the changed behavior and the checks you ran with a contribution.
+Use [setup](docs/setup.md) to build the library and the CLI; kernel work also
+wants the [pinned Loom toolchain](patches/loom/README.md), which the Python
+tooling under `tools/` drives directly. Include a description of the changed
+behavior and the checks you ran with a contribution.
 For performance changes, record the shape, precision, hardware, toolchain,
 timing boundary, and numerical comparison alongside the result.
 
@@ -15,13 +16,13 @@ timing boundary, and numerical comparison alongside the result.
 | `cli/` | the `h3` command, a client of the `h3` crate's own API |
 | `loomrun/` | the kernel-test launcher the Python harness dispatches through |
 | `include/` | `h3.h`, generated from `h3/src/capi.rs` by cbindgen and checked in |
-| `kernels/` | Runtime Loom sources, mostly emitted by `tools/gen_*.py` |
+| `h3/kernels/` | Runtime Loom sources, mostly emitted by `tools/gen_*.py` |
 | `tools/` | Generators, Python client, benchmarks, and ComfyUI comparison tools |
 | `tests/` | kernel numerical checks and pipeline comparisons; the host's own tests are `cargo test` |
 | `reference/` | PyTorch/diffusers numerical oracles; unused during normal inference |
 | `experiments/` | Kernel alternatives, including templates and GPU regression inputs |
 | `examples/` | C, Rust, Go, and Python clients |
-| `assets/` | Tokenizer data embedded into the library |
+| `h3/assets/` | Tokenizer data embedded into the library |
 | `docs/archive/` | Historical measurements and tuning logs |
 
 Edit a generated kernel's generator and regenerate the source together.

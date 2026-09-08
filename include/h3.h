@@ -65,11 +65,11 @@ typedef struct h3_config {
   const char *video_vae_file;
   // minimax_h3_audio_vae_fp32.safetensors: the vocoder and the audio encoder
   const char *audio_vae_file;
-  // the repo's kernels/ directory (.loom files)
+  // Optional directory of .loom sources; NULL or empty selects embedded sources
   const char *kernel_sources;
-  // where compiled .hsaco files live (created)
+  // Optional cache directory; NULL or empty selects the shared per-user HRX cache
   const char *cache_dir;
-  // path to the loom-compile binary
+  // Optional compiler override; NULL or empty selects LOOM_COMPILE or the pinned bundle
   const char *loom_compile;
   // the DiT attention's QK^T operands: 16 (f16), 8 (int8, the parity path) or 4 (int4); 0 means 8
   int attn_qk_bits;

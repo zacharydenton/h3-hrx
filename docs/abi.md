@@ -44,7 +44,10 @@ the library never keeps a pointer past the call except the session's own state. 
 the caller's memory rather than copied, so a call's input and output buffers must not overlap. Latent, frame and
 sample buffers must be at least the sizes below; pass their element counts, and the library
 refuses short ones rather than writing past them. A larger buffer (a pooled one, say) is accepted
-and exactly the required count is read or written; the rest is untouched.
+and exactly the required count is read or written; the rest is untouched. A pointer must also be
+aligned for the type it names and its span must not wrap the address space; a count of zero is the
+one case where NULL is accepted, and yields an empty slice. What the library cannot check — that
+the pointer really names the memory it claims — remains the caller's promise.
 
 **On failure.** Arguments are validated before any output is written, so `H3_INVALID_ARGUMENT`
 always leaves the output buffers as they were. A failure raised once a call is under way — a device
@@ -113,9 +116,13 @@ step: the DiT blocks' and text encoder's int8 ConvRot rows run on the
 int8 GEMMs with their stored scales, the bf16 refiner, condition projection and vision tower on
 bf16 kernels, the video VAE's f16 and the audio VAE's f32 tensors in their own types. A file may
 be NULL; the calls that need it then fail with a message naming it, and each file is opened on
-first use. `kernel_sources` is the repository's `kernels/`, `cache_dir` any writable directory,
-`loom_compile` the compiler binary. `attn_qk_bits` chooses the DiT attention's QK^T operands: 8
-(the default and the parity path), 16 for f16, or 4 for int4.
+first use. The three remaining strings are all optional, and NULL or `""` selects a default:
+`kernel_sources` the Loom sources built into the library (pass the repository's `h3/kernels/` to
+compile from a working tree instead), `cache_dir` the shared per-user HRX cache under
+`$XDG_CACHE_HOME/hrx` (pass any writable directory to keep a cache of your own), and `loom_compile`
+whatever `LOOM_COMPILE` names or, failing that, the compiler in the pinned native bundle.
+`attn_qk_bits` chooses the DiT attention's QK^T operands: 8 (the default and the parity path), 16
+for f16, or 4 for int4.
 
 `h3_tokenizer_create(NULL)` uses the vocabulary compiled into the library (`H3_TOKENIZER=<file>`
 overrides it); passing a path reads that file instead.

@@ -8,53 +8,52 @@ Run commands from the repository root unless stated otherwise.
   128 GB Strix Halo system. Allow room for activations as well as weights;
   smaller memory configurations have not been validated.
 - ffmpeg for input decoding and MP4/WAV output.
-- `cargo` (Rust). Everything outside `kernels/` is Rust: the library, the `h3`
+- `cargo` (Rust). Everything outside `h3/kernels/` is Rust: the library, the `h3`
   command and the `loomrun` kernel launcher. No ROCm headers and no `hipcc` —
   the runtime surface is `libhrx`.
-- `cbindgen` (`cargo install cbindgen`) to regenerate `include/h3.h`. The build
-  skips it when absent and uses the committed header.
-- [Loom with the included compiler patches](../patches/loom/README.md).
-  Everything dispatches through `libhrx` from that build.
+- A checkout of the [`hrx.rs`](shared-hrx.md) crate beside the directory holding
+  this one. It is a path dependency, so nothing here builds without it, and it
+  supplies the Loom compiler, `libhrx` and a compatible HSA as a pinned,
+  digest-verified native bundle. No ROCm headers, no `hipcc`, no LLVM build.
 - For downloads, the Hugging Face CLI (`python3 -m pip install huggingface_hub`
   in a Python environment). For development, Python 3 with NumPy. Inference
   itself runs without Python.
 
 ## Toolchain and build
 
+The native bundle is a tested local candidate; its public release has not been
+uploaded yet, so prepare it from the sibling checkout rather than letting HRX
+fetch it:
+
 ```sh
-export HRX_BUILD=/path/to/hrx-system/build
-source scripts/env.sh
+cargo install --locked --path ../hrx.rs --features runner
+hrx prepare ../hrx.rs/artifacts/hrx-linux-x86_64-gfx1151.tar.gz
 bash scripts/build_host.sh
 ```
 
-`env.sh` derives tool paths from `HRX_BUILD`; individual `LOOM_COMPILE`,
-`LOOM_FORMAT`, `LOOM_CHECK`, `IREE_TEST_LOOM`, and `IREE_BENCHMARK_LOOM`
-overrides are respected. It retains the development checkout default
-`~/code/hrx-system/build-cuda` when `HRX_BUILD` is unset.
+`HRX_RUNTIME_DIR` points at a native directory of your own, `HRX_BUNDLE_MANIFEST`
+at a pinned mirror, and `HRX_OFFLINE` refuses the network outright. `LOOM_COMPILE`
+selects a developer compiler in place of the bundle's.
 
 The build produces `build/libh3.so`, `build/h3`, `build/loomrun` and
-`include/h3.h`. Keep the repository's `kernels/` directory available: kernels
-compile on first use for each shape and are cached in `build/kernel_cache`.
-Use `h3 --root DIR` if you relocate the executable.
+`include/h3.h`, the last copied from what the Cargo build generated — an ordinary
+`cargo build` leaves the checkout alone. An installed binary carries the Loom
+sources and the tokenizer inside it and caches compiled kernels per user under
+`$XDG_CACHE_HOME/hrx`; `h3 --root DIR` opts back into a working tree's
+`h3/kernels/` and `build/kernel_cache` instead.
 
 Optional CLI installation:
 
 ```sh
-mkdir -p ~/.local/bin
-ln -s "$PWD/build/h3" ~/.local/bin/h3
+cargo install --locked --path cli   # or: ln -s "$PWD/build/h3" ~/.local/bin/h3
 ```
 
-The optional HRX backend is built when `libhrx.so` is available under
-`HRX_SYSTEM` (default `~/code/hrx-system`). The HIP backend is the normal CLI
-path.
-
-An unpatched HRX runtime fails to initialize on a ROCr older than the
-`HSA_AMD_AGENT_INFO_PM4_EMULATION` attribute, including the distribution's
-HSA 1.18: `hrx_gpu_initialize` returns `INVALID_ARGUMENT` from
-`hsa_agent_get_info`. `patches/loom/0003-amdgpu-pm4-emulation-query-optional.patch`
-fixes that. With it applied, HRX runs on the stock system runtime and produces
-frames and samples bit-identical to the HIP backend, so no replacement runtime
-and no `LD_LIBRARY_PATH` entry is needed.
+Building Loom yourself, rather than taking the bundle's compiler, needs
+[the included compiler patches](../patches/loom/README.md) — among them
+`0003-amdgpu-pm4-emulation-query-optional.patch`, without which `hrx_gpu_initialize`
+returns `INVALID_ARGUMENT` from `hsa_agent_get_info` on a ROCr older than the
+`HSA_AMD_AGENT_INFO_PM4_EMULATION` attribute. The Python kernel tooling under
+`tools/` still drives such a build, through `scripts/env.sh` and `HRX_BUILD`.
 
 ## Checkpoints
 

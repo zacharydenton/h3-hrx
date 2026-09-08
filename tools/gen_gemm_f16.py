@@ -88,7 +88,7 @@ def gemm(K: str, elem: str = "f16") -> str:
 def main():
     for stem in GEMMS:
         for elem in ("f16", "bf16"):
-            out = ROOT / "kernels" / f"{stem.replace('gemm_i8_', f'gemm_{elem}_')}.loom"; out.write_text(gemm((ROOT / "kernels" / f"{stem}.loom").read_text(), elem)); print("wrote", out.name)
+            out = ROOT / "h3/kernels" / f"{stem.replace('gemm_i8_', f'gemm_{elem}_')}.loom"; out.write_text(gemm((ROOT / "h3/kernels" / f"{stem}.loom").read_text(), elem)); print("wrote", out.name)
 
 
 if __name__ == "__main__":

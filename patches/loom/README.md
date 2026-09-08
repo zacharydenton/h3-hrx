@@ -51,9 +51,11 @@ source scripts/env.sh
 bash scripts/test.sh --cpu
 ```
 
-`libhrx_src_libhrx_hrx` builds `libhrx.so`, which is not optional: every
-executable in this project links it, and `scripts/env.sh` finds it at
-`$HRX_BUILD/libhrx/src/libhrx`. There is no HIP path any more.
+`libhrx_src_libhrx_hrx` builds `libhrx.so`. Nothing links it any more — the
+library loads a digest-verified copy from the HRX bundle at run time — but the
+Python kernel tooling under `tools/` still finds this build's tools through
+`scripts/env.sh` and `$HRX_BUILD`, and `LOOM_COMPILE` points the Rust side at
+this `loom-compile` in place of the bundle's. There is no HIP path any more.
 
 The three patches reproduce the committed compiler source used for the recorded
 measurements. The CPU suite checks this project's generated kernels with the

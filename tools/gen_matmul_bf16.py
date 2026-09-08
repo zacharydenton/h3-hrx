@@ -56,7 +56,7 @@ def twin(text: str, kind: str) -> str:
 
 def main():
     for kind in KINDS:
-        src = ROOT / "kernels" / f"matmul_{kind}_f16_wmma.loom"; out = ROOT / "kernels" / f"matmul_{kind}_bf16_wmma.loom"
+        src = ROOT / "h3/kernels" / f"matmul_{kind}_f16_wmma.loom"; out = ROOT / "h3/kernels" / f"matmul_{kind}_bf16_wmma.loom"
         out.write_text(twin(src.read_text(), kind)); print("wrote", out.name)
 
 

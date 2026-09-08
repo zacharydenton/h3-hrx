@@ -15,7 +15,7 @@ def main():
     if "--m-group" in args: g_override = int(args[args.index("--m-group") + 1])
     if "--repeat" in args: repeat = int(args[args.index("--repeat") + 1])
     shapes = [tuple(int(v) for v in a.split("x")) for a in args[1:] if "x" in a and a[0].isdigit()]
-    src = ROOT / "kernels" / f"{stem}.loom"
+    src = ROOT / "h3/kernels" / f"{stem}.loom"
     if not src.exists(): src = ROOT / "experiments" / f"{stem}.loom"
     ns, sym = "h3." + stem, "h3_" + stem
     rng = np.random.default_rng(0)

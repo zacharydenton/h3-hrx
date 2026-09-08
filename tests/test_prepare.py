@@ -26,7 +26,7 @@ def check(name, tmp, tokens, width, x_expected, args, cfg, bits=4):
     ns, sym = f"h3.prepare_{name}_i{bits}", f"h3_prepare_{name}_i{bits}"
     hs = tmp / f"{name}_{width}_{bits}.hsaco"
     lanes = lanes_for(width); out_stride = width + int(os.environ.get("PREP_OUT_PAD", "0"))     # PREP_OUT_PAD=64: rows written at a padded pitch (the GEMMs' k_stride)
-    compile_kernel(ROOT / f"kernels/prepare_{name}_i{bits}.loom", sym, {f"{ns}.width": width, f"{ns}.lanes": lanes, f"{ns}.out_stride": out_stride, **cfg}, hs)
+    compile_kernel(ROOT / f"h3/kernels/prepare_{name}_i{bits}.loom", sym, {f"{ns}.width": width, f"{ns}.lanes": lanes, f"{ns}.out_stride": out_stride, **cfg}, hs)
     (q, s), t = launch(hs, sym, (tokens, 1, 1), (lanes, 1, 1), [("i32", tokens)] + args +
                        [("out", ((tokens, out_stride // (8 // bits)), np.uint8)), ("out", ((tokens,), np.float32))], tmp, repeat=3)
     q = q[:, :width // (8 // bits)]     # PREP_OUT_PAD: the rows are written at the padded pitch, the tail is left alone

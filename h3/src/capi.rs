@@ -71,11 +71,11 @@ pub struct h3_config {
     pub video_vae_file: *const c_char,
     /// minimax_h3_audio_vae_fp32.safetensors: the vocoder and the audio encoder
     pub audio_vae_file: *const c_char,
-    /// the repo's kernels/ directory (.loom files)
+    /// Optional directory of .loom sources; NULL or empty selects embedded sources
     pub kernel_sources: *const c_char,
-    /// where compiled .hsaco files live (created)
+    /// Optional cache directory; NULL or empty selects the shared per-user HRX cache
     pub cache_dir: *const c_char,
-    /// path to the loom-compile binary
+    /// Optional compiler override; NULL or empty selects LOOM_COMPILE or the pinned bundle
     pub loom_compile: *const c_char,
     /// the DiT attention's QK^T operands: 16 (f16), 8 (int8, the parity path) or 4 (int4); 0 means 8
     pub attn_qk_bits: c_int,
@@ -191,20 +191,14 @@ pub extern "C" fn h3_last_error() -> *const c_char {
 ///
 /// The panic hook is not touched, so a panic still prints where it happened before being converted.
 fn guard(f: impl FnOnce() -> Result<(), Error> + std::panic::UnwindSafe) -> c_int {
-    match std::panic::catch_unwind(f) {
-        Ok(Ok(())) => OK,
-        Ok(Err(e)) => {
-            set_error(&e.to_string());
-            code(&e)
-        }
-        Err(p) => {
-            let what = p
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| p.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "panicked".into());
-            set_error(&format!("internal error: {what}"));
-            ERROR
+    match hrx::ffi::catch(
+        || f().map_err(|e| hrx::ffi::Failure::new(code(&e), e.to_string())),
+        ERROR,
+    ) {
+        Ok(()) => OK,
+        Err(e) => {
+            set_error(&e.message);
+            e.code
         }
     }
 }
@@ -225,26 +219,12 @@ unsafe fn path(p: *const c_char) -> Option<std::path::PathBuf> {
 /// result — the contract violation is not an unwind. So a NULL with a count is an error, and only a
 /// count of zero yields an empty slice.
 unsafe fn slice<'a, T>(p: *const T, n: usize, what: &str) -> Result<&'a [T], Error> {
-    if n == 0 {
-        return Ok(&[]);
-    }
-    if p.is_null() {
-        return Err(Error::Invalid(format!(
-            "{what} is NULL with a count of {n}"
-        )));
-    }
-    Ok(std::slice::from_raw_parts(p, n))
+    hrx::ffi::slice(p, n).map_err(|e| Error::Invalid(format!("{what}: {e}")))
 }
 
 /// A caller's output buffer as a mutable slice, on the same terms.
 unsafe fn out_slice<'a, T>(p: *mut T, n: usize, what: &str) -> Result<&'a mut [T], Error> {
-    if n == 0 {
-        return Ok(&mut []);
-    }
-    if p.is_null() {
-        return Err(Error::Invalid(format!("{what} is NULL")));
-    }
-    Ok(std::slice::from_raw_parts_mut(p, n))
+    hrx::ffi::slice_mut(p, n).map_err(|e| Error::Invalid(format!("{what}: {e}")))
 }
 
 /// A product of dimensions, in `usize` and checked.
@@ -312,19 +292,18 @@ pub unsafe extern "C" fn h3_create(
     out_session: *mut *mut h3_session,
 ) -> c_int {
     guard(|| {
+        if !out_session.is_null() {
+            hrx::ffi::check_span(out_session, 1).map_err(|e| Error::Invalid(e.to_string()))?;
+            *out_session = std::ptr::null_mut();
+        }
         if config.is_null() || out_session.is_null() {
             return Err(Error::Invalid("config and out_session are required".into()));
         }
+        hrx::ffi::check_span(config, 1).map_err(|e| Error::Invalid(e.to_string()))?;
         let c = &*config;
-        let (Some(kernel_sources), Some(cache_dir), Some(loom_compile)) = (
-            path(c.kernel_sources),
-            path(c.cache_dir),
-            path(c.loom_compile),
-        ) else {
-            return Err(Error::Invalid(
-                "kernel_sources, cache_dir and loom_compile are required".into(),
-            ));
-        };
+        let kernel_sources = path(c.kernel_sources).unwrap_or_default();
+        let cache_dir = path(c.cache_dir).unwrap_or_default();
+        let loom_compile = path(c.loom_compile).unwrap_or_default();
         // Safety: stated in the header — a checkpoint must not be modified while the
         // session holds it. The C caller made that promise by calling h3_create.
         let session =
@@ -399,9 +378,13 @@ unsafe fn with(
     }
     // A poisoned lock means an earlier call panicked inside; the session is not trustworthy after
     // that, so say so rather than handing back state of unknown shape.
-    let mut guard = (*s).inner.lock().map_err(|_| {
-        Error::Other("the session was left inconsistent by an earlier failure".into())
-    })?;
+    let mut guard = hrx::ffi::handle(s)
+        .map_err(|e| Error::Invalid(e.to_string()))?
+        .inner
+        .lock()
+        .map_err(|_| {
+            Error::Other("the session was left inconsistent by an earlier failure".into())
+        })?;
     f(&mut guard)
 }
 
@@ -451,6 +434,17 @@ unsafe fn refs_of<'a>(p: *const h3_ref, n: c_int) -> Result<Vec<Reference<'a>>, 
             &[r.audio_t, 2, crate::avae::AUDIO_CH as c_int],
         )?;
         let plen = extent("reference pixels", &[r.height, r.width, 3])?;
+        if !r.video_latent.is_null() {
+            hrx::ffi::check_span(r.video_latent, vlen)
+                .map_err(|e| Error::Invalid(e.to_string()))?;
+        }
+        if !r.audio_latent.is_null() {
+            hrx::ffi::check_span(r.audio_latent, alen)
+                .map_err(|e| Error::Invalid(e.to_string()))?;
+        }
+        if !r.pixels.is_null() {
+            hrx::ffi::check_span(r.pixels, plen).map_err(|e| Error::Invalid(e.to_string()))?;
+        }
         let video = (!r.video_latent.is_null()).then(|| slice_unchecked(r.video_latent, vlen));
         let audio = (!r.audio_latent.is_null()).then(|| {
             (
@@ -521,6 +515,17 @@ unsafe fn keyframes_of<'a>(
             &[k.audio_t, 2, crate::avae::AUDIO_CH as c_int],
         )?;
         let plen = extent("keyframe pixels", &[k.height, k.width, 3])?;
+        if !k.video_latent.is_null() {
+            hrx::ffi::check_span(k.video_latent, vlen)
+                .map_err(|e| Error::Invalid(e.to_string()))?;
+        }
+        if !k.audio_latent.is_null() {
+            hrx::ffi::check_span(k.audio_latent, alen)
+                .map_err(|e| Error::Invalid(e.to_string()))?;
+        }
+        if !k.pixels.is_null() {
+            hrx::ffi::check_span(k.pixels, plen).map_err(|e| Error::Invalid(e.to_string()))?;
+        }
         out.push(Keyframe {
             frame_index: k.frame_index,
             latents: slice_unchecked(k.video_latent, vlen),
@@ -591,6 +596,12 @@ unsafe fn denoise_into(
 
     let ids = slice(ids, n, "ids")?;
     let dp = DenoiseParams::from(p);
+    if !noise_video.is_null() {
+        hrx::ffi::check_span(noise_video, vlen).map_err(|e| Error::Invalid(e.to_string()))?;
+    }
+    if !noise_audio.is_null() {
+        hrx::ffi::check_span(noise_audio, alen).map_err(|e| Error::Invalid(e.to_string()))?;
+    }
     let noise = Noise {
         video: (!noise_video.is_null()).then(|| slice_unchecked(noise_video, vlen)),
         audio: (!noise_audio.is_null()).then(|| slice_unchecked(noise_audio, alen)),

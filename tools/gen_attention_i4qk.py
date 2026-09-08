@@ -1,4 +1,4 @@
-"""kernels/attention_i4qk_*.loom: the MHA attention kernel with QK^T in int4 WMMA (SageAttention-style
+"""h3/kernels/attention_i4qk_*.loom: the MHA attention kernel with QK^T in int4 WMMA (SageAttention-style
 operands from prepare_qk_i4: per-token, per-head int4 codes and scales, the head rotated, K mean-smoothed)
 and PV in f16 as before. Derived from gen_attention_lds.py by substitution: Q lives in registers as eight
 int4 fragments (16 VGPRs instead of 64), a K tile is 16 keys x 16 words staged into LDS, the i32 scores
@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 WAVES = int(os.environ.get("ATTN_WAVES", "8"))
 STEM = os.environ.get("ATTN_STEM", {8: "attention_i4qk_mha8_lds_f16_wmma", 4: "attention_i4qk_mha_lds_f16_wmma", 16: "attention_i4qk_mha16_lds_f16_wmma"}[WAVES])
-OUT = ROOT / ("kernels" if STEM in ("attention_i4qk_mha8_lds_f16_wmma", "attention_i4qk_mha_lds_f16_wmma") else "experiments") / f"{STEM}.loom"
+OUT = ROOT / ("h3/kernels" if STEM in ("attention_i4qk_mha8_lds_f16_wmma", "attention_i4qk_mha_lds_f16_wmma") else "experiments") / f"{STEM}.loom"
 
 # run the f16 generator in-process with every Q fragment hoisted (no Q LDS) and capture its text
 env = {"ATTN_WAVES": str(WAVES), "ATTN_HOIST": os.environ.get("ATTN_HOIST", "8"), "ATTN_QLDS": os.environ.get("ATTN_QLDS", "0"), "ATTN_D": "128", "ATTN_GQA": "1", "ATTN_TILE": "16", "ATTN_CAUSAL": "0",
@@ -209,7 +209,7 @@ if os.environ.get("ATTN_DBUF", "1") == "1":
     K = K[:body_start] + body + "  }\n  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)\n" + K[loop_end + len("  }\n"):]
     STEM3 = os.environ.get("ATTN_DBUF_STEM", STEM)
     if STEM3 != STEM: K = K.replace(SYM, "h3_" + STEM3).replace(NS, "h3." + STEM3)
-    OUT3 = (ROOT / "kernels" / f"{STEM3}.loom") if STEM3 == STEM or STEM3 == "attention_i4qkl_mha8_lds_f16_wmma" else (ROOT / "experiments" / f"{STEM3}.loom")
+    OUT3 = (ROOT / "h3/kernels" / f"{STEM3}.loom") if STEM3 == STEM or STEM3 == "attention_i4qkl_mha8_lds_f16_wmma" else (ROOT / "experiments" / f"{STEM3}.loom")
     OUT3.write_text(K); print("wrote", OUT3, "(double-buffered)")
 
 # --- tile skipping (SpargeAttn's P.V skip): after the int4 QK^T, a key tile whose scores sit more than skip_tau below
@@ -267,7 +267,7 @@ if os.environ.get("ATTN_SKIP", "1") == "1":
     # the plain kernels keep their names; each gets a skip twin (i4qk -> i4qks: attention_i4qks_mha8, attention_i4qksl_mha8, ...)
     # chosen by the builders only when a tau is set: with the skip disabled the twin is 10-13% slower (phi copies and branch
     # bookkeeping around the eight per-fragment branches: 897 vs 487 instructions per key tile; docs/archive/notes.md)
-    for path in [ROOT / "kernels" / f"{STEM}.loom"] + ([ROOT / "kernels" / f"{os.environ['ATTN_DBUF_STEM']}.loom"] if os.environ.get("ATTN_DBUF_STEM", "").startswith("attention_i4qkl") else []):
+    for path in [ROOT / "h3/kernels" / f"{STEM}.loom"] + ([ROOT / "h3/kernels" / f"{os.environ['ATTN_DBUF_STEM']}.loom"] if os.environ.get("ATTN_DBUF_STEM", "").startswith("attention_i4qkl") else []):
         if path.exists():
             text = path.read_text(); stem_here = path.stem
             assert "skip_tau" not in text, path
@@ -276,12 +276,12 @@ if os.environ.get("ATTN_SKIP", "1") == "1":
             text = add_skip(text)
             sstem = stem_here.replace("i4qk", "i4qks")
             text = text.replace("h3." + STEM, "h3." + sstem).replace("h3_" + stem_here, "h3_" + sstem)
-            (ROOT / "kernels" / f"{sstem}.loom").write_text(text); print("tile-skip twin", ROOT / "kernels" / f"{sstem}.loom")
+            (ROOT / "h3/kernels" / f"{sstem}.loom").write_text(text); print("tile-skip twin", ROOT / "h3/kernels" / f"{sstem}.loom")
 
 # --- ATTN_DIRECT_OUT=1: the epilogue stores the accumulator layout straight to global memory (lane holds column
 # lane%16 of rows 2e + lane/16): 64 scalar f16 stores per lane, no LDS round trips or subgroup barriers
 if os.environ.get("ATTN_DIRECT_OUT", "0") == "1":
-    src_path = ROOT / "kernels" / f"{STEM}.loom"
+    src_path = ROOT / "h3/kernels" / f"{STEM}.loom"
     K = src_path.read_text()
     i0 = K.index("  // Publish one 16x16 fragment at a time"); i1 = K.index("  kernel.return")
     ep = "  // direct epilogue: each lane writes its 8 rows of column lane_column for each of the 8 channel fragments\n"
@@ -363,7 +363,7 @@ if os.environ.get("ATTN_PREFETCH", "0") == "1" and WAVES == 8:
 # LDS slot after the compute, followed by the tile's single barrier. The lookahead past the last tile re-reads it.
 # ATTN_PP_PAD adds LDS bytes to cap workgroups per CU. Output: experiments/<stem with i4qk -> i4qkpp>.
 if os.environ.get("ATTN_PINGPONG", "0") == "1" and WAVES == 4:
-    src_path = ROOT / "kernels" / f"{STEM}.loom"
+    src_path = ROOT / "h3/kernels" / f"{STEM}.loom"
     K = src_path.read_text()
     def sub3(old, new, count=1):
         global K
@@ -429,7 +429,7 @@ if os.environ.get("ATTN_PINGPONG", "0") == "1" and WAVES == 4:
 if os.environ.get("ATTN_PINGPONG", "0") == "1" and WAVES == 8:
     SRC = os.environ.get("ATTN_PP_SRC", "attention_i4qkl_mha8_lds_f16_wmma")
     MODE = os.environ.get("ATTN_PP_MODE", "uncond")
-    K = (ROOT / "kernels" / f"{SRC}.loom").read_text()
+    K = (ROOT / "h3/kernels" / f"{SRC}.loom").read_text()
     def sub4(old, new, count=1):
         global K
         assert K.count(old) == count, (old[:80], K.count(old))

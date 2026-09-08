@@ -40,10 +40,10 @@ def main() -> int:
     with workdir() as tmp:
         tmp = Path(tmp)
         hs = {}
-        for stem, sub, cfg in (("gemm_i4", "kernels", {"k_size": K, "n_size": N, "m_group": g}),
-                               ("gemm_i4_swiglu", "kernels", {"k_size": K, "n_size": N, "m_group": g}),
+        for stem, sub, cfg in (("gemm_i4", "h3/kernels", {"k_size": K, "n_size": N, "m_group": g}),
+                               ("gemm_i4_swiglu", "h3/kernels", {"k_size": K, "n_size": N, "m_group": g}),
                                ("prepare_swiglu_i4", "experiments", {"width": INTER, "gate_stride": N}),
-                               ("prepare_plain_i4", "kernels", {"width": INTER})):
+                               ("prepare_plain_i4", "h3/kernels", {"width": INTER})):
             out = tmp / f"{stem}.hsaco"
             compile_kernel(ROOT / sub / f"{stem}.loom", f"krea2_{stem}", {f"krea2.{stem}.{k}": v for k, v in cfg.items()}, out)
             hs[stem] = out

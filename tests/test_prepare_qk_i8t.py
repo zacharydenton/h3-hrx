@@ -18,7 +18,7 @@ def main():
     want = parity_split(np.concatenate([want_scales.numpy(), np.zeros((cap - T, HEADS), np.float32)]))
     with workdir() as tmp:
         tmp = Path(tmp); hs = tmp / "pqkt.hsaco"; ns, sym = "h3.prepare_qk_i8t", "h3_prepare_qk_i8t"
-        compile_kernel(ROOT / "kernels/prepare_qk_i8t.loom", sym, {f"{ns}.row_stride": HEADS * D, f"{ns}.head_offset": 0, f"{ns}.heads": HEADS, f"{ns}.extra_scale": extra, f"{ns}.token_capacity": cap}, hs)
+        compile_kernel(ROOT / "h3/kernels/prepare_qk_i8t.loom", sym, {f"{ns}.row_stride": HEADS * D, f"{ns}.head_offset": 0, f"{ns}.heads": HEADS, f"{ns}.extra_scale": extra, f"{ns}.token_capacity": cap}, hs)
         (codes, scales), t = launch(hs, sym, (T, 1, 1), (256, 1, 1),
                                     [("i32", T), ("in_f16", x.numpy()), ("in", mean.numpy()), ("out", ((T, HEADS * 32), np.int32)), ("out", ((HEADS, cap), np.float32))], tmp, repeat=1)
     differ = (codes != want_codes.numpy()).mean()

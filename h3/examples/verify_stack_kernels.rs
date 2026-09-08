@@ -27,7 +27,7 @@ fn main() {
 
     let exe = std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into());
     let gpu = hrx::Gpu::open().expect("gpu");
-    let compiler = Compiler::new(exe, root.join("kernels"), &cache);
+    let compiler = Compiler::new(exe, root.join("h3/kernels"), &cache);
     // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
     let weights = unsafe { Weights::open(&path, h3::plan::vvae::plan) }.expect("plan");
 

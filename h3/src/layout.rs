@@ -550,8 +550,8 @@ mod tests {
         assert!(l.ref_segs.iter().all(|s| s.kind == 0 || s.kind == 1));
         assert_eq!(l.tclass[l.ref_segs[0].row0], 2); // the image, conditioning video
         assert_eq!(l.tclass[l.ref_segs[1].row0], 3); // the sound, conditioning audio
-        // The final norm has two classes, and the reference rows do not fit them — which is why
-        // only the generated span is uploaded to it. That span does fit.
+                                                     // The final norm has two classes, and the reference rows do not fit them — which is why
+                                                     // only the generated span is uploaded to it. That span does fit.
         assert!(
             crate::dispatch::classes_fit(&l.tclass, 2).is_err(),
             "reference rows carry conditioning classes"
@@ -584,7 +584,8 @@ mod tests {
             "the whole array does not fit the final norm's table"
         );
         assert!(
-            crate::dispatch::classes_fit(&l.tclass[lr..lr + l.audio_rows + l.video_rows], 2).is_ok(),
+            crate::dispatch::classes_fit(&l.tclass[lr..lr + l.audio_rows + l.video_rows], 2)
+                .is_ok(),
             "the generated span does"
         );
     }

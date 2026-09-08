@@ -16,11 +16,8 @@ cp target/release/h3 build/h3
 cp target/release/loomrun build/loomrun
 printf 'built build/libh3.so, build/h3, build/loomrun\n'
 
-# The header is generated from the code that implements it, so it cannot drift. scripts/test.sh
-# checks the committed copy still matches a fresh run.
-if command -v cbindgen >/dev/null 2>&1; then
-  (cd h3 && cbindgen --config cbindgen.toml --crate h3 --output ../include/h3.h --quiet)
-  printf 'generated include/h3.h\n'
-else
-  printf 'skipped include/h3.h: cbindgen not found (cargo install cbindgen)\n' >&2
-fi
+# Export the header from this build, including when Cargo reused cached outputs.
+# Only this explicit build/install step updates the checkout's committed copy.
+cargo run --release --quiet -p h3 --example export_header > build/h3.h
+cp build/h3.h include/h3.h
+printf 'generated include/h3.h\n'

@@ -302,12 +302,7 @@ impl VideoVae {
             table_mlp: zeros,
             gate_mlp: scales[i].1,
         };
-        let (x, cls, cos, sin) = (
-            b.x.binding(),
-            b.cls.all(),
-            b.cos.binding(),
-            b.sin.binding(),
-        );
+        let (x, cls, cos, sin) = (b.x.binding(), b.cls.all(), b.cos.binding(), b.sin.binding());
         b.stack
             .forward(gpu, prof, x, cls, cos, sin, &cond, 0, None)?;
 

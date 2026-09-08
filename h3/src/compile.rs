@@ -8,14 +8,15 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub const BACKEND: &str = "amdgpu-hal";
 pub const TARGET: &str = "gfx1151";
 
-/// A kernel's configuration: ordered, because the order is part of the cache tag and of the argv.
+/// A kernel's configuration. `hrx::loom` canonicalises it into a `BTreeMap` before hashing it and
+/// before spelling out the argv, so the order these pairs are built in is not observable — but a
+/// key repeated in one `Cfg` would silently lose all but one of its values, which `config` refuses.
 pub type Cfg = Vec<(String, String)>;
 
 #[derive(Debug, thiserror::Error)]
@@ -81,31 +82,16 @@ fn trim(s: &str) -> String {
     t.strip_suffix('.').unwrap_or(t).to_string()
 }
 
-/// FNV-1a 64, with the canonical offset basis and prime.
-fn fnv(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 14695981039346656037;
-    for b in bytes {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(1099511628211);
-    }
-    h
-}
-
-/// The first `digits` characters of the 16-digit hex, which is the high nibbles.
-fn hex(h: u64, digits: usize) -> String {
-    format!("{h:016x}")[..digits].to_string()
-}
-
+/// Model-specific source selection and loaded exports. Compilation, integrity,
+/// process locks and publication are provided by the shared HRX crate.
 pub struct Compiler {
     exe: String,
     sources: PathBuf,
+    source_cache: Mutex<HashMap<String, Arc<str>>>,
     cache: PathBuf,
-    compiler_id: OnceLock<String>,
-    /// Loaded once per process. A loaded kernel is an immutable handle, so it is shared rather than
-    /// reloaded, and the map is behind a lock so a session can be moved between threads.
+    compiler: OnceLock<hrx::loom::Compiler>,
     loaded: Mutex<HashMap<String, Arc<hrx::Kernel>>>,
 }
-
 impl Compiler {
     pub fn new(
         exe: impl Into<String>,
@@ -115,85 +101,67 @@ impl Compiler {
         Self {
             exe: exe.into(),
             sources: sources.into(),
+            source_cache: Mutex::new(HashMap::new()),
             cache: cache.into(),
-            compiler_id: OnceLock::new(),
+            compiler: OnceLock::new(),
             loaded: Mutex::new(HashMap::new()),
         }
     }
-
-    fn source_path(&self, stem: &str) -> PathBuf {
-        self.sources.join(format!("{stem}.loom"))
-    }
-
-    fn source_hash(&self, stem: &str) -> Result<String> {
-        let path = self.source_path(stem);
-        let text = std::fs::read(&path).map_err(|_| Error::MissingSource(path))?;
-        Ok(hex(fnv(&text), 10))
-    }
-
-    /// The compiler binary as the spawn would find it — a bare name searches `PATH` — with its size and
-    /// modification time, so replacing it invalidates every entry it produced.
-    fn compiler_id(&self) -> Result<&str> {
-        if let Some(id) = self.compiler_id.get() {
-            return Ok(id);
+    fn compiler(&self) -> Result<&hrx::loom::Compiler> {
+        if let Some(c) = self.compiler.get() {
+            return Ok(c);
         }
-        let id = self.measure_compiler()?;
-        let _ = self.compiler_id.set(id);
-        Ok(self.compiler_id.get().expect("just set"))
+        let explicit = if self.exe.is_empty() || self.exe == "loom-compile" {
+            None
+        } else {
+            Some(Path::new(&self.exe))
+        };
+        let compiler = hrx::loom::Compiler::resolve(explicit)?;
+        let _ = self.compiler.set(compiler);
+        Ok(self.compiler.get().expect("compiler initialized"))
     }
-
-    /// Reads the compiler's identity from the filesystem now.
-    fn measure_compiler(&self) -> Result<String> {
-        let mut path = PathBuf::from(&self.exe);
-        if !self.exe.contains('/') {
-            let dirs = std::env::var("PATH").unwrap_or_default();
-            for dir in dirs.split(':') {
-                let candidate = Path::new(if dir.is_empty() { "." } else { dir }).join(&self.exe);
-                // X_OK, the same test the spawn will make
-                if unsafe { libc::access(cstring(&candidate)?.as_ptr(), libc::X_OK) } == 0 {
-                    path = candidate;
-                    break;
-                }
-            }
+    fn source(&self, stem: &str) -> Result<Arc<str>> {
+        if let Some(source) = self
+            .source_cache
+            .lock()
+            .expect("source cache poisoned")
+            .get(stem)
+        {
+            return Ok(source.clone());
         }
-        let meta = std::fs::metadata(&path).map_err(|_| Error::NoCompiler(self.exe.clone()))?;
-        use std::os::unix::fs::MetadataExt;
-        Ok(format!(
-            "{}:{}:{}.{}",
-            path.display(),
-            meta.size(),
-            meta.mtime(),
-            meta.mtime_nsec()
-        ))
+        let path = self.sources.join(format!("{stem}.loom"));
+        let source: Arc<str> = if self.sources.as_os_str().is_empty() {
+            embedded_source(stem)
+                .ok_or_else(|| Error::MissingSource(path.clone()))?
+                .into()
+        } else {
+            std::fs::read_to_string(&path)
+                .map_err(|_| Error::MissingSource(path.clone()))?
+                .into()
+        };
+        self.source_cache
+            .lock()
+            .expect("source cache poisoned")
+            .insert(stem.into(), source.clone());
+        Ok(source)
+    }
+    /// Where compiled artifacts go. An empty `cache` means the caller expressed no preference, and
+    /// gets the shared per-user one; resolving it here rather than at the call sites keeps a
+    /// `Compiler::new(_, _, "")` from quietly writing a cache into the process's current directory.
+    fn cache_dir(&self) -> Result<PathBuf> {
+        if self.cache.as_os_str().is_empty() {
+            Ok(hrx::bundle::cache_root()?.join("h3/kernels/hrx-v1"))
+        } else {
+            Ok(self.cache.join("hrx-v1"))
+        }
     }
 
-    /// The cache file's name, which is also the in-process key.
     pub fn tag(&self, stem: &str, symbol: &str, cfg: &Cfg) -> Result<String> {
-        let mut tag = format!("{stem}__s{}", self.source_hash(stem)?);
-        let mut identity = format!("{BACKEND}\n{TARGET}\n{symbol}\n{}\n", self.compiler_id()?);
-        for (key, value) in cfg {
-            // the tag carries only the last dotted component, the identity the whole key
-            let short = key
-                .rfind('.')
-                .map(|i| &key[i + 1..])
-                .unwrap_or(key.as_str());
-            tag.push_str(&format!("__{short}_{value}"));
-            identity.push_str(&format!("{key}={value}\n"));
-        }
-        tag.push_str(&format!("__i{}", hex(fnv(identity.as_bytes()), 10)));
-        Ok(tag
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect())
+        let source = self.source(stem)?;
+        let mut request = hrx::loom::Request::new(&source, symbol);
+        request.config = config(stem, cfg)?;
+        Ok(self.compiler()?.key(&request)?)
     }
-
-    /// The kernel, compiling it into the cache first if it is not there. Loaded once per process.
     pub fn get(
         &self,
         gpu: &hrx::Gpu,
@@ -201,118 +169,45 @@ impl Compiler {
         symbol: &str,
         cfg: &Cfg,
     ) -> Result<Arc<hrx::Kernel>> {
-        let tag = self.tag(stem, symbol, cfg)?;
-        if let Some(kernel) = self.loaded.lock().expect("not poisoned").get(&tag) {
+        let source = self.source(stem)?;
+        let mut request = hrx::loom::Request::new(&source, symbol);
+        request.config = config(stem, cfg)?;
+        let compiler = self.compiler()?;
+        let tag = compiler.key(&request)?;
+        if let Some(kernel) = self
+            .loaded
+            .lock()
+            .expect("compiler cache poisoned")
+            .get(&tag)
+        {
             return Ok(kernel.clone());
         }
-        let path = self.cache.join(format!("{tag}.hsaco"));
-        if !path.exists() {
-            self.compile(stem, symbol, cfg, &path)?;
-        }
-        // Safety: the code object was produced by this process's own loom-compile, from a source in
-        // `sources` and a configuration this crate wrote, under a name that hashes all of it. A file
-        // in the cache under that name is one this build made.
+        let path = compiler.compile(&request, &self.cache_dir()?)?;
+        // Safety: verified artifact from trusted model source and configured compiler.
         let kernel = Arc::new(unsafe { gpu.load(&path, symbol)? });
-        self.loaded
-            .lock()
-            .expect("not poisoned")
-            .insert(tag, kernel.clone());
-        Ok(kernel)
-    }
-
-    /// Compile into a unique temporary and rename it into place under a lock on `<path>.lock`, so
-    /// several sessions asking for the same kernel at once neither load a half-written binary nor
-    /// clobber each other's temporary.
-    fn compile(&self, stem: &str, symbol: &str, cfg: &Cfg, path: &Path) -> Result<()> {
-        // The tag was computed from the identity read the first time. If the executable has been
-        // replaced since, the binary about to run is not the one the name describes, and publishing
-        // its output under that name would put another compiler's code object in the cache for good.
-        let pinned = self.compiler_id()?;
-        let now = self.measure_compiler()?;
-        if now != pinned {
-            return Err(Error::Failed {
-                stem: stem.to_string(),
-                command: format!(
-                    "the compiler changed under this session ({pinned} -> {now}); start again"
-                ),
-            });
-        }
-        std::fs::create_dir_all(&self.cache).map_err(|e| Error::Io(e.to_string()))?;
-        let lock_path = path.with_extension("hsaco.lock");
-        let lock = File::create(&lock_path)
-            .map_err(|e| Error::Io(format!("cannot create {}: {e}", lock_path.display())))?;
-        let _guard = FlockGuard::exclusive(&lock)?;
-        if path.exists() {
-            return Ok(()); // another session published it while we waited
-        }
-
-        let tmp = path.with_extension(format!(
-            "hsaco.tmp.{}.{:016x}",
-            std::process::id(),
-            fnv(&std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos().to_le_bytes().to_vec())
-                .unwrap_or_default())
-        ));
-        let mut args: Vec<String> = vec![
-            self.source_path(stem).display().to_string(),
-            format!("--backend={BACKEND}"),
-            format!("--target={TARGET}"),
-            format!("--root=@{symbol}"),
-            format!("--output={}", tmp.display()),
-        ];
-        for (key, value) in cfg {
-            args.push(format!("--config={key}={value}"));
-        }
-        let status = std::process::Command::new(&self.exe)
-            .args(&args)
-            .status()
-            .map_err(|e| Error::Io(format!("cannot spawn {}: {e}", self.exe)))?;
-        let produced = std::fs::metadata(&tmp)
-            .map(|m| m.len() > 0)
-            .unwrap_or(false);
-        if !status.success() || !produced {
-            let _ = std::fs::remove_file(&tmp);
-            let mut command = self.exe.clone();
-            for a in &args {
-                command.push(' ');
-                command.push_str(a);
-            }
-            return Err(Error::Failed {
-                stem: stem.into(),
-                command,
-            });
-        }
-        std::fs::rename(&tmp, path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            Error::Io(format!("cannot rename {}: {e}", tmp.display()))
-        })
+        let mut loaded = self.loaded.lock().expect("compiler cache poisoned");
+        Ok(loaded.entry(tag).or_insert(kernel).clone())
     }
 }
 
-fn cstring(path: &Path) -> Result<std::ffi::CString> {
-    std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-        .map_err(|_| Error::Io(format!("{} contains a NUL", path.display())))
-}
-
-/// Holds an exclusive `flock` for its lifetime, released even if the compile throws.
-struct FlockGuard(i32);
-
-impl FlockGuard {
-    fn exclusive(file: &File) -> Result<Self> {
-        let fd = file.as_raw_fd();
-        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
-            return Err(Error::Io("cannot take the compile lock".into()));
-        }
-        Ok(Self(fd))
+/// A `Cfg` as the map the compiler hashes and spells out, rejecting a repeated key.
+///
+/// The map keeps one value per key, so a builder that pushed the same key twice would have all but
+/// the last of them disappear — into the cache tag as well as into the argv, which means the kernel
+/// that ran and the name it was filed under would agree with each other and with nothing else. It
+/// costs one comparison per kernel built to know that never happens.
+fn config(stem: &str, cfg: &Cfg) -> Result<std::collections::BTreeMap<String, String>> {
+    let map: std::collections::BTreeMap<String, String> = cfg.iter().cloned().collect();
+    if map.len() != cfg.len() {
+        return Err(Error::Failed {
+            stem: stem.to_string(),
+            command: "a configuration key was given twice".into(),
+        });
     }
+    Ok(map)
 }
 
-impl Drop for FlockGuard {
-    fn drop(&mut self) {
-        unsafe { libc::flock(self.0, libc::LOCK_UN) };
-    }
-}
+include!(concat!(env!("OUT_DIR"), "/kernel_sources.rs"));
 
 /// Writes a file, creating its directory. Used by the tests and by callers staging sources.
 pub fn write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -327,19 +222,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fnv_is_the_standard_one() {
-        // The published FNV-1a 64 vectors. The C source had 1469598103934665603 as its offset basis,
-        // one digit short of the canonical 14695981039346656037; both implementations now use the real
-        // constant, which orphaned every cache entry built before the fix.
-        assert_eq!(fnv(b""), 0xcbf29ce484222325);
-        assert_eq!(fnv(b"a"), 0xaf63dc4c8601ec8c);
-        assert_eq!(fnv(b"foobar"), 0x85944171f73967e8);
+    fn embedded_sources_need_no_checkout_and_explicit_directories_are_honored() {
+        let c = Compiler::new("unused", PathBuf::new(), PathBuf::new());
+        assert!(c.source("gn_silu_f16").unwrap().contains("h3_gn_silu_f16"));
+        let directory = tempfile::tempdir().unwrap();
+        let c = Compiler::new("unused", directory.path(), PathBuf::new());
+        assert!(c.source("gn_silu_f16").is_err());
     }
 
     #[test]
-    fn hex_takes_the_high_nibbles() {
-        assert_eq!(hex(0x0123456789abcdef, 10), "0123456789");
-        assert_eq!(hex(0xf, 16), "000000000000000f");
+    fn a_key_given_twice_is_refused_rather_than_silently_dropped() {
+        let one: Cfg = vec![
+            ("h3.gemm.k_size".into(), "2048".into()),
+            ("h3.gemm.n_size".into(), "4096".into()),
+        ];
+        assert_eq!(config("gemm", &one).unwrap().len(), 2);
+        // the map would keep 4096 and lose 2048, in the argv and in the cache tag alike
+        let twice: Cfg = vec![
+            ("h3.gemm.k_size".into(), "2048".into()),
+            ("h3.gemm.k_size".into(), "4096".into()),
+        ];
+        assert!(config("gemm", &twice).is_err());
     }
 
     // The literals are written with as many digits as printf emitted, so each pair reads as
@@ -396,14 +299,11 @@ mod tests {
 
         let cfg: Cfg = vec![("h3.gemm.k_size".into(), "2048".into())];
         let base = c.tag("gemm", "h3_gemm", &cfg).unwrap();
-        assert!(base.starts_with("gemm__s"), "{base}");
-        assert!(base.contains("__k_size_2048"), "{base}"); // only the last dotted component
-        assert!(base.contains("__i"), "{base}");
+        assert_eq!(base.len(), 64);
 
         // the symbol is in the identity, not the visible tag, so it changes the __i suffix
         let other_symbol = c.tag("gemm", "h3_other", &cfg).unwrap();
         assert_ne!(base, other_symbol);
-        assert_eq!(base.split("__i").next(), other_symbol.split("__i").next());
 
         // a different config value changes both halves
         let other_cfg: Cfg = vec![("h3.gemm.k_size".into(), "4096".into())];

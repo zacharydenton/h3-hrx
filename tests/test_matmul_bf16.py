@@ -30,7 +30,7 @@ def run(tmp, kind, M, K, N, rng):
         args += [("in", a32), ("in_bf16", w), ("in", b), ("out", ((M, N), np.float32))]
         full = a.astype(np.float64) @ w.astype(np.float64).T + b
         want = {"bias": full, "gelu": gelu_tanh(full), "gelu_erf": gelu_erf(full)}[kind]
-    hs = tmp / f"{stem}_{K}_{N}.hsaco"; compile_kernel(ROOT / "kernels" / f"{stem}.loom", sym, {f"{ns}.k_size": K, f"{ns}.n_size": N}, hs)
+    hs = tmp / f"{stem}_{K}_{N}.hsaco"; compile_kernel(ROOT / "h3/kernels" / f"{stem}.loom", sym, {f"{ns}.k_size": K, f"{ns}.n_size": N}, hs)
     (out,), t = launch(hs, sym, (N // 64, (M + 63) // 64, 1), (256, 1, 1), args, tmp, repeat=1 if kind == "resid" else 3)   # resid accumulates into C: once
     tflops = 2.0 * M * K * N / (t["per_launch_us"] * 1e-6) / 1e12
     atol = 2e-2 if kind == "resid" else 2e-3   # the resid output is f16
@@ -40,7 +40,7 @@ def run(tmp, kind, M, K, N, rng):
 def run_f32(tmp, M, K, N, rng):
     stem = "matmul_f32"; ns, sym = "h3." + stem, "h3_" + stem
     x = (rng.standard_normal((M, K)) * 0.5).astype(np.float32); w = (rng.standard_normal((N, K)) / np.sqrt(K)).astype(np.float32); b = (rng.standard_normal(N) * 0.1).astype(np.float32)
-    hs = tmp / f"{stem}_{K}_{N}.hsaco"; compile_kernel(ROOT / "kernels" / f"{stem}.loom", sym, {f"{ns}.k": K, f"{ns}.n": N}, hs)
+    hs = tmp / f"{stem}_{K}_{N}.hsaco"; compile_kernel(ROOT / "h3/kernels" / f"{stem}.loom", sym, {f"{ns}.k": K, f"{ns}.n": N}, hs)
     (out,), t = launch(hs, sym, ((N + 255) // 256, M, 1), (256, 1, 1), [("i32", M), ("in", x), ("in", w), ("in", b), ("out", ((M, N), np.float32))], tmp, repeat=3)
     tflops = 2.0 * M * K * N / (t["per_launch_us"] * 1e-6) / 1e12
     return report(f"{stem:26s} {M}x{K}x{N} {t['per_launch_us'] / 1e3:8.3f} ms {tflops:5.1f} TFLOP/s", out.astype(np.float64), x.astype(np.float64) @ w.astype(np.float64).T + b, atol=1e-4, rtol=1e-4)

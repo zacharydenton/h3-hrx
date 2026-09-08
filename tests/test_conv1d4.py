@@ -37,7 +37,7 @@ def main():
         source.write_text(generate())
         formatter = LOOM_COMPILE.parent.parent / "loom-format/loom-format"
         subprocess.run([str(formatter), "--in-place", str(source)], check=True, capture_output=True)
-        assert source.read_bytes() == (ROOT / "kernels/conv1d4_f32.loom").read_bytes(), "stale generated kernel"
+        assert source.read_bytes() == (ROOT / "h3/kernels/conv1d4_f32.loom").read_bytes(), "stale generated kernel"
         compiled = {}
         # Broad index bounds without allocation, within the backend's existing
         # 32-bit dynamic byte-offset limit for either convolution kernel.
@@ -50,7 +50,7 @@ def main():
                           accumulate=acc, len_bound=(n + 255) // 256 * 256)
             for stem in ("conv1d_f32", "conv1d4_f32"):
                 hsaco = tmp / (stem + "_" + "_".join(map(str, case)) + ".hsaco")
-                compile_kernel(ROOT / "kernels" / (stem + ".loom"), "h3_" + stem,
+                compile_kernel(ROOT / "h3/kernels" / (stem + ".loom"), "h3_" + stem,
                                {f"h3.{stem}.{key}": value for key, value in config.items()}, hsaco)
                 compiled[case, stem] = hsaco
         print(f"PASS generated identity and {len(compile_cases) * 2} CPU compile configurations", flush=True)

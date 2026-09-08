@@ -115,7 +115,11 @@ pub(crate) fn checked(
     bindings: &[View<'_>],
     required: &[usize],
 ) -> Result<()> {
-    debug_assert_eq!(bindings.len(), required.len(), "{stage}: a bound per binding");
+    debug_assert_eq!(
+        bindings.len(),
+        required.len(),
+        "{stage}: a bound per binding"
+    );
     for (i, (view, need)) in bindings.iter().zip(required).enumerate() {
         if view.len() < *need {
             return Err(crate::compile::Error::Io(format!(
@@ -225,7 +229,10 @@ impl Classes {
 
     /// `rows` of them from `from`, which is how a stage takes the classes of its own span.
     pub fn slice(&self, from: usize, rows: usize) -> ClassRows<'_> {
-        assert!(from + rows <= self.written, "class rows past what was written");
+        assert!(
+            from + rows <= self.written,
+            "class rows past what was written"
+        );
         ClassRows {
             view: self.buf.slice(from * 4, rows * 4),
             rows,
@@ -1012,7 +1019,13 @@ pub struct NormMod {
 }
 
 impl NormMod {
-    pub fn build(c: &Compiler, gpu: &hrx::Gpu, width: usize, eps: f64, classes: usize) -> Result<Self> {
+    pub fn build(
+        c: &Compiler,
+        gpu: &hrx::Gpu,
+        width: usize,
+        eps: f64,
+        classes: usize,
+    ) -> Result<Self> {
         let lanes = lanes_for(width).ok_or_else(|| {
             crate::compile::Error::Io(format!("no norm_mod lane count for width {width}"))
         })?;
@@ -1152,7 +1165,7 @@ mod tests {
 
     #[test]
     fn gemm_stems_name_kernels_that_exist() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kernels");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
         for (elem, mode, bias, gate_first, tile) in [
             ("i8", "plain", false, true, Tile::Plain),
             ("i8", "resid", false, true, Tile::Plain),
@@ -1181,7 +1194,7 @@ mod tests {
 
     #[test]
     fn prepare_stems_name_kernels_that_exist() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kernels");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
         for elem in ["i8", "f16", "bf16"] {
             for form in ["norm", "lnorm", "plain"] {
                 let stem = format!("prepare_{form}_{elem}");

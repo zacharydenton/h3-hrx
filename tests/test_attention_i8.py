@@ -10,7 +10,7 @@ from kernel_test import compile_kernel, launch, report, workdir
 from test_prepare_qk_i8 import replica, HEADS, D
 import os
 WAVES = int(os.environ.get("ATTN_WAVES", "8")); STEM = os.environ.get("ATTN_STEM", "attention_i8qk_mha8_lds_f16_wmma" if WAVES == 8 else "attention_i8qk_mha_lds_f16_wmma"); NS, SYM = "h3." + STEM, "h3_" + STEM
-KERNEL = ROOT / "kernels" / f"{STEM}.loom"
+KERNEL = ROOT / "h3/kernels" / f"{STEM}.loom"
 if not KERNEL.exists(): KERNEL = ROOT / "experiments" / f"{STEM}.loom"
 
 

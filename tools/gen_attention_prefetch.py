@@ -128,11 +128,11 @@ def interleave_pv(K: str) -> str:
 
 
 def main():
-    src = (ROOT / "kernels/attention_i8qk_mha8_lds_f16_wmma.loom").read_text()
+    src = (ROOT / "h3/kernels/attention_i8qk_mha8_lds_f16_wmma.loom").read_text()
     full = convert(src)
     (ROOT / "experiments/attention_i8qkfv_mha8_lds_f16_wmma.loom").write_text(full.replace("i8qkf_mha8", "i8qkfv_mha8"))   # the V-carrying form: spills
-    (ROOT / "kernels/attention_i8qkf_mha8_lds_f16_wmma.loom").write_text(interleave_pv(konly(full).replace("i8qkfk_mha8", "i8qkf_mha8")))
-    (ROOT / "experiments/attention_i8qkf_mha_lds_f16_wmma.loom").write_text(four_wave((ROOT / "kernels/attention_i8qk_mha_lds_f16_wmma.loom").read_text()))
+    (ROOT / "h3/kernels/attention_i8qkf_mha8_lds_f16_wmma.loom").write_text(interleave_pv(konly(full).replace("i8qkfk_mha8", "i8qkf_mha8")))
+    (ROOT / "experiments/attention_i8qkf_mha_lds_f16_wmma.loom").write_text(four_wave((ROOT / "h3/kernels/attention_i8qk_mha_lds_f16_wmma.loom").read_text()))
     print("wrote kernels/attention_i8qkf_mha8_*; experiments: the four-wave form (0.78x at 2922 rows) and the V-carrying form (spills)")
 
 

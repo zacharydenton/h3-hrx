@@ -111,7 +111,7 @@ def main():
     if "swiglu" in stem:
         parser.error("SwiGLU is not supported by this benchmark")
     residual = "resid" in stem
-    src = ROOT / "kernels" / f"{stem}.loom"
+    src = ROOT / "h3/kernels" / f"{stem}.loom"
     if not src.exists():
         src = ROOT / "experiments" / f"{stem}.loom"
     ns, sym = "h3." + stem, "h3_" + stem

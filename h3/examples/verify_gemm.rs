@@ -39,7 +39,11 @@ fn main() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let exe = std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into());
     let gpu = hrx::Gpu::open().expect("gpu");
-    let compiler = Compiler::new(exe, root.join("kernels"), root.join("build/kernel_cache"));
+    let compiler = Compiler::new(
+        exe,
+        root.join("h3/kernels"),
+        root.join("build/kernel_cache"),
+    );
 
     let (k, n) = (2048usize, 2048usize);
     let k_stride = gemm_pitch(k, 16);

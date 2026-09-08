@@ -52,7 +52,7 @@ def run(tmp, mode, M, K, N, rng, bias=False, kpad=0, wide=False, outpad=0, fast=
         want = (first / (1 + np.exp(-first)) * second) if not bias else (second / (1 + np.exp(-second)) * first)
     if bias: args.append(("in", b_vec if mode != "swiglu" else interleave(b_vec[:, None])[:, 0]))
     hs = tmp / f"{stem}_{K}_{N}.hsaco"
-    compile_kernel(ROOT / "kernels" / f"{stem}.loom", sym, cfg, hs)
+    compile_kernel(ROOT / "h3/kernels" / f"{stem}.loom", sym, cfg, hs)
     (out,), t = launch(hs, sym, (N // (256 if wide or fast else 128), gy, 1), (512 if wide else 256, 1, 1), args, tmp, repeat=1 if mode == "resid" else 3)
     guards_ok = True
     if (wide or fast) and mode == "swiglu":

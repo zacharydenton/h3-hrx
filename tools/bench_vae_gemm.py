@@ -62,7 +62,7 @@ def main():
                 if mode == "resid": cfg[f"{ns}.classes"] = 1
                 if variant != "base" and mode == "swiglu": cfg[f"{ns}.out_stride"] = n // 2 + 128
                 hs = tmp / f"{stage}_{variant}.hsaco"
-                source = ROOT / "kernels" / f"{stem}.loom"
+                source = ROOT / "h3/kernels" / f"{stem}.loom"
                 if not source.exists(): source = ROOT / "experiments" / f"{stem}.loom"
                 compile_kernel(source, "h3_" + stem, cfg, hs)
                 compiled[stage, variant] = (stem, hs, tm, tn, threads, group)

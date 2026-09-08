@@ -1,4 +1,4 @@
-"""kernels/gemm_i4{,_resid,_swiglu}_256.loom: MiniMax H3's int4 GEMM family on loom-gemm's
+"""h3/kernels/gemm_i4{,_resid,_swiglu}_256.loom: MiniMax H3's int4 GEMM family on loom-gemm's
 64x64-wave-tile kernel (workgroup tile 256x128, 0.5 LDS operand reads per multiply), with the
 three epilogues the runtime needs:
   plain  : C[m, n] = f16( acc * w_scale[n] * a_scale[m] )
@@ -442,19 +442,19 @@ def generate(mode: str, bias: bool = False, gate_first: bool = True, bits: int =
 if __name__ == "__main__":
     for mode in ("plain", "resid", "swiglu"):
         stem = {"plain": "gemm_i4_256", "resid": "gemm_i4_resid_256", "swiglu": "gemm_i4_swiglu_256"}[mode]
-        (ROOT / "kernels" / f"{stem}.loom").write_text(generate(mode))
+        (ROOT / "h3/kernels" / f"{stem}.loom").write_text(generate(mode))
         print("wrote", stem)
     # the VAE decoder's family: biases everywhere, diffusers' SwiGLU order (linear first, gate second)
     for mode, stem in (("plain", "gemm_i4_256b"), ("resid", "gemm_i4_resid_256b"), ("swiglu", "gemm_i4_swiglu_256b_gs")):
-        (ROOT / "kernels" / f"{stem}.loom").write_text(generate(mode, bias=True, gate_first=(mode != "swiglu")))
+        (ROOT / "h3/kernels" / f"{stem}.loom").write_text(generate(mode, bias=True, gate_first=(mode != "swiglu")))
         print("wrote", stem)
     # the same family in int8 (W8A8): the decoder when int4 is not enough, and the text encoder
     for mode, stem in (("plain", "gemm_i8_256b"), ("resid", "gemm_i8_resid_256b"), ("swiglu", "gemm_i8_swiglu_256b_gs")):
-        (ROOT / "kernels" / f"{stem}.loom").write_text(generate(mode, bias=True, gate_first=(mode != "swiglu"), bits=8))
+        (ROOT / "h3/kernels" / f"{stem}.loom").write_text(generate(mode, bias=True, gate_first=(mode != "swiglu"), bits=8))
         print("wrote", stem)
     # the text encoder's family: int8, no biases, gate-first SwiGLU (Qwen3)
     for mode, stem in (("plain", "gemm_i8_256"), ("resid", "gemm_i8_resid_256"), ("swiglu", "gemm_i8_swiglu_256")):
-        (ROOT / "kernels" / f"{stem}.loom").write_text(generate(mode, bits=8))
+        (ROOT / "h3/kernels" / f"{stem}.loom").write_text(generate(mode, bits=8))
         print("wrote", stem)
     # experiment: unconditional staging loads (the `u` family), timed against the shipped kernels
     for mode, stem in (("plain", "gemm_i8u_256b"), ("resid", "gemm_i8u_resid_256b"), ("swiglu", "gemm_i8u_swiglu_256b_gs")):

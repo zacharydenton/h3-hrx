@@ -1,4 +1,4 @@
-"""kernels/rope*_qknorm_f16.loom: per-head RMSNorm (weight w[c]) and rotate-half RoPE on q and
+"""h3/kernels/rope*_qknorm_f16.loom: per-head RMSNorm (weight w[c]) and rotate-half RoPE on q and
 k from a fused [tokens][row_stride] projection (q at 0, k at k_offset, v after k; kv_heads k/v heads), written to
 contiguous q/k/v [tokens][heads*D]. One workgroup of 256 lanes per token, a wave per head,
 D/32 channels per lane; channels c < R/2 pair with c + R/2, the partner quad R/2/(D/32) lanes
@@ -193,5 +193,5 @@ kernel.def target(@{SYM}_gfx11) export("{SYM}") @{SYM}(%tokens: index) {{
 
 if __name__ == "__main__":
     for stem, (D, R) in VARIANTS.items():
-        (ROOT / "kernels" / f"{stem}.loom").write_text(generate(stem, D, R))
+        (ROOT / "h3/kernels" / f"{stem}.loom").write_text(generate(stem, D, R))
         print("wrote", stem)

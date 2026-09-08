@@ -25,7 +25,11 @@ fn main() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let exe = std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into());
     let gpu = hrx::Gpu::open().expect("gpu");
-    let compiler = Compiler::new(exe, root.join("kernels"), root.join("build/kernel_cache"));
+    let compiler = Compiler::new(
+        exe,
+        root.join("h3/kernels"),
+        root.join("build/kernel_cache"),
+    );
     // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
     let weights =
         unsafe { Weights::open(&a[0], h3::plan::te::plan) }.expect("text encoder checkpoint");

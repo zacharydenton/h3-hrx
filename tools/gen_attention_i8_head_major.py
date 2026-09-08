@@ -186,7 +186,7 @@ def transform(s):
 
 def prepare_source():
     s = (
-        (ROOT / "kernels/prepare_qk_i8.loom")
+        (ROOT / "h3/kernels/prepare_qk_i8.loom")
         .read_text()
         .replace("prepare_qk_i8", "prepare_qk_i8hm")
     )
@@ -222,8 +222,8 @@ def prepare_source():
 
 
 def main():
-    (ROOT / "kernels" / f"{STEM}.loom").write_text(transform(attention_source()))
-    (ROOT / "kernels/prepare_qk_i8hm.loom").write_text(prepare_source())
+    (ROOT / "h3/kernels" / f"{STEM}.loom").write_text(transform(attention_source()))
+    (ROOT / "h3/kernels/prepare_qk_i8hm.loom").write_text(prepare_source())
 
 
 if __name__ == "__main__":

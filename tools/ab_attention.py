@@ -33,7 +33,7 @@ def main() -> int:
             ns, sym = "h3." + stem, "h3_" + stem
             hs = tmp / f"{stem}.hsaco"
             cfg = {f"{ns}.q_stride": HEADS * D, f"{ns}.kv_stride": KV * D, f"{ns}.tokens": tokens, f"{ns}.token_capacity": capacity, f"{ns}.scale": 1.0 / math.sqrt(D), f"{ns}.out_stride": HEADS * D}
-            src = ROOT / "kernels" / f"{stem}.loom"
+            src = ROOT / "h3/kernels" / f"{stem}.loom"
             compile_kernel(src if src.exists() else ROOT / "experiments" / f"{stem}.loom", sym, cfg, hs)
             built[stem] = (hs, sym)
         best = {a_stem: 1e9, b_stem: 1e9}

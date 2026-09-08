@@ -95,7 +95,7 @@ class H3:
         native.h3_encode_audio.argtypes = [ctypes.c_void_p, _F32P, ctypes.c_int, _F32P, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int)]
         self._native = native
         cfg = Config(os.fsencode(dit or DIT), os.fsencode(te or TE), os.fsencode(video_vae or VIDEO_VAE), os.fsencode(audio_vae or AUDIO_VAE),
-                     os.fsencode(ROOT / "kernels"), os.fsencode(cache or ROOT / "build/kernel_cache"), os.fsencode(default_loom_compile()), {"i4": 4, "i8": 8, "f16": 16}[attn])
+                     os.fsencode(ROOT / "h3/kernels"), os.fsencode(cache or ROOT / "build/kernel_cache"), os.fsencode(default_loom_compile()), {"i4": 4, "i8": 8, "f16": 16}[attn])
         handle = ctypes.c_void_p()
         if native.h3_create(ctypes.byref(cfg), ctypes.byref(handle)): raise H3Error(_last_error(native))
         self._handle = handle

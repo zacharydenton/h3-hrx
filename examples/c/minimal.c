@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
     const char *models = getenv("H3_MODELS") ? getenv("H3_MODELS") : join(home, "comfy-models");
     h3_config cfg = {join(models, "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"), join(models, "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
                          join(models, "vae/minimax_h3_video_vae_fp16.safetensors"), join(models, "vae/minimax_h3_audio_vae_fp32.safetensors"),
-                         join(root, "kernels"), join(root, "build/kernel_cache"), loom, 8};
+                         join(root, "h3/kernels"), join(root, "build/kernel_cache"), loom, 8};
     h3_session *s = NULL;
     if (h3_create(&cfg, &s)) { fprintf(stderr, "create: %s\n", h3_last_error()); return 1; }
 

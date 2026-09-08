@@ -21,10 +21,9 @@
 //! # What is not supported
 //!
 //! Everything else — the transformer stack, the kernel compiler and cache, the packed layout, the
-//! samplers, the checkpoint reader — is an implementation detail behind the `internals` feature. It
-//! is public under that feature so the diagnostic examples in `h3/examples/` can drive one stage at a
-//! time, not because it is a stable interface. Building against it means tracking this crate's
-//! internals, which change with the model.
+//! samplers, the checkpoint reader — is an implementation detail. Those modules are public, and
+//! `#[doc(hidden)]`, so the diagnostic examples in `h3/examples/` can drive one stage at a time; that
+//! is not a promise about them. They carry no stability guarantee and change with the model.
 //!
 //! # What this crate trusts
 //!
@@ -33,46 +32,50 @@
 //! library has already validated, or shrink the file under reads that are in flight. Point a session
 //! at files you control.
 
-// Some of the implementation's own API has its only callers in the diagnostic examples, which build
-// only under `internals`. Without the feature those items are unreachable and warn, which says
-// nothing useful; `cargo clippy --all-features` is the configuration where dead code is really dead,
-// and scripts/test.sh runs it that way.
-#![cfg_attr(not(feature = "internals"), allow(dead_code))]
-
-/// The implementation. Public only under the `internals` feature; see the crate documentation.
-macro_rules! internal {
-    ($($m:ident),* $(,)?) => {
-        $(
-            #[cfg(feature = "internals")]
-            pub mod $m;
-            #[cfg(not(feature = "internals"))]
-            mod $m;
-        )*
-    };
-}
-
-internal!(
-    avae,
-    cache,
-    checkpoint,
-    compile,
-    conditioning,
-    dispatch,
-    dit,
-    layout,
-    model,
-    noise,
-    pixels,
-    plan,
-    rope,
-    sampler,
-    stack,
-    te,
-    tiles,
-    vision,
-    vvae,
-    weights,
-);
+// The implementation. Public so the diagnostic examples in `h3/examples/` can drive one stage at a
+// time, and `#[doc(hidden)]` because it is not an interface anyone should build against. Written
+// out as plain `mod` items rather than generated: rustfmt follows only literal module
+// declarations, and a macro here would keep every file below out of `cargo fmt`.
+#[doc(hidden)]
+pub mod avae;
+#[doc(hidden)]
+pub mod cache;
+#[doc(hidden)]
+pub mod checkpoint;
+#[doc(hidden)]
+pub mod compile;
+#[doc(hidden)]
+pub mod conditioning;
+#[doc(hidden)]
+pub mod dispatch;
+#[doc(hidden)]
+pub mod dit;
+#[doc(hidden)]
+pub mod layout;
+#[doc(hidden)]
+pub mod model;
+#[doc(hidden)]
+pub mod noise;
+#[doc(hidden)]
+pub mod pixels;
+#[doc(hidden)]
+pub mod plan;
+#[doc(hidden)]
+pub mod rope;
+#[doc(hidden)]
+pub mod sampler;
+#[doc(hidden)]
+pub mod stack;
+#[doc(hidden)]
+pub mod te;
+#[doc(hidden)]
+pub mod tiles;
+#[doc(hidden)]
+pub mod vision;
+#[doc(hidden)]
+pub mod vvae;
+#[doc(hidden)]
+pub mod weights;
 
 pub mod capi;
 pub mod error;

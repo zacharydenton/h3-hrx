@@ -175,4 +175,4 @@ def generate():
 
 
 if __name__ == "__main__":
-    (ROOT / "kernels" / f"{STEM}.loom").write_text(generate())
+    (ROOT / "h3/kernels" / f"{STEM}.loom").write_text(generate())

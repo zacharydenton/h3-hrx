@@ -44,7 +44,7 @@ def run(tmp: Path, tokens: int, heads=HEADS) -> bool:
     hs = tmp / f"{STEM}_{heads}.hsaco"
     cfg = {f"{NS}.q_stride": heads * D, f"{NS}.kv_stride": kv_heads * D, f"{NS}.tokens": tokens, f"{NS}.token_capacity": capacity,
            f"{NS}.scale": 1.0 / math.sqrt(D), f"{NS}.out_stride": heads * D}
-    source = ROOT / "kernels" / f"{STEM}.loom"
+    source = ROOT / "h3/kernels" / f"{STEM}.loom"
     if not source.exists(): source = ROOT / "experiments" / f"{STEM}.loom"
     compile_kernel(source, SYM, cfg, hs)
     query_block = 16 * WAVES

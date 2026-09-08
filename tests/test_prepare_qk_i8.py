@@ -34,7 +34,7 @@ def main():
     want_codes, want_scales, deq = replica(x.float(), mean, extra)
     with workdir() as tmp:
         tmp = Path(tmp); hs = tmp / "pqk.hsaco"; ns, sym = "h3.prepare_qk_i8", "h3_prepare_qk_i8"
-        compile_kernel(ROOT / "kernels/prepare_qk_i8.loom", sym, {f"{ns}.row_stride": HEADS * D, f"{ns}.head_offset": 0, f"{ns}.heads": HEADS, f"{ns}.extra_scale": extra}, hs)
+        compile_kernel(ROOT / "h3/kernels/prepare_qk_i8.loom", sym, {f"{ns}.row_stride": HEADS * D, f"{ns}.head_offset": 0, f"{ns}.heads": HEADS, f"{ns}.extra_scale": extra}, hs)
         (codes, scales), t = launch(hs, sym, (T, 1, 1), (256, 1, 1),
                                     [("i32", T), ("in_f16", x.numpy()), ("in", mean.numpy()), ("out", ((T, HEADS * 32), np.int32)), ("out", ((T, HEADS), np.float32))], tmp, repeat=1)
     same = np.array_equal(codes, want_codes.numpy()); differ = (codes != want_codes.numpy()).mean()

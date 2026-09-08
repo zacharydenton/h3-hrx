@@ -41,7 +41,7 @@ def main():
             source = tmp / f"{stem}.loom"
             source.write_text(generator(mode))
             subprocess.run([str(formatter), "--in-place", str(source)], check=True, capture_output=True)
-            if source.read_bytes() != (ROOT / "kernels" / source.name).read_bytes():
+            if source.read_bytes() != (ROOT / "h3/kernels" / source.name).read_bytes():
                 raise RuntimeError(f"{stem} differs from its generator")
         for mode, k, n in shapes:
             stem = stems[mode]; ns = "h3." + stem
@@ -50,7 +50,7 @@ def main():
                        f"{ns}.k_stride": k + 128, f"{ns}.m_group": group}
                 if mode == "resid": cfg[f"{ns}.classes"] = 1
                 if mode == "swiglu": cfg[f"{ns}.out_stride"] = n // 2 + 128
-                compile_kernel(ROOT / "kernels" / f"{stem}.loom", "h3_" + stem, cfg,
+                compile_kernel(ROOT / "h3/kernels" / f"{stem}.loom", "h3_" + stem, cfg,
                                tmp / f"{mode}_{k}_{n}_{group}.hsaco")
         print(f"PASS generated {'fast' if args.fast else 'wide'} kernels and CPU compilation of {20 if args.fast else 16} decoder configurations", flush=True)
         if args.compile_only:

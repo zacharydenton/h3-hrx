@@ -9,12 +9,8 @@ path = "src/lib.rs"
 # rlib for cli/ and the examples, cdylib for everyone reaching the C ABI
 crate-type = ["rlib", "cdylib"]
 
-[features]
-# The implementation modules, for the diagnostic examples in examples/. Not a stable interface.
-internals = []
-
 [dependencies]
-hrx = { path = "../hrx" }
+hrx = { version = "0.1.0", path = "../../hrx.rs" }
 memmap2 = "0.9"
 safetensors = "0.8"
 half = { version = "2", features = ["bytemuck"] }
@@ -33,111 +29,5 @@ rand_distr = "0.5"
 [dev-dependencies]
 tempfile = "3"
 
-# The diagnostic drivers reach into the implementation, so they say so.
-[[example]]
-name = "audio_vae"
-required-features = ["internals"]
-
-[[example]]
-name = "cache_dump"
-required-features = ["internals"]
-
-[[example]]
-name = "checkpoint_dump"
-required-features = ["internals"]
-
-[[example]]
-name = "chunks_dump"
-required-features = ["internals"]
-
-[[example]]
-name = "cond_dump"
-required-features = ["internals"]
-
-[[example]]
-name = "decode_video"
-required-features = ["internals"]
-
-[[example]]
-name = "denoise_cases"
-required-features = ["internals"]
-
-[[example]]
-name = "encode_video"
-required-features = ["internals"]
-
-[[example]]
-name = "g17"
-required-features = ["internals"]
-
-[[example]]
-name = "half_dump"
-required-features = ["internals"]
-
-[[example]]
-name = "layout_dump"
-required-features = ["internals"]
-
-[[example]]
-name = "pixels_dump"
-required-features = ["internals"]
-
-[[example]]
-name = "plan_dump"
-required-features = ["internals"]
-
-[[example]]
-name = "resolve"
-required-features = ["internals"]
-
-[[example]]
-name = "rope_dump"
-required-features = ["internals"]
-
-[[example]]
-name = "sampler_dump"
-required-features = ["internals"]
-
-[[example]]
-name = "selection_dump"
-required-features = ["internals"]
-
-[[example]]
-name = "text_in"
-required-features = ["internals"]
-
-[[example]]
-name = "tiles_dump"
-required-features = ["internals"]
-
-[[example]]
-name = "tok_dump"
-required-features = ["internals"]
-
-[[example]]
-name = "two_sessions"
-required-features = ["internals"]
-
-[[example]]
-name = "verify_cache_tags"
-required-features = ["internals"]
-
-[[example]]
-name = "verify_gemm"
-required-features = ["internals"]
-
-[[example]]
-name = "verify_send"
-required-features = ["internals"]
-
-[[example]]
-name = "verify_stack_kernels"
-required-features = ["internals"]
-
-[[example]]
-name = "verify_upload"
-required-features = ["internals"]
-
-[[example]]
-name = "vision_embed"
-required-features = ["internals"]
+[build-dependencies]
+cbindgen = "0.29.4"

@@ -233,7 +233,7 @@ def pipeline_fragments(s):
 def main():
     # Canonical formatting makes template anchors independent of generated spacing.
     template = subprocess.check_output(
-        [str(FORMAT), str(ROOT / "kernels" / f"{BASE}.loom")], text=True
+        [str(FORMAT), str(ROOT / "h3/kernels" / f"{BASE}.loom")], text=True
     )
     s = template.replace(BASE, STEM)
     s = pipeline_fragments(group_accumulators(keys64(s)))
@@ -245,7 +245,7 @@ def main():
         "// K and V tiles: 16 keys x 128 channels, rows padded to 136 halves",
         "// Shared K/V tiles contain 64 keys and 128 channels.",
     )
-    path = ROOT / "kernels" / f"{STEM}.loom"
+    path = ROOT / "h3/kernels" / f"{STEM}.loom"
     path.write_text(s)
     subprocess.run([str(FORMAT), "--in-place", str(path)], check=True)
 

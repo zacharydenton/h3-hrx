@@ -63,7 +63,7 @@ def run(tmp, mode, tile_m, M, K, N, rng, bits=4, bias=False):
     if bias:
         args.append(("in", b_vec if mode != "swiglu" else interleave(b_vec[:, None])[:, 0]))
     hs = tmp / f"{stem}_{K}_{N}.hsaco"
-    src = ROOT / "kernels" / f"{stem}.loom"
+    src = ROOT / "h3/kernels" / f"{stem}.loom"
     if not src.exists(): src = ROOT / "experiments" / f"{stem}.loom"
     compile_kernel(src, sym, cfg, hs)
     (out,), t = launch(hs, sym, (N // 128, gy, 1), (256, 1, 1), args, tmp, repeat=1 if mode == "resid" else 3)   # in place: once

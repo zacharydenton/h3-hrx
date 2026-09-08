@@ -194,7 +194,7 @@ fn tempfile_probe(dir: &Path) -> bool {
     false
 }
 
-/// The repository root: the binary's parent's parent, so `build/h3` finds `kernels/` beside it.
+/// The repository root: the binary's parent's parent, so `build/h3` finds `h3/kernels/` beside it.
 fn exe_root() -> PathBuf {
     std::env::current_exe()
         .ok()
@@ -452,8 +452,18 @@ fn run(cli: Cli) -> Result<()> {
         if ref2va { ", ref2va weights" } else { "" }
     );
 
-    let sources = root.join("kernels");
-    let cache = root.join("build/kernel_cache");
+    // Installed binaries use their packaged sources and the writable shared
+    // cache. --root explicitly opts into a developer's source/cache tree.
+    let sources = if cli.root.is_some() {
+        root.join("h3/kernels")
+    } else {
+        PathBuf::new()
+    };
+    let cache = if cli.root.is_some() {
+        root.join("build/kernel_cache")
+    } else {
+        PathBuf::new()
+    };
     let loom_compile = std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into());
     let config = Config {
         dit: Some(dit.clone()),

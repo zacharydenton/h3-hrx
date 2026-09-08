@@ -12,7 +12,7 @@ from test_prepare import lanes_for
 def check(name, out, tmp, tokens, width, want, args, cfg, out_stride=None):
     out_stride = out_stride or width
     ns, sym = f"h3.prepare_{name}_{out}", f"h3_prepare_{name}_{out}"; hs = tmp / f"{name}_{width}_{out}.hsaco"; lanes = lanes_for(width)
-    compile_kernel(ROOT / f"kernels/prepare_{name}_{out}.loom", sym, {f"{ns}.width": width, f"{ns}.lanes": lanes, f"{ns}.out_stride": out_stride, **cfg}, hs)
+    compile_kernel(ROOT / f"h3/kernels/prepare_{name}_{out}.loom", sym, {f"{ns}.width": width, f"{ns}.lanes": lanes, f"{ns}.out_stride": out_stride, **cfg}, hs)
     (o,), t = launch(hs, sym, (tokens, 1, 1), (lanes, 1, 1), [("i32", tokens)] + args + [(f"out_{out}", ((tokens, out_stride), None))], tmp, repeat=3)
     got = (o.astype(np.float64) if out == "f16" else from_bf16(o).astype(np.float64))[:, :width]
     tol = 2e-3 if out == "f16" else 8e-3   # f16 keeps 11 significant bits, bf16 8 (the values are O(1) after normalisation)

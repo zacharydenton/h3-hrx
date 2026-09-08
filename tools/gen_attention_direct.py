@@ -45,7 +45,7 @@ def convert(K: str, waves: int) -> str:
 
 def main():
     for stem, waves in (("attention_i8qk_mha_lds_f16_wmma", 4), ("attention_i8qk_mha8_lds_f16_wmma", 8)):
-        src = (ROOT / "kernels" / f"{stem}.loom").read_text()
+        src = (ROOT / "h3/kernels" / f"{stem}.loom").read_text()
         try:
             out = convert(src, waves)
         except AssertionError as e:

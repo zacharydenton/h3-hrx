@@ -194,12 +194,7 @@ impl TextEncoder {
 
         let cond = self.constants.identity();
         let cond_fn = |_: usize| crate::stack::LayerCond { ..cond };
-        let (x, cls, cos, sin) = (
-            b.x.binding(),
-            b.cls.all(),
-            b.cos.binding(),
-            b.sin.binding(),
-        );
+        let (x, cls, cos, sin) = (b.x.binding(), b.cls.all(), b.cos.binding(), b.sin.binding());
         if spans.is_empty() {
             b.stack
                 .forward(gpu, prof, x, cls, cos, sin, &cond_fn, 0, None)?;

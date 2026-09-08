@@ -9,4 +9,4 @@ name = "loomrun"
 path = "src/main.rs"
 
 [dependencies]
-hrx = { path = "../hrx" }
+hrx = { version = "0.1.0", path = "../../hrx.rs", features = ["runner"] }

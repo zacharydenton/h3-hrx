@@ -19,7 +19,7 @@ def main():
         for stem in stems:
             waves = 16 if "mha16" in stem else (8 if "mha8" in stem else 4)
             cap = max((tokens + 16 + 31) // 32 * 32, (tokens + 16 * waves - 1) // (16 * waves) * (16 * waves))
-            src = ROOT / "kernels" / f"{stem}.loom"; src = src if src.exists() else ROOT / "experiments" / f"{stem}.loom"
+            src = ROOT / "h3/kernels" / f"{stem}.loom"; src = src if src.exists() else ROOT / "experiments" / f"{stem}.loom"
             ns, sym = "h3." + stem, "h3_" + stem; hs = tmp / f"{stem}.hsaco"
             compile_kernel(src, sym, {f"{ns}.q_stride": HEADS * D, f"{ns}.kv_stride": HEADS * D, f"{ns}.tokens": tokens, f"{ns}.token_capacity": cap, f"{ns}.scale": 1.0, f"{ns}.out_stride": HEADS * D, **({f"{ns}.skip_tau": float(__import__("os").environ.get("ATTN_SKIP_TAU", "1e30"))} if "skip_tau" in src.read_text() else {})}, hs)
             qi = rng.integers(-2**31, 2**31, size=(cap, HEADS * 16), dtype=np.int32); ki = rng.integers(-2**31, 2**31, size=(cap, HEADS * 16), dtype=np.int32)

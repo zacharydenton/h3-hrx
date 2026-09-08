@@ -14,7 +14,7 @@ def groupnorm(tmp):
     stem = "gn_silu_f16"; ns = "h3." + stem + "."; sym = "h3_" + stem
     cfg = {ns + "channels": 32, ns + "groups": 1, ns + "plane": 2, ns + "rows_bound": 64, ns + "eps": 1e-6}
     hs = tmp / "gn.hsaco"
-    compile_kernel(ROOT / "kernels" / (stem + ".loom"), sym, cfg, hs)
+    compile_kernel(ROOT / "h3/kernels" / (stem + ".loom"), sym, cfg, hs)
     for amplitude in (0.0005, 0.0, 0.5):
         x = np.tile(np.array([-amplitude, amplitude], np.float16), 32).reshape(2, 32)
         xf = x.astype(np.float64)

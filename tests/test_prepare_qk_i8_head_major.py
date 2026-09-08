@@ -32,7 +32,7 @@ def main():
                     config["token_capacity"] = cap
                 hsaco = tmp / (stem + ".hsaco")
                 compile_kernel(
-                    ROOT / "kernels" / (stem + ".loom"),
+                    ROOT / "h3/kernels" / (stem + ".loom"),
                     "h3_" + stem,
                     {"h3." + stem + "." + k: v for k, v in config.items()},
                     hsaco,

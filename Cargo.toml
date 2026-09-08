@@ -4,7 +4,7 @@
 # repository would — its own lockfile, resolved against the crate as published — is the point of it.
 [workspace]
 resolver = "2"
-members = ["h3", "hrx", "cli", "loomrun"]
+members = ["h3", "cli", "loomrun"]
 exclude = ["examples/rust"]
 
 [workspace.package]

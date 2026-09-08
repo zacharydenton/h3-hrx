@@ -204,7 +204,7 @@ def main():
         refs[int(head)] = prob @ v[head, :, :n].astype(np.float32).T
     built, results = {}, {}
     for stem in args.stems:
-        src = ROOT / "kernels" / f"{stem}.loom"
+        src = ROOT / "h3/kernels" / f"{stem}.loom"
         if not src.exists():
             src = ROOT / "experiments" / f"{stem}.loom"
         if not src.exists():

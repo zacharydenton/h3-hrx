@@ -1,4 +1,4 @@
-"""kernels/prepare_*.loom: the GEMM-input preparation kernels, one workgroup of `lanes`
+"""h3/kernels/prepare_*.loom: the GEMM-input preparation kernels, one workgroup of `lanes`
 lanes per token (96 for 5376, 128 for 7168, 256 for 14336), 8 elements per lane per step (16-byte loads, 4-byte packed stores).
 The row is formed first, in one of three ways:
   norm   : rmsnorm(h) * norm_weight * (1 + scale[class]) + shift[class]  (block inputs; class = (timestep, modality) row)
@@ -14,7 +14,7 @@ and then written as one of two operands:
 import re
 from pathlib import Path
 
-OUT = Path(__file__).resolve().parent.parent / "kernels"
+OUT = Path(__file__).resolve().parent.parent / "h3/kernels"
 
 def stage(d: int, lds: str = "f32") -> str:
     return f"""  scf.for %t0 = [%lane to %quads step %lanes] {{

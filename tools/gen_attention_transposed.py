@@ -179,11 +179,11 @@ def prepare(K: str) -> str:
 
 
 def main():
-    src = (ROOT / "kernels/attention_i8qkf_mha8_lds_f16_wmma.loom").read_text()
-    (ROOT / "kernels/attention_i8qkt_mha8_lds_f16_wmma.loom").write_text(drop_v_placeholder(convert(src))); print("wrote attention_i8qkt_mha8")
+    src = (ROOT / "h3/kernels/attention_i8qkf_mha8_lds_f16_wmma.loom").read_text()
+    (ROOT / "h3/kernels/attention_i8qkt_mha8_lds_f16_wmma.loom").write_text(drop_v_placeholder(convert(src))); print("wrote attention_i8qkt_mha8")
     # the shipped form minus the zero V packet it still carries: experiments/, timed against the shipped kernel
     (ROOT / "experiments/attention_i8qkfz_mha8_lds_f16_wmma.loom").write_text(drop_v_placeholder(src).replace("attention_i8qkf_mha8", "attention_i8qkfz_mha8")); print("wrote attention_i8qkfz_mha8")
-    (ROOT / "kernels/prepare_qk_i8t.loom").write_text(prepare((ROOT / "kernels/prepare_qk_i8.loom").read_text())); print("wrote prepare_qk_i8t")
+    (ROOT / "h3/kernels/prepare_qk_i8t.loom").write_text(prepare((ROOT / "h3/kernels/prepare_qk_i8.loom").read_text())); print("wrote prepare_qk_i8t")
 
 
 if __name__ == "__main__":

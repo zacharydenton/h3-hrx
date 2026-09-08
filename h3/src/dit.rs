@@ -476,7 +476,10 @@ impl Reference<'_> {
         }
         if let Some(p) = self.presented() {
             let Some(need) = p.height.checked_mul(p.width).and_then(|n| n.checked_mul(3)) else {
-                return Err(at(format!("pixels of {}x{} overflow a usize", p.height, p.width)));
+                return Err(at(format!(
+                    "pixels of {}x{} overflow a usize",
+                    p.height, p.width
+                )));
             };
             if need == 0 || p.pixels.len() < need {
                 return Err(at(format!(
@@ -528,7 +531,10 @@ impl Keyframe<'_> {
         }
         if let Some(p) = self.presented {
             let Some(want) = p.height.checked_mul(p.width).and_then(|n| n.checked_mul(3)) else {
-                return Err(at(format!("pixels of {}x{} overflow a usize", p.height, p.width)));
+                return Err(at(format!(
+                    "pixels of {}x{} overflow a usize",
+                    p.height, p.width
+                )));
             };
             if want == 0 || p.pixels.len() < want {
                 return Err(at(format!(

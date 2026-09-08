@@ -41,7 +41,7 @@ def main() -> int:
     want_k = R.apply_rope(R.rms_norm(k, kw), cos, sin, rope_dim).reshape(tokens, -1)
     with workdir() as tmp:
         tmp = Path(tmp); hs = tmp / "rope.hsaco"
-        compile_kernel(ROOT / "kernels" / f"{STEM}.loom", SYM,
+        compile_kernel(ROOT / "h3/kernels" / f"{STEM}.loom", SYM,
                        {f"{NS}.row_stride": stride, f"{NS}.heads": heads, f"{NS}.kv_heads": kv_heads, f"{NS}.k_offset": k_off, f"{NS}.eps": 1e-5}, hs)
         (qo, ko, vo), t = launch(hs, SYM, (tokens, 1, 1), (256, 1, 1),
                                  [("i32", tokens), ("in_f16", fused.numpy()), ("in", qw.numpy()), ("in", kw.numpy()),

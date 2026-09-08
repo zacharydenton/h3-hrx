@@ -34,10 +34,10 @@ def run(tmp,m,k,n=6144):
   stem=f'gemm_f16_{variant}_256b';ns='h3.'+stem
   cfg={ns+'.k_size':k,ns+'.n_size':n,ns+'.k_stride':k+128,ns+'.m_group':group}
   if variant=='qkvropehm':cfg.update({ns+'.token_capacity':cap,ns+'.eps':eps})
-  hs=tmp/(variant+'.hsaco');compile_kernel(ROOT / 'kernels' / (stem+'.loom'),'h3_'+stem,cfg,hs)
+  hs=tmp/(variant+'.hsaco');compile_kernel(ROOT / 'h3/kernels' / (stem+'.loom'),'h3_'+stem,cfg,hs)
   compiled[variant]=(stem,hs)
  stem='rope64_qknorm_f16';ns='h3.'+stem;rhs=tmp/'rope.hsaco'
- compile_kernel(ROOT / 'kernels' / (stem+'.loom'),'h3_'+stem,{ns+'.row_stride':n,ns+'.heads':width//64,ns+'.kv_heads':width//64,ns+'.k_offset':width,ns+'.eps':eps},rhs)
+ compile_kernel(ROOT / 'h3/kernels' / (stem+'.loom'),'h3_'+stem,{ns+'.row_stride':n,ns+'.heads':width//64,ns+'.kv_heads':width//64,ns+'.k_offset':width,ns+'.eps':eps},rhs)
  gy=(tiles+group-1)//group*group
  outs,_=launch(compiled['fast'][1],'h3_'+compiled['fast'][0],(n//256,gy,1),(256,1,1),[('i32',m),('in_f16',a),('in_f16',w),('out_f16',((m,n),np.float16)),('in',bias)],tmp)
  projected=outs[0]
@@ -79,7 +79,7 @@ def main():
         source.write_text(generate())
         formatter = LOOM_COMPILE.parent.parent / "loom-format/loom-format"
         subprocess.run([str(formatter), "--in-place", str(source)], check=True, capture_output=True)
-        assert source.read_bytes() == (ROOT / "kernels" / source.name).read_bytes(), "generated source differs"
+        assert source.read_bytes() == (ROOT / "h3/kernels" / source.name).read_bytes(), "generated source differs"
         ns = "h3." + STEM
         for k in (128, 2048):
             for group, capacity in ((1, 256), (2, 256), (2, 288), (3, 768), (3, 2048), (4, 2048), (15, 2048)):

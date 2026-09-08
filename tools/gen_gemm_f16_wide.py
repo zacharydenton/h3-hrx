@@ -114,5 +114,5 @@ def generate(mode, kstep=64):
 
 if __name__ == "__main__":
     for mode, stem in STEMS.items():
-        (ROOT / "kernels" / f"{stem}.loom").write_text(generate(mode))
+        (ROOT / "h3/kernels" / f"{stem}.loom").write_text(generate(mode))
         print("wrote", stem)

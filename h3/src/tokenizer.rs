@@ -10,7 +10,7 @@
 use std::path::Path;
 
 /// Qwen's `tokenizer.json`, Apache-2.0, vendored under `assets/`.
-const EMBEDDED: &[u8] = include_bytes!("../../assets/tokenizer.json");
+const EMBEDDED: &[u8] = include_bytes!("../assets/tokenizer.json");
 
 #[derive(Debug, thiserror::Error)]
 #[error("tokenizer: {0}")]

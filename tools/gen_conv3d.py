@@ -17,7 +17,7 @@ import argparse
 import re
 from pathlib import Path
 
-KERNELS = Path(__file__).resolve().parent.parent / "kernels"
+KERNELS = Path(__file__).resolve().parent.parent / "h3/kernels"
 
 SOURCES = {
     "conv3d_f16_wmma": ("matmul_bias_f16_wmma_af16_cf16", "h3_matmul_bias_f16_wmma_af16_cf16",

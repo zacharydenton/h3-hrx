@@ -1,4 +1,4 @@
-"""kernels/attention_gqa_lds_f16_wmma.loom: GQA attention with K/V tiles staged in LDS.
+"""h3/kernels/attention_gqa_lds_f16_wmma.loom: GQA attention with K/V tiles staged in LDS.
 
 One workgroup of four waves per (16 query rows, key-value head): wave w is query head
 kv_head*4 + w. Per 16-key tile the workgroup loads the K tile [16][128] and the V tile
@@ -21,10 +21,10 @@ assert GQA == 4 and WAVES == 4 or GQA == 1 and WAVES in (4, 8, 16) or GQA == 8 a
 QBLOCK = 16 * WAVES                                     # query rows per workgroup
 STEM = os.environ.get("ATTN_STEM", ({4: "attention_mha_lds_f16_wmma", 8: "attention_mha8_lds_f16_wmma", 16: "attention_mha16_lds_f16_wmma"}[WAVES].replace("mha", f"mha{D}" if D != 128 else "mha")) if GQA == 1 else ("attention_gqa8c_lds_f16_wmma" if GQA == 8 else "attention_gqa_lds_f16_wmma"))
 assert TILE in (16, 32)
-OUT = ROOT / ("kernels" if STEM in ("attention_gqa_lds_f16_wmma", "attention_mha_lds_f16_wmma", "attention_mha8_lds_f16_wmma", "attention_mha64_lds_f16_wmma", "attention_mha648_lds_f16_wmma", "attention_gqa8c_lds_f16_wmma") else "experiments") / f"{STEM}.loom"   # 16 waves lost (0.92x): experiments/
+OUT = ROOT / ("h3/kernels" if STEM in ("attention_gqa_lds_f16_wmma", "attention_mha_lds_f16_wmma", "attention_mha8_lds_f16_wmma", "attention_mha64_lds_f16_wmma", "attention_mha648_lds_f16_wmma", "attention_gqa8c_lds_f16_wmma") else "experiments") / f"{STEM}.loom"   # 16 waves lost (0.92x): experiments/
 if STEM in ("attention_mha64t32_lds_f16_wmma", "attention_mha64hm32_lds_f16_wmma"):
     assert D == 64 and TILE == 32 and WAVES == 4 and GQA == 1
-    OUT = ROOT / "kernels" / f"{STEM}.loom"
+    OUT = ROOT / "h3/kernels" / f"{STEM}.loom"
 NS, SYM = "h3." + STEM, "h3_" + STEM
 ROW = D + 8   # LDS row length in halves for a D-channel tile
 import os

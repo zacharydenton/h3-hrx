@@ -395,7 +395,10 @@ mod tests {
         // a header length that runs past the file
         let bad = dir.path().join("bad.safetensors");
         write_checkpoint(&bad, &[("a", "F16", vec![1], vec![0, 0])], Some(1 << 20));
-        assert!(matches!(unsafe { Checkpoint::open(&bad) }, Err(Error::Header { .. })));
+        assert!(matches!(
+            unsafe { Checkpoint::open(&bad) },
+            Err(Error::Header { .. })
+        ));
     }
 
     #[test]

@@ -382,7 +382,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "473c7e07f409a8d772161724aa8db6a765a2532a70f9667eeb7b49d3d02fbdca"
 dependencies = [
  "clap_builder",
- "clap_derive",
 ]
 
 [[package]]
@@ -395,18 +394,6 @@ dependencies = [
  "anstyle",
  "clap_lex",
  "strsim",
-]
-
-[[package]]
-name = "clap_derive"
-version = "4.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d012d2b9d65aca7f18f4d9878a045bc17899bba951561ba5ec3c2ba1eed9a061"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 3.0.5",
 ]
 
 [[package]]
@@ -1132,17 +1119,14 @@ dependencies = [
  "rand_chacha",
  "rand_distr",
  "safetensors",
- "tempfile",
  "thiserror",
  "tokenizers",
 ]
 
 [[package]]
-name = "h3-cli"
+name = "h3-minimal"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "clap",
  "h3",
 ]
 
@@ -1698,13 +1682,6 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
-
-[[package]]
-name = "loomrun"
-version = "0.1.0"
-dependencies = [
- "hrx",
-]
 
 [[package]]
 name = "lru-slab"

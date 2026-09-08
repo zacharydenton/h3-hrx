@@ -27,36 +27,35 @@ for name in set(paths.decode().split("\0")) - {""}:
     if Path(name).is_file():
         py_compile.compile(name, doraise=True)
 PY
-if [ -x "${LOOM_FORMAT:-}" ] && ls kernels/*.loom >/dev/null 2>&1; then step "loom sources are canonically formatted" bash -c '"$LOOM_FORMAT" --check kernels/*.loom'; else skip "loom sources are canonically formatted" "no loom-format (scripts/env.sh)"; fi
+if [ -x "${LOOM_FORMAT:-}" ] && ls h3/kernels/*.loom >/dev/null 2>&1; then step "loom sources are canonically formatted" bash -c '"$LOOM_FORMAT" --check h3/kernels/*.loom'; else skip "loom sources are canonically formatted" "no loom-format (scripts/env.sh)"; fi
 if [ -x "${LOOM_FORMAT:-}" ]; then
 step "generated kernels match their generators" bash -c '
   tmpdir=$(mktemp -d); trap "rm -rf $tmpdir" EXIT
-  cp -r kernels "$tmpdir/kernels" && cp -r tools "$tmpdir/tools" && cp -r experiments "$tmpdir/experiments" && cp -r scripts "$tmpdir/scripts" && cd "$tmpdir" &&
+  mkdir -p "$tmpdir/h3" && cp -r h3/kernels "$tmpdir/h3/kernels" && cp -r tools "$tmpdir/tools" && cp -r experiments "$tmpdir/experiments" && cp -r scripts "$tmpdir/scripts" && cd "$tmpdir" &&
   "$0" tools/gen_prepare.py >/dev/null && "$0" tools/gen_attention_lds.py >/dev/null && ATTN_WAVES=8 "$0" tools/gen_attention_lds.py >/dev/null && ATTN_GQA=8 ATTN_WAVES=8 ATTN_CAUSAL=1 "$0" tools/gen_attention_lds.py >/dev/null && "$0" tools/gen_gemm.py >/dev/null && "$0" tools/gen_rope.py >/dev/null && sh scripts/gen_attention_i4.sh >/dev/null &&
   "$0" tools/gen_attention_i8_head_major.py >/dev/null && "$0" tools/gen_attention_i8_head_major_64.py >/dev/null && "$0" tools/gen_gemm_f16.py >/dev/null && ATTN_D=64 ATTN_TILE=32 ATTN_STEM=attention_mha64t32_lds_f16_wmma "$0" tools/gen_attention_lds.py >/dev/null && ATTN_D=64 ATTN_TILE=32 ATTN_STEM=attention_mha64hm32_lds_f16_wmma "$0" tools/gen_attention_lds.py >/dev/null && "$0" tools/gen_matmul_bf16.py >/dev/null &&
-  for f in attention_mha64hm32_lds_f16_wmma attention_mha64t32_lds_f16_wmma attention_i4qk_mha8_lds_f16_wmma attention_i4qk_mha_lds_f16_wmma attention_i4qkl_mha8_lds_f16_wmma attention_i4qks_mha8_lds_f16_wmma attention_i4qks_mha_lds_f16_wmma attention_i4qksl_mha8_lds_f16_wmma prepare_norm_i4 prepare_plain_i4 prepare_norm_i8 prepare_plain_i8 prepare_plain16_i8 prepare_lnorm_i8 prepare_norm_f16 prepare_lnorm_f16 prepare_plain_f16 prepare_norm_bf16 prepare_lnorm_bf16 prepare_plain_bf16 attention_mha_lds_f16_wmma attention_mha8_lds_f16_wmma attention_gqa8c_lds_f16_wmma gemm_i4_256 gemm_i4_resid_256 gemm_i4_swiglu_256 gemm_i8_256b gemm_i8_resid_256b gemm_i8_swiglu_256b_gs gemm_i8_256 gemm_i8_resid_256 gemm_i8_swiglu_256 gemm_f16_256 gemm_f16_256b gemm_f16_resid_256 gemm_f16_resid_256b gemm_f16_swiglu_256 gemm_f16_swiglu_256b_gs gemm_bf16_256 gemm_bf16_256b gemm_bf16_resid_256 gemm_bf16_resid_256b gemm_bf16_swiglu_256 gemm_bf16_swiglu_256b_gs matmul_bias_bf16_wmma matmul_resid_bf16_wmma matmul_gelu_bf16_wmma matmul_gelu_erf_bf16_wmma rope_qknorm_f16 rope64_qknorm_f16 rope128_qknorm_f16 attention_i8qkhm_mha8_lds_f16_wmma attention_i8qkhm_mha8_k64_lds_f16_wmma prepare_qk_i8hm; do "$LOOM_FORMAT" --in-place "kernels/$f.loom" >/dev/null && cmp -s "kernels/$f.loom" "$OLDPWD/kernels/$f.loom" || { echo "  $f differs"; exit 1; }; done' "$PY"
+  for f in attention_mha64hm32_lds_f16_wmma attention_mha64t32_lds_f16_wmma attention_i4qk_mha8_lds_f16_wmma attention_i4qk_mha_lds_f16_wmma attention_i4qkl_mha8_lds_f16_wmma attention_i4qks_mha8_lds_f16_wmma attention_i4qks_mha_lds_f16_wmma attention_i4qksl_mha8_lds_f16_wmma prepare_norm_i4 prepare_plain_i4 prepare_norm_i8 prepare_plain_i8 prepare_plain16_i8 prepare_lnorm_i8 prepare_norm_f16 prepare_lnorm_f16 prepare_plain_f16 prepare_norm_bf16 prepare_lnorm_bf16 prepare_plain_bf16 attention_mha_lds_f16_wmma attention_mha8_lds_f16_wmma attention_gqa8c_lds_f16_wmma gemm_i4_256 gemm_i4_resid_256 gemm_i4_swiglu_256 gemm_i8_256b gemm_i8_resid_256b gemm_i8_swiglu_256b_gs gemm_i8_256 gemm_i8_resid_256 gemm_i8_swiglu_256 gemm_f16_256 gemm_f16_256b gemm_f16_resid_256 gemm_f16_resid_256b gemm_f16_swiglu_256 gemm_f16_swiglu_256b_gs gemm_bf16_256 gemm_bf16_256b gemm_bf16_resid_256 gemm_bf16_resid_256b gemm_bf16_swiglu_256 gemm_bf16_swiglu_256b_gs matmul_bias_bf16_wmma matmul_resid_bf16_wmma matmul_gelu_bf16_wmma matmul_gelu_erf_bf16_wmma rope_qknorm_f16 rope64_qknorm_f16 rope128_qknorm_f16 attention_i8qkhm_mha8_lds_f16_wmma attention_i8qkhm_mha8_k64_lds_f16_wmma prepare_qk_i8hm; do "$LOOM_FORMAT" --in-place "h3/kernels/$f.loom" >/dev/null && cmp -s "h3/kernels/$f.loom" "$OLDPWD/h3/kernels/$f.loom" || { echo "  $f differs"; exit 1; }; done' "$PY"
 else skip "generated kernels match their generators" "no loom-format (scripts/env.sh)"; fi
 step "Rust sources are formatted" cargo fmt --all --check
-# --all-features so the diagnostic examples build: they are the only callers of some internal API,
-# and without them dead-code analysis reports items that are merely feature-gated.
-step "Rust lints" cargo clippy --workspace --all-targets --all-features --quiet -- -D warnings
+# --all-targets so the diagnostic examples are linted too: they are the only callers of some of the
+# implementation's own API, and dead-code analysis needs them to see it reached.
+step "Rust lints" cargo clippy --workspace --all-targets --quiet -- -D warnings
 step "CPU host regressions" env H3_PYTHON="$PY" bash scripts/test_host.sh
+step "standalone Rust example lockfile and build" cargo check --locked --manifest-path examples/rust/Cargo.toml
 # CPU-only binding, cache and runner regressions: no weights, no GPU, no containers.
 step "binding and runner regressions" "$PY" tests/test_review_regressions.py
 # include/h3.h is generated from h3/src/capi.rs; a committed copy that no longer matches means the
 # header and the code that implements it have parted company.
-if command -v cbindgen >/dev/null 2>&1; then
 step "the committed C header matches the code" bash -c '
   tmp=$(mktemp); trap "rm -f $tmp" EXIT
-  (cd h3 && cbindgen --config cbindgen.toml --crate h3 --output "$tmp" --quiet) &&
+  cargo run --quiet -p h3 --example export_header > "$tmp" &&
   diff -u include/h3.h "$tmp"'
-else skip "the committed C header matches the code" "no cbindgen (cargo install cbindgen)"; fi
-# loomrun's own tests: the option table and the rotation cycle. They link libhrx but never open the GPU.
-HRX_LIB_DIR="${HRX_BUILD:-$HOME/code/hrx-system/build-cuda}/libhrx/src/libhrx"
-if command -v cargo >/dev/null 2>&1 && [ -f "$HRX_LIB_DIR/libhrx.so" ]; then
-step "loomrun (Rust) unit tests" cargo test --quiet --release --manifest-path loomrun/Cargo.toml
-step "h3 library unit tests" cargo test --quiet --release --manifest-path h3/Cargo.toml
-else skip "loomrun and h3 unit tests" "no cargo or libhrx"; fi
+# The whole workspace's tests. None of them open the GPU, and libhrx is loaded on demand rather than
+# linked, so there is nothing to look for on disk first. loomrun's own tests — the option table and
+# the rotation cycle — went with the runner into the hrx crate and are run from there.
+if command -v cargo >/dev/null 2>&1; then
+step "Rust unit tests" cargo test --quiet --release --workspace
+else skip "Rust unit tests" "no cargo"; fi
 if [ -x "${LOOM_COMPILE:-}" ] && [ -x "${LOOM_FORMAT:-}" ]; then
 step "wide decoder kernels generate and compile (CPU only)" "$PY" tests/test_gemm_f16_wide.py --compile-only
 step "fast decoder kernels generate and compile (CPU only)" "$PY" tests/test_gemm_f16_wide.py --compile-only --fast

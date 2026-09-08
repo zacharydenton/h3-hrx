@@ -67,4 +67,4 @@ def generate(mode):
 if __name__ == "__main__":
     for mode in ("plain", "resid", "swiglu"):
         stem = "gemm_f16_fast" + ("" if mode == "plain" else "_" + mode) + "_256b" + ("_gs" if mode == "swiglu" else "")
-        (ROOT / "kernels" / f"{stem}.loom").write_text(generate(mode))
+        (ROOT / "h3/kernels" / f"{stem}.loom").write_text(generate(mode))

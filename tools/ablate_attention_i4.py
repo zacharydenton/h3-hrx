@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 from kernel_test import compile_kernel, launch, workdir
 HEADS, D, WAVES = 56, 128, 8
-BASE = ROOT / "kernels/attention_i4qk_mha8_lds_f16_wmma.loom"
+BASE = ROOT / "h3/kernels/attention_i4qk_mha8_lds_f16_wmma.loom"
 
 
 def variants(src: str):

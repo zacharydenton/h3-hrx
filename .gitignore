@@ -9,3 +9,5 @@ __pycache__/
 /examples/go/minimal
 /target/
 /examples/rust/target/
+
+/examples/rustler/target/

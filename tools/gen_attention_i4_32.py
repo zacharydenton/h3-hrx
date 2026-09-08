@@ -122,6 +122,6 @@ def unrolled(K: str, src_stem: str, out_stem: str, lds_pad: int = 0) -> str:
 if __name__ == "__main__":
     argv = [a for a in sys.argv[1:] if a != "--unroll"]; src_stem, out_stem = argv[0], argv[1]; pad = int(argv[2]) if len(argv) > 2 else 0
     fn = unrolled if "--unroll" in sys.argv else doubled
-    src = ROOT / "kernels" / f"{src_stem}.loom"
-    out = ROOT / ("kernels" if out_stem in ("attention_i4qk32_mha8_lds_f16_wmma",) else "experiments") / f"{out_stem}.loom"
+    src = ROOT / "h3/kernels" / f"{src_stem}.loom"
+    out = ROOT / ("h3/kernels" if out_stem in ("attention_i4qk32_mha8_lds_f16_wmma",) else "experiments") / f"{out_stem}.loom"
     out.write_text(fn(src.read_text(), src_stem, out_stem, pad)); print("wrote", out)

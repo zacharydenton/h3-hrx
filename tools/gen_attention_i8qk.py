@@ -48,8 +48,8 @@ def convert(K: str) -> str:
 
 def main():
     for stem in STEMS:
-        src = ROOT / "kernels" / f"{stem}.loom"; K = convert(src.read_text())
-        out = ROOT / "kernels" / f"{stem.replace('i4qk', 'i8qk')}.loom"; out.write_text(K); print("wrote", out.name, len(K))
+        src = ROOT / "h3/kernels" / f"{stem}.loom"; K = convert(src.read_text())
+        out = ROOT / "h3/kernels" / f"{stem.replace('i4qk', 'i8qk')}.loom"; out.write_text(K); print("wrote", out.name, len(K))
 
 
 if __name__ == "__main__":
