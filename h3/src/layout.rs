@@ -550,6 +550,43 @@ mod tests {
         assert!(l.ref_segs.iter().all(|s| s.kind == 0 || s.kind == 1));
         assert_eq!(l.tclass[l.ref_segs[0].row0], 2); // the image, conditioning video
         assert_eq!(l.tclass[l.ref_segs[1].row0], 3); // the sound, conditioning audio
+        // The final norm has two classes, and the reference rows do not fit them — which is why
+        // only the generated span is uploaded to it. That span does fit.
+        assert!(
+            crate::dispatch::classes_fit(&l.tclass, 2).is_err(),
+            "reference rows carry conditioning classes"
+        );
+        let generated = 12 + l.ref_rows;
+        assert!(
+            crate::dispatch::classes_fit(&l.tclass[generated..], 2).is_ok(),
+            "the generated rows are the final norm's own two classes"
+        );
+    }
+
+    /// The image reference the differential harness drives: 256x256x5 with one 64x64 reference.
+    /// Its conditioning rows carry class 2, which is why the final norm is given the generated span
+    /// alone — uploading the whole array against its two classes refuses every reference run.
+    #[test]
+    fn the_final_norms_span_is_the_generated_rows() {
+        let image = Ref {
+            kind: 0,
+            latent_t: 1,
+            lat_h: 4,
+            lat_w: 4,
+            audio_t: 0,
+            has_audio: false,
+        };
+        let l = Layout::new(18, 2, 16, 16, 9, &[image], &[]).unwrap();
+        let lr = 18 + l.ref_rows;
+        assert!(l.ref_rows > 0, "the reference takes rows");
+        assert!(
+            crate::dispatch::classes_fit(&l.tclass, 2).is_err(),
+            "the whole array does not fit the final norm's table"
+        );
+        assert!(
+            crate::dispatch::classes_fit(&l.tclass[lr..lr + l.audio_rows + l.video_rows], 2).is_ok(),
+            "the generated span does"
+        );
     }
 
     #[test]

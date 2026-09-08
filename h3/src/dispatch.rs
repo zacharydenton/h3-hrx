@@ -234,6 +234,17 @@ impl Classes {
     }
 }
 
+/// Whether every value is a row of a `classes`-row table, which is the half of [`Classes::write`]
+/// that needs no device.
+pub(crate) fn classes_fit(values: &[i32], classes: usize) -> Result<()> {
+    if let Some(bad) = values.iter().find(|v| **v < 0 || **v as usize >= classes) {
+        return Err(crate::compile::Error::Io(format!(
+            "class {bad} is not one of the {classes} a table has"
+        )));
+    }
+    Ok(())
+}
+
 /// What [`Classes::write`] accepts, without a device: rows that fit, each one a row of the table.
 fn checkable(values: &[i32], classes: usize, capacity: usize) -> Result<()> {
     if values.len() > capacity {
@@ -242,12 +253,7 @@ fn checkable(values: &[i32], classes: usize, capacity: usize) -> Result<()> {
             values.len()
         )));
     }
-    if let Some(bad) = values.iter().find(|v| **v < 0 || **v as usize >= classes) {
-        return Err(crate::compile::Error::Io(format!(
-            "class {bad} is not one of the {classes} a table has"
-        )));
-    }
-    Ok(())
+    classes_fit(values, classes)
 }
 
 /// A run of checked class rows, and the table width they were checked against.

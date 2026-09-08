@@ -775,8 +775,11 @@ impl Dit {
             crate::rope::dit(&lay.pos, inv, &mut cos, &mut sin);
             let seq = self.seq.as_mut().expect("sized above");
             seq.cls.write(gpu, &lay.adaln_rows, CLASSES)?;
-            // the final head has only the video and audio timestep classes
-            seq.tcls.write(gpu, &lay.tclass, 2)?;
+            // The final head runs on the generated rows alone, and has only the video and audio
+            // timestep classes. The rows before them carry conditioning classes its two-row table
+            // has no place for — 2 for a reference's video, 3 for its audio — so only the generated
+            // span goes up, and the head binds it from row zero.
+            seq.tcls.write(gpu, &lay.tclass[lr..lr + na + nv], 2)?;
             gpu.h2d_at(&seq.cos, 0, crate::vvae::as_bytes(&cos))?;
             gpu.h2d_at(&seq.sin, 0, crate::vvae::as_bytes(&sin))?;
         }
@@ -909,7 +912,7 @@ impl Dit {
                     seq.x.slice(lr * HID * 4, generated * HID * 4),
                     self.weights.at(gpu, "h3.final.norm", HID * 4)?.binding(),
                     cond.final_table.binding(),
-                    seq.tcls.slice(lr, generated),
+                    seq.tcls.slice(0, generated),
                 )?;
             }
             {
