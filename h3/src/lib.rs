@@ -9,6 +9,7 @@ pub mod model;
 pub mod models;
 pub mod noise;
 pub mod plan;
+pub mod rope;
 pub mod sampler;
 pub mod stack;
 pub mod tokenizer;
