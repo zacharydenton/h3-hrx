@@ -91,11 +91,15 @@ fn write_wav(path: &str, samples: &[f32], n: usize) {
     w.write_all(b"RIFF").unwrap();
     w.write_all(&(36 + bytes).to_le_bytes()).unwrap();
     w.write_all(b"WAVEfmt ").unwrap();
-    for v in [16u32, 0x0001_0002, 32000, 128000] {
-        w.write_all(&v.to_le_bytes()).unwrap();
-    }
-    w.write_all(&4u16.to_le_bytes()).unwrap();
-    w.write_all(&16u16.to_le_bytes()).unwrap();
+    // each field at its own width: packing format and channels into one u32 wrote format 2,
+    // channels 1, which is neither what the payload is nor readable
+    w.write_all(&16u32.to_le_bytes()).unwrap(); // fmt chunk size
+    w.write_all(&1u16.to_le_bytes()).unwrap(); // PCM
+    w.write_all(&2u16.to_le_bytes()).unwrap(); // stereo
+    w.write_all(&32000u32.to_le_bytes()).unwrap(); // sample rate
+    w.write_all(&128_000u32.to_le_bytes()).unwrap(); // bytes per second
+    w.write_all(&4u16.to_le_bytes()).unwrap(); // block align
+    w.write_all(&16u16.to_le_bytes()).unwrap(); // bits per sample
     w.write_all(b"data").unwrap();
     w.write_all(&bytes.to_le_bytes()).unwrap();
     for i in 0..n {

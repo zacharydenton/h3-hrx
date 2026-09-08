@@ -201,23 +201,44 @@ impl Checkpoint {
         if range.is_empty() {
             return;
         }
-        let map_start = self.map.as_ptr() as usize;
-        let map_end = map_start + self.map.len();
-        let first = range.as_ptr() as usize;
-        let last = first + range.len();
-        if first < map_start || last > map_end {
-            return;
-        }
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        let (begin, end) = if how == libc::MADV_WILLNEED {
-            (first & !(page - 1), (last + page - 1) & !(page - 1))
-        } else {
-            ((first + page - 1) & !(page - 1), last & !(page - 1))
+        let Some((begin, end)) = advise_pages(
+            (self.map.as_ptr() as usize, self.map.len()),
+            (range.as_ptr() as usize, range.len()),
+            page,
+            how == libc::MADV_WILLNEED,
+        ) else {
+            return;
         };
-        if end > begin {
-            unsafe { libc::madvise(begin as *mut libc::c_void, end - begin, how) };
-        }
+        unsafe { libc::madvise(begin as *mut libc::c_void, end - begin, how) };
     }
+}
+
+/// The page range to advise, or `None` when there is nothing to do.
+///
+/// Split out so it can be tested with plain integers: the interesting cases are a range outside the
+/// mapping and one that runs past its end, and *constructing* a slice for either of those would
+/// itself be undefined behaviour — a test that has to break the rules to reach the check proves
+/// nothing about it.
+fn advise_pages(
+    map: (usize, usize),
+    range: (usize, usize),
+    page: usize,
+    outward: bool,
+) -> Option<(usize, usize)> {
+    let (map_start, map_len) = map;
+    let (first, len) = range;
+    let map_end = map_start.checked_add(map_len)?;
+    let last = first.checked_add(len)?;
+    if first < map_start || last > map_end {
+        return None;
+    }
+    let (begin, end) = if outward {
+        (first & !(page - 1), (last + page - 1) & !(page - 1))
+    } else {
+        ((first + page - 1) & !(page - 1), last & !(page - 1))
+    };
+    (end > begin).then_some((begin, end))
 }
 
 /// Bytes per element for the dtypes a ComfyUI checkpoint holds. `U8` includes its quantisation
@@ -440,6 +461,51 @@ mod tests {
     }
 
     #[test]
+    fn a_range_outside_the_mapping_is_never_advised() {
+        // Integers, not slices: a range outside the mapping cannot be built as a reference without
+        // undefined behaviour, so the check is tested where it can be reached honestly.
+        const PAGE: usize = 4096;
+        let map = (0x1000_0000usize, 64 * PAGE);
+        // wholly inside is advised
+        assert!(advise_pages(map, (map.0, 8 * PAGE), PAGE, true).is_some());
+        // wholly outside, before and after
+        assert_eq!(advise_pages(map, (map.0 - PAGE, PAGE), PAGE, true), None);
+        assert_eq!(advise_pages(map, (map.0 + map.1, PAGE), PAGE, true), None);
+        // starting inside and running past the end
+        assert_eq!(advise_pages(map, (map.0, map.1 + 1), PAGE, true), None);
+        assert_eq!(advise_pages(map, (map.0 + PAGE, map.1), PAGE, false), None);
+        // and a length that would overflow the address space
+        assert_eq!(advise_pages(map, (map.0, usize::MAX), PAGE, true), None);
+        assert_eq!(
+            advise_pages((map.0, usize::MAX), (map.0, 1), PAGE, true),
+            None
+        );
+    }
+
+    #[test]
+    fn advised_pages_round_outward_to_read_and_inward_to_drop() {
+        const PAGE: usize = 4096;
+        let map = (0x1000_0000usize, 64 * PAGE);
+        // a range inside one page: reading takes the whole page, dropping takes none of it
+        let part = (map.0 + 100, 200);
+        assert_eq!(
+            advise_pages(map, part, PAGE, true),
+            Some((map.0, map.0 + PAGE))
+        );
+        assert_eq!(advise_pages(map, part, PAGE, false), None);
+        // two and a bit pages: reading rounds out to three, dropping in to the whole one between
+        let span = (map.0 + PAGE - 8, 2 * PAGE + 16);
+        assert_eq!(
+            advise_pages(map, span, PAGE, true),
+            Some((map.0, map.0 + 4 * PAGE))
+        );
+        assert_eq!(
+            advise_pages(map, span, PAGE, false),
+            Some((map.0 + PAGE, map.0 + 3 * PAGE))
+        );
+    }
+
+    #[test]
     fn madvise_rounds_outward_to_read_and_inward_to_drop() {
         let dir = tmp();
         let path = dir.path().join("c.safetensors");
@@ -464,9 +530,5 @@ mod tests {
             foreign.iter().all(|b| *b == 0xAB),
             "foreign memory was touched"
         );
-        // and a range that starts inside the mapping but runs past its end is refused, not clamped
-        let inside = ck.bytes(ck.at("a").unwrap());
-        let past = unsafe { std::slice::from_raw_parts(inside.as_ptr(), 1 << 30) };
-        ck.done_with(past);
     }
 }

@@ -190,12 +190,52 @@ unsafe fn path(p: *const c_char) -> Option<std::path::PathBuf> {
         .then(|| std::path::PathBuf::from(CStr::from_ptr(p).to_string_lossy().into_owned()))
 }
 
-unsafe fn slice<'a, T>(p: *const T, n: usize) -> &'a [T] {
-    if p.is_null() || n == 0 {
-        &[]
-    } else {
-        std::slice::from_raw_parts(p, n)
+/// A caller's input buffer as a slice.
+///
+/// `from_raw_parts` requires a non-null pointer to `n` initialised elements. A NULL with a positive
+/// count breaks that before anything inside can check it, and the panic guard would not catch the
+/// result — the contract violation is not an unwind. So a NULL with a count is an error, and only a
+/// count of zero yields an empty slice.
+unsafe fn slice<'a, T>(p: *const T, n: usize, what: &str) -> Result<&'a [T], Error> {
+    if n == 0 {
+        return Ok(&[]);
     }
+    if p.is_null() {
+        return Err(Error::Invalid(format!(
+            "{what} is NULL with a count of {n}"
+        )));
+    }
+    Ok(std::slice::from_raw_parts(p, n))
+}
+
+/// A caller's output buffer as a mutable slice, on the same terms.
+unsafe fn out_slice<'a, T>(p: *mut T, n: usize, what: &str) -> Result<&'a mut [T], Error> {
+    if n == 0 {
+        return Ok(&mut []);
+    }
+    if p.is_null() {
+        return Err(Error::Invalid(format!("{what} is NULL")));
+    }
+    Ok(std::slice::from_raw_parts_mut(p, n))
+}
+
+/// A product of dimensions, in `usize` and checked.
+///
+/// The dimensions arrive as `c_int` and the products are large: 8192 x 8192 x 124 pixels overflows a
+/// signed 32-bit multiply and wraps negative, which `.max(0)` then turns into a required size of
+/// *zero* — so a capacity check passes and the write is unbounded. Every size the ABI computes goes
+/// through here, and an overflow is a refusal rather than a wrap.
+fn extent(what: &str, dims: &[c_int]) -> Result<usize, Error> {
+    let mut n: usize = 1;
+    for d in dims {
+        if *d < 0 {
+            return Err(Error::Invalid(format!("{what}: negative dimension {d}")));
+        }
+        n = n
+            .checked_mul(*d as usize)
+            .ok_or_else(|| Error::Invalid(format!("{what}: dimensions overflow a usize")))?;
+    }
+    Ok(n)
 }
 
 /// A count that must be at least what the shape needs.
@@ -328,36 +368,55 @@ pub unsafe extern "C" fn h3_text_in(
             return Err(Error::Invalid("ids must hold at least one token".into()));
         }
         enough("text_in out", out_elements, n * crate::model::HID)?;
-        let ids = slice(ids, n).to_vec();
-        with(s, |session| {
-            let rows = std::slice::from_raw_parts_mut(out, n * crate::model::HID);
-            session.text_in(&ids, rows)
-        })
+        let ids = slice(ids, n, "ids")?.to_vec();
+        let rows = out_slice(out, n * crate::model::HID, "text_in out")?;
+        with(s, |session| session.text_in(&ids, rows))
     })
 }
 
 /// The reference and keyframe arrays, borrowed from the caller's memory for one call.
-unsafe fn refs_of<'a>(p: *const h3_ref, n: c_int) -> Vec<RefInput<'a>> {
-    slice(p, n.max(0) as usize)
-        .iter()
-        .map(|r| {
-            let vlen = (r.latent_t * r.lat_h * r.lat_w).max(0) as usize * crate::model::LATENT_CH;
-            let alen = r.audio_t.max(0) as usize * 2 * crate::avae::AUDIO_CH;
-            let plen = (r.height * r.width).max(0) as usize * 3;
-            RefInput {
-                kind: r.kind,
-                video_latent: (!r.video_latent.is_null()).then(|| slice(r.video_latent, vlen)),
-                latent_t: r.latent_t,
-                lat_h: r.lat_h,
-                lat_w: r.lat_w,
-                audio_latent: (!r.audio_latent.is_null()).then(|| slice(r.audio_latent, alen)),
-                audio_t: r.audio_t,
-                pixels: (!r.pixels.is_null()).then(|| slice(r.pixels, plen)),
-                height: r.height,
-                width: r.width,
-            }
-        })
-        .collect()
+unsafe fn refs_of<'a>(p: *const h3_ref, n: c_int) -> Result<Vec<RefInput<'a>>, Error> {
+    let mut out = Vec::with_capacity(n.max(0) as usize);
+    for r in slice(p, n.max(0) as usize, "refs")? {
+        let vlen = extent(
+            "reference latents",
+            &[
+                r.latent_t,
+                r.lat_h,
+                r.lat_w,
+                crate::model::LATENT_CH as c_int,
+            ],
+        )?;
+        let alen = extent(
+            "reference audio",
+            &[r.audio_t, 2, crate::avae::AUDIO_CH as c_int],
+        )?;
+        let plen = extent("reference pixels", &[r.height, r.width, 3])?;
+        out.push(RefInput {
+            kind: r.kind,
+            video_latent: (!r.video_latent.is_null())
+                .then(|| slice_unchecked(r.video_latent, vlen)),
+            latent_t: r.latent_t,
+            lat_h: r.lat_h,
+            lat_w: r.lat_w,
+            audio_latent: (!r.audio_latent.is_null())
+                .then(|| slice_unchecked(r.audio_latent, alen)),
+            audio_t: r.audio_t,
+            pixels: (!r.pixels.is_null()).then(|| slice_unchecked(r.pixels, plen)),
+            height: r.height,
+            width: r.width,
+        });
+    }
+    Ok(out)
+}
+
+/// A pointer already established non-null, with the length its own fields give.
+unsafe fn slice_unchecked<'a, T>(p: *const T, n: usize) -> &'a [T] {
+    if n == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(p, n)
+    }
 }
 
 unsafe fn keyframes_of<'a>(
@@ -365,26 +424,33 @@ unsafe fn keyframes_of<'a>(
     n: c_int,
     lat_h: c_int,
     lat_w: c_int,
-) -> Vec<KeyframeInput<'a>> {
-    let vlen = (lat_h * lat_w).max(0) as usize * crate::model::LATENT_CH;
-    slice(p, n.max(0) as usize)
-        .iter()
-        .map(|k| KeyframeInput {
+) -> Result<Vec<KeyframeInput<'a>>, Error> {
+    let vlen = extent(
+        "keyframe latents",
+        &[lat_h, lat_w, crate::model::LATENT_CH as c_int],
+    )?;
+    let mut out = Vec::with_capacity(n.max(0) as usize);
+    for k in slice(p, n.max(0) as usize, "keyframes")? {
+        if k.video_latent.is_null() {
+            return Err(Error::Invalid("a keyframe without video latents".into()));
+        }
+        let alen = extent(
+            "keyframe audio",
+            &[k.audio_t, 2, crate::avae::AUDIO_CH as c_int],
+        )?;
+        let plen = extent("keyframe pixels", &[k.height, k.width, 3])?;
+        out.push(KeyframeInput {
             frame_index: k.frame_index,
-            video_latent: slice(k.video_latent, vlen),
-            audio_latent: (!k.audio_latent.is_null()).then(|| {
-                slice(
-                    k.audio_latent,
-                    k.audio_t.max(0) as usize * 2 * crate::avae::AUDIO_CH,
-                )
-            }),
+            video_latent: slice_unchecked(k.video_latent, vlen),
+            audio_latent: (!k.audio_latent.is_null())
+                .then(|| slice_unchecked(k.audio_latent, alen)),
             audio_t: k.audio_t,
-            pixels: (!k.pixels.is_null())
-                .then(|| slice(k.pixels, (k.height * k.width).max(0) as usize * 3)),
+            pixels: (!k.pixels.is_null()).then(|| slice_unchecked(k.pixels, plen)),
             height: k.height,
             width: k.width,
-        })
-        .collect()
+        });
+    }
+    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -420,19 +486,30 @@ unsafe fn denoise_into(
                 .into(),
         ));
     };
-    let vlen = crate::model::LATENT_CH * (sh.latent_t * sh.lat_h * sh.lat_w).max(0) as usize;
-    let alen = 2 * crate::avae::AUDIO_CH * sh.audio_t.max(0) as usize;
+    let vlen = extent(
+        "video latents",
+        &[
+            sh.latent_t,
+            sh.lat_h,
+            sh.lat_w,
+            crate::model::LATENT_CH as c_int,
+        ],
+    )?;
+    let alen = extent(
+        "audio latents",
+        &[sh.audio_t, 2, crate::avae::AUDIO_CH as c_int],
+    )?;
     enough("video latents", video_elements, vlen)?;
     enough("audio latents", audio_elements, alen)?;
 
-    let ids = slice(ids, n).to_vec();
+    let ids = slice(ids, n, "ids")?.to_vec();
     let dp = DenoiseParams::from(p);
     let noise = Noise {
-        video: (!noise_video.is_null()).then(|| slice(noise_video, vlen)),
-        audio: (!noise_audio.is_null()).then(|| slice(noise_audio, alen)),
+        video: (!noise_video.is_null()).then(|| slice_unchecked(noise_video, vlen)),
+        audio: (!noise_audio.is_null()).then(|| slice_unchecked(noise_audio, alen)),
     };
-    let refs = refs_of(refs, n_refs);
-    let kfs = keyframes_of(keyframes, n_keyframes, sh.lat_h, sh.lat_w);
+    let refs = refs_of(refs, n_refs)?;
+    let kfs = keyframes_of(keyframes, n_keyframes, sh.lat_h, sh.lat_w)?;
 
     // The callback runs while the session lock is held, which is what the C does too: a progress
     // callback that re-entered the session would deadlock there and does here.
@@ -441,6 +518,8 @@ unsafe fn denoise_into(
             f(user, step as c_int, steps as c_int, seconds) != 0
         }
     });
+    let video_out = out_slice(video_latents, vlen, "video latents")?;
+    let audio_out = out_slice(audio_latents, alen, "audio latents")?;
     let out = with(s, |session| {
         let latents = session.denoise(
             &ids,
@@ -451,8 +530,8 @@ unsafe fn denoise_into(
             cb.as_mut()
                 .map(|c| c as &mut dyn FnMut(usize, usize, f64) -> bool),
         )?;
-        std::slice::from_raw_parts_mut(video_latents, vlen).copy_from_slice(&latents.video);
-        std::slice::from_raw_parts_mut(audio_latents, alen).copy_from_slice(&latents.audio);
+        video_out.copy_from_slice(&latents.video);
+        audio_out.copy_from_slice(&latents.audio);
         Ok(())
     });
     out
@@ -524,15 +603,21 @@ pub unsafe extern "C" fn h3_decode_video(
         let Some(sh) = Session::shape_for(p.height, p.width, p.frames) else {
             return Err(Error::Invalid("no such shape".into()));
         };
-        let vlen = crate::model::LATENT_CH * (sh.latent_t * sh.lat_h * sh.lat_w).max(0) as usize;
-        let pixels = (sh.frames * p.height * p.width).max(0) as usize * 3;
+        let vlen = extent(
+            "video latents",
+            &[
+                sh.latent_t,
+                sh.lat_h,
+                sh.lat_w,
+                crate::model::LATENT_CH as c_int,
+            ],
+        )?;
+        let pixels = extent("frames", &[sh.frames, p.height, p.width, 3])?;
         enough("video latents", video_elements, vlen)?;
         enough("frames", frame_bytes, pixels)?;
-        let z = slice(video_latents, vlen).to_vec();
-        with(s, |session| {
-            let out = std::slice::from_raw_parts_mut(frames, pixels);
-            session.decode_video(&sh, &z, out)
-        })
+        let z = slice(video_latents, vlen, "video latents")?.to_vec();
+        let out = out_slice(frames, pixels, "frames")?;
+        with(s, |session| session.decode_video(&sh, &z, out))
     })
 }
 
@@ -559,7 +644,7 @@ pub unsafe extern "C" fn h3_encode_video(
                 "frames, height and width are required".into(),
             ));
         }
-        let px = slice(pixels, f * h * w * 3).to_vec();
+        let px = slice(pixels, f * h * w * 3, "pixels")?.to_vec();
         let clip = Clip {
             pixels: &px,
             frames: f,
@@ -569,7 +654,7 @@ pub unsafe extern "C" fn h3_encode_video(
         with(s, |session| {
             let (z, t) = session.encode_video(clip)?;
             enough("video latents", latent_elements, z.len())?;
-            std::slice::from_raw_parts_mut(latents, z.len()).copy_from_slice(&z);
+            out_slice(latents, z.len(), "video latents")?.copy_from_slice(&z);
             if !latent_t.is_null() {
                 *latent_t = t as c_int;
             }
@@ -597,11 +682,9 @@ pub unsafe extern "C" fn h3_decode_audio(
         let slen = 2 * t * crate::avae::HOP;
         enough("audio latents", audio_elements, alen)?;
         enough("samples", sample_elements, slen)?;
-        let z = slice(audio_latents, alen).to_vec();
-        with(s, |session| {
-            let out = std::slice::from_raw_parts_mut(samples, slen);
-            session.decode_audio(&z, t, out)
-        })
+        let z = slice(audio_latents, alen, "audio latents")?.to_vec();
+        let out = out_slice(samples, slen, "samples")?;
+        with(s, |session| session.decode_audio(&z, t, out))
     })
 }
 
@@ -620,11 +703,11 @@ pub unsafe extern "C" fn h3_encode_audio(
         if n == 0 {
             return Err(Error::Invalid("n_samples must be at least one".into()));
         }
-        let x = slice(samples, 2 * n).to_vec();
+        let x = slice(samples, 2 * n, "samples")?.to_vec();
         with(s, |session| {
             let (z, t) = session.encode_audio(&x, n)?;
             enough("audio latents", latent_elements, z.len())?;
-            std::slice::from_raw_parts_mut(latents, z.len()).copy_from_slice(&z);
+            out_slice(latents, z.len(), "audio latents")?.copy_from_slice(&z);
             if !audio_t.is_null() {
                 *audio_t = t as c_int;
             }
@@ -648,14 +731,13 @@ pub unsafe extern "C" fn h3_vision_embed(
 ) -> c_int {
     guard(|| {
         let (h, w) = (height.max(0) as usize, width.max(0) as usize);
-        let px = slice(pixels, h * w * 3).to_vec();
+        let px = slice(pixels, h * w * 3, "pixels")?.to_vec();
         with(s, |session| {
             let e = session.vision_embed(&px, h, w)?;
             enough("merged", merged_elements, e.merged.len())?;
             enough("deepstack", deepstack_elements, e.deepstack.len())?;
-            std::slice::from_raw_parts_mut(merged, e.merged.len()).copy_from_slice(&e.merged);
-            std::slice::from_raw_parts_mut(deepstack, e.deepstack.len())
-                .copy_from_slice(&e.deepstack);
+            out_slice(merged, e.merged.len(), "merged")?.copy_from_slice(&e.merged);
+            out_slice(deepstack, e.deepstack.len(), "deepstack")?.copy_from_slice(&e.deepstack);
             if !tokens.is_null() {
                 *tokens = e.tokens as c_int;
             }
@@ -742,4 +824,75 @@ pub unsafe extern "C" fn h3_tokenizer_vocab_size(t: *const h3_tokenizer) -> c_in
         return -1;
     }
     (*t).inner.vocab_size() as c_int
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_null_buffer_with_a_count_is_refused_rather_than_dereferenced() {
+        // from_raw_parts on NULL is undefined behaviour and aborts rather than unwinding, so the
+        // panic guard would not catch it: the check has to come first.
+        unsafe {
+            assert!(slice::<f32>(std::ptr::null(), 8, "in").is_err());
+            assert!(out_slice::<f32>(std::ptr::null_mut(), 8, "out").is_err());
+            // a count of zero is the one case where NULL is fine, and yields an empty slice
+            assert_eq!(slice::<f32>(std::ptr::null(), 0, "in").unwrap().len(), 0);
+            assert_eq!(
+                out_slice::<f32>(std::ptr::null_mut(), 0, "out")
+                    .unwrap()
+                    .len(),
+                0
+            );
+            // and a real pointer still works
+            let mut v = [1.0f32, 2.0, 3.0];
+            assert_eq!(slice(v.as_ptr(), 3, "in").unwrap(), &[1.0, 2.0, 3.0]);
+            assert_eq!(out_slice(v.as_mut_ptr(), 3, "out").unwrap().len(), 3);
+        }
+    }
+
+    #[test]
+    fn dimensions_that_would_overflow_are_refused_not_wrapped() {
+        // 8192 x 8192 x 124 x 3 is 24,964,497,408 bytes. As a signed 32-bit product it wraps
+        // negative, and `.max(0)` then makes the required size zero — a capacity check that passes
+        // for any buffer at all.
+        let wrapped = (8192i32).wrapping_mul(8192).wrapping_mul(124);
+        assert!(wrapped < 0, "the i32 product really does wrap");
+        assert_eq!(
+            wrapped.max(0) as usize,
+            0,
+            "and .max(0) really does yield zero"
+        );
+
+        let n = extent("frames", &[8192, 8192, 124, 3]).expect("fits a usize");
+        assert_eq!(n, 24_964_497_408);
+        assert!(extent("frames", &[-1, 4]).is_err(), "a negative dimension");
+        assert!(
+            extent("frames", &[i32::MAX, i32::MAX, i32::MAX, i32::MAX]).is_err(),
+            "a product past a usize"
+        );
+        assert_eq!(extent("nothing", &[]).unwrap(), 1);
+        assert_eq!(extent("empty", &[0, 5]).unwrap(), 0);
+    }
+
+    #[test]
+    fn the_status_codes_are_the_ones_the_header_declares() {
+        assert_eq!(h3_status::H3_OK as c_int, 0);
+        assert_eq!(h3_status::H3_ERROR as c_int, 1);
+        assert_eq!(h3_status::H3_CANCELLED as c_int, 2);
+        assert_eq!(h3_status::H3_INVALID_ARGUMENT as c_int, 64);
+        assert_eq!(ABI_VERSION, 8);
+    }
+
+    #[test]
+    fn a_failure_leaves_its_message_for_the_thread_that_saw_it() {
+        set_error("first");
+        let text = unsafe { CStr::from_ptr(h3_last_error()) };
+        assert_eq!(text.to_str().unwrap(), "first");
+        // an interior NUL cannot reach C, and must not truncate the message there either
+        set_error("before\0after");
+        let text = unsafe { CStr::from_ptr(h3_last_error()) };
+        assert_eq!(text.to_str().unwrap(), "before?after");
+    }
 }

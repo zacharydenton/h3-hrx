@@ -163,15 +163,35 @@ fn dir_writable(path: &Path) -> bool {
 }
 
 /// `access(dir, W_OK)` without libc: creating and removing a uniquely named entry.
+///
+/// Exclusive creation, and a fresh name if that collides. `File::create` on a predictable name would
+/// truncate whatever is already there — and through a symlink, truncate somewhere else entirely — for
+/// a probe whose whole purpose is to touch nothing.
 fn tempfile_probe(dir: &Path) -> bool {
-    let probe = dir.join(format!(".h3-write-probe-{}", std::process::id()));
-    match std::fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
+    for attempt in 0..8 {
+        let probe = dir.join(format!(
+            ".h3-write-probe-{}-{attempt}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        match std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                return true;
+            }
+            // taken: try another name rather than touching what is there
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return false,
         }
-        Err(_) => false,
     }
+    false
 }
 
 /// The repository root: the binary's parent's parent, so `build/h3` finds `kernels/` beside it.
@@ -468,7 +488,12 @@ fn run(cli: Cli) -> Result<()> {
     let keyframe_latents = match &keyframe {
         Some(k) => Some(
             session
-                .encode_video(Clip { pixels: &k.pixels, frames: 1, height: k.h as usize, width: k.w as usize })
+                .encode_video(Clip {
+                    pixels: &k.pixels,
+                    frames: 1,
+                    height: k.h as usize,
+                    width: k.w as usize,
+                })
                 .context("encode keyframe")?
                 .0,
         ),
@@ -478,7 +503,12 @@ fn run(cli: Cli) -> Result<()> {
     for im in &ref_images {
         image_latents.push(
             session
-                .encode_video(Clip { pixels: &im.pixels, frames: 1, height: im.h as usize, width: im.w as usize })
+                .encode_video(Clip {
+                    pixels: &im.pixels,
+                    frames: 1,
+                    height: im.h as usize,
+                    width: im.w as usize,
+                })
                 .context("encode reference image")?
                 .0,
         );
@@ -537,13 +567,34 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     let t0 = Instant::now();
-    let latents = session.denoise(&ids, &params, Noise::default(), &refs, &keyframes, None)?;
+    let mut show = |step: usize, steps: usize, seconds: f64| {
+        eprint!("\r  step {step}/{steps}  {seconds:5.1} s");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        false // true would cancel
+    };
+    let latents = session.denoise(
+        &ids,
+        &params,
+        Noise::default(),
+        &refs,
+        &keyframes,
+        Some(&mut show),
+    )?;
+    eprintln!();
     let (video, audio) = (latents.video, latents.audio);
     eprintln!("denoised in {:.1} s", t0.elapsed().as_secs_f64());
+    if let Some(report) = session.profile_report() {
+        eprintln!("  denoise stages ({report})");
+    }
 
     if let Some(prefix) = &cli.latents {
         for (suffix, data) in [("video.f32", &video), ("audio.f32", &audio)] {
-            let path = prefix.with_extension(suffix);
+            // appended, not substituted: `with_extension` on `run.seed7` would drop `.seed7` and
+            // write `run.video.f32`, so two different prefixes could name one file
+            let mut name = prefix.clone().into_os_string();
+            name.push(".");
+            name.push(suffix);
+            let path = PathBuf::from(name);
             let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
             std::fs::write(&path, &bytes)
                 .with_context(|| format!("cannot write {}", path.display()))?;
@@ -571,8 +622,12 @@ fn run(cli: Cli) -> Result<()> {
     }
     let mut samples = vec![0.0f32; 2 * shape.audio_t as usize * 800];
     session.decode_audio(&audio, shape.audio_t as usize, &mut samples)?;
-    drop(session);
     eprintln!("decoded in {:.1} s", t0.elapsed().as_secs_f64());
+    if let Some(report) = session.profile_report() {
+        eprintln!("  decode stages ({report})");
+    }
+    // the weights are released before muxing, which is where the memory is wanted
+    drop(session);
 
     let n = shape.audio_t as u32 * 800;
     std::fs::write(&wav_path, media::wav_bytes(&samples, n))

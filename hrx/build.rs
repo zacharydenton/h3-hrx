@@ -11,8 +11,12 @@ fn main() {
 }
 
 fn hrx_lib_dir() -> String {
-    let system = std::env::var("HRX_SYSTEM")
-        .unwrap_or_else(|_| format!("{}/code/hrx-system", std::env::var("HOME").unwrap_or_default()));
+    let system = std::env::var("HRX_SYSTEM").unwrap_or_else(|_| {
+        format!(
+            "{}/code/hrx-system",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
     let build = std::env::var("HRX_BUILD").unwrap_or_else(|_| format!("{system}/build-cuda"));
     format!("{build}/libhrx/src/libhrx")
 }

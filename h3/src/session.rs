@@ -58,6 +58,18 @@ impl Session {
         })
     }
 
+    /// The stage timings gathered since the last call, and a reset.
+    ///
+    /// Empty unless `H3_PROFILE` is set, which is what turns on the synchronise around each launch.
+    pub fn profile_report(&mut self) -> Option<String> {
+        if !self.prof.on {
+            return None;
+        }
+        let report = self.prof.report(0.01);
+        self.prof.take();
+        (!report.is_empty()).then_some(report)
+    }
+
     /// The attention width this session was created with. The stack is built for it, so it is not a
     /// per-run parameter — and a run that quietly ignored it would make a precision comparison
     /// meaningless rather than wrong in any visible way.
@@ -141,6 +153,18 @@ impl Session {
 
     /// The refined text rows the blocks see, `[n][5376]`.
     pub fn text_in(&mut self, ids: &[i32], out: &mut [f32]) -> Result<()> {
+        // checked before a checkpoint is opened: a bad request should cost nothing
+        if ids.is_empty() {
+            return invalid("ids must hold at least one token");
+        }
+        if out.len() < ids.len() * crate::model::HID {
+            return invalid(format!(
+                "text_in needs {} floats for {} tokens, {} given",
+                ids.len() * crate::model::HID,
+                ids.len(),
+                out.len()
+            ));
+        }
         let (gpu, c, prof, dit, te) = self.prompt_pair()?;
         dit.text_in(gpu, c, prof, te, ids, &[])?;
         dit.read_rows(gpu, ids.len(), out)
@@ -249,6 +273,8 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dit::{KeyframeInput, RefInput};
+    use crate::vvae::Clip;
 
     fn config(bits: usize) -> Config {
         Config {
@@ -261,6 +287,89 @@ mod tests {
             loom_compile: "loom-compile".into(),
             attn_qk_bits: bits,
         }
+    }
+
+    #[test]
+    fn a_clip_must_match_the_buffer_it_names() {
+        let pixels = vec![0.0f32; 2 * 32 * 32 * 3];
+        let ok = Clip {
+            pixels: &pixels,
+            frames: 2,
+            height: 32,
+            width: 32,
+        };
+        assert!(ok.check().is_ok());
+        // no frames at all: this reached a temporal underflow inside the encoder
+        assert!(Clip { frames: 0, ..ok }.check().is_err());
+        assert!(Clip { height: 0, ..ok }.check().is_err());
+        // a shape the buffer cannot cover
+        assert!(Clip { frames: 3, ..ok }.check().is_err());
+        assert!(Clip {
+            height: 64,
+            width: 64,
+            ..ok
+        }
+        .check()
+        .is_err());
+        // and one that is not a whole number of patches
+        assert!(Clip { height: 40, ..ok }.check().is_err());
+    }
+
+    #[test]
+    fn a_reference_must_match_the_buffers_it_names() {
+        let z = vec![0.0f32; crate::model::LATENT_CH * 4 * 4];
+        let image = RefInput {
+            kind: 0,
+            video_latent: Some(&z),
+            latent_t: 1,
+            lat_h: 4,
+            lat_w: 4,
+            audio_latent: None,
+            audio_t: 0,
+            pixels: None,
+            height: 0,
+            width: 0,
+        };
+        assert!(image.check(0).is_ok());
+        // latents that do not cover the grid claimed
+        assert!(RefInput { lat_h: 8, ..image }.check(0).is_err());
+        // a visual reference with no latents at all
+        assert!(RefInput {
+            video_latent: None,
+            ..image
+        }
+        .check(0)
+        .is_err());
+        // an audio reference needs audio
+        assert!(RefInput {
+            kind: 1,
+            video_latent: None,
+            ..image
+        }
+        .check(0)
+        .is_err());
+        // and an unknown kind is refused rather than silently treated as visual
+        assert!(RefInput { kind: 7, ..image }.check(0).is_err());
+    }
+
+    #[test]
+    fn a_keyframe_must_sit_on_the_generations_grid() {
+        let z = vec![0.0f32; crate::model::LATENT_CH * 16 * 16];
+        let kf = KeyframeInput {
+            frame_index: 0,
+            video_latent: &z,
+            audio_latent: None,
+            audio_t: 0,
+            pixels: None,
+            height: 0,
+            width: 0,
+        };
+        assert!(kf.check(0, 16, 16).is_ok());
+        assert!(
+            kf.check(0, 32, 32).is_err(),
+            "a larger grid needs more latents"
+        );
+        assert!(kf.check(0, 0, 16).is_err(), "an empty grid is not a grid");
     }
 
     #[test]

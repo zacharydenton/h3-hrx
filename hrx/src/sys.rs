@@ -51,7 +51,11 @@ pub struct BufferRef {
 
 #[link(name = "hrx")]
 extern "C" {
-    pub fn hrx_status_to_string(status: Status, out_message: *mut *mut c_char, out_length: *mut usize) -> Status;
+    pub fn hrx_status_to_string(
+        status: Status,
+        out_message: *mut *mut c_char,
+        out_length: *mut usize,
+    ) -> Status;
     pub fn hrx_status_free_message(message: *mut c_char);
     pub fn hrx_status_ignore(status: Status);
 

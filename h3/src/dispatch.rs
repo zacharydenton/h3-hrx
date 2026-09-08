@@ -32,6 +32,31 @@ impl Profile {
     pub fn total_seconds(&self) -> f64 {
         self.micros.values().sum::<f64>() * 1e-6
     }
+
+    /// The stages worth naming, largest first: any taking more than `floor` of the total.
+    ///
+    /// `H3_PROFILE` costs a synchronise around every launch, so a run that pays for it must get the
+    /// report back — otherwise it is pure slowdown.
+    pub fn report(&self, floor: f64) -> String {
+        let total = self.total_seconds();
+        if total <= 0.0 {
+            return String::new();
+        }
+        let mut stages: Vec<(&String, &f64)> = self.micros.iter().collect();
+        stages.sort_by(|a, b| b.1.total_cmp(a.1));
+        let mut out = format!("{total:.1} s:");
+        for (name, micros) in stages {
+            if *micros > floor * total * 1e6 {
+                out.push_str(&format!("  {name} {:.2}s", micros * 1e-6));
+            }
+        }
+        out
+    }
+
+    /// Empties the counters, so the next phase is reported on its own.
+    pub fn take(&mut self) -> BTreeMap<String, f64> {
+        std::mem::take(&mut self.micros)
+    }
 }
 
 /// One launch, timed into `profile` when it is on.

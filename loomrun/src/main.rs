@@ -30,7 +30,11 @@ enum Direction {
 
 enum Arg {
     Scalar(u32),
-    Buffer { path: PathBuf, bytes: usize, direction: Direction },
+    Buffer {
+        path: PathBuf,
+        bytes: usize,
+        direction: Direction,
+    },
 }
 
 struct Options {
@@ -50,7 +54,10 @@ fn parse_triple(text: &str, what: &str) -> Result<[u32; 3], String> {
         if i >= 3 {
             return Err(format!("{what} takes at most three components"));
         }
-        out[i] = part.trim().parse().map_err(|_| format!("{what} component {:?} is not a number", part))?;
+        out[i] = part
+            .trim()
+            .parse()
+            .map_err(|_| format!("{what} component {:?} is not a number", part))?;
     }
     Ok(out)
 }
@@ -63,7 +70,9 @@ fn parse_args(argv: &[String]) -> Result<Options, String> {
     let mut i = 0;
     let next = |i: &mut usize, name: &str| -> Result<String, String> {
         *i += 1;
-        argv.get(*i).cloned().ok_or_else(|| format!("{name} needs a value"))
+        argv.get(*i)
+            .cloned()
+            .ok_or_else(|| format!("{name} needs a value"))
     };
     while i < argv.len() {
         let a = argv[i].as_str();
@@ -73,7 +82,9 @@ fn parse_args(argv: &[String]) -> Result<Options, String> {
             "--grid" => grid = parse_triple(&next(&mut i, a)?, "--grid")?,
             "--block" => block = parse_triple(&next(&mut i, a)?, "--block")?,
             "--repeat" => {
-                repeat = next(&mut i, a)?.parse().map_err(|_| "--repeat must be a number".to_string())?
+                repeat = next(&mut i, a)?
+                    .parse()
+                    .map_err(|_| "--repeat must be a number".to_string())?
             }
             "--verbose" => verbose = true,
             "--rotate-input" => {
@@ -93,22 +104,42 @@ fn parse_args(argv: &[String]) -> Result<Options, String> {
                 rotate = Some((index, count));
             }
             "--i32" => {
-                let v: i32 = next(&mut i, a)?.parse().map_err(|_| "--i32 wants an integer".to_string())?;
+                let v: i32 = next(&mut i, a)?
+                    .parse()
+                    .map_err(|_| "--i32 wants an integer".to_string())?;
                 args.push(Arg::Scalar(v as u32));
             }
             "--f32" => {
-                let v: f32 = next(&mut i, a)?.parse().map_err(|_| "--f32 wants a number".to_string())?;
+                let v: f32 = next(&mut i, a)?
+                    .parse()
+                    .map_err(|_| "--f32 wants a number".to_string())?;
                 args.push(Arg::Scalar(v.to_bits()));
             }
             "--in" | "--inout" => {
-                let direction = if a == "--in" { Direction::In } else { Direction::InOut };
-                args.push(Arg::Buffer { path: PathBuf::from(next(&mut i, a)?), bytes: 0, direction });
+                let direction = if a == "--in" {
+                    Direction::In
+                } else {
+                    Direction::InOut
+                };
+                args.push(Arg::Buffer {
+                    path: PathBuf::from(next(&mut i, a)?),
+                    bytes: 0,
+                    direction,
+                });
             }
             "--out" => {
                 let spec = next(&mut i, a)?;
-                let (path, bytes) = spec.rsplit_once(':').ok_or_else(|| "--out wants path:bytes".to_string())?;
-                let bytes: usize = bytes.parse().map_err(|_| "--out wants path:bytes".to_string())?;
-                args.push(Arg::Buffer { path: PathBuf::from(path), bytes, direction: Direction::Out });
+                let (path, bytes) = spec
+                    .rsplit_once(':')
+                    .ok_or_else(|| "--out wants path:bytes".to_string())?;
+                let bytes: usize = bytes
+                    .parse()
+                    .map_err(|_| "--out wants path:bytes".to_string())?;
+                args.push(Arg::Buffer {
+                    path: PathBuf::from(path),
+                    bytes,
+                    direction: Direction::Out,
+                });
             }
             _ => return Err(format!("unknown option {a}")),
         }
@@ -121,12 +152,27 @@ fn parse_args(argv: &[String]) -> Result<Options, String> {
     }
     // The rotated argument must name an uploaded input: an output has nothing to copy.
     if let Some((index, _)) = rotate {
-        let ok = matches!(args.get(index), Some(Arg::Buffer { direction: Direction::In, .. }));
+        let ok = matches!(
+            args.get(index),
+            Some(Arg::Buffer {
+                direction: Direction::In,
+                ..
+            })
+        );
         if !ok {
             return Err("--rotate-input must name an --in buffer argument".into());
         }
     }
-    Ok(Options { hsaco, kernel, grid, block, repeat, rotate, verbose, args })
+    Ok(Options {
+        hsaco,
+        kernel,
+        grid,
+        block,
+        repeat,
+        rotate,
+        verbose,
+        args,
+    })
 }
 
 /// Which rotated copy launch `r` reads, counting the warm-up as launch zero so the timed launches
@@ -143,7 +189,9 @@ fn warms_up(repeat: u32) -> bool {
 
 fn run(opt: Options) -> Result<(), String> {
     let gpu = hrx::Gpu::open().map_err(|e| e.to_string())?;
-    let kernel = gpu.load(&opt.hsaco, &opt.kernel).map_err(|e| e.to_string())?;
+    let kernel = gpu
+        .load(&opt.hsaco, &opt.kernel)
+        .map_err(|e| e.to_string())?;
 
     // Upload in declaration order, keeping scalars and buffers in their own sequences: the export
     // reports the constant block and the binding count separately.
@@ -156,15 +204,25 @@ fn run(opt: Options) -> Result<(), String> {
                 scalars.push(*v);
                 buffer_of_arg.push(None);
             }
-            Arg::Buffer { path, bytes, direction } => {
+            Arg::Buffer {
+                path,
+                bytes,
+                direction,
+            } => {
                 let host = if *direction == Direction::Out {
                     Vec::new()
                 } else {
-                    std::fs::read(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?
+                    std::fs::read(path)
+                        .map_err(|e| format!("cannot open {}: {e}", path.display()))?
                 };
-                let size = if *direction == Direction::Out { *bytes } else { host.len() };
+                let size = if *direction == Direction::Out {
+                    *bytes
+                } else {
+                    host.len()
+                };
                 let buffer = gpu.alloc(size).map_err(|e| e.to_string())?;
-                gpu.memset(&buffer, 0, buffer.bytes()).map_err(|e| e.to_string())?;
+                gpu.memset(&buffer, 0, buffer.bytes())
+                    .map_err(|e| e.to_string())?;
                 if !host.is_empty() {
                     gpu.h2d(&buffer, &host).map_err(|e| e.to_string())?;
                 }
@@ -181,7 +239,8 @@ fn run(opt: Options) -> Result<(), String> {
         let source = &buffers[slot];
         for _ in 1..count {
             let copy = gpu.alloc(source.bytes()).map_err(|e| e.to_string())?;
-            gpu.d2d(&copy, source, source.bytes()).map_err(|e| e.to_string())?;
+            gpu.d2d(&copy, source, source.bytes())
+                .map_err(|e| e.to_string())?;
             rotated.push(copy);
         }
         gpu.sync().map_err(|e| e.to_string())?;
@@ -198,20 +257,27 @@ fn run(opt: Options) -> Result<(), String> {
 
     let warmup = warms_up(opt.repeat);
     if warmup {
-        gpu.dispatch(&kernel, opt.grid, opt.block, &scalars, &bindings).map_err(|e| e.to_string())?;
+        gpu.dispatch(&kernel, opt.grid, opt.block, &scalars, &bindings)
+            .map_err(|e| e.to_string())?;
         gpu.sync().map_err(|e| e.to_string())?;
     }
 
-    let rotate_slot = opt.rotate.map(|(index, _)| buffer_of_arg[index].expect("validated"));
+    let rotate_slot = opt
+        .rotate
+        .map(|(index, _)| buffer_of_arg[index].expect("validated"));
     let started = Instant::now();
     for r in 0..opt.repeat {
         if let (Some(slot), Some((_, count))) = (rotate_slot, opt.rotate) {
             let which = rotation_slot(r, warmup, count);
             // Copy 0 is the original upload; the extra allocations follow it.
-            bindings[slot] =
-                if which == 0 { buffers[slot].binding() } else { rotated[which - 1].binding() };
+            bindings[slot] = if which == 0 {
+                buffers[slot].binding()
+            } else {
+                rotated[which - 1].binding()
+            };
         }
-        gpu.dispatch(&kernel, opt.grid, opt.block, &scalars, &bindings).map_err(|e| e.to_string())?;
+        gpu.dispatch(&kernel, opt.grid, opt.block, &scalars, &bindings)
+            .map_err(|e| e.to_string())?;
     }
     gpu.sync().map_err(|e| e.to_string())?;
     let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
@@ -225,14 +291,21 @@ fn run(opt: Options) -> Result<(), String> {
     );
 
     for (arg, slot) in opt.args.iter().zip(&buffer_of_arg) {
-        if let (Arg::Buffer { path, direction, .. }, Some(slot)) = (arg, slot) {
+        if let (
+            Arg::Buffer {
+                path, direction, ..
+            },
+            Some(slot),
+        ) = (arg, slot)
+        {
             if *direction == Direction::In {
                 continue;
             }
             let buffer = &buffers[*slot];
             let mut host = vec![0u8; buffer.bytes()];
             gpu.d2h(buffer, &mut host).map_err(|e| e.to_string())?;
-            std::fs::write(path, &host).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            std::fs::write(path, &host)
+                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
         }
     }
     Ok(())
@@ -269,8 +342,18 @@ mod tests {
         // Every spelling the C implementation refused, refused for the same reason.
         for spec in ["-1:3", "2:1", "2:65", "3:3", "0:3", "2:3junk"] {
             let argv = args(&[
-                "--hsaco", "k.hsaco", "--kernel", "k", "--i32", "1", "--in", "a.bin", "--out", "o.bin:16",
-                "--rotate-input", spec,
+                "--hsaco",
+                "k.hsaco",
+                "--kernel",
+                "k",
+                "--i32",
+                "1",
+                "--in",
+                "a.bin",
+                "--out",
+                "o.bin:16",
+                "--rotate-input",
+                spec,
             ]);
             assert!(parse_args(&argv).is_err(), "{spec} should be rejected");
         }
@@ -279,8 +362,18 @@ mod tests {
     #[test]
     fn accepts_a_rotate_spec_naming_an_input() {
         let argv = args(&[
-            "--hsaco", "k.hsaco", "--kernel", "k", "--i32", "1", "--in", "a.bin", "--out", "o.bin:16",
-            "--rotate-input", "1:3",
+            "--hsaco",
+            "k.hsaco",
+            "--kernel",
+            "k",
+            "--i32",
+            "1",
+            "--in",
+            "a.bin",
+            "--out",
+            "o.bin:16",
+            "--rotate-input",
+            "1:3",
         ]);
         let opt = parse_args(&argv).unwrap();
         assert_eq!(opt.rotate, Some((1, 3)));
@@ -303,14 +396,26 @@ mod tests {
     #[test]
     fn parses_grids_blocks_and_out_specs() {
         let argv = args(&[
-            "--hsaco", "k", "--kernel", "k", "--grid", "3,4,5", "--block", "256", "--out",
+            "--hsaco",
+            "k",
+            "--kernel",
+            "k",
+            "--grid",
+            "3,4,5",
+            "--block",
+            "256",
+            "--out",
             "/tmp/a:b/out.bin:4096",
         ]);
         let opt = parse_args(&argv).unwrap();
         assert_eq!((opt.grid, opt.block), ([3, 4, 5], [256, 1, 1]));
         // the path is split at the LAST colon, so a colon in a directory name survives
         match &opt.args[0] {
-            Arg::Buffer { path, bytes, direction } => {
+            Arg::Buffer {
+                path,
+                bytes,
+                direction,
+            } => {
                 assert_eq!(path.to_str().unwrap(), "/tmp/a:b/out.bin");
                 assert_eq!(*bytes, 4096);
                 assert!(*direction == Direction::Out);
@@ -326,9 +431,10 @@ mod tests {
         let (repeat, count) = (7u32, 3usize);
         let warmup = warms_up(repeat);
         assert_eq!(repeat + u32::from(warmup), 8);
-        let seen: Vec<usize> = std::iter::once(rotation_slot(0, false, count)) // the warm-up itself
-            .chain((0..repeat).map(|r| rotation_slot(r, warmup, count)))
-            .collect();
+        let seen: Vec<usize> =
+            std::iter::once(rotation_slot(0, false, count)) // the warm-up itself
+                .chain((0..repeat).map(|r| rotation_slot(r, warmup, count)))
+                .collect();
         assert_eq!(seen.len(), 8);
         for (i, slot) in seen.iter().enumerate() {
             assert_eq!(*slot, i % count, "launch {i}");
@@ -345,7 +451,9 @@ mod tests {
 
     #[test]
     fn scalars_and_buffers_keep_declaration_order() {
-        let argv = args(&["--hsaco", "k", "--kernel", "k", "--i32", "7", "--in", "a", "--f32", "0.5", "--in", "b"]);
+        let argv = args(&[
+            "--hsaco", "k", "--kernel", "k", "--i32", "7", "--in", "a", "--f32", "0.5", "--in", "b",
+        ]);
         let opt = parse_args(&argv).unwrap();
         let scalars: Vec<u32> = opt
             .args
@@ -356,6 +464,12 @@ mod tests {
             })
             .collect();
         assert_eq!(scalars, vec![7u32, 0.5f32.to_bits()]);
-        assert_eq!(opt.args.iter().filter(|a| matches!(a, Arg::Buffer { .. })).count(), 2);
+        assert_eq!(
+            opt.args
+                .iter()
+                .filter(|a| matches!(a, Arg::Buffer { .. }))
+                .count(),
+            2
+        );
     }
 }

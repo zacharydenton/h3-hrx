@@ -333,6 +333,59 @@ pub struct RefInput<'a> {
     pub width: i32,
 }
 
+impl RefInput<'_> {
+    /// The buffers against the dimensions they claim.
+    pub fn check(&self, i: usize) -> crate::error::Result<()> {
+        let at = |what: &str| format!("reference {i}: {what}");
+        match self.kind {
+            0 | 2 => {
+                let t = if self.kind == 0 { 1 } else { self.latent_t };
+                let need = LATENT_CH
+                    * (t.max(0) as usize)
+                    * (self.lat_h.max(0) as usize)
+                    * (self.lat_w.max(0) as usize);
+                let Some(z) = self.video_latent else {
+                    return crate::error::invalid(at("a visual reference without latents"));
+                };
+                if need == 0 || z.len() < need {
+                    return crate::error::invalid(at(&format!(
+                        "latents of {t}x{}x{} need {need} floats, {} given",
+                        self.lat_h,
+                        self.lat_w,
+                        z.len()
+                    )));
+                }
+            }
+            1 => {}
+            other => return crate::error::invalid(at(&format!("unknown kind {other}"))),
+        }
+        if self.kind == 1 || self.audio_latent.is_some() {
+            let need = 2 * crate::avae::AUDIO_CH * self.audio_t.max(0) as usize;
+            let Some(z) = self.audio_latent else {
+                return crate::error::invalid(at("an audio reference without latents"));
+            };
+            if need == 0 || z.len() < need {
+                return crate::error::invalid(at(&format!(
+                    "audio latents need {need} floats, {} given",
+                    z.len()
+                )));
+            }
+        }
+        if let Some(px) = self.pixels {
+            let need = (self.height.max(0) as usize) * (self.width.max(0) as usize) * 3;
+            if need == 0 || px.len() < need {
+                return crate::error::invalid(at(&format!(
+                    "pixels of {}x{} need {need} floats, {} given",
+                    self.height,
+                    self.width,
+                    px.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A keyframe: one latent frame pinned at a frame index, optionally with audio and pixels.
 pub struct KeyframeInput<'a> {
     pub frame_index: i32,
@@ -342,6 +395,40 @@ pub struct KeyframeInput<'a> {
     pub pixels: Option<&'a [f32]>,
     pub height: i32,
     pub width: i32,
+}
+
+impl KeyframeInput<'_> {
+    /// The buffers against the generation's own latent grid, which is what a keyframe sits on.
+    pub fn check(&self, i: usize, lat_h: i32, lat_w: i32) -> crate::error::Result<()> {
+        let need = LATENT_CH * (lat_h.max(0) as usize) * (lat_w.max(0) as usize);
+        if need == 0 || self.video_latent.len() < need {
+            return crate::error::invalid(format!(
+                "keyframe {i}: latents on the {lat_h}x{lat_w} grid need {need} floats, {} given",
+                self.video_latent.len()
+            ));
+        }
+        if let Some(z) = self.audio_latent {
+            let want = 2 * crate::avae::AUDIO_CH * self.audio_t.max(0) as usize;
+            if want == 0 || z.len() < want {
+                return crate::error::invalid(format!(
+                    "keyframe {i}: audio latents need {want} floats, {} given",
+                    z.len()
+                ));
+            }
+        }
+        if let Some(px) = self.pixels {
+            let want = (self.height.max(0) as usize) * (self.width.max(0) as usize) * 3;
+            if want == 0 || px.len() < want {
+                return crate::error::invalid(format!(
+                    "keyframe {i}: pixels of {}x{} need {want} floats, {} given",
+                    self.height,
+                    self.width,
+                    px.len()
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What a run produces.

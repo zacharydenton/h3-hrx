@@ -174,15 +174,18 @@ impl Weights {
     /// device: a tensor is read once, and tens of gigabytes of resident checkpoint would compete with
     /// the device allocations for the same memory on this part.
     pub fn at(&self, gpu: &hrx::Gpu, name: &str, expect_bytes: usize) -> Result<Arc<hrx::Buffer>> {
-        if let Some(buffer) = self.uploaded.lock().expect("not poisoned").get(name) {
-            return Ok(buffer.clone());
-        }
+        // The size is checked on both paths. Checking only the miss would mean the guard against a
+        // wrongly-sized kernel operand held for the first caller and vanished for every one after,
+        // which is the worst shape for a check to have.
         let recipe = self.recipe(name)?;
         if recipe.device_bytes() != expect_bytes {
             return layout(format!(
                 "tensor {name} is {} bytes on the device, expected {expect_bytes}",
                 recipe.device_bytes()
             ));
+        }
+        if let Some(buffer) = self.uploaded.lock().expect("not poisoned").get(name) {
+            return Ok(buffer.clone());
         }
         let buffer = Arc::new(
             gpu.alloc(expect_bytes.max(1))

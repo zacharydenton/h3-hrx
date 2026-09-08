@@ -137,6 +137,13 @@ impl Compiler {
         if let Some(id) = self.compiler_id.get() {
             return Ok(id);
         }
+        let id = self.measure_compiler()?;
+        let _ = self.compiler_id.set(id);
+        Ok(self.compiler_id.get().expect("just set"))
+    }
+
+    /// Reads the compiler's identity from the filesystem now.
+    fn measure_compiler(&self) -> Result<String> {
         let mut path = PathBuf::from(&self.exe);
         if !self.exe.contains('/') {
             let dirs = std::env::var("PATH").unwrap_or_default();
@@ -151,15 +158,13 @@ impl Compiler {
         }
         let meta = std::fs::metadata(&path).map_err(|_| Error::NoCompiler(self.exe.clone()))?;
         use std::os::unix::fs::MetadataExt;
-        let id = format!(
+        Ok(format!(
             "{}:{}:{}.{}",
             path.display(),
             meta.size(),
             meta.mtime(),
             meta.mtime_nsec()
-        );
-        let _ = self.compiler_id.set(id);
-        Ok(self.compiler_id.get().expect("just set"))
+        ))
     }
 
     /// The cache file's name, which is also the in-process key.
@@ -216,6 +221,19 @@ impl Compiler {
     /// several sessions asking for the same kernel at once neither load a half-written binary nor
     /// clobber each other's temporary.
     fn compile(&self, stem: &str, symbol: &str, cfg: &Cfg, path: &Path) -> Result<()> {
+        // The tag was computed from the identity read the first time. If the executable has been
+        // replaced since, the binary about to run is not the one the name describes, and publishing
+        // its output under that name would put another compiler's code object in the cache for good.
+        let pinned = self.compiler_id()?;
+        let now = self.measure_compiler()?;
+        if now != pinned {
+            return Err(Error::Failed {
+                stem: stem.to_string(),
+                command: format!(
+                    "the compiler changed under this session ({pinned} -> {now}); start again"
+                ),
+            });
+        }
         std::fs::create_dir_all(&self.cache).map_err(|e| Error::Io(e.to_string()))?;
         let lock_path = path.with_extension("hsaco.lock");
         let lock = File::create(&lock_path)

@@ -13,7 +13,7 @@ use std::path::Path;
 pub const TARGET_FAMILY: &str = "amdgpu";
 pub const TARGET_KEY: &str = "gfx1151";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Error(String);
 
 impl fmt::Display for Error {
@@ -85,23 +85,58 @@ pub struct Gpu {
     _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
-
+/// libhrx initialises once for the process, not once per handle: a second `hrx_gpu_initialize`
+/// returns ALREADY_EXISTS, and dropping a `Gpu` releases its stream without shutting the runtime
+/// down. So the initialisation is done once behind a lock and every handle after the first reuses it
+/// — which is what lets a server create and drop sessions, and a Python caller hold two `H3`s.
+///
+/// The lock also serialises the call itself: the initialisation touches ordinary global state, so two
+/// threads opening concurrently must not both be inside it.
+fn initialize_runtime() -> Result<()> {
+    static READY: std::sync::Mutex<Option<Result<()>>> = std::sync::Mutex::new(None);
+    let mut ready = READY
+        .lock()
+        .map_err(|_| Error("the GPU runtime's initialisation panicked in another thread".into()))?;
+    if let Some(done) = ready.as_ref() {
+        return done.clone();
+    }
+    // ALREADY_EXISTS means someone outside this crate got there first, which is fine: the runtime is
+    // up, which is all this needs.
+    let result = unsafe {
+        match check(sys::hrx_gpu_initialize(0), "hrx_gpu_initialize") {
+            Err(e) if e.0.contains("already initialized") => Ok(()),
+            other => other,
+        }
+    };
+    *ready = Some(result.clone());
+    result
+}
 
 impl Gpu {
     pub fn open() -> Result<Self> {
+        initialize_runtime()?;
         unsafe {
-            check(sys::hrx_gpu_initialize(0), "hrx_gpu_initialize")?;
             let mut count = 0;
-            check(sys::hrx_gpu_device_count(&mut count), "hrx_gpu_device_count")?;
+            check(
+                sys::hrx_gpu_device_count(&mut count),
+                "hrx_gpu_device_count",
+            )?;
             if count < 1 {
                 return Err(Error(
-                    "no GPU device (is the HSA runtime on LD_LIBRARY_PATH? see docs/setup.md)".into(),
+                    "no GPU device (is the HSA runtime on LD_LIBRARY_PATH? see docs/setup.md)"
+                        .into(),
                 ));
             }
             let mut device = std::ptr::null_mut();
-            check(sys::hrx_gpu_device_get(0, &mut device), "hrx_gpu_device_get")?;
+            check(
+                sys::hrx_gpu_device_get(0, &mut device),
+                "hrx_gpu_device_get",
+            )?;
             let mut stream = std::ptr::null_mut();
-            check(sys::hrx_stream_create(device, 0, &mut stream), "hrx_stream_create")?;
+            check(
+                sys::hrx_stream_create(device, 0, &mut stream),
+                "hrx_stream_create",
+            )?;
             Ok(Self {
                 inner: std::sync::Arc::new(Inner { device, stream }),
                 _not_sync: std::marker::PhantomData,
@@ -110,7 +145,12 @@ impl Gpu {
     }
 
     pub fn sync(&self) -> Result<()> {
-        unsafe { check(sys::hrx_stream_synchronize(self.inner.stream), "hrx_stream_synchronize") }
+        unsafe {
+            check(
+                sys::hrx_stream_synchronize(self.inner.stream),
+                "hrx_stream_synchronize",
+            )
+        }
     }
 
     /// A device-local allocation. Zero bytes is rounded to one so every argument has an address.
@@ -128,7 +168,11 @@ impl Gpu {
                 "hrx_buffer_allocate",
             )?;
         }
-        Ok(Buffer { raw: buffer, bytes: bytes.max(1), _device: self.inner.clone() })
+        Ok(Buffer {
+            raw: buffer,
+            bytes: bytes.max(1),
+            _device: self.inner.clone(),
+        })
     }
 
     /// Only the low byte of `value` is meaningful: the fill pattern is one byte wide.
@@ -195,7 +239,13 @@ impl Gpu {
         self.sync()?;
         unsafe {
             check(
-                sys::hrx_synchronous_d2h(self.inner.device, src.raw, 0, dst.as_mut_ptr() as *mut c_void, dst.len()),
+                sys::hrx_synchronous_d2h(
+                    self.inner.device,
+                    src.raw,
+                    0,
+                    dst.as_mut_ptr() as *mut c_void,
+                    dst.len(),
+                ),
                 "hrx_synchronous_d2h",
             )
         }
@@ -263,7 +313,8 @@ impl Gpu {
             .map_err(|_| Error(format!("{} contains a NUL", path.display())))?;
         let c_family = CString::new(TARGET_FAMILY).unwrap();
         let c_key = CString::new(TARGET_KEY).unwrap();
-        let c_symbol = CString::new(symbol).map_err(|_| Error(format!("{symbol} contains a NUL")))?;
+        let c_symbol =
+            CString::new(symbol).map_err(|_| Error(format!("{symbol} contains a NUL")))?;
         unsafe {
             let mut executable = std::ptr::null_mut();
             check(
@@ -279,7 +330,11 @@ impl Gpu {
             let kernel = (|| {
                 let mut ordinal = 0u32;
                 check(
-                    sys::hrx_executable_lookup_export_by_name(executable, c_symbol.as_ptr(), &mut ordinal),
+                    sys::hrx_executable_lookup_export_by_name(
+                        executable,
+                        c_symbol.as_ptr(),
+                        &mut ordinal,
+                    ),
                     &format!("looking up {symbol} in {}", path.display()),
                 )?;
                 let mut info = sys::ExportInfo::default();
@@ -327,10 +382,13 @@ impl Gpu {
         let mut constants = [0u8; 256];
         let size = info.constant_byte_length as usize;
         if size > constants.len() {
-            return Err(Error(format!("{} wants {size} constant bytes", kernel.symbol)));
+            return Err(Error(format!(
+                "{} wants {size} constant bytes",
+                kernel.symbol
+            )));
         }
         if !scalars.is_empty() {
-            if size % scalars.len() != 0 {
+            if !size.is_multiple_of(scalars.len()) {
                 return Err(Error(format!(
                     "{} wants {size} constant bytes, not divisible by {} scalars",
                     kernel.symbol,
@@ -339,13 +397,19 @@ impl Gpu {
             }
             let width = size / scalars.len();
             if width != 4 && width != 8 {
-                return Err(Error(format!("{} implies a {width}-byte scalar slot", kernel.symbol)));
+                return Err(Error(format!(
+                    "{} implies a {width}-byte scalar slot",
+                    kernel.symbol
+                )));
             }
             for (i, v) in scalars.iter().enumerate() {
                 constants[i * width..i * width + 4].copy_from_slice(&v.to_le_bytes());
             }
         } else if size != 0 {
-            return Err(Error(format!("{} wants {size} constant bytes, none given", kernel.symbol)));
+            return Err(Error(format!(
+                "{} wants {size} constant bytes, none given",
+                kernel.symbol
+            )));
         }
         let config = sys::DispatchConfig {
             workgroup_count: grid,
@@ -436,7 +500,12 @@ impl Buffer {
     /// the C did with pointer arithmetic; a device buffer here has no host-visible address, so the
     /// offset travels in the binding instead.
     pub fn slice(&self, offset: usize, length: usize) -> View<'_> {
-        assert!(offset + length <= self.bytes, "slice past the allocation");
+        // checked: `offset + length` wraps for a large offset, and the wrapped sum passes the
+        // comparison — an eight-byte allocation would accept `slice(usize::MAX, 2)`
+        let end = offset
+            .checked_add(length)
+            .expect("slice offset and length overflow");
+        assert!(end <= self.bytes, "slice past the allocation");
         View::new(sys::BufferRef {
             buffer: self.raw,
             offset,
@@ -478,5 +547,25 @@ impl Kernel {
 impl Drop for Kernel {
     fn drop(&mut self) {
         unsafe { sys::hrx_executable_release(self.executable) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The bounds arithmetic, without a device: `offset + length` must not wrap into a pass.
+    #[test]
+    fn a_slice_past_the_allocation_is_refused_even_when_the_sum_wraps() {
+        let checked = |offset: usize, length: usize, bytes: usize| -> bool {
+            match offset.checked_add(length) {
+                Some(end) => end <= bytes,
+                None => false,
+            }
+        };
+        assert!(checked(0, 8, 8));
+        assert!(checked(4, 4, 8));
+        assert!(!checked(4, 5, 8));
+        // the wrapping case: 8 bytes must not accept an offset near the top of the address space
+        assert!(!checked(usize::MAX, 2, 8));
+        assert!(!checked(usize::MAX - 1, 4, 8));
     }
 }

@@ -547,6 +547,40 @@ pub struct Clip<'a> {
 }
 
 impl Clip<'_> {
+    /// Checks the buffer against the dimensions it claims.
+    ///
+    /// A `Clip` is public and freely constructible, so its slice and its shape can disagree. Caught
+    /// here, that is an error; carried inward it is an indexing panic somewhere in the encoder, or a
+    /// temporal underflow for a clip of no frames.
+    pub fn check(&self) -> crate::error::Result<()> {
+        if self.frames == 0 || self.height == 0 || self.width == 0 {
+            return crate::error::invalid(format!(
+                "a clip of {} frames at {}x{} is empty",
+                self.frames, self.height, self.width
+            ));
+        }
+        if !self.height.is_multiple_of(VAE_PS) || !self.width.is_multiple_of(VAE_PS) {
+            return crate::error::invalid(format!(
+                "{}x{} is not a multiple of {VAE_PS}",
+                self.height, self.width
+            ));
+        }
+        let need = self
+            .frames
+            .checked_mul(self.plane())
+            .ok_or_else(|| crate::error::Error::Invalid("clip dimensions overflow".into()))?;
+        if self.pixels.len() < need {
+            return crate::error::invalid(format!(
+                "a clip of {} frames at {}x{} needs {need} floats, {} given",
+                self.frames,
+                self.height,
+                self.width,
+                self.pixels.len()
+            ));
+        }
+        Ok(())
+    }
+
     fn plane(&self) -> usize {
         self.height * self.width * 3
     }
@@ -969,6 +1003,7 @@ impl VideoVae {
         prof: &mut Profile,
         clip: Clip<'_>,
     ) -> Result<(Vec<f32>, usize)> {
+        clip.check()?;
         let (lh, lw) = clip.latent();
         let frames = clip.frames;
         if frames == 1 {
