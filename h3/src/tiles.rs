@@ -4,7 +4,7 @@
 //! new tile; the decoder blends in pixel space in place; the decoder's temporal pass cross-fades whole
 //! frames between chunks. Each clamps its overlap differently, and one of them does not clamp at all.
 //! They are kept apart on purpose.
-use crate::model::LATENT_CH;
+use crate::model::*;
 
 /// ComfyUI's `split_tiles`: 256-pixel tiles with overlaps of at least 64, grown in 16-pixel units.
 ///
@@ -147,6 +147,67 @@ pub fn crossfade(
     }
 }
 
+/// How the decoder cuts a clip up in time.
+///
+/// diffusers' `_decode`: five-token chunks with a two-token overlap, seventeen frames kept per chunk
+/// with three dropped off the front, and five-frame cross-fades between them. The token count is
+/// padded up so the chunks divide evenly, and the frames the padding produced are dropped at the end —
+/// which is not simply `pad_tokens * 4`, because a chunk boundary lands mid-clip and contributes only
+/// the clip's intra-chunk tail.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChunkPlan {
+    /// tokens appended by repeating the last latent frame
+    pub pad_tokens: usize,
+    /// the token count after padding
+    pub padded_tokens: usize,
+    pub chunks: usize,
+    /// frames one chunk contributes
+    pub chunk_frames: usize,
+    /// frames dropped off the front of every clip
+    pub pre: usize,
+    /// how many frames the cross-fade spans
+    pub overlap_frames: usize,
+    /// frames to drop at the end, from the padding
+    pub pad_frames: usize,
+}
+
+/// diffusers' chunk count: at least one, and one fewer than the tokens divide into because the last
+/// chunk is carried as the overlap rather than emitted.
+pub fn decoder_chunks(tokens: usize, padding: usize) -> usize {
+    ((tokens + VAE_TOKEN_DROP + padding) / VAE_CHUNK)
+        .saturating_sub(1)
+        .max(1)
+}
+
+/// The plan for `t` latent frames.
+pub fn chunk_plan(t: usize) -> ChunkPlan {
+    let num_tokens = t + VAE_TOKEN_DROP;
+    let pad_tokens = (VAE_CHUNK - num_tokens % VAE_CHUNK) % VAE_CHUNK;
+    let chunks = decoder_chunks(t, pad_tokens);
+    let pre = (VAE_TRATIO - VAE_CLIP % VAE_TRATIO) % VAE_TRATIO;
+    let intra_tail = VAE_CLIP % VAE_TRATIO;
+    // each padded token is a whole temporal step, except one that lands on a chunk boundary, which
+    // contributes only the clip's tail
+    let pad_frames = (0..pad_tokens)
+        .map(|k| {
+            if intra_tail != 0 && (t + k).is_multiple_of(VAE_CHUNK) {
+                intra_tail
+            } else {
+                VAE_TRATIO
+            }
+        })
+        .sum();
+    ChunkPlan {
+        pad_tokens,
+        padded_tokens: t + pad_tokens,
+        chunks,
+        chunk_frames: VAE_CHUNK * VAE_TRATIO,
+        pre,
+        overlap_frames: (VAE_OVERLAP * VAE_TRATIO).saturating_sub(pre),
+        pad_frames,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +269,69 @@ mod tests {
         assert_eq!(split_tiles(768), (vec![0, 160, 336, 512], vec![96, 80, 80]));
         // a length one pixel over a tile still needs two, overlapping almost completely
         assert_eq!(split_tiles(257), (vec![0, 16], vec![240]));
+    }
+
+    #[test]
+    fn the_chunk_plan_decodes_exactly_the_frames_the_shape_promises() {
+        // The decoder emits chunk_frames per chunk, plus whatever the trailing overlap carries, and
+        // then drops pad_frames. For every shape the pipeline can be asked for, that has to come to
+        // the frame count exactly — the C throws if it does not.
+        for frames in [5, 22, 39, 56, 73, 90, 175, 209, 481] {
+            let sh = crate::layout::shape_for(480, 864, frames).expect("a valid shape");
+            let t = sh.latent_t as usize;
+            let p = chunk_plan(t);
+            // walk the loop the decoder runs: each chunk covers VAE_CHUNK tokens with VAE_OVERLAP more
+            // for context, emits the first chunk_frames past `pre`, and carries the rest forward
+            let mut emitted = 0usize;
+            let mut carried = 0usize;
+            for i in 0..p.chunks {
+                let start = i * VAE_CHUNK;
+                let ft = (VAE_CHUNK + VAE_OVERLAP).min(p.padded_tokens - start);
+                let clip_frames = ft * VAE_TRATIO;
+                carried = 0;
+                for j in 0..2 {
+                    let f0 = j * p.chunk_frames + p.pre;
+                    let f1 = ((j + 1) * p.chunk_frames).min(clip_frames);
+                    if f0 >= f1 {
+                        continue;
+                    }
+                    if j == 0 {
+                        emitted += f1 - f0;
+                    } else {
+                        carried = f1 - f0;
+                    }
+                }
+            }
+            emitted += carried;
+            assert_eq!(
+                emitted - p.pad_frames,
+                sh.frames as usize,
+                "{frames} frames, latent_t {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_clip_still_decodes_in_one_chunk() {
+        let p = chunk_plan(2);
+        assert_eq!(p.chunks, 1);
+        assert_eq!(p.pre, 3, "three frames come off the front of every clip");
+        assert_eq!(p.overlap_frames, 5, "and the cross-fade spans five");
+    }
+
+    #[test]
+    fn the_padding_frames_are_not_simply_four_per_token() {
+        // a token landing on a chunk boundary contributes only the clip's intra-chunk tail
+        let mismatched: Vec<usize> = (1..200)
+            .filter(|t| {
+                let p = chunk_plan(*t);
+                p.pad_tokens > 0 && p.pad_frames != p.pad_tokens * VAE_TRATIO
+            })
+            .collect();
+        assert!(
+            !mismatched.is_empty(),
+            "the boundary case has to actually occur, or the loop is dead code"
+        );
     }
 
     #[test]
