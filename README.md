@@ -14,7 +14,7 @@ through all 50 blocks against ComfyUI's own run) and, on the same GPU, it is 3.9
 h3 ref.jpg voice.wav < prompt.txt        # references by extension, prompt on stdin, clip.mp4 out
 ```
 
-![fox](docs/media/fox_480p_5s_strip.jpg)
+https://github.com/user-attachments/assets/41a98dcf-48f0-4328-a0f4-7f17119243e6
 
 ## Numbers
 
