@@ -41,7 +41,8 @@ step "CPU host regressions" env H3_PYTHON="$PY" bash scripts/test_host.sh
 HRX_LIB_DIR="${HRX_BUILD:-$HOME/code/hrx-system/build-cuda}/libhrx/src/libhrx"
 if command -v cargo >/dev/null 2>&1 && [ -f "$HRX_LIB_DIR/libhrx.so" ]; then
 step "loomrun (Rust) unit tests" cargo test --quiet --release --manifest-path loomrun/Cargo.toml
-else skip "loomrun (Rust) unit tests" "no cargo or libhrx"; fi
+step "h3 library unit tests" cargo test --quiet --release --manifest-path h3/Cargo.toml
+else skip "loomrun and h3 unit tests" "no cargo or libhrx"; fi
 if [ -x "${LOOM_COMPILE:-}" ] && [ -x "${LOOM_FORMAT:-}" ]; then
 step "wide decoder kernels generate and compile (CPU only)" "$PY" tests/test_gemm_f16_wide.py --compile-only
 step "fast decoder kernels generate and compile (CPU only)" "$PY" tests/test_gemm_f16_wide.py --compile-only --fast
