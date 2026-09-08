@@ -1,4 +1,4 @@
-"""The C stacks against their references, block by block, through libh3pipe's own dumps (H3_DUMP_BLOCKS): the host runs,
+"""The stacks against their references, block by block, through the library's own dumps (H3_DUMP_BLOCKS): the host runs,
 writes x before the first block and after each one, and the reference continues from the same x.
 
     python3 tests/test_stack_parity.py --stack dit    the 50 DiT blocks vs reference/h3_ref.py on the same checkpoint
@@ -25,14 +25,14 @@ def dit(depths, tokens_hw):
     """The DiT stack: the host's packed rows through reference/h3_ref.py's blocks (the same int8 checkpoint, dequantised)."""
     import torch
     import h3_ref as R
-    from h3pipe_loom import H3Pipe
+    from h3_loom import H3
     from h3tok_ids import encode_presentation
     height, width, frames = tokens_hw
     with tempfile.TemporaryDirectory(prefix="h3-dit-parity-") as tmp:
         os.environ["H3_DUMP_BLOCKS"] = tmp; os.environ["H3_DUMP_CALL"] = "0"
-        pipe = H3Pipe()
+        pipe = H3()
         ids = np.asarray(encode_presentation("A red fox trotting through a snowy forest at dawn, cinematic"), np.int32)
-        p = H3Pipe.params(height=height, width=width, frames=frames, steps=2, seed=1); s = pipe.shape(p)
+        p = H3.params(height=height, width=width, frames=frames, steps=2, seed=1); s = pipe.shape(p)
         rng = np.random.default_rng(1)
         nv = rng.standard_normal((24, s.latent_t, s.lat_h, s.lat_w)).astype(np.float32); na = rng.standard_normal((2, 32, s.audio_t)).astype(np.float32)
         t0 = time.time(); pipe.denoise(ids, p, noise_video=nv, noise_audio=na); print(f"C evaluation in {time.time() - t0:.1f} s")
@@ -63,13 +63,13 @@ def dit(depths, tokens_hw):
 def te(depths):
     """The text encoder: the host's embedding rows through transformers' bf16 layers on the same checkpoint's weights."""
     import torch
-    from h3pipe_loom import H3Pipe, TE
+    from h3_loom import H3, TE
     from h3tok_ids import encode_presentation
     cache = ROOT / "build/te_hidden.pt"
     ids = np.asarray(encode_presentation("A red fox trotting through a snowy forest at dawn, cinematic"), np.int32)
     with tempfile.TemporaryDirectory(prefix="h3-te-parity-") as tmp:
         os.environ["H3_DUMP_BLOCKS"] = tmp; os.environ["H3_DUMP_CALL"] = "0"
-        pipe = H3Pipe(); t0 = time.time(); pipe.text_in(ids); print(f"C text_in in {time.time() - t0:.1f} s"); pipe.close()
+        pipe = H3(); t0 = time.time(); pipe.text_in(ids); print(f"C text_in in {time.time() - t0:.1f} s"); pipe.close()
         got = {d: dumped(Path(tmp), "te", f"blk_{d - 1:02d}", 5120) for d in depths}
         x0 = dumped(Path(tmp), "te", "h_in", 5120)
     if not cache.exists():

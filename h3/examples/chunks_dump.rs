@@ -1,6 +1,6 @@
 //! Prints the decoder's temporal chunk plan for each latent frame count given.
 //!
-//! The companion harness prints the same from lines sliced out of `host/h3pipe.cpp`.
+//! The companion harness prints the same from lines sliced out of the C implementation (deleted; see git history).
 use h3::tiles::chunk_plan;
 
 fn main() {

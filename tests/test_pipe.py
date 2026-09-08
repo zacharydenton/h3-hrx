@@ -1,4 +1,4 @@
-"""The C pipeline (libh3pipe.so) against the Python reference, stage by stage:
+"""The C pipeline (libh3.so) against the Python reference, stage by stage:
   text_in: the refined text rows for a cached prompt vs reference/h3_ref.py's text_in on the same embeddings;
   --decode / --audio: the video and audio decoders against the reference decoders on the fox latents.
     python3 tests/test_pipe.py [--decode] [--audio] [--prompt-file build/prompts/<hash>.pt]"""
@@ -8,7 +8,7 @@ import numpy as np, torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "reference")); sys.path.insert(0, str(ROOT / "tools"))
 import h3_ref as R
-from h3pipe_loom import H3Pipe
+from h3_loom import H3
 
 
 def main():
@@ -20,7 +20,7 @@ def main():
     ckpt = R.Checkpoint(device="cuda", dtype=torch.bfloat16); ref = R.H3Ref(ckpt, quant="none")
     with torch.no_grad(): want = ref.text_in(prompt["embeds"].cuda()).float().cpu().numpy()
     del ref, ckpt; torch.cuda.empty_cache()
-    t0 = time.time(); pipe = H3Pipe(); print(f"session in {time.time() - t0:.1f} s")
+    t0 = time.time(); pipe = H3(); print(f"session in {time.time() - t0:.1f} s")
     t0 = time.time(); got = pipe.text_in(ids); print(f"text_in in {time.time() - t0:.2f} s")
     c = float(np.dot(got.ravel(), want.ravel()) / (np.linalg.norm(got) * np.linalg.norm(want) + 1e-30)); err = float(np.linalg.norm(got - want) / (np.linalg.norm(want) + 1e-30))
     print(f"  {'PASS' if c > 0.999 else 'FAIL'} text_in: cosine {c:.5f}, rel err {err:.4f}  (the C path re-encodes the prompt in Loom; the reference uses the cached Loom embeddings)")
@@ -37,7 +37,7 @@ def decode_video(pipe, a):
     """The C decoder (the f16 blocks, chunking, heads, blending, ImageNet mapping) vs diffusers' f32 decoder on the same latents."""
     import math
     fx = torch.load(ROOT / "build/fox_480p_5s_latents.pt"); frames = 22
-    p = H3Pipe.params(height=480, width=864, frames=frames, steps=2); sh = pipe.shape(p)
+    p = H3.params(height=480, width=864, frames=frames, steps=2); sh = pipe.shape(p)
     z = fx["video"][0, :, :sh.latent_t].float().numpy()
     t0 = time.time(); got = pipe.decode_video(p, z); print(f"  C decode {frames} frames in {time.time() - t0:.1f} s")
     from test_decoder_tiles import diffusers_decode

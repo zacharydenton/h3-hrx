@@ -2,7 +2,7 @@
 //!
 //!   sampler_dump <input.bin> <output.bin>
 //!
-//! The companion harness compiles the same loop out of `host/h3pipe.cpp` by slicing the lines with
+//! The companion harness compiles the same loop out of the C implementation (deleted; see git history) by slicing the lines with
 //! `sed`, so the two outputs are the shipped C text and this port on identical numbers. The comparison
 //! is bitwise: nothing here is allowed to be a near miss.
 use h3::layout::Schedule;

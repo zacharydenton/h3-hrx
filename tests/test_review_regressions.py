@@ -16,14 +16,14 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT), str(ROOT / "tools")]
-from h3pipe_loom import H3Pipe, Shape
+from h3_loom import H3, Shape
 import kernel_cache
 import kernel_test
 
 
 def spy_pipe(shape=Shape(22, 7, 4, 6, 37, 4096)):
-    """An H3Pipe whose native calls record their arguments and succeed, with a fixed shape; no library is loaded."""
-    pipe = H3Pipe.__new__(H3Pipe); pipe.shape = lambda p: shape; calls = []
+    """An H3 whose native calls record their arguments and succeed, with a fixed shape; no library is loaded."""
+    pipe = H3.__new__(H3); pipe.shape = lambda p: shape; calls = []
     class Native:
         def __getattr__(self, name):
             def call(*args): calls.append((name, args)); return 0
@@ -58,9 +58,9 @@ class ReviewRegressions(unittest.TestCase):
                     self.assertEqual(path, encoder.prompt_path("a fox", Path(tmp)))
 
     def test_keyframe_shapes_are_rejected_before_native_call(self):
-        pipe = H3Pipe.__new__(H3Pipe)
+        pipe = H3.__new__(H3)
         pipe.shape = lambda p: Shape(22, 7, 4, 6, 37, 4096)
-        p = H3Pipe.params(height=64, width=96, frames=22)
+        p = H3.params(height=64, width=96, frames=22)
         # _native intentionally does not exist: a bad buffer must fail before ctypes.
         for shape in [(24, 1, 2, 2), (24, 1, 6, 4), (24, 2, 4, 6)]:
             with self.subTest(shape=shape), self.assertRaisesRegex(ValueError, "keyframe video"):
@@ -71,22 +71,22 @@ class ReviewRegressions(unittest.TestCase):
                 pipe.denoise([1], p, keyframes=[{"frame_index": 0, "video": valid, field: value}])
 
     def test_valid_keyframe_reaches_native_with_correct_data(self):
-        pipe = H3Pipe.__new__(H3Pipe)
+        pipe = H3.__new__(H3)
         pipe.shape = lambda p: Shape(22, 7, 4, 6, 37, 4096)
         seen = []
         class Native:
-            def h3pipe_denoise_refs(self, handle, ids, n, params, keyframes, count, *args):
+            def h3_denoise(self, handle, ids, n, params, keyframes, count, *args):
                 seen.append(np.ctypeslib.as_array(keyframes[0].video_latent, shape=(24 * 4 * 6,)).copy())
                 return 0
         pipe._native, pipe._handle = Native(), None
         video = np.arange(24 * 4 * 6, dtype=np.float32).reshape(24, 1, 4, 6)
-        pipe.denoise([1], H3Pipe.params(height=64, width=96, frames=22), keyframes=[{"frame_index": 0, "video": video}])
+        pipe.denoise([1], H3.params(height=64, width=96, frames=22), keyframes=[{"frame_index": 0, "video": video}])
         np.testing.assert_array_equal(seen[0], video.ravel())
 
     def test_undersized_arrays_never_reach_native(self):
         """Every array crosses to C as a raw pointer with a size C derives from other arguments; the binding checks the shape first (also under python -O)."""
         pipe, calls = spy_pipe()
-        p = H3Pipe.params(height=64, width=96, frames=22)
+        p = H3.params(height=64, width=96, frames=22)
         bad = [
             ("encode_video", (np.zeros((1, 32, 32, 1)),), "channels"),        # grayscale: 1024 floats where C reads 3072
             ("encode_video", (np.zeros((32, 32)),), "dimensions"),
@@ -117,29 +117,29 @@ class ReviewRegressions(unittest.TestCase):
         # the well-formed calls do reach C with the sizes C will read
         pipe.encode_video(np.zeros((32, 32, 3))); pipe.vision_embed(np.zeros((32, 64, 3))); pipe.encode_audio(np.zeros((2, 801))); pipe.decode_audio(np.zeros((2, 32, 3)))
         pipe.denoise([1], p, refs=[{"kind": "image", "video": np.zeros((24, 1, 4, 6)), "pixels": np.zeros((64, 96, 3))}, {"kind": "audio", "audio": np.zeros((2, 32, 5))}])
-        self.assertEqual([c[0] for c in calls], ["h3pipe_encode_video", "h3pipe_vision_embed", "h3pipe_encode_audio", "h3pipe_decode_audio", "h3pipe_denoise_refs"])
+        self.assertEqual([c[0] for c in calls], ["h3_encode_video", "h3_vision_embed", "h3_encode_audio", "h3_decode_audio", "h3_denoise"])
         self.assertEqual(calls[0][1][2:5], (1, 32, 32)); self.assertEqual(calls[2][1][2], 801)
         refs = calls[4][1][6]; self.assertEqual((refs[0].latent_t, refs[0].lat_h, refs[0].lat_w, refs[0].height, refs[0].width, refs[1].audio_t), (1, 4, 6, 64, 96, 5))
 
     def test_shape_failure_is_an_error(self):
-        pipe = H3Pipe.__new__(H3Pipe)
+        pipe = H3.__new__(H3)
         class Native:
-            def h3pipe_shape_for(self, p, s): return 64
+            def h3_shape_for(self, p, s): return 64
         pipe._native = Native()
-        with self.assertRaisesRegex(ValueError, "invalid parameters"): pipe.shape(H3Pipe.params(height=31))
+        with self.assertRaisesRegex(ValueError, "invalid parameters"): pipe.shape(H3.params(height=31))
 
     def test_parity_gate_fails_on_broken_comparisons(self):
         """The ComfyUI parity gate: a comparison that exits nonzero, or omits an expected block or the trajectory line, is a failure; missing fixtures skip unless required."""
         spec = importlib.util.spec_from_file_location("parity", ROOT / "tests/test_comfy_parity.py"); parity = importlib.util.module_from_spec(spec); spec.loader.exec_module(parity)
         blocks = " ".join(f"blk_{b}: [video 0.9995]" for b in parity.REQUIRED_BLOCKS)
-        import h3pipe_loom
+        import h3_loom
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); (root / "tools").mkdir()
             for f in ("build/comfy_t2va_blocks/blocks/blk_49.npy", "build/comfy_fl2va/x_19.npy", "checkpoint.safetensors"):
                 (root / f).parent.mkdir(parents=True, exist_ok=True); (root / f).write_text("")
             compare = root / "tools/compare_comfy.py"
             def fake(body): compare.write_text("import sys\n" + body)
-            with patch.object(parity, "ROOT", root), patch.object(h3pipe_loom, "DIT", root / "checkpoint.safetensors"), contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(parity, "ROOT", root), patch.object(h3_loom, "DIT", root / "checkpoint.safetensors"), contextlib.redirect_stdout(io.StringIO()):
                 fake("sys.exit(42)"); self.assertEqual(parity.main(), 1)                                            # every comparison crashed
                 fake("print('')"); self.assertEqual(parity.main(), 1)                                               # no results at all
                 fake(f"print('{blocks}'.replace(' blk_', '\\nblk_'))"); self.assertEqual(parity.main(), 1)          # blocks but no trajectory
@@ -153,11 +153,11 @@ class ReviewRegressions(unittest.TestCase):
 
     def test_clients_agree_on_the_checkpoint_layout(self):
         """h3, the binding and the examples must name the same four ComfyUI files under the same models directory."""
-        import h3pipe_loom
+        import h3_loom
         files = ["diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors", "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
                  "vae/minimax_h3_video_vae_fp16.safetensors", "vae/minimax_h3_audio_vae_fp32.safetensors"]
         for name, want in zip(("DIT", "TE", "VIDEO_VAE", "AUDIO_VAE"), files):
-            self.assertTrue(str(getattr(h3pipe_loom, name)).endswith(want), name)
+            self.assertTrue(str(getattr(h3_loom, name)).endswith(want), name)
         # h3/src/models.rs is where the paths live for the Rust side; the clients that still spell them
         # out must agree with it.
         for path in ("h3/src/models.rs", "examples/c/minimal.c", "examples/rust/src/main.rs", "examples/go/main.go", "README.md"):

@@ -1,0 +1,40 @@
+# include/h3.h is generated from src/capi.rs, so it cannot drift from the code that implements it.
+# scripts/build_host.sh regenerates it and scripts/test.sh checks the committed copy still matches.
+language = "C"
+header = """// C ABI for the whole MiniMax H3 text -> video + audio pipeline with every kernel in Loom:
+// prompt token ids in, latents / frames / samples out. Everything between the kernels runs on the
+// host in Rust — layout, AdaLN curves, scheduler, noise, patching, blending.
+//
+// Kernels are compiled on first use for a shape by spawning `loom-compile` into cache_dir; the
+// runtime surface is libhrx, and there is no device code in this library.
+//
+// A call returns H3_OK or a status; h3_last_error() gives the reason for the last failure on the
+// calling thread.
+//
+// GENERATED from h3/src/capi.rs by cbindgen. Do not edit; run scripts/build_host.sh."""
+include_guard = "H3_LOOM_H"
+no_includes = true
+sys_includes = ["stddef.h", "stdint.h"]
+cpp_compat = true
+documentation_style = "c99"
+line_length = 110
+after_includes = """
+#define H3_ABI_VERSION 8u"""
+
+[export]
+# Only what the ABI is: the crate's other public constants and types are not interface.
+item_types = ["enums", "structs", "opaque", "typedefs", "functions"]
+include = [
+    "h3_config",
+    "h3_params",
+    "h3_shape",
+    "h3_ref",
+    "h3_keyframe",
+    "h3_session",
+    "h3_tokenizer",
+    "h3_progress",
+    "h3_status",
+]
+
+[parse]
+parse_deps = false

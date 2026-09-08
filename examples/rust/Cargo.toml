@@ -2,7 +2,10 @@
 name = "h3-minimal"
 version = "0.1.0"
 edition = "2021"
-description = "libh3pipe from Rust without bindgen: prompt -> frames + samples"
+description = "The h3 crate from Rust: prompt -> frames + samples"
+
+[dependencies]
+h3 = { path = "../../h3" }
 
 [[bin]]
 name = "minimal"

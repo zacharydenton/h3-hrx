@@ -3,7 +3,7 @@
 //!   decode_video <video_vae.safetensors> <latents.f32> <out.rgb> <height> <width> <frames>
 //!
 //! Latents are `[24][latent_t][H/16][W/16]` f32; the output is `[frames][H][W][3]` u8, the same bytes
-//! `h3pipe_decode_video` writes. The companion script runs the C implementation on the same latents
+//! `h3_decode_video` writes. The companion script runs the C implementation on the same latents
 //! through its Python binding and compares.
 use h3::compile::Compiler;
 use h3::dispatch::Profile;

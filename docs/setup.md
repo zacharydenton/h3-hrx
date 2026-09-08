@@ -7,16 +7,14 @@ Run commands from the repository root unless stated otherwise.
 - Linux and a Radeon 8060S (`gfx1151`). Development and measurements used a
   128 GB Strix Halo system. Allow room for activations as well as weights;
   smaller memory configurations have not been validated.
-- ROCm with HIP headers, runtime, and `hipcc`; the tested installation is in
-  `/opt/rocm`. Set `ROCM_PATH` or `HIPCC` for another installation.
-- `g++` for the host/tokenizer build and CPU tests.
 - ffmpeg for input decoding and MP4/WAV output.
-- `cargo` (Rust) for the `h3` command in `cli/` and the `loomrun` kernel launcher
-  in `loomrun/`; `scripts/build_host.sh` skips both and still builds the library
-  and `h3pipe` when cargo is missing.
+- `cargo` (Rust). Everything outside `kernels/` is Rust: the library, the `h3`
+  command and the `loomrun` kernel launcher. No ROCm headers and no `hipcc` —
+  the runtime surface is `libhrx`.
+- `cbindgen` (`cargo install cbindgen`) to regenerate `include/h3.h`. The build
+  skips it when absent and uses the committed header.
 - [Loom with the included compiler patches](../patches/loom/README.md).
-  `loomrun` links `libhrx` from that build and dispatches through it, so the
-  kernel tests need neither HIP headers nor `hipcc`.
+  Everything dispatches through `libhrx` from that build.
 - For downloads, the Hugging Face CLI (`python3 -m pip install huggingface_hub`
   in a Python environment). For development, Python 3 with NumPy. Inference
   itself runs without Python.
@@ -34,8 +32,8 @@ bash scripts/build_host.sh
 overrides are respected. It retains the development checkout default
 `~/code/hrx-system/build-cuda` when `HRX_BUILD` is unset.
 
-The build produces `build/h3`, `build/h3pipe`, `build/libh3pipe.so`, and
-`build/loomrun`. Keep the repository's `kernels/` directory available: kernels
+The build produces `build/libh3.so`, `build/h3`, `build/loomrun` and
+`include/h3.h`. Keep the repository's `kernels/` directory available: kernels
 compile on first use for each shape and are cached in `build/kernel_cache`.
 Use `h3 --root DIR` if you relocate the executable.
 

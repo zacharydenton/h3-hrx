@@ -1,4 +1,4 @@
-"""Prompt ids from the C tokenizer in libh3pipe (h3tok), with H3's reference presentation: for each reference in
+"""Prompt ids from the tokenizer in libh3.so, with H3's reference presentation: for each reference in
 order images, videos, audio: "<Picture i>: " + <|vision_start|> + one placeholder id per merged vision token +
 <|vision_end|>; "<Audio j>: "; "<Video k>: " + per 2-frame block "<t seconds>" + a vision span; then the prompt.
 Placeholders are -1 (the host replaces those rows with the vision embeds).
@@ -11,20 +11,20 @@ _lib = None
 def _native():
     global _lib
     if _lib is None:
-        _lib = ctypes.CDLL(str(os.environ.get("H3PIPE_LIB") or ROOT / "build/libh3pipe.so"))
-        _lib.h3tok_create.restype = ctypes.c_void_p; _lib.h3tok_create.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
-        _lib.h3tok_encode.restype = ctypes.c_int; _lib.h3tok_encode.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_size_t]
+        _lib = ctypes.CDLL(str(os.environ.get("H3_LIB") or ROOT / "build/libh3.so"))
+        _lib.h3_tokenizer_create.restype = ctypes.c_void_p; _lib.h3_tokenizer_create.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
+        _lib.h3_tokenizer_encode.restype = ctypes.c_int; _lib.h3_tokenizer_encode.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_size_t]
         err = ctypes.create_string_buffer(1024)
-        _lib._tok = _lib.h3tok_create(os.fsencode(Path.home() / "h3-models/tokenizer/tokenizer.json"), err, 1024)
+        _lib._tok = _lib.h3_tokenizer_create(os.fsencode(Path.home() / "h3-models/tokenizer/tokenizer.json"), err, 1024)
         if not _lib._tok: raise RuntimeError(err.value.decode())
     return _lib
 def encode_text(text: str) -> list:
-    """h3tok_encode returns the count the text needs even when the buffer is smaller: size the buffer to it."""
-    lib = _native(); utf8 = text.encode("utf-8"); cap = 8192; buf = (ctypes.c_int32 * cap)(); n = lib.h3tok_encode(lib._tok, utf8, buf, cap)
-    if n < 0: raise RuntimeError("h3tok_encode failed")
+    """h3_tokenizer_encode returns the count the text needs even when the buffer is smaller: size the buffer to it."""
+    lib = _native(); utf8 = text.encode("utf-8"); cap = 8192; buf = (ctypes.c_int32 * cap)(); n = lib.h3_tokenizer_encode(lib._tok, utf8, buf, cap)
+    if n < 0: raise RuntimeError("h3_tokenizer_encode failed")
     if n > cap:
         cap = n; buf = (ctypes.c_int32 * cap)()
-        if lib.h3tok_encode(lib._tok, utf8, buf, cap) != n: raise RuntimeError("h3tok_encode failed")
+        if lib.h3_tokenizer_encode(lib._tok, utf8, buf, cap) != n: raise RuntimeError("h3_tokenizer_encode failed")
     return [int(buf[i]) for i in range(n)]
 def encode_presentation(prompt: str, images=(), audios: int = 0, videos=()) -> list:
     """images: merged vision token counts per reference image; videos: lists of (token_count, timestamp) per block."""

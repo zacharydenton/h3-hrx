@@ -14,7 +14,7 @@ use hrx::sys::BufferRef;
 
 /// Samples per latent frame, at 32 kHz.
 pub const HOP: usize = 800;
-pub const AUDIO_CH: usize = 32;
+pub use crate::model::AUDIO_CH;
 
 /// The encoder's downsampling rates, and the decoder's upsampling ones with their kernel sizes.
 const ENC_RATES: [usize; 5] = [2, 4, 4, 5, 5];

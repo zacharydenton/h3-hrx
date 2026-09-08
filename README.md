@@ -2,9 +2,10 @@
 
 MiniMax H3 (Hailuo 3.0) video and audio generation on AMD Strix Halo
 (Radeon 8060S, `gfx1151`). Every GPU kernel is written in
-[Loom](https://github.com/ROCm/hrx-system), with a C++ host and a C API.
-Inference uses the HIP runtime; it needs no Python, PyTorch, Triton, or vendor
-math libraries. The host reads ComfyUI-format checkpoints directly.
+[Loom](https://github.com/ROCm/hrx-system); everything else is Rust, behind both a
+Rust API and a generated C one. Inference dispatches through `libhrx` and needs no
+Python, PyTorch, Triton, or vendor math libraries — and no ROCm headers or `hipcc`
+to build. The host reads ComfyUI-format checkpoints directly.
 
 Text-to-video, first-frame animation, and image/audio reference conditioning
 are supported. This is an experimental implementation tested on a 128 GB
@@ -33,9 +34,8 @@ measurements, and decoder timings.
 
 ## Setup
 
-You need Linux, ROCm with `gfx1151` support (tested with the 7.1 series), a C++
-compiler, Rust (the `h3` command is a Rust client of the C API; the library itself
-is C++), ffmpeg, and a built Loom compiler. The measured kernels require
+You need Linux, a `gfx1151` device with its kernel driver, Rust, ffmpeg, and a
+built Loom compiler. The measured kernels require
 [two Loom patches included here](patches/loom/README.md).
 Python 3 and NumPy are needed for development and CPU tests.
 

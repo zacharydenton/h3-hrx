@@ -2,7 +2,7 @@
 //!
 //!   text_in <dit.safetensors> <text_encoder.safetensors> <ids.i32> <out.f32> [<ids> <out>]...
 //!
-//! Ids are int32; each output is `[n][5376]` f32, the same array `h3pipe_text_in` writes. Several
+//! Ids are int32; each output is `[n][5376]` f32, the same array `h3_text_in` writes. Several
 //! pairs run in one process because opening the encoder is the expensive part, not the pass. No vision
 //! spans — those go through the tower first, and this exercises the text path on its own.
 use h3::compile::Compiler;

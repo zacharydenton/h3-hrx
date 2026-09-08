@@ -235,7 +235,7 @@ impl Dit {
         Ok(())
     }
 
-    /// The sequence's first `rows` rows, `[rows][5376]` f32 — what `h3pipe_text_in` hands back.
+    /// The sequence's first `rows` rows, `[rows][5376]` f32 — what `h3_text_in` hands back.
     pub fn read_rows(&self, gpu: &hrx::Gpu, rows: usize, out: &mut [f32]) -> Result<()> {
         let seq = self.seq.as_ref().expect("a sequence has been sized");
         gpu.sync()?;
@@ -526,7 +526,7 @@ impl Dit {
         noise: Noise<'_>,
         refs: &[RefInput<'_>],
         kfs: &[KeyframeInput<'_>],
-        mut progress: Option<&mut dyn FnMut(usize, usize) -> bool>,
+        mut progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
     ) -> Result<Latents> {
         let sh = crate::layout::shape_for(p.height, p.width, p.frames)
             .ok_or_else(|| crate::error::Error::Invalid("no such shape".into()))?;
@@ -656,6 +656,7 @@ impl Dit {
         for sg in &lay.ref_segs {
             in_rows = in_rows.max(sg.rows);
         }
+        let started = std::time::Instant::now();
         let mut in32 = vec![0.0f32; in_rows * VIDEO_PATCH];
         let mut out32 = vec![0.0f32; generated * FINAL_N];
         // the interpolation curve, taken once: upload_mods needs &self, so it cannot be borrowed
@@ -777,7 +778,12 @@ impl Dit {
                 old_a = den_a;
             }
             if let Some(cb) = progress.as_deref_mut() {
-                if cb(step + 1, sv.timesteps.len()) {
+                // elapsed since the first step, which is what a caller drawing a bar wants
+                if cb(
+                    step + 1,
+                    sv.timesteps.len(),
+                    started.elapsed().as_secs_f64(),
+                ) {
                     return Err(crate::error::Error::Cancelled);
                 }
             }

@@ -1,4 +1,4 @@
-"""Text -> video + audio through libh3pipe.so alone: the tokenizer here, everything else in the C
+"""Text -> video + audio through libh3.so alone: the tokenizer here, everything else in the C
 library (every kernel in Loom). Writes <out>.mp4 (+ .wav) through ffmpeg.
     python3 tools/pipeline_c.py "a red fox ..." [--frames 124 --steps 50 --height 480 --width 864 --seed 0 --out build/clip_c.mp4]"""
 import argparse, os, math, subprocess, sys, time, wave
@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "tools"))
-from h3pipe_loom import H3Pipe
+from h3_loom import H3
 FPS, RATE = 24, 32000
 
 
@@ -22,14 +22,14 @@ def main():
     ap.add_argument("--base-weights", action="store_true", help="run reference files on the base checkpoint when the ref2va one is absent (otherwise an error)")
     a = ap.parse_args()
     from h3tok_ids import encode_presentation
-    from h3pipe_loom import DIT, REF2VA
+    from h3_loom import DIT, REF2VA
     want_refs = bool(a.ref_image or a.ref_audio)
     if want_refs and not REF2VA.exists() and not a.base_weights and not a.dit:
         raise SystemExit(f"references need the ref2va checkpoint, {REF2VA} (README, Weights); --base-weights runs the base checkpoint anyway, or give --dit")
     dit = a.dit or str(REF2VA if want_refs and REF2VA.exists() and not a.base_weights else DIT)
     attn = a.attn
-    t0 = time.time(); pipe = H3Pipe(dit=dit, attn=attn); print(f"session in {time.time() - t0:.1f} s ({os.path.basename(dit)}, {attn} attention)", flush=True)
-    p = H3Pipe.params(height=a.height, width=a.width, frames=a.frames, steps=a.steps, seed=a.seed, cache_threshold=a.cache_threshold, sampler=a.sampler); sh = pipe.shape(p)
+    t0 = time.time(); pipe = H3(dit=dit, attn=attn); print(f"session in {time.time() - t0:.1f} s ({os.path.basename(dit)}, {attn} attention)", flush=True)
+    p = H3.params(height=a.height, width=a.width, frames=a.frames, steps=a.steps, seed=a.seed, cache_threshold=a.cache_threshold, sampler=a.sampler); sh = pipe.shape(p)
     print(f"{sh.frames} frames at {a.width}x{a.height}: {sh.latent_t}x{sh.lat_h}x{sh.lat_w} latents, {sh.audio_t} audio latents", flush=True)
     # references (ref2va) and the keyframe (fl2va): images resized as ComfyUI's nodes do, encoded by the Loom encoders
     refs, kfs, image_tokens = [], [], []

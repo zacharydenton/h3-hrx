@@ -3,7 +3,7 @@
 //!   encode_video <video_vae.safetensors> <pixels.f32> <out.f32> <frames> <height> <width>
 //!
 //! Pixels are `[frames][H][W][3]` f32 in `[0, 1]`; the output is `[24][latent_t][H/16][W/16]` f32, the
-//! same array `h3pipe_encode_video` writes. The companion script runs the C on the same pixels.
+//! same array `h3_encode_video` writes. The companion script runs the C on the same pixels.
 use h3::compile::Compiler;
 use h3::dispatch::Profile;
 use h3::vvae::{Clip, VideoVae};

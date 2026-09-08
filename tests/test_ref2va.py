@@ -6,7 +6,7 @@ import argparse, sys, time
 from pathlib import Path
 import numpy as np
 ROOT = Path(__file__).resolve().parent.parent; sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "tools"))
-from h3pipe_loom import H3Pipe
+from h3_loom import H3
 ap = argparse.ArgumentParser(); ap.add_argument("--case", default="audio", help="t2va | audio | both | fl2va"); ap.add_argument("--own-encoders", action="store_true")
 ap.add_argument("--dit", default=None, help="the DiT checkpoint (default: the ref2va file under $H3_MODELS)")
 ap.add_argument("--prompt", default="A red fox trotting through a snowy forest at dawn, cinematic, with the sound of <Audio 1>")
@@ -23,8 +23,8 @@ ids = encode_presentation(a.prompt, images=[n_img] if img is not None else [], a
 ids_ref = np.concatenate([np.full(n_img, -1, np.int64) if v == -1 else np.array([v], np.int64) for v in ids_ref.tolist()])   # comfy keeps one entry per vision span
 ok_ids = np.array_equal(np.asarray(ids), ids_ref); print(f"presentation ids: ours {len(ids)} vs comfy {len(ids_ref)}: {'match' if ok_ids else 'DIFFER'}")
 if not ok_ids: print("  ours:", ids[:24], "\n  ref: ", ids_ref[:24].tolist())
-from h3pipe_loom import REF2VA
-pipe = H3Pipe(dit=a.dit or str(REF2VA))
+from h3_loom import REF2VA
+pipe = H3(dit=a.dit or str(REF2VA))
 nv, na = L(f"{a.case}_noise_video"), L(f"{a.case}_noise_audio")               # [24][T][H][W], [32][2][t] -> ours [2][32][t]
 na = np.transpose(na, (1, 0, 2))
 refs, kfs = [], []
@@ -38,7 +38,7 @@ if a.case in ("both", "audio"):
 if a.case == "fl2va":
     z = L("fl2va_keyframe_latent") if not a.own_encoders else pipe.encode_video(img)
     kfs.append({"frame_index": 0, "video": z, "pixels": img})
-frames = 22; p = H3Pipe.params(height=480, width=864, frames=frames, steps=2, seed=0)
+frames = 22; p = H3.params(height=480, width=864, frames=frames, steps=2, seed=0)
 t0 = time.time(); video, audio = pipe.denoise(np.asarray(ids, np.int32), p, noise_video=nv, noise_audio=na, refs=refs, keyframes=kfs); dt = time.time() - t0
 dv, da = L(f"{a.case}_denoised_video"), np.transpose(L(f"{a.case}_denoised_audio"), (1, 0, 2))
 raw = (T / f"{a.case}_out_video.npy").exists()

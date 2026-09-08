@@ -15,7 +15,7 @@ import time
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from h3pipe_loom import H3Pipe
+from h3_loom import H3
 
 
 def main():
@@ -63,7 +63,7 @@ def main():
         for variant in opt.variants:
             os.environ["H3_VAE_FAST"] = "1" if variant == "fast" else "0"
             os.environ["H3_VAE_WIDE"] = "1" if variant == "wide" else "0"
-            pipe = H3Pipe(dit="/unused/dit", te="/unused/te", library=opt.library)
+            pipe = H3(dit="/unused/dit", te="/unused/te", library=opt.library)
             try:
                 params = pipe.params(height=results["height"], width=results["width"], frames=frames)
                 av = audio

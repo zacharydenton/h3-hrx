@@ -1,4 +1,4 @@
-//! `h3`: the whole MiniMax H3 pipeline from the shell, through `libh3pipe` alone (every kernel in Loom).
+//! `h3`: the whole MiniMax H3 pipeline from the shell, through the `h3` crate (every kernel in Loom).
 //!
 //!   h3 [ref1.jpg ref2.png voice.wav ...] [-p "prompt"] [options] < prompt
 //!
@@ -9,12 +9,15 @@
 //!
 //! This is also the worked example of the C ABI: `ffi.rs` declares it by hand and `pipe.rs` wraps it, so a
 //! client in any language can be read off these two files. `examples/rust` is the minimal version.
-mod ffi;
 mod media;
-mod pipe;
 mod resize;
 
-use anyhow::{bail, Context, Result};
+use h3::dit::{DenoiseParams, KeyframeInput, Noise, RefInput};
+use h3::session::{Config, Session};
+use h3::tokenizer::Tokenizer;
+use h3::vvae::Clip;
+
+use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -229,14 +232,6 @@ macro_rules! usage {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    if unsafe { ffi::h3pipe_abi_version() } != ffi::ABI_VERSION {
-        bail!(
-            "libh3pipe is ABI {}, this h3 was built for {} (rebuild: scripts/build_host.sh)",
-            unsafe { ffi::h3pipe_abi_version() },
-            ffi::ABI_VERSION
-        );
-    }
-
     let (mut image_files, mut audio_files) = (Vec::new(), Vec::new());
     for f in &cli.files {
         let e = lower_ext(f);
@@ -342,21 +337,20 @@ fn run(cli: Cli) -> Result<()> {
         );
     }
 
-    let params = ffi::Params {
+    let params = DenoiseParams {
         height: cli.height,
         width: cli.width,
         frames: cli.frames,
-        steps: cli.steps,
+        steps: cli.steps as usize,
         seed: cli.seed,
-        video_shift: 0.0,
-        audio_shift: 0.0,
         sampler: match cli.sampler {
             Sampler::Euler => 0,
             Sampler::ResMultistep => 1,
         },
-        cache_threshold: 0.0,
+        ..DenoiseParams::default()
     };
-    let shape = pipe::Session::shape_for(&params).map_err(|e| UsageError(e.to_string()))?;
+    let shape = Session::shape_for(params.height, params.width, params.frames)
+        .ok_or_else(|| UsageError("no such shape".into()))?;
 
     // inputs first: they are cheap and they fail fast. The keyframe fills the canvas; references are
     // scaled to at most the canvas' pixel count on a 32-pixel grid.
@@ -398,7 +392,7 @@ fn run(cli: Cli) -> Result<()> {
 
     // the presentation: keyframe, then reference images ("<Picture i>: " + a vision span), then
     // "<Audio j>: ", then the prompt
-    let tok = pipe::Tokenizer::new(None)?; // the tokenizer compiled into libh3pipe (H3_TOKENIZER overrides it)
+    let tok = Tokenizer::new()?; // the vocabulary compiled into the crate (H3_TOKENIZER overrides it)
     let mut ids: Vec<i32> = Vec::new();
     let mut picture = 0;
     let mut vision_span = |ids: &mut Vec<i32>, w: i32, h: i32| -> Result<()> {
@@ -441,18 +435,14 @@ fn run(cli: Cli) -> Result<()> {
     let sources = root.join("kernels");
     let cache = root.join("build/kernel_cache");
     let loom_compile = std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into());
-    let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
-    let (c_dit, c_te, c_vv, c_av) = (c(&dit), c(&te), c(&video_vae), c(&audio_vae));
-    let (c_src, c_cache) = (c(&sources), c(&cache));
-    let c_loom = std::ffi::CString::new(loom_compile)?;
-    let config = ffi::Config {
-        dit_file: c_dit.as_ptr(),
-        te_file: c_te.as_ptr(),
-        video_vae_file: c_vv.as_ptr(),
-        audio_vae_file: c_av.as_ptr(),
-        kernel_sources: c_src.as_ptr(),
-        cache_dir: c_cache.as_ptr(),
-        loom_compile: c_loom.as_ptr(),
+    let config = Config {
+        dit: Some(dit.clone()),
+        te: Some(te),
+        video_vae: Some(video_vae),
+        audio_vae: Some(audio_vae),
+        kernel_sources: sources,
+        cache_dir: cache,
+        loom_compile,
         attn_qk_bits: match cli.attn {
             Attn::F16 => 16,
             Attn::I8 => 8,
@@ -461,7 +451,7 @@ fn run(cli: Cli) -> Result<()> {
     };
 
     let t0 = Instant::now();
-    let session = pipe::Session::new(&config)?;
+    let mut session = Session::new(config)?;
     eprintln!(
         "session in {:.1} s ({}, {} attention)",
         t0.elapsed().as_secs_f64(),
@@ -473,68 +463,83 @@ fn run(cli: Cli) -> Result<()> {
         }
     );
 
-    // encoders: latents for the keyframe and the references. The latent buffers must outlive the raw
-    // pointers the ABI structs hold, so they are all owned here.
-    let mut latent_store: Vec<Vec<f32>> =
-        Vec::with_capacity(1 + ref_images.len() + ref_audio.len());
-    let mut keyframes: Vec<ffi::Keyframe> = Vec::new();
-    let mut refs: Vec<ffi::Ref> = Vec::new();
-    if let Some(k) = &keyframe {
-        let mut latents = vec![0.0f32; 24 * (k.h / 16) as usize * (k.w / 16) as usize];
-        session
-            .encode_video(&k.pixels, 1, k.h, k.w, &mut latents)
-            .context("encode keyframe")?;
-        latent_store.push(latents);
-        keyframes.push(ffi::Keyframe {
+    // encoders: latents for the keyframe and the references, encoded before the run so a bad input
+    // fails early. Each reference borrows its own latents, which live until the denoise returns.
+    let keyframe_latents = match &keyframe {
+        Some(k) => Some(
+            session
+                .encode_video(Clip { pixels: &k.pixels, frames: 1, height: k.h as usize, width: k.w as usize })
+                .context("encode keyframe")?
+                .0,
+        ),
+        None => None,
+    };
+    let mut image_latents = Vec::with_capacity(ref_images.len());
+    for im in &ref_images {
+        image_latents.push(
+            session
+                .encode_video(Clip { pixels: &im.pixels, frames: 1, height: im.h as usize, width: im.w as usize })
+                .context("encode reference image")?
+                .0,
+        );
+    }
+    let mut audio_latents = Vec::with_capacity(ref_audio.len());
+    for (samples, n) in &ref_audio {
+        audio_latents.push(
+            session
+                .encode_audio(samples, *n as usize)
+                .context("encode reference audio")?,
+        );
+    }
+
+    let keyframes: Vec<KeyframeInput<'_>> = keyframe
+        .iter()
+        .zip(keyframe_latents.iter())
+        .map(|(k, z)| KeyframeInput {
             frame_index: 0,
-            video_latent: latent_store.last().unwrap().as_ptr(),
-            pixels: k.pixels.as_ptr(),
+            video_latent: z,
+            pixels: Some(&k.pixels),
             height: k.h,
             width: k.w,
-            audio_latent: std::ptr::null(),
+            audio_latent: None,
             audio_t: 0,
-        });
-    }
-    for im in &ref_images {
-        let mut latents = vec![0.0f32; 24 * (im.h / 16) as usize * (im.w / 16) as usize];
-        session
-            .encode_video(&im.pixels, 1, im.h, im.w, &mut latents)
-            .context("encode reference image")?;
-        latent_store.push(latents);
-        refs.push(ffi::Ref {
+        })
+        .collect();
+    let mut refs: Vec<RefInput<'_>> = ref_images
+        .iter()
+        .zip(image_latents.iter())
+        .map(|(im, z)| RefInput {
             kind: 0,
-            video_latent: latent_store.last().unwrap().as_ptr(),
+            video_latent: Some(z),
             latent_t: 1,
             lat_h: im.h / 16,
             lat_w: im.w / 16,
-            pixels: im.pixels.as_ptr(),
+            audio_latent: None,
+            audio_t: 0,
+            pixels: Some(&im.pixels),
             height: im.h,
             width: im.w,
-            ..Default::default()
-        });
-    }
-    for (samples, n) in &ref_audio {
-        let t = (n + 799) / 800;
-        let mut latents = vec![0.0f32; 2 * 32 * t as usize];
-        let audio_t = session
-            .encode_audio(samples, *n, &mut latents)
-            .context("encode reference audio")?;
-        latent_store.push(latents);
-        refs.push(ffi::Ref {
+        })
+        .collect();
+    for (z, t) in &audio_latents {
+        refs.push(RefInput {
             kind: 1,
-            audio_latent: latent_store.last().unwrap().as_ptr(),
-            audio_t,
-            ..Default::default()
+            video_latent: None,
+            latent_t: 0,
+            lat_h: 0,
+            lat_w: 0,
+            audio_latent: Some(z),
+            audio_t: *t as i32,
+            pixels: None,
+            height: 0,
+            width: 0,
         });
     }
 
-    let mut video =
-        vec![0.0f32; 24 * shape.latent_t as usize * shape.lat_h as usize * shape.lat_w as usize];
-    let mut audio = vec![0.0f32; 2 * 32 * shape.audio_t as usize];
     let t0 = Instant::now();
-    session.denoise(&ids, &params, &keyframes, &refs, &mut video, &mut audio)?;
+    let latents = session.denoise(&ids, &params, Noise::default(), &refs, &keyframes, None)?;
+    let (video, audio) = (latents.video, latents.audio);
     eprintln!("denoised in {:.1} s", t0.elapsed().as_secs_f64());
-    drop(latent_store); // the pointers in keyframes/refs are dead from here
 
     if let Some(prefix) = &cli.latents {
         for (suffix, data) in [("video.f32", &video), ("audio.f32", &audio)] {
@@ -562,10 +567,10 @@ fn run(cli: Cli) -> Result<()> {
         }
     ];
     if !cli.audio_only {
-        session.decode_video(&params, &video, &mut frames)?;
+        session.decode_video(&shape, &video, &mut frames)?;
     }
     let mut samples = vec![0.0f32; 2 * shape.audio_t as usize * 800];
-    session.decode_audio(&audio, shape.audio_t, &mut samples)?;
+    session.decode_audio(&audio, shape.audio_t as usize, &mut samples)?;
     drop(session);
     eprintln!("decoded in {:.1} s", t0.elapsed().as_secs_f64());
 

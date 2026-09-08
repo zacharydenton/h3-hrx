@@ -11,7 +11,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT), str(ROOT / "tools")]
-from h3pipe_loom import H3Pipe
+from h3_loom import H3
 
 
 def diffusers_decode(z, frames=None):
@@ -37,7 +37,7 @@ def session_isolation():
     z = np.random.default_rng(3).normal(size=(24, 2, 4, 6)).astype(np.float32)
     results = []
     for _ in range(2):
-        pipe = H3Pipe(dit="/unused/dit.safetensors", te="/unused/te.safetensors")
+        pipe = H3(dit="/unused/dit.safetensors", te="/unused/te.safetensors")
         try:
             results.append(pipe.decode_video(pipe.params(height=64, width=96, frames=5), z))
         finally:
@@ -57,7 +57,7 @@ def main():
     frames = (t - 2) // 5 * 17 + 5
     assert t >= 7 and (t - 2) % 5 == 0 and h > 16 and w > 16
     # Missing DiT/text paths must be harmless for a decoder-only session.
-    pipe = H3Pipe(dit="/unused/dit.safetensors", te="/unused/te.safetensors")
+    pipe = H3(dit="/unused/dit.safetensors", te="/unused/te.safetensors")
     try:
         got = pipe.decode_video(pipe.params(height=h * 16, width=w * 16, frames=frames), z)
     finally:

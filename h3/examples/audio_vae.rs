@@ -4,7 +4,7 @@
 //!   audio_vae encode <audio_vae.safetensors> <samples.f32> <out.f32> <n>
 //!
 //! Latents are `[2][32][audio_t]` f32, samples `[2][n]` f32 at 32 kHz — the same arrays
-//! `h3pipe_decode_audio` and `h3pipe_encode_audio` take and write. The companion script runs the C on
+//! `h3_decode_audio` and `h3_encode_audio` take and write. The companion script runs the C on
 //! the same inputs.
 use h3::avae::{AudioVae, AUDIO_CH, HOP};
 use h3::compile::Compiler;

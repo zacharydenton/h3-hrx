@@ -1,4 +1,4 @@
-"""Prompt -> Qwen3-VL token ids (no special tokens), one per line or space-separated for host/h3pipe_cli.
+"""Prompt -> Qwen3-VL token ids (no special tokens), one per line or space-separated.
     python3 tools/prompt_ids.py "a red fox ..." """
 import sys
 from pathlib import Path

@@ -5,8 +5,7 @@
 //! Qwen2-VL's preprocessing is CLIP's, and using ImageNet there shifts every vision embedding.
 use crate::model::*;
 
-pub const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
-pub const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
+pub use crate::model::{IMAGENET_MEAN, IMAGENET_STD};
 // Spelled out to the digit the preprocessing config gives, so they can be read against it directly;
 // two of them carry more digits than an f32 holds and round to the same value regardless.
 #[allow(clippy::excessive_precision)]

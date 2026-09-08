@@ -1,4 +1,4 @@
-"""The C tokenizer (host/h3tok.cpp, in libh3pipe.so) against transformers' Qwen3-VL tokenizer on a set of prompts.
+"""The C tokenizer (host/h3tok.cpp, in libh3.so) against transformers' Qwen3-VL tokenizer on a set of prompts.
     python3 tests/test_tokenizer.py"""
 import ctypes, sys
 from pathlib import Path
@@ -22,17 +22,17 @@ PROMPTS = [
 def main():
     from transformers import AutoTokenizer
     hf = AutoTokenizer.from_pretrained(str(TOK))
-    lib = ctypes.CDLL(str(ROOT / "build/libh3pipe.so"))
-    lib.h3tok_create.restype = ctypes.c_void_p; lib.h3tok_create.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
-    lib.h3tok_encode.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_size_t]; lib.h3tok_encode.restype = ctypes.c_int
-    lib.h3tok_vocab_size.argtypes = [ctypes.c_void_p]; lib.h3tok_vocab_size.restype = ctypes.c_int
-    err = ctypes.create_string_buffer(512); tok = lib.h3tok_create(str(TOK / "tokenizer.json").encode(), err, 512)
+    lib = ctypes.CDLL(str(ROOT / "build/libh3.so"))
+    lib.h3_tokenizer_create.restype = ctypes.c_void_p; lib.h3_tokenizer_create.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
+    lib.h3_tokenizer_encode.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_size_t]; lib.h3_tokenizer_encode.restype = ctypes.c_int
+    lib.h3_tokenizer_vocab_size.argtypes = [ctypes.c_void_p]; lib.h3_tokenizer_vocab_size.restype = ctypes.c_int
+    err = ctypes.create_string_buffer(512); tok = lib.h3_tokenizer_create(str(TOK / "tokenizer.json").encode(), err, 512)
     assert tok, err.value.decode()
-    print(f"vocab {lib.h3tok_vocab_size(tok)} (hf {len(hf)})")
+    print(f"vocab {lib.h3_tokenizer_vocab_size(tok)} (hf {len(hf)})")
     ok = True
     for text in PROMPTS:
         want = hf(text, add_special_tokens=False)["input_ids"]
-        buf = (ctypes.c_int32 * 4096)(); n = lib.h3tok_encode(tok, text.encode(), buf, 4096); got = list(buf[:n]) if n >= 0 else None
+        buf = (ctypes.c_int32 * 4096)(); n = lib.h3_tokenizer_encode(tok, text.encode(), buf, 4096); got = list(buf[:n]) if n >= 0 else None
         same = got == want
         ok &= same
         print(f"  {'PASS' if same else 'FAIL'} {text[:50]!r}: {len(want)} tokens" + ("" if same else f"\n       want {want}\n       got  {got}"))

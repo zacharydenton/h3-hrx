@@ -23,7 +23,7 @@ def run(args) -> list:
 def main() -> int:
     require = "--require" in sys.argv[1:] or os.environ.get("H3_REQUIRE_PARITY") == "1"
     sys.path.insert(0, str(ROOT))
-    from h3pipe_loom import DIT
+    from h3_loom import DIT
     missing = [str(f) for f in (ROOT / "build/comfy_t2va_blocks/blocks/blk_49.npy", ROOT / "build/comfy_fl2va/x_19.npy", DIT) if not f.exists()]
     if missing:
         print(f"{'FAIL' if require else 'SKIP'}: missing {', '.join(missing)} (tools/comfy_clip.py --dump-steps --dump-blocks 0,1,2,5,10,20,30,40,49 --steps 2 --out build/comfy_t2va_blocks; README, Weights)")

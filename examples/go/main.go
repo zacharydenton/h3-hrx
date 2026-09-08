@@ -1,13 +1,13 @@
-// libh3pipe from Go through cgo: prompt -> frames + samples, written as <out>.rgb and <out>.wav.
+// libh3.so from Go through cgo: prompt -> frames + samples, written as <out>.rgb and <out>.wav.
 //   go build -o minimal . && ./minimal "A red fox ..." [frames] [steps] [out]     (from the repository root, or set H3_ROOT)
 package main
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../host
-#cgo LDFLAGS: -L${SRCDIR}/../../build -lh3pipe -Wl,-rpath,${SRCDIR}/../../build
+#cgo CFLAGS: -I${SRCDIR}/../../include
+#cgo LDFLAGS: -L${SRCDIR}/../../build -lh3 -Wl,-rpath,${SRCDIR}/../../build
 #include <stdlib.h>
-#include "h3pipe.h"
-#include "h3tok.h"
+#include "h3.h"
+
 
 int goProgress(void *user, int step, int steps, double seconds);   // exported from Go below
 */
@@ -27,8 +27,8 @@ func goProgress(user unsafe.Pointer, step C.int, steps C.int, seconds C.double) 
 	return 0 // nonzero cancels
 }
 
-func fail(what string, err []C.char) {
-	fmt.Fprintf(os.Stderr, "%s: %s\n", what, C.GoString(&err[0]))
+func fail(what string) {
+	fmt.Fprintf(os.Stderr, "%s: %s\n", what, C.GoString(C.h3_last_error()))
 	os.Exit(1)
 }
 
@@ -42,44 +42,44 @@ func main() {
 	if v := os.Getenv("HOME"); v != "" { home = v }
 	if len(os.Args) > 4 { out = os.Args[4] }
 	atoi := func(i int, dflt int) int { if len(os.Args) > i { v, _ := strconv.Atoi(os.Args[i]); return v }; return dflt }
-	err := make([]C.char, 4096)
-	if uint32(C.h3pipe_abi_version()) != uint32(C.H3PIPE_ABI_VERSION) { fmt.Fprintln(os.Stderr, "libh3pipe ABI mismatch"); os.Exit(1) }
+	if uint32(C.h3_abi_version()) != uint32(C.H3_ABI_VERSION) { fmt.Fprintln(os.Stderr, "libh3.so ABI mismatch"); os.Exit(1) }
 
 	// text -> ids
-	tok := C.h3tok_create(nil, &err[0], C.size_t(len(err)))   // the tokenizer compiled into libh3pipe
-	if tok == nil { fail("tokenizer", err) }
+	tok := C.h3_tokenizer_create(nil)   // the tokenizer compiled into libh3.so
+	if tok == nil { fail("tokenizer") }
 	prompt := C.CString(os.Args[1]); defer C.free(unsafe.Pointer(prompt))
 	ids := make([]C.int32_t, 4096)
-	n := int(C.h3tok_encode(tok, prompt, &ids[0], C.size_t(len(ids))))
-	C.h3tok_destroy(tok)
+	n := int(C.h3_tokenizer_encode(tok, prompt, &ids[0], C.size_t(len(ids))))
+	C.h3_tokenizer_destroy(tok)
 	if n < 0 || n > len(ids) { fmt.Fprintln(os.Stderr, "cannot tokenize the prompt"); os.Exit(1) }
 
 	// Validate sizes before creating a session or allocating output buffers.
-	p := C.h3pipe_params{height: 480, width: 864, frames: C.int(atoi(2, 124)), steps: C.int(atoi(3, 31)), seed: 0, sampler: 1}
-	var sh C.h3pipe_shape
-	if C.h3pipe_shape_for(&p, &sh) != 0 { fmt.Fprintln(os.Stderr, "invalid parameters"); os.Exit(64) }
+	p := C.h3_params{height: 480, width: 864, frames: C.int(atoi(2, 124)), steps: C.int(atoi(3, 31)), seed: 0, sampler: 1}
+	var sh C.h3_shape
+	if C.h3_shape_for(&p, &sh) != 0 { fmt.Fprintln(os.Stderr, "invalid parameters"); os.Exit(64) }
 
 	// a session
 	cs := func(s string) *C.char { return C.CString(s) }
 	loom := "loom-compile"
 	if v := os.Getenv("LOOM_COMPILE"); v != "" { loom = v }
 	models := os.Getenv("H3_MODELS"); if models == "" { models = home + "/comfy-models" }
-	cfg := C.h3pipe_config{dit_file: cs(models + "/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"), te_file: cs(models + "/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
+	cfg := C.h3_config{dit_file: cs(models + "/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"), te_file: cs(models + "/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
 		video_vae_file: cs(models + "/vae/minimax_h3_video_vae_fp16.safetensors"), audio_vae_file: cs(models + "/vae/minimax_h3_audio_vae_fp32.safetensors"),
 		kernel_sources: cs(root + "/kernels"), cache_dir: cs(root + "/build/kernel_cache"), loom_compile: cs(loom), attn_qk_bits: 8}
-	var s *C.h3pipe_session
-	if C.h3pipe_create(&cfg, &s, &err[0], C.size_t(len(err))) != 0 { fail("create", err) }
+	var s *C.h3_session
+	if C.h3_create(&cfg, &s) != 0 { fail("create") }
 
 	video := make([]C.float, 24*int(sh.latent_t)*int(sh.lat_h)*int(sh.lat_w))
 	audio := make([]C.float, 64*int(sh.audio_t))
 	fmt.Fprintf(os.Stderr, "%d frames, %dx%dx%d latents, %d audio latents, %d prompt tokens\n", int(sh.frames), int(sh.latent_t), int(sh.lat_h), int(sh.lat_w), int(sh.audio_t), n)
-	if C.h3pipe_denoise(s, &ids[0], C.int(n), &p, nil, nil, &video[0], C.size_t(len(video)), &audio[0], C.size_t(len(audio)), C.h3pipe_progress(C.goProgress), nil, &err[0], C.size_t(len(err))) != 0 { fail("denoise", err) }
+	// no keyframes and no references: the plain text-to-video case
+	if C.h3_denoise(s, &ids[0], C.int(n), &p, nil, 0, nil, 0, nil, nil, &video[0], C.size_t(len(video)), &audio[0], C.size_t(len(audio)), C.h3_progress(C.goProgress), nil) != 0 { fail("denoise") }
 
 	frames := make([]byte, int(sh.frames)*int(p.height)*int(p.width)*3)
 	samples := make([]C.float, 1600*int(sh.audio_t))
-	if C.h3pipe_decode_video(s, &p, &video[0], C.size_t(len(video)), (*C.uint8_t)(unsafe.Pointer(&frames[0])), C.size_t(len(frames)), &err[0], C.size_t(len(err))) != 0 { fail("decode video", err) }
-	if C.h3pipe_decode_audio(s, &audio[0], C.size_t(len(audio)), sh.audio_t, &samples[0], C.size_t(len(samples)), &err[0], C.size_t(len(err))) != 0 { fail("decode audio", err) }
-	C.h3pipe_destroy(s)
+	if C.h3_decode_video(s, &p, &video[0], C.size_t(len(video)), (*C.uint8_t)(unsafe.Pointer(&frames[0])), C.size_t(len(frames))) != 0 { fail("decode video") }
+	if C.h3_decode_audio(s, &audio[0], C.size_t(len(audio)), sh.audio_t, &samples[0], C.size_t(len(samples))) != 0 { fail("decode audio") }
+	C.h3_destroy(s)
 
 	if e := os.WriteFile(out+".rgb", frames, 0o644); e != nil { panic(e) }
 	f, e := os.Create(out + ".wav"); if e != nil { panic(e) }

@@ -5,7 +5,7 @@
 //!   rope_dump vision <out> <gh> <gw>
 //!   rope_dump vae    <out> <ft> <h> <w>
 //!
-//! The companion harness builds the same tables from lines sliced out of `host/h3pipe.cpp`, and the
+//! The companion harness builds the same tables from lines sliced out of the C implementation (deleted; see git history), and the
 //! two dumps are compared bitwise. The DiT's table is the one that matters most here: its angle is a
 //! `float`, so a port that reached for `f64` would differ in the last bits everywhere.
 use h3::model::*;

@@ -4,7 +4,7 @@
 //!
 //! The measurement file is `nsteps ngroups` followed by each step's partial sums, the pairs the
 //! device's reduction hands back. The companion harness runs the same replay with the decision
-//! arithmetic sliced out of `host/h3pipe.cpp`; the two outputs are diffed line for line.
+//! arithmetic sliced out of the C implementation (deleted; see git history); the two outputs are diffed line for line.
 use h3::cache::StepCache;
 use h3::compile::num;
 

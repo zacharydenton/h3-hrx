@@ -1,35 +1,42 @@
-# The C ABI: `libh3pipe.so`
+# The C ABI: `libh3.so`
 
-[`host/h3pipe.h`](../host/h3pipe.h) and [`host/h3tok.h`](../host/h3tok.h) declare the pipeline and tokenizer.
-Every language with a C foreign-function interface can drive it; `examples/` has working
-programs in C, Rust (no bindgen) and Go (cgo), and `h3pipe_loom.py` is the ctypes binding the
-Python tools use. `cli/` is the complete client: references, keyframes, decoding and
-muxing.
+[`include/h3.h`](../include/h3.h) declares the whole surface. It is generated from
+[`h3/src/capi.rs`](../h3/src/capi.rs) by cbindgen and checked in; `scripts/test.sh` fails if the
+committed copy no longer matches the code that implements it.
+
+Every language with a C foreign-function interface can drive it; `examples/c` and `examples/go` are
+working clients, and `h3_loom.py` is the ctypes binding the Python tools use. A **Rust** caller does
+not need the C ABI at all: the `h3` crate's `Session` is the same API with slices, borrows and
+`Result`, which is what `cli/` and `examples/rust` use.
 
 ```
-h3pipe_abi_version                                   -> 7
-h3tok_create / h3tok_encode / h3tok_vocab_size / h3tok_destroy      text -> token ids
-h3pipe_create / h3pipe_destroy                       a session: weights resident, kernels cached
-h3pipe_shape_for                                     parameters -> latent and frame counts (no session needed)
-h3pipe_denoise / h3pipe_denoise_refs                 ids (+ keyframes, references) -> model-space latents
-h3pipe_decode_video / h3pipe_decode_audio            latents -> RGB8 frames / 32 kHz stereo samples
-h3pipe_encode_video / h3pipe_encode_audio / h3pipe_vision_embed     references in
-h3pipe_text_in                                       the refined text rows (inspection)
+h3_abi_version                                            -> 8
+h3_last_error                                             the last failure on this thread
+h3_tokenizer_create / _encode / _vocab_size / _destroy    text -> token ids
+h3_create / h3_destroy                                    a session: weights resident, kernels cached
+h3_shape_for                                              parameters -> latent and frame counts (no session)
+h3_denoise                                                ids (+ keyframes, references) -> model-space latents
+h3_decode_video / h3_decode_audio                         latents -> RGB8 frames / 32 kHz stereo samples
+h3_encode_video / h3_encode_audio / h3_vision_embed       references in
+h3_text_in                                                the refined text rows (inspection)
 ```
+
+**Errors.** A call returns `H3_OK` or a status; `h3_last_error()` gives the reason for the last
+failure on the calling thread, valid until the next one. Signatures carry no error buffer.
 
 ## Contract
 
-**Versioning.** `h3pipe_abi_version()` returns `H3PIPE_ABI_VERSION` (7). Check it before using
+**Versioning.** `h3_abi_version()` returns `H3_ABI_VERSION` (8). Check it before using
 the structs; the structs' layouts are frozen per version and every field is a fixed-width C
 type or a pointer, so no language needs a bindings generator.
 
-**Return codes.** Every call returns `H3PIPE_OK` (0) on success, `H3PIPE_INVALID_ARGUMENT` (64)
-for a bad parameter or a buffer that is too small, `H3PIPE_CANCELLED` (2) when the progress
-callback cancelled, `H3PIPE_ERROR` (1) otherwise. On failure the `error` buffer holds a NUL-terminated
+**Return codes.** Every call returns `H3_OK` (0) on success, `H3_INVALID_ARGUMENT` (64)
+for a bad parameter or a buffer that is too small, `H3_CANCELLED` (2) when the progress
+callback cancelled, `H3_ERROR` (1) otherwise. On failure the `error` buffer holds a NUL-terminated
 message (pass its capacity; 4096 bytes is plenty). `h3tok_encode` returns the id count or -1: the count is
 what the text needs even when it exceeds the buffer's capacity, and only the first `capacity` ids are
 written, so check the count against the capacity (or call with capacity 0 to size the buffer).
-`h3pipe_shape_for` returns `H3PIPE_INVALID_ARGUMENT` for a canvas that is not multiples of 32 in 32..8192
+`h3_shape_for` returns `H3_INVALID_ARGUMENT` for a canvas that is not multiples of 32 in 32..8192
 or a frame count outside 1..1048576; check it before allocating from the shape.
 
 **Ownership.** The caller allocates every buffer and keeps it alive for the duration of the call;
@@ -40,7 +47,7 @@ and exactly the required count is read or written; the rest is untouched.
 
 **Threading.** A session serialises its calls with an internal mutex: concurrent calls from several
 threads are safe and run one at a time. The progress callback runs on the calling thread between
-denoising steps; returning nonzero from it cancels the run, which returns `H3PIPE_CANCELLED` with
+denoising steps; returning nonzero from it cancels the run, which returns `H3_CANCELLED` with
 the output buffers unspecified. Reuse a session across requests to retain loaded weights and compiled kernels.
 
 **Kernels.** The first call at a new shape spawns `loom-compile` (path in the config) for the kernels
@@ -53,10 +60,10 @@ resident.
 
 ## Sizes and layouts
 
-Fill an `h3pipe_params` (height and width multiples of 32; frames snaps up to `17n + 5`; steps is
+Fill an `h3_params` (height and width multiples of 32; frames snaps up to `17n + 5`; steps is
 the number of sigma grid points, evaluations + 1; `seed`; `sampler` 1 for ComfyUI's
 `res_multistep`, 0 for Euler; shifts and `cache_threshold` 0 for the defaults) and call
-`h3pipe_shape_for` to get the counts:
+`h3_shape_for` to get the counts:
 
 | buffer | element type | layout | element count |
 | --- | --- | --- | --- |
@@ -76,23 +83,23 @@ presentation in this order, then the prompt: keyframes first, then reference ima
 `"<Picture i>: "` tokenised, id 151652 (`<|vision_start|>`), `(height/32) * (width/32)` placeholder
 ids of value -1, id 151653 (`<|vision_end|>`); then `"<Audio j>: "` per reference audio. The host
 replaces the placeholder rows with the vision tower's embeds of the pixels you pass in the
-`h3pipe_ref` / `h3pipe_keyframe` structs.
+`h3_ref` / `h3_keyframe` structs.
 
-- **Reference image** (`h3pipe_ref.kind` 0): resize so its pixel count is at most the canvas' and
-  both sides are multiples of 32; `h3pipe_encode_video` on the one frame gives `video_latent`
+- **Reference image** (`h3_ref.kind` 0): resize so its pixel count is at most the canvas' and
+  both sides are multiples of 32; `h3_encode_video` on the one frame gives `video_latent`
   (`[24][1][h/16][w/16]`, `latent_t` 1); pass the same pixels (f32 `[h][w][3]` in [0, 1]) as
   `pixels`. The reference-conditioned checkpoint (`..._ref2va_...safetensors`) is the one to load.
-- **Reference audio** (kind 1): `h3pipe_encode_audio` on planar stereo f32 samples at 32 kHz gives
+- **Reference audio** (kind 1): `h3_encode_audio` on planar stereo f32 samples at 32 kHz gives
   `audio_latent` and `audio_t`.
-- **Keyframe** (`h3pipe_keyframe`, first-frame generation): the frame resized to the canvas,
+- **Keyframe** (`h3_keyframe`, first-frame generation): the frame resized to the canvas,
   encoded the same way, `frame_index` 0.
 
-`h3pipe_denoise_refs` takes the keyframe and reference arrays; `h3pipe_denoise` is the plain
+`h3_denoise` takes the keyframe and reference arrays, which may be NULL with a count of zero for the plain
 text-to-video call.
 
 ## Configuration files
 
-`h3pipe_config` names ComfyUI's four checkpoints, listed in the [setup guide](setup.md#checkpoints):
+`h3_config` names ComfyUI's four checkpoints, listed in the [setup guide](setup.md#checkpoints):
 `dit_file` (`minimax_h3_fl2va_pruned_int8_convrot.safetensors`, or the `ref2va` one for
 reference-conditioned clips), `te_file`, `video_vae_file` and `audio_vae_file`. There is no export
 step: the DiT blocks' and text encoder's int8 ConvRot rows run on the
@@ -103,16 +110,17 @@ first use. `kernel_sources` is the repository's `kernels/`, `cache_dir` any writ
 `loom_compile` the compiler binary. `attn_qk_bits` chooses the DiT attention's QK^T operands: 8
 (the default and the parity path), 16 for f16, or 4 for int4.
 
-`h3tok_create(NULL, ...)` uses the tokenizer compiled into the library (`H3_TOKENIZER=<file>`
+`h3_tokenizer_create(NULL)` uses the vocabulary compiled into the library (`H3_TOKENIZER=<file>`
 overrides it); passing a path reads that file instead.
 
 ## Clients
 
 [Complete examples](../examples/README.md) cover C, Rust, Go, and Python,
-including error handling and output. The C++ CLI in
-[`cli/src/main.rs`](../cli/src/main.rs) also demonstrates reference preparation
-and muxing. Use [structured prompts](prompting.md) for generation.
+including error handling and output. The `h3` command in
+[`cli/src/main.rs`](../cli/src/main.rs) is the fullest client: reference
+preparation, keyframes, decoding and muxing. Use [structured
+prompts](prompting.md) for generation.
 
-Link with `-L build -lh3pipe` and put the library directory on the runtime
+Link with `-L build -lh3` and put the library directory on the runtime
 search path (`-Wl,-rpath` or `LD_LIBRARY_PATH`). See [setup](setup.md) for the
-ROCm and Loom toolchain configuration.
+Loom toolchain configuration.

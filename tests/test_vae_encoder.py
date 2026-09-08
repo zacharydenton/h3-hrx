@@ -4,10 +4,10 @@ import sys, time
 from pathlib import Path
 import numpy as np
 ROOT = Path(__file__).resolve().parent.parent; sys.path.insert(0, str(ROOT))
-from h3pipe_loom import H3Pipe
+from h3_loom import H3
 from PIL import Image
 T = ROOT / "build/ref_truth"; L = lambda n: np.load(T / f"{n}.npy")
-pipe = H3Pipe()
+pipe = H3()
 def cmp(name, a, b):
     a, b = a.astype(np.float64).ravel(), b.astype(np.float64).ravel(); cos = float(a @ b / np.sqrt((a @ a) * (b @ b))); rel = float(np.linalg.norm(a - b) / np.linalg.norm(b))
     print(f"  {name}: cosine {cos:.6f}  rel rms {rel:.4f}"); return cos

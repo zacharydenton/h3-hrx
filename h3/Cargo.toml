@@ -6,6 +6,8 @@ description = "MiniMax H3 inference: ComfyUI checkpoints in, video and audio out
 
 [lib]
 path = "src/lib.rs"
+# rlib for cli/ and the examples, cdylib for everyone reaching the C ABI
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 hrx = { path = "../hrx" }

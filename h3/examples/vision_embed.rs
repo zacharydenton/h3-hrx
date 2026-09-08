@@ -3,7 +3,7 @@
 //!   vision_embed <text_encoder.safetensors> <pixels.f32> <merged.f32> <deepstack.f32> <h> <w>
 //!
 //! Pixels are `[h][w][3]` f32 in `[0, 1]`; the outputs are `[n/4][5120]` and `[3][n/4][5120]` f32, the
-//! same arrays `h3pipe_vision_embed` writes. The tower's weights live in the text encoder's
+//! same arrays `h3_vision_embed` writes. The tower's weights live in the text encoder's
 //! checkpoint, which is where Qwen3-VL keeps them.
 use h3::compile::Compiler;
 use h3::dispatch::Profile;

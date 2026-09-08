@@ -4,7 +4,7 @@ import sys, time
 from pathlib import Path
 import numpy as np
 ROOT = Path(__file__).resolve().parent.parent; sys.path.insert(0, str(ROOT))
-from h3pipe_loom import H3Pipe
+from h3_loom import H3
 T = ROOT / "build/ref_truth"; L = lambda n: np.load(T / f"{n}.npy")
 img = L("image_resized").astype(np.float32)                      # [H][W][3] in [0,1]
 H, W = img.shape[:2]; gh, gw = H // 16, W // 16
@@ -13,7 +13,7 @@ mean = np.array([0.48145466, 0.4578275, 0.40821073], np.float32); std = np.array
 x = ((img - mean) / std).transpose(2, 0, 1)[None].repeat(2, 0)    # [2][3][H][W], CLIP normalisation (process_qwen2vl_images)
 p = x.reshape(2, 3, gh // 2, 2, 16, gw // 2, 2, 16).transpose(2, 5, 3, 6, 1, 0, 4, 7).reshape(gh * gw, 1536)
 pref = L("vision_patches"); print("patches vs comfy: max|diff|", float(np.abs(p - pref).max()))
-pipe = H3Pipe()
+pipe = H3()
 t0 = time.time(); merged, ds = pipe.vision_embed(img); dt = time.time() - t0
 mref, dref = L("vision_merged"), L("vision_deepstack")
 def cmp(name, a, b):

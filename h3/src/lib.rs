@@ -1,6 +1,7 @@
 //! MiniMax H3 inference against ComfyUI's checkpoints, with every GPU kernel in Loom.
 pub mod avae;
 pub mod cache;
+pub mod capi;
 pub mod checkpoint;
 pub mod compile;
 pub mod conditioning;
@@ -15,6 +16,7 @@ pub mod pixels;
 pub mod plan;
 pub mod rope;
 pub mod sampler;
+pub mod session;
 pub mod stack;
 pub mod te;
 pub mod tiles;

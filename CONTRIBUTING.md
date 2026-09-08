@@ -10,11 +10,14 @@ timing boundary, and numerical comparison alongside the result.
 
 | Directory | Purpose |
 | --- | --- |
-| `host/` | C++ pipeline, checkpoint loader, tokenizer, HIP/HRX runtime bindings |
-| `cli/` | the `h3` command in Rust, and the worked example of the C API |
+| `h3/` | the library: pipeline, checkpoint loader, tokenizer, and the C ABI in `src/capi.rs` |
+| `hrx/` | the safe wrapper over libhrx: devices, buffers, kernels, dispatch |
+| `cli/` | the `h3` command, a client of the `h3` crate's own API |
+| `loomrun/` | the kernel-test launcher the Python harness dispatches through |
+| `include/` | `h3.h`, generated from `h3/src/capi.rs` by cbindgen and checked in |
 | `kernels/` | Runtime Loom sources, mostly emitted by `tools/gen_*.py` |
 | `tools/` | Generators, Python client, benchmarks, and ComfyUI comparison tools |
-| `tests/` | CPU host regressions, kernel numerical checks, and pipeline comparisons |
+| `tests/` | kernel numerical checks and pipeline comparisons; the host's own tests are `cargo test` |
 | `reference/` | PyTorch/diffusers numerical oracles; unused during normal inference |
 | `experiments/` | Kernel alternatives, including templates and GPU regression inputs |
 | `examples/` | C, Rust, Go, and Python clients |

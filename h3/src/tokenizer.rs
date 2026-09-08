@@ -51,6 +51,16 @@ impl Tokenizer {
         Ok(encoding.get_ids().iter().map(|id| *id as i32).collect())
     }
 
+    /// Appends the text's ids to `ids`.
+    ///
+    /// A prompt presentation is built in pieces — "<Picture 1>: ", a vision span, the prompt — so
+    /// appending is what the caller actually wants, and it keeps one buffer rather than a Vec per
+    /// fragment.
+    pub fn encode_into(&self, text: &str, ids: &mut Vec<i32>) -> Result<()> {
+        ids.extend(self.encode(text)?);
+        Ok(())
+    }
+
     pub fn vocab_size(&self) -> usize {
         self.0.get_vocab_size(true)
     }

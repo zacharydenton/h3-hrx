@@ -6,7 +6,7 @@
 //!   tiles_dump xfade  <in> <out> <plane> <nf> <overlap_frames> <ov>
 //!
 //! The companion harness runs the same four with `split_tiles` and all three blend lambdas sliced out
-//! of `host/h3pipe.cpp`. They are separate functions there too, and this is what proves they stay
+//! of the C implementation (deleted; see git history). They are separate functions there too, and this is what proves they stay
 //! separate: a port that unified them would pass one case and fail the others.
 use h3::model::LATENT_CH;
 use h3::tiles;

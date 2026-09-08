@@ -4,12 +4,12 @@ import sys, time
 from pathlib import Path
 import numpy as np
 ROOT = Path(__file__).resolve().parent.parent; sys.path.insert(0, str(ROOT))
-from h3pipe_loom import H3Pipe
+from h3_loom import H3
 truth = ROOT / "build/ref_truth"
 wav = np.load(truth / "audio_wav.npy").astype(np.float32)          # [2][L]
 z_ref = np.load(truth / "audio_z.npy").astype(np.float32)          # [32][2][T] -> [2][32][T]
 z_ref = np.transpose(z_ref, (1, 0, 2))
-pipe = H3Pipe()
+pipe = H3()
 t0 = time.time(); z = pipe.encode_audio(wav); dt = time.time() - t0
 print(f"encoded {wav.shape[1]} samples -> {z.shape} in {dt:.2f} s (first call compiles)")
 t0 = time.time(); z = pipe.encode_audio(wav); print(f"second call {time.time() - t0:.3f} s")

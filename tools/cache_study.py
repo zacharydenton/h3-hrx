@@ -1,4 +1,4 @@
-"""The first-block step cache's trade: for each threshold, denoise the same prompt/seed through libh3pipe,
+"""The first-block step cache's trade: for each threshold, denoise the same prompt/seed through libh3.so,
 report the evaluations skipped, the time, and the latent agreement with the uncached run (plus frame PSNR
 after the Loom decode). Small clip by default so a run is a minute.
     python3 tools/cache_study.py [--thresholds 0,0.05,0.1,0.15,0.2] [--frames 22] [--steps 30] [--height 480 --width 864]"""
@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "tools"))
-from h3pipe_loom import H3Pipe
+from h3_loom import H3
 from encode_prompt import TOK
 PROMPT = "A red fox trotting through a snowy forest at dawn, cinematic"
 
@@ -19,9 +19,9 @@ def main():
     from transformers import AutoTokenizer
     ids = AutoTokenizer.from_pretrained(str(TOK))(a.prompt, add_special_tokens=False)["input_ids"]
     os.environ["H3_CACHE_TRACE"] = "1"
-    pipe = H3Pipe(); base = None
+    pipe = H3(); base = None
     for th in [float(v) for v in a.thresholds.split(",")]:
-        p = H3Pipe.params(height=a.height, width=a.width, frames=a.frames, steps=a.steps, seed=0, cache_threshold=th); sh = pipe.shape(p)
+        p = H3.params(height=a.height, width=a.width, frames=a.frames, steps=a.steps, seed=0, cache_threshold=th); sh = pipe.shape(p)
         t0 = time.time(); video, audio = pipe.denoise(ids, p); dt = time.time() - t0
         if base is None:
             base = (video.copy(), audio.copy()); frames0 = pipe.decode_video(p, video) if a.decode else None

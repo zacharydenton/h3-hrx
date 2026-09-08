@@ -18,15 +18,15 @@ ap.add_argument("--dump", default=None, help="directory for the per-step / per-b
 ap.add_argument("--block-ids", default="0,1,2,5,10,20,30,40,49")
 a = ap.parse_args()
 from PIL import Image
-from h3pipe_loom import H3Pipe
+from h3_loom import H3
 from h3tok_ids import encode_presentation
-from h3pipe_loom import DIT
+from h3_loom import DIT
 D = Path(a.truth); dit = a.dit or str(DIT)
 dump = Path(a.dump or D / f"mine_{Path(dit).stem}_{a.attn}"); dump.mkdir(parents=True, exist_ok=True)
 os.environ["H3_DUMP_DIR"] = str(dump)
 if a.mode == "blocks": os.environ["H3_DUMP_BLOCKS"] = str(dump)
-pipe = H3Pipe(dit=dit, attn=a.attn)
-p = H3Pipe.params(height=a.height, width=a.width, frames=a.frames, steps=2 if a.mode == "blocks" else 21, seed=a.seed, sampler="res_multistep"); sh = pipe.shape(p)
+pipe = H3(dit=dit, attn=a.attn)
+p = H3.params(height=a.height, width=a.width, frames=a.frames, steps=2 if a.mode == "blocks" else 21, seed=a.seed, sampler="res_multistep"); sh = pipe.shape(p)
 nv = np.load(D / "noise_video.npy").astype(np.float32); na = np.load(D / "noise_audio.npy").astype(np.float32)   # ComfyUI's pack: video [24,T,H,W], audio [32, 2, A]
 kfs, toks = [], []
 if a.case == "fl2va":
