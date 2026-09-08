@@ -1,0 +1,1006 @@
+//! The audio VAE: a DAC-style convolutional encoder with a small attention head, and BigVGAN as the
+//! decoder. Every kernel here is plain f32 SIMT — no WMMA, no quantisation.
+//!
+//! The two directions are not mirror images. The encoder ends in an AttnProjection whose attention is
+//! pooled down to 32 channels; the decoder is seven transposed-convolution upsamples, each followed by
+//! three anti-aliased residual blocks whose outputs are *averaged*, not summed. Both run one channel of
+//! stereo at a time, since the model is mono and the two channels are independent.
+use crate::compile::{Cfg, Compiler};
+use crate::dispatch::{axpy, launch, MatmulF32, Profile};
+use crate::error::{other, Result};
+use crate::model::THREADS;
+use crate::weights::Weights;
+use hrx::sys::BufferRef;
+
+/// Samples per latent frame, at 32 kHz.
+pub const HOP: usize = 800;
+pub const AUDIO_CH: usize = 32;
+
+/// The encoder's downsampling rates, and the decoder's upsampling ones with their kernel sizes.
+const ENC_RATES: [usize; 5] = [2, 4, 4, 5, 5];
+const DEC_RATES: [usize; 7] = [5, 5, 2, 2, 2, 2, 2];
+const DEC_UPK: [usize; 7] = [9, 9, 4, 4, 4, 4, 4];
+/// The three residual kernel sizes and their dilations, the AMP block's fixed shape.
+const RES_K: [usize; 3] = [3, 7, 11];
+const RES_DIL: [usize; 3] = [1, 3, 5];
+
+/// The encoder's length bounds are powers of two; the decoder's are multiples of 256. Both are
+/// compiled into their kernels, so the two conventions are kept apart.
+fn pow2_bound(n: usize) -> usize {
+    let mut b = 256;
+    while b < n {
+        b *= 2;
+    }
+    b
+}
+
+fn round256(n: usize) -> usize {
+    n.div_ceil(256) * 256
+}
+
+/// A strided, dilated 1-D convolution over `[cin][in_len]` f32.
+#[allow(clippy::too_many_arguments)]
+fn conv_s(
+    c: &Compiler,
+    gpu: &hrx::Gpu,
+    prof: &mut Profile,
+    stage: &str,
+    (cin, cout, ksize, dil, pad, stride): (usize, usize, usize, usize, usize, usize),
+    in_len: usize,
+    out_len: usize,
+    x: BufferRef,
+    w: BufferRef,
+    b: BufferRef,
+    out: BufferRef,
+) -> Result<()> {
+    let ns = "h3.conv1d_s_f32.";
+    let cfg: Cfg = vec![
+        (format!("{ns}cin"), cin.to_string()),
+        (format!("{ns}cout"), cout.to_string()),
+        (format!("{ns}ksize"), ksize.to_string()),
+        (format!("{ns}dilation"), dil.to_string()),
+        (format!("{ns}pad"), pad.to_string()),
+        (format!("{ns}stride"), stride.to_string()),
+        (format!("{ns}in_bound"), pow2_bound(in_len).to_string()),
+        (format!("{ns}out_bound"), pow2_bound(out_len).to_string()),
+    ];
+    let k = c.get(gpu, "conv1d_s_f32", "h3_conv1d_s_f32", &cfg)?;
+    launch(
+        gpu,
+        &k,
+        Some(prof),
+        stage,
+        [out_len.div_ceil(256) as u32, cout as u32, 1],
+        [THREADS, 1, 1],
+        &[out_len as u32, in_len as u32],
+        &[x, w, b, out],
+    )?;
+    Ok(())
+}
+
+/// The plain Snake activation, `x + sin^2(alpha x) / alpha`.
+#[allow(clippy::too_many_arguments)]
+fn snake_plain(
+    c: &Compiler,
+    gpu: &hrx::Gpu,
+    prof: &mut Profile,
+    channels: usize,
+    len: usize,
+    x: BufferRef,
+    alpha: BufferRef,
+    out: BufferRef,
+) -> Result<()> {
+    let ns = "h3.snake_f32.";
+    let cfg: Cfg = vec![
+        (format!("{ns}channels"), channels.to_string()),
+        (format!("{ns}len_bound"), pow2_bound(len).to_string()),
+    ];
+    let k = c.get(gpu, "snake_f32", "h3_snake_f32", &cfg)?;
+    launch(
+        gpu,
+        &k,
+        Some(prof),
+        "aenc snake",
+        [len.div_ceil(256) as u32, channels as u32, 1],
+        [THREADS, 1, 1],
+        &[len as u32],
+        &[x, alpha, out],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn layernorm(
+    c: &Compiler,
+    gpu: &hrx::Gpu,
+    prof: &mut Profile,
+    rows: usize,
+    width: usize,
+    x: BufferRef,
+    w: BufferRef,
+    b: BufferRef,
+    out: BufferRef,
+) -> Result<()> {
+    let ns = "h3.layernorm_f32.";
+    let cfg: Cfg = vec![
+        (format!("{ns}width"), width.to_string()),
+        (format!("{ns}eps"), crate::compile::num(1e-5)),
+    ];
+    let k = c.get(gpu, "layernorm_f32", "h3_layernorm_f32", &cfg)?;
+    launch(
+        gpu,
+        &k,
+        Some(prof),
+        "aenc layernorm",
+        [rows as u32, 1, 1],
+        [32, 1, 1],
+        &[rows as u32],
+        &[x, w, b, out],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transpose(
+    c: &Compiler,
+    gpu: &hrx::Gpu,
+    prof: &mut Profile,
+    rows: usize,
+    cols: usize,
+    x: BufferRef,
+    out: BufferRef,
+) -> Result<()> {
+    let ns = "h3.transpose_f32.";
+    let cfg: Cfg = vec![(format!("{ns}cols"), cols.to_string())];
+    let k = c.get(gpu, "transpose_f32", "h3_transpose_f32", &cfg)?;
+    launch(
+        gpu,
+        &k,
+        Some(prof),
+        "aenc transpose",
+        [(rows * cols).div_ceil(256) as u32, 1, 1],
+        [THREADS, 1, 1],
+        &[rows as u32],
+        &[x, out],
+    )?;
+    Ok(())
+}
+
+/// A non-strided, dilated 1-D convolution, four samples per lane. The `accumulate` form adds into its
+/// output instead of overwriting, which is how a residual block's second convolution closes the skip.
+#[allow(clippy::too_many_arguments)]
+fn conv4(
+    c: &Compiler,
+    gpu: &hrx::Gpu,
+    prof: &mut Profile,
+    stage: &str,
+    (cin, cout, ksize, dil, pad): (usize, usize, usize, usize, usize),
+    accumulate: bool,
+    len: usize,
+    x: BufferRef,
+    w: BufferRef,
+    b: BufferRef,
+    out: BufferRef,
+) -> Result<()> {
+    let ns = "h3.conv1d4_f32.";
+    let cfg: Cfg = vec![
+        (format!("{ns}cin"), cin.to_string()),
+        (format!("{ns}cout"), cout.to_string()),
+        (format!("{ns}ksize"), ksize.to_string()),
+        (format!("{ns}dilation"), dil.to_string()),
+        (format!("{ns}pad"), pad.to_string()),
+        (
+            format!("{ns}accumulate"),
+            if accumulate { "1" } else { "0" }.to_string(),
+        ),
+        (format!("{ns}len_bound"), round256(len).to_string()),
+    ];
+    let k = c.get(gpu, "conv1d4_f32", "h3_conv1d4_f32", &cfg)?;
+    // Four independent samples per lane retain the original 256-sample workgroup span.
+    launch(
+        gpu,
+        &k,
+        Some(prof),
+        stage,
+        [len.div_ceil(256) as u32, cout as u32, 1],
+        [64, 1, 1],
+        &[len as u32],
+        &[x, w, b, out],
+    )?;
+    Ok(())
+}
+
+pub struct AudioVae {
+    weights: Weights,
+    /// the decoder's conv_post has no bias in the checkpoint, so it is handed zeros
+    zeros: hrx::Buffer,
+    dec: Option<DecBuffers>,
+    dec_mean: Vec<f32>,
+    dec_std: Vec<f32>,
+    enc_mean: Vec<f32>,
+    enc_std: Vec<f32>,
+}
+
+/// The decoder's scratch, sized for the widest `[C][len]` plane the stack reaches.
+struct DecBuffers {
+    cap: usize,
+    h: hrx::Buffer,
+    acc: hrx::Buffer,
+    hj: hrx::Buffer,
+    r: hrx::Buffer,
+    r2: hrx::Buffer,
+    /// the 2x buffer the anti-aliased activation passes through, hence twice the width
+    tmp2: hrx::Buffer,
+    input: hrx::Buffer,
+}
+
+impl AudioVae {
+    pub fn open(gpu: &hrx::Gpu, path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let weights = Weights::open(path, crate::plan::avae::plan)?;
+        let zeros = gpu.alloc(2048 * 4)?;
+        gpu.memset(&zeros, 0, 2048 * 4)?;
+        Ok(Self {
+            dec_mean: weights.host_f32("audio.latents_mean", AUDIO_CH)?,
+            dec_std: weights.host_f32("audio.latents_std", AUDIO_CH)?,
+            enc_mean: weights.host_f32("aenc.latents_mean", AUDIO_CH)?,
+            enc_std: weights.host_f32("aenc.latents_std", AUDIO_CH)?,
+            weights,
+            zeros,
+            dec: None,
+        })
+    }
+
+    pub fn weights(&self) -> &Weights {
+        &self.weights
+    }
+
+    /// The anti-aliased SnakeBeta: up two, activate, down two, through a FIR the checkpoint carries.
+    #[allow(clippy::too_many_arguments)]
+    fn snake_beta(
+        &self,
+        c: &Compiler,
+        gpu: &hrx::Gpu,
+        prof: &mut Profile,
+        channels: usize,
+        len: usize,
+        x: BufferRef,
+        alpha: BufferRef,
+        beta: BufferRef,
+        tmp2: BufferRef,
+        out: BufferRef,
+    ) -> Result<()> {
+        let (nu, nd) = ("h3.up2_snake_f32.", "h3.down2_f32.");
+        let up_cfg: Cfg = vec![
+            (format!("{nu}channels"), channels.to_string()),
+            (format!("{nu}len_bound"), round256(len).to_string()),
+        ];
+        let down_cfg: Cfg = vec![
+            (format!("{nd}channels"), channels.to_string()),
+            (format!("{nd}len_bound"), round256(2 * len).to_string()),
+        ];
+        let up = c.get(gpu, "up2_snake_f32", "h3_up2_snake_f32", &up_cfg)?;
+        let down = c.get(gpu, "down2_f32", "h3_down2_f32", &down_cfg)?;
+        let fir = self.weights.at(gpu, "audio.fir", 12 * 4)?;
+        launch(
+            gpu,
+            &up,
+            Some(prof),
+            "audio snake up",
+            [(2 * len).div_ceil(256) as u32, channels as u32, 1],
+            [THREADS, 1, 1],
+            &[len as u32],
+            &[x, fir.binding(), alpha, beta, tmp2],
+        )?;
+        launch(
+            gpu,
+            &down,
+            Some(prof),
+            "audio snake down",
+            [len.div_ceil(256) as u32, channels as u32, 1],
+            [THREADS, 1, 1],
+            &[(2 * len) as u32],
+            &[tmp2, fir.binding(), out],
+        )?;
+        Ok(())
+    }
+
+    fn ensure_dec(&mut self, gpu: &hrx::Gpu, t: usize) -> Result<()> {
+        let l_out = t * HOP;
+        let cap = (2048 * t).max(8 * l_out) + 4096;
+        if self.dec.as_ref().is_some_and(|d| d.cap >= cap) {
+            return Ok(());
+        }
+        self.dec = None;
+        self.dec = Some(DecBuffers {
+            cap,
+            h: gpu.alloc(cap * 4)?,
+            acc: gpu.alloc(cap * 4)?,
+            hj: gpu.alloc(cap * 4)?,
+            r: gpu.alloc(cap * 4)?,
+            r2: gpu.alloc(cap * 4)?,
+            tmp2: gpu.alloc(cap * 8)?,
+            input: gpu.alloc(AUDIO_CH * t * 4 + 4096)?,
+        });
+        Ok(())
+    }
+
+    /// Model-space latents `[2][32][audio_t]` to stereo samples `[2][audio_t * 800]` at 32 kHz.
+    pub fn decode(
+        &mut self,
+        gpu: &hrx::Gpu,
+        c: &Compiler,
+        prof: &mut Profile,
+        latents: &[f32],
+        audio_t: usize,
+        samples: &mut [f32],
+    ) -> Result<()> {
+        let t = audio_t;
+        let l_out = t * HOP;
+        self.ensure_dec(gpu, t)?;
+
+        for ch in 0..2 {
+            // undo the latent normalisation into the [32][T] the first projection reads
+            let mut input = vec![0.0f32; AUDIO_CH * t];
+            for k in 0..AUDIO_CH {
+                for i in 0..t {
+                    input[k * t + i] =
+                        latents[(ch * AUDIO_CH + k) * t + i] * self.dec_std[k] + self.dec_mean[k];
+                }
+            }
+            let d = self.dec.as_ref().expect("sized above");
+            gpu.h2d_at(&d.input, 0, crate::vvae::as_bytes(&input))?;
+
+            conv4(
+                c,
+                gpu,
+                prof,
+                "audio dec_in_proj",
+                (AUDIO_CH, 2048, 1, 1, 0),
+                false,
+                t,
+                d.input.binding(),
+                self.weights
+                    .at(gpu, "audio.dec_in_proj.w", 2048 * AUDIO_CH * 4)?
+                    .binding(),
+                self.weights
+                    .at(gpu, "audio.dec_in_proj.b", 2048 * 4)?
+                    .binding(),
+                d.r.binding(),
+            )?;
+            conv4(
+                c,
+                gpu,
+                prof,
+                "audio conv_pre",
+                (2048, 1024, 7, 1, 3),
+                false,
+                t,
+                d.r.binding(),
+                self.weights
+                    .at(gpu, "audio.conv_pre.w", 1024 * 2048 * 7 * 4)?
+                    .binding(),
+                self.weights
+                    .at(gpu, "audio.conv_pre.b", 1024 * 4)?
+                    .binding(),
+                d.h.binding(),
+            )?;
+
+            let (mut len, mut chan) = (t, 1024usize);
+            for i in 0..7 {
+                let (cout, k, rate) = (chan / 2, DEC_UPK[i], DEC_RATES[i]);
+                let pad = (k - rate) / 2;
+                let olen = (len - 1) * rate + k - 2 * pad;
+                {
+                    let ns = "h3.convt1d_f32.";
+                    let cfg: Cfg = vec![
+                        (format!("{ns}cin"), chan.to_string()),
+                        (format!("{ns}cout"), cout.to_string()),
+                        (format!("{ns}ksize"), k.to_string()),
+                        (format!("{ns}stride"), rate.to_string()),
+                        (format!("{ns}pad"), pad.to_string()),
+                        (format!("{ns}len_bound"), round256(olen).to_string()),
+                    ];
+                    let kt = c.get(gpu, "convt1d_f32", "h3_convt1d_f32", &cfg)?;
+                    let d = self.dec.as_ref().expect("sized above");
+                    launch(
+                        gpu,
+                        &kt,
+                        Some(prof),
+                        "audio upsample",
+                        [olen.div_ceil(256) as u32, cout as u32, 1],
+                        [THREADS, 1, 1],
+                        &[len as u32, olen as u32],
+                        &[
+                            d.h.binding(),
+                            self.weights
+                                .at(gpu, &format!("audio.ups.{i}.w"), chan * cout * k * 4)?
+                                .binding(),
+                            self.weights
+                                .at(gpu, &format!("audio.ups.{i}.b"), cout * 4)?
+                                .binding(),
+                            d.r.binding(),
+                        ],
+                    )?;
+                }
+                len = olen;
+                chan = cout;
+                let plane = chan * len;
+                let d = self.dec.as_ref().expect("sized above");
+                gpu.d2d(&d.h, &d.r, plane * 4)?;
+                gpu.memset(&d.acc, 0, plane * 4)?;
+
+                // three AMP blocks, averaged rather than summed
+                for (j, &kk) in RES_K.iter().enumerate() {
+                    let r = i * 3 + j;
+                    let d = self.dec.as_ref().expect("sized above");
+                    gpu.d2d(&d.hj, &d.h, plane * 4)?;
+                    for (dl, &dil) in RES_DIL.iter().enumerate() {
+                        let act1 = format!("audio.res.{r}.act.{}.", 2 * dl);
+                        let act2 = format!("audio.res.{r}.act.{}.", 2 * dl + 1);
+                        let d = self.dec.as_ref().expect("sized above");
+                        let (hj, rb, r2b, tmp2) = (
+                            d.hj.binding(),
+                            d.r.binding(),
+                            d.r2.binding(),
+                            d.tmp2.binding(),
+                        );
+                        let a1 = self
+                            .weights
+                            .at(gpu, &format!("{act1}alpha"), chan * 4)?
+                            .binding();
+                        let b1 = self
+                            .weights
+                            .at(gpu, &format!("{act1}beta"), chan * 4)?
+                            .binding();
+                        self.snake_beta(c, gpu, prof, chan, len, hj, a1, b1, tmp2, rb)?;
+                        conv4(
+                            c,
+                            gpu,
+                            prof,
+                            "audio res conv1",
+                            (chan, chan, kk, dil, (kk * dil - dil) / 2),
+                            false,
+                            len,
+                            rb,
+                            self.weights
+                                .at(
+                                    gpu,
+                                    &format!("audio.res.{r}.c1.{dl}.w"),
+                                    chan * chan * kk * 4,
+                                )?
+                                .binding(),
+                            self.weights
+                                .at(gpu, &format!("audio.res.{r}.c1.{dl}.b"), chan * 4)?
+                                .binding(),
+                            r2b,
+                        )?;
+                        let a2 = self
+                            .weights
+                            .at(gpu, &format!("{act2}alpha"), chan * 4)?
+                            .binding();
+                        let b2 = self
+                            .weights
+                            .at(gpu, &format!("{act2}beta"), chan * 4)?
+                            .binding();
+                        self.snake_beta(c, gpu, prof, chan, len, r2b, a2, b2, tmp2, rb)?;
+                        // the accumulating form closes the skip in place
+                        conv4(
+                            c,
+                            gpu,
+                            prof,
+                            "audio res conv2",
+                            (chan, chan, kk, 1, (kk - 1) / 2),
+                            true,
+                            len,
+                            rb,
+                            self.weights
+                                .at(
+                                    gpu,
+                                    &format!("audio.res.{r}.c2.{dl}.w"),
+                                    chan * chan * kk * 4,
+                                )?
+                                .binding(),
+                            self.weights
+                                .at(gpu, &format!("audio.res.{r}.c2.{dl}.b"), chan * 4)?
+                                .binding(),
+                            hj,
+                        )?;
+                    }
+                    let d = self.dec.as_ref().expect("sized above");
+                    axpy(
+                        c,
+                        gpu,
+                        Some(prof),
+                        "audio axpy",
+                        1.0,
+                        1.0,
+                        plane,
+                        d.hj.binding(),
+                        d.acc.binding(),
+                    )?;
+                }
+                let d = self.dec.as_ref().expect("sized above");
+                axpy(
+                    c,
+                    gpu,
+                    Some(prof),
+                    "audio axpy",
+                    1.0 / 3.0,
+                    0.0,
+                    plane,
+                    d.acc.binding(),
+                    d.h.binding(),
+                )?;
+            }
+
+            let d = self.dec.as_ref().expect("sized above");
+            let (hb, rb, r2b, tmp2) = (
+                d.h.binding(),
+                d.r.binding(),
+                d.r2.binding(),
+                d.tmp2.binding(),
+            );
+            let pa = self
+                .weights
+                .at(gpu, "audio.post.alpha", chan * 4)?
+                .binding();
+            let pb = self.weights.at(gpu, "audio.post.beta", chan * 4)?.binding();
+            self.snake_beta(c, gpu, prof, chan, len, hb, pa, pb, tmp2, rb)?;
+            conv4(
+                c,
+                gpu,
+                prof,
+                "audio conv_post",
+                (chan, 1, 7, 1, 3),
+                false,
+                len,
+                rb,
+                self.weights
+                    .at(gpu, "audio.conv_post.w", chan * 7 * 4)?
+                    .binding(),
+                self.zeros.binding(),
+                r2b,
+            )?;
+            if len != l_out {
+                return other(format!("audio length {len} != {l_out}"));
+            }
+            let mut out = vec![0.0f32; l_out];
+            gpu.sync()?;
+            gpu.d2h_ref(r2b, crate::vvae::as_bytes_mut(&mut out))?;
+            for (i, v) in out.iter().enumerate() {
+                samples[ch * l_out + i] = v.clamp(-1.0, 1.0);
+            }
+        }
+        Ok(())
+    }
+
+    /// Stereo samples `[2][n]` at 32 kHz to model-space latents `[2][32][audio_t]`.
+    ///
+    /// The sample count is padded up to a whole number of 800-sample frames; the tail is silence, not
+    /// a repeat, because the encoder is causal and a repeated tail would be heard.
+    pub fn encode(
+        &mut self,
+        gpu: &hrx::Gpu,
+        c: &Compiler,
+        prof: &mut Profile,
+        samples: &[f32],
+        n: usize,
+    ) -> Result<(Vec<f32>, usize)> {
+        let lp = n.div_ceil(HOP) * HOP;
+        let t = lp / HOP;
+        let plane = 64 * lp;
+
+        let x0 = gpu.alloc(lp * 4)?;
+        let mut h = gpu.alloc(plane * 4)?;
+        let mut h2 = gpu.alloc(plane * 4)?;
+        let y = gpu.alloc(plane * 4)?;
+        let y2 = gpu.alloc(plane * 4)?;
+        let rows = gpu.alloc(t * 2048 * 4)?;
+        let n1 = gpu.alloc(t * 2048 * 4)?;
+        let qkv = gpu.alloc(t * 6144 * 4)?;
+        let pattn = gpu.alloc(8 * t * t * 4)?;
+        let pool = gpu.alloc(t * AUDIO_CH * 4)?;
+        let xa = gpu.alloc(t * AUDIO_CH * 4)?;
+        let xb = gpu.alloc(t * AUDIO_CH * 4)?;
+        let xc = gpu.alloc(t * AUDIO_CH * 4)?;
+        let a0 = gpu.alloc(t * 64 * 4)?;
+        let a1 = gpu.alloc(t * 64 * 4)?;
+        let g = gpu.alloc(t * 64 * 4)?;
+
+        let mut out = vec![0.0f32; 2 * AUDIO_CH * t];
+        let mut host = vec![0.0f32; lp];
+        let w = |gpu: &hrx::Gpu, nm: &str, count: usize| self.weights.at(gpu, nm, count * 4);
+
+        for ch in 0..2 {
+            host.fill(0.0);
+            host[..n].copy_from_slice(&samples[ch * n..ch * n + n]);
+            gpu.h2d(&x0, crate::vvae::as_bytes(&host))?;
+
+            let (mut len, mut dim) = (lp, 64usize);
+            conv_s(
+                c,
+                gpu,
+                prof,
+                "aenc conv_in",
+                (1, 64, 7, 1, 3, 1),
+                lp,
+                lp,
+                x0.binding(),
+                w(gpu, "aenc.conv_in.w", 64 * 7)?.binding(),
+                w(gpu, "aenc.conv_in.b", 64)?.binding(),
+                h.binding(),
+            )?;
+            for i in 1..=5 {
+                for r in 0..3 {
+                    let dil = [1usize, 3, 9][r];
+                    let p = format!("aenc.b{i}.r{r}.");
+                    snake_plain(
+                        c,
+                        gpu,
+                        prof,
+                        dim,
+                        len,
+                        h.binding(),
+                        w(gpu, &format!("{p}act0"), dim)?.binding(),
+                        y.binding(),
+                    )?;
+                    conv_s(
+                        c,
+                        gpu,
+                        prof,
+                        "aenc res conv7",
+                        (dim, dim, 7, dil, 3 * dil, 1),
+                        len,
+                        len,
+                        y.binding(),
+                        w(gpu, &format!("{p}c1.w"), dim * dim * 7)?.binding(),
+                        w(gpu, &format!("{p}c1.b"), dim)?.binding(),
+                        y2.binding(),
+                    )?;
+                    snake_plain(
+                        c,
+                        gpu,
+                        prof,
+                        dim,
+                        len,
+                        y2.binding(),
+                        w(gpu, &format!("{p}act1"), dim)?.binding(),
+                        y.binding(),
+                    )?;
+                    conv_s(
+                        c,
+                        gpu,
+                        prof,
+                        "aenc res conv1",
+                        (dim, dim, 1, 1, 0, 1),
+                        len,
+                        len,
+                        y.binding(),
+                        w(gpu, &format!("{p}c2.w"), dim * dim)?.binding(),
+                        w(gpu, &format!("{p}c2.b"), dim)?.binding(),
+                        y2.binding(),
+                    )?;
+                    axpy(
+                        c,
+                        gpu,
+                        Some(prof),
+                        "audio axpy",
+                        1.0,
+                        1.0,
+                        dim * len,
+                        y2.binding(),
+                        h.binding(),
+                    )?;
+                }
+                let s = ENC_RATES[i - 1];
+                let out_len = len / s;
+                let p = format!("aenc.b{i}.");
+                snake_plain(
+                    c,
+                    gpu,
+                    prof,
+                    dim,
+                    len,
+                    h.binding(),
+                    w(gpu, &format!("{p}act"), dim)?.binding(),
+                    y.binding(),
+                )?;
+                conv_s(
+                    c,
+                    gpu,
+                    prof,
+                    "aenc down",
+                    (dim, 2 * dim, 2 * s, 1, s.div_ceil(2), s),
+                    len,
+                    out_len,
+                    y.binding(),
+                    w(gpu, &format!("{p}down.w"), 2 * dim * dim * 2 * s)?.binding(),
+                    w(gpu, &format!("{p}down.b"), 2 * dim)?.binding(),
+                    h2.binding(),
+                )?;
+                std::mem::swap(&mut h, &mut h2);
+                dim *= 2;
+                len = out_len;
+            }
+            if dim != 2048 || len != t {
+                return other("audio encoder shape mismatch");
+            }
+            snake_plain(
+                c,
+                gpu,
+                prof,
+                2048,
+                len,
+                h.binding(),
+                w(gpu, "aenc.act_out", 2048)?.binding(),
+                y.binding(),
+            )?;
+            conv_s(
+                c,
+                gpu,
+                prof,
+                "aenc conv_out",
+                (2048, 2048, 3, 1, 1, 1),
+                len,
+                len,
+                y.binding(),
+                w(gpu, "aenc.conv_out.w", 2048 * 2048 * 3)?.binding(),
+                w(gpu, "aenc.conv_out.b", 2048)?.binding(),
+                h.binding(),
+            )?;
+            transpose(c, gpu, prof, 2048, t, h.binding(), rows.binding())?;
+
+            // AttnProjection: x = proj(norm3(x)) + attn(norm1(x)); x += mlp(norm2(x))
+            layernorm(
+                c,
+                gpu,
+                prof,
+                t,
+                2048,
+                rows.binding(),
+                w(gpu, "aenc.pre.norm3.w", 2048)?.binding(),
+                w(gpu, "aenc.pre.norm3.b", 2048)?.binding(),
+                n1.binding(),
+            )?;
+            MatmulF32::build(c, gpu, 2048, AUDIO_CH)?.run(
+                gpu,
+                Some(prof),
+                "aenc matmul",
+                t,
+                n1.binding(),
+                w(gpu, "aenc.pre.proj.w", AUDIO_CH * 2048)?.binding(),
+                w(gpu, "aenc.pre.proj.b", AUDIO_CH)?.binding(),
+                xa.binding(),
+            )?;
+            layernorm(
+                c,
+                gpu,
+                prof,
+                t,
+                2048,
+                rows.binding(),
+                w(gpu, "aenc.pre.norm1.w", 2048)?.binding(),
+                w(gpu, "aenc.pre.norm1.b", 2048)?.binding(),
+                n1.binding(),
+            )?;
+            MatmulF32::build(c, gpu, 2048, 6144)?.run(
+                gpu,
+                Some(prof),
+                "aenc matmul",
+                t,
+                n1.binding(),
+                w(gpu, "aenc.pre.qkv.w", 6144 * 2048)?.binding(),
+                w(gpu, "aenc.pre.qkv.b", 6144)?.binding(),
+                qkv.binding(),
+            )?;
+            {
+                let ns = "h3.attn_scores_f32.";
+                let cfg: Cfg = vec![
+                    (format!("{ns}heads"), "8".into()),
+                    (format!("{ns}hd"), "256".into()),
+                    (format!("{ns}scale"), crate::compile::num(1.0 / 16.0)),
+                ];
+                let k = c.get(gpu, "attn_scores_f32", "h3_attn_scores_f32", &cfg)?;
+                launch(
+                    gpu,
+                    &k,
+                    Some(prof),
+                    "aenc attention",
+                    [t.div_ceil(256) as u32, 8, 1],
+                    [THREADS, 1, 1],
+                    &[t as u32],
+                    &[qkv.binding(), pattn.binding()],
+                )?;
+            }
+            {
+                let ns = "h3.attn_pv_pool_f32.";
+                let cfg: Cfg = vec![
+                    (format!("{ns}heads"), "8".into()),
+                    (format!("{ns}hd"), "256".into()),
+                    (format!("{ns}pool"), "8".into()),
+                ];
+                let k = c.get(gpu, "attn_pv_pool_f32", "h3_attn_pv_pool_f32", &cfg)?;
+                launch(
+                    gpu,
+                    &k,
+                    Some(prof),
+                    "aenc attention",
+                    [t as u32, 1, 1],
+                    [32, 1, 1],
+                    &[t as u32],
+                    &[qkv.binding(), pattn.binding(), pool.binding()],
+                )?;
+            }
+            MatmulF32::build(c, gpu, AUDIO_CH, AUDIO_CH)?.run(
+                gpu,
+                Some(prof),
+                "aenc matmul",
+                t,
+                pool.binding(),
+                w(gpu, "aenc.pre.attn_proj.w", AUDIO_CH * AUDIO_CH)?.binding(),
+                w(gpu, "aenc.pre.attn_proj.b", AUDIO_CH)?.binding(),
+                xb.binding(),
+            )?;
+            axpy(
+                c,
+                gpu,
+                Some(prof),
+                "audio axpy",
+                1.0,
+                1.0,
+                t * AUDIO_CH,
+                xb.binding(),
+                xa.binding(),
+            )?;
+
+            layernorm(
+                c,
+                gpu,
+                prof,
+                t,
+                AUDIO_CH,
+                xa.binding(),
+                w(gpu, "aenc.pre.norm2.w", AUDIO_CH)?.binding(),
+                w(gpu, "aenc.pre.norm2.b", AUDIO_CH)?.binding(),
+                xb.binding(),
+            )?;
+            layernorm(
+                c,
+                gpu,
+                prof,
+                t,
+                AUDIO_CH,
+                xb.binding(),
+                w(gpu, "aenc.pre.mlp.norm.w", AUDIO_CH)?.binding(),
+                w(gpu, "aenc.pre.mlp.norm.b", AUDIO_CH)?.binding(),
+                xc.binding(),
+            )?;
+            let mlp = MatmulF32::build(c, gpu, AUDIO_CH, 64)?;
+            mlp.run(
+                gpu,
+                Some(prof),
+                "aenc matmul",
+                t,
+                xc.binding(),
+                w(gpu, "aenc.pre.mlp.w0.w", 64 * AUDIO_CH)?.binding(),
+                w(gpu, "aenc.pre.mlp.w0.b", 64)?.binding(),
+                a0.binding(),
+            )?;
+            mlp.run(
+                gpu,
+                Some(prof),
+                "aenc matmul",
+                t,
+                xc.binding(),
+                w(gpu, "aenc.pre.mlp.w1.w", 64 * AUDIO_CH)?.binding(),
+                w(gpu, "aenc.pre.mlp.w1.b", 64)?.binding(),
+                a1.binding(),
+            )?;
+            {
+                let k = c.get(gpu, "geglu_tanh_f32", "h3_geglu_tanh_f32", &Cfg::new())?;
+                launch(
+                    gpu,
+                    &k,
+                    Some(prof),
+                    "aenc geglu",
+                    [(t * 64).div_ceil(256) as u32, 1, 1],
+                    [THREADS, 1, 1],
+                    &[(t * 64) as u32],
+                    &[a0.binding(), a1.binding(), g.binding()],
+                )?;
+            }
+            MatmulF32::build(c, gpu, 64, AUDIO_CH)?.run(
+                gpu,
+                Some(prof),
+                "aenc matmul",
+                t,
+                g.binding(),
+                w(gpu, "aenc.pre.mlp.w2.w", AUDIO_CH * 64)?.binding(),
+                w(gpu, "aenc.pre.mlp.w2.b", AUDIO_CH)?.binding(),
+                xb.binding(),
+            )?;
+            axpy(
+                c,
+                gpu,
+                Some(prof),
+                "audio axpy",
+                1.0,
+                1.0,
+                t * AUDIO_CH,
+                xb.binding(),
+                xa.binding(),
+            )?;
+            MatmulF32::build(c, gpu, AUDIO_CH, AUDIO_CH)?.run(
+                gpu,
+                Some(prof),
+                "aenc matmul",
+                t,
+                xa.binding(),
+                w(gpu, "aenc.mean_proj.w", AUDIO_CH * AUDIO_CH)?.binding(),
+                w(gpu, "aenc.mean_proj.b", AUDIO_CH)?.binding(),
+                xc.binding(),
+            )?;
+
+            let mut zrow = vec![0.0f32; t * AUDIO_CH];
+            gpu.d2h_ref(xc.binding(), crate::vvae::as_bytes_mut(&mut zrow))?;
+            for i in 0..t {
+                for k in 0..AUDIO_CH {
+                    out[(ch * AUDIO_CH + k) * t + i] =
+                        (zrow[i * AUDIO_CH + k] - self.enc_mean[k]) / self.enc_std[k];
+                }
+            }
+        }
+        gpu.sync()?;
+        Ok((out, t))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_encoder_bounds_round_up_to_powers_of_two_from_256() {
+        assert_eq!(pow2_bound(1), 256);
+        assert_eq!(pow2_bound(256), 256);
+        assert_eq!(pow2_bound(257), 512);
+        assert_eq!(pow2_bound(800), 1024);
+        assert_eq!(pow2_bound(1 << 20), 1 << 20);
+        // and the decoder's do not: they are multiples of 256
+        assert_eq!(round256(257), 512);
+        assert_eq!(round256(800), 1024);
+        assert_eq!(round256(1000), 1024);
+        assert_eq!(round256(1025), 1280);
+    }
+
+    #[test]
+    fn the_rates_multiply_out_to_the_hop() {
+        assert_eq!(ENC_RATES.iter().product::<usize>(), HOP);
+        assert_eq!(DEC_RATES.iter().product::<usize>(), HOP);
+    }
+
+    #[test]
+    fn the_decoder_halves_its_width_at_every_upsample() {
+        // 1024 down to 8 over seven levels, which is what makes 8 * l_out the plane bound
+        let mut chan = 1024usize;
+        for _ in 0..7 {
+            chan /= 2;
+        }
+        assert_eq!(chan, 8);
+    }
+
+    #[test]
+    fn the_residual_paddings_keep_the_length() {
+        // a dilated convolution keeps its length when pad = (k*d - d) / 2, and the second, undilated
+        // one when pad = (k - 1) / 2
+        for (i, k) in RES_K.iter().enumerate() {
+            let d = RES_DIL[i];
+            assert_eq!(
+                2 * ((k * d - d) / 2),
+                (k - 1) * d,
+                "kernel {k} dilation {d}"
+            );
+            assert_eq!(2 * ((k - 1) / 2), k - 1, "kernel {k}");
+        }
+    }
+}

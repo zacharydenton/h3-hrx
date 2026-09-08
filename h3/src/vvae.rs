@@ -164,8 +164,8 @@ impl VideoVae {
         crate::rope::vae(grid.ft, grid.h, grid.w, &mut cos_h, &mut sin_h);
         let cos = gpu.alloc(t * VAE_ROPE_HALF * 4)?;
         let sin = gpu.alloc(t * VAE_ROPE_HALF * 4)?;
-        gpu.h2d(&cos, bytemuck_f32(&cos_h))?;
-        gpu.h2d(&sin, bytemuck_f32(&sin_h))?;
+        gpu.h2d(&cos, as_bytes(&cos_h))?;
+        gpu.h2d(&sin, as_bytes(&sin_h))?;
 
         // the output norm's (scale, shift) table: no scale, the checkpoint's bias as the shift
         let norm_table = gpu.alloc(2 * VAE_HID * 4)?;
@@ -1027,9 +1027,13 @@ impl VideoVae {
     }
 }
 
-fn bytemuck_f32(v: &[f32]) -> &[u8] {
-    // f32 has no padding and no invalid bit patterns, so its bytes are a plain reinterpretation
+/// f32 has no padding and no invalid bit patterns, so its bytes are a plain reinterpretation.
+pub fn as_bytes(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
+}
+
+pub fn as_bytes_mut(v: &mut [f32]) -> &mut [u8] {
+    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
 }
 
 fn bytemuck_f16(v: &[half::f16]) -> &[u8] {

@@ -542,6 +542,85 @@ impl Matmul {
     }
 }
 
+/// `out[m][n] = x[m][k] . w[n][k] + b`, one lane per output element.
+///
+/// The plain f32 matmul the heads and the patch projections use: no tiling, no quantisation, just the
+/// arithmetic in the order the checkpoint stores it.
+pub struct MatmulF32 {
+    kernel: Arc<hrx::Kernel>,
+    n: usize,
+}
+
+impl MatmulF32 {
+    pub fn build(c: &Compiler, gpu: &hrx::Gpu, k: usize, n: usize) -> Result<Self> {
+        let ns = "h3.matmul_f32.";
+        let cfg: Cfg = vec![
+            (format!("{ns}k"), k.to_string()),
+            (format!("{ns}n"), n.to_string()),
+        ];
+        Ok(Self {
+            kernel: c.get(gpu, "matmul_f32", "h3_matmul_f32", &cfg)?,
+            n,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        gpu: &hrx::Gpu,
+        profile: Option<&mut Profile>,
+        stage: &str,
+        m: usize,
+        x: BufferRef,
+        w: BufferRef,
+        b: BufferRef,
+        out: BufferRef,
+    ) -> Result<()> {
+        launch(
+            gpu,
+            &self.kernel,
+            profile,
+            stage,
+            [self.n.div_ceil(256) as u32, m as u32, 1],
+            [THREADS, 1, 1],
+            &[m as u32],
+            &[x, w, b, out],
+        )
+    }
+}
+
+/// `y = a x + b y`, elementwise. The coefficients are compiled in, so each pair is its own kernel —
+/// which is why they are spelled with the same `%.17g` every other float config uses.
+#[allow(clippy::too_many_arguments)]
+pub fn axpy(
+    c: &Compiler,
+    gpu: &hrx::Gpu,
+    profile: Option<&mut Profile>,
+    stage: &str,
+    a: f32,
+    b: f32,
+    count: usize,
+    x: BufferRef,
+    y: BufferRef,
+) -> Result<()> {
+    let ns = "h3.axpy_f32.";
+    let cfg: Cfg = vec![
+        (format!("{ns}a"), num(f64::from(a))),
+        (format!("{ns}b"), num(f64::from(b))),
+    ];
+    let kernel = c.get(gpu, "axpy_f32", "h3_axpy_f32", &cfg)?;
+    launch(
+        gpu,
+        &kernel,
+        profile,
+        stage,
+        [count.div_ceil(256) as u32, 1, 1],
+        [THREADS, 1, 1],
+        &[count as u32],
+        &[x, y],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
