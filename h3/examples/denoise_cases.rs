@@ -6,7 +6,8 @@
 //! across a comparison sweep. It is one `key value` pair per line; a `case` line starts a new case and
 //! a blank line is ignored:
 //!
-//!   ids <path>            int32 token ids
+//!   ids <path>            int32 token ids; before any case it is the default, inside one it is
+//!                         that case's own — a prompt with image placeholders is not the same prompt
 //!   case <name>           starts a case, and names its outputs <name>.video / <name>.audio
 //!   size <h> <w> <frames>
 //!   steps <n> <sampler> <seed> <cache_threshold>
@@ -69,6 +70,7 @@ struct OwnedKeyframe {
 #[derive(Default)]
 struct Case {
     name: String,
+    ids: Vec<i32>,
     p: DenoiseParams,
     noise: Option<(Vec<f32>, Vec<f32>)>,
     refs: Vec<OwnedRef>,
@@ -89,15 +91,20 @@ fn main() {
         }
         match f[0] {
             "ids" => {
-                ids = std::fs::read(f[1])
+                let v: Vec<i32> = std::fs::read(f[1])
                     .expect("ids")
                     .chunks_exact(4)
                     .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
-                    .collect()
+                    .collect();
+                match cases.last_mut() {
+                    Some(c) => c.ids = v,
+                    None => ids = v,
+                }
             }
             "out" => out_dir = f[1].to_string(),
             "case" => cases.push(Case {
                 name: f[1].into(),
+                ids: ids.clone(),
                 ..Case::default()
             }),
             "size" => {
@@ -196,7 +203,7 @@ fn main() {
         let start = std::time::Instant::now();
         let out = dit
             .denoise(
-                &gpu, &compiler, &mut prof, &mut te, &ids, &case.p, noise, &refs, &kfs, None,
+                &gpu, &compiler, &mut prof, &mut te, &case.ids, &case.p, noise, &refs, &kfs, None,
             )
             .unwrap_or_else(|e| panic!("{}: {e}", case.name));
         eprintln!(

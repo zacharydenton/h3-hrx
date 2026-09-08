@@ -37,6 +37,12 @@ impl Noise {
 ///
 /// ComfyUI's visual condition augmentation: `0.999 z + 0.001 n`, with a generator seeded per segment
 /// from the run's seed so a reference's augmentation does not depend on how many latents preceded it.
+///
+/// This is the one place the change of generator is observable in a differential against the C: a run
+/// conditioned on a visual reference diverges here and nowhere else. Substituting the C's splitmix64
+/// makes every reference case bit-identical, which is how the rest of the path was verified. There is
+/// no way for a caller to supply this noise — the C has the same limitation — so an exact comparison
+/// with another implementation needs the generators to agree.
 pub fn augment_ref(lat: &[f32], rows: &mut [f32], t_len: usize, h: usize, w: usize, seed: u64) {
     let mut rng = Noise::new(seed);
     for c in 0..LATENT_CH {
