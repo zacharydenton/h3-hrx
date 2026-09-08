@@ -59,7 +59,7 @@ For the target video, at 0.00 seconds into the target video, <Picture 1> (from [
 
 ## The README clip
 
-The prompt is `docs/prompts/cliff_rider_768p.txt`, and this reproduces the clip:
+The prompt is [cliff_rider_768p.txt](prompts/cliff_rider_768p.txt), and this reproduces the clip:
 
 ```sh
 h3 --width 1344 --height 768 --frames 124 --steps 31 --seed 7 \
@@ -71,4 +71,4 @@ h3 --width 1344 --height 768 --frames 124 --steps 31 --seed 7 \
 It is a single 5-second shot with no dialogue, so it carries no speaker IDs; the wind and hooves are diegetic
 and the brass and timpani are not. Measured 2026-09-07 on the Radeon 8060S with `H3_PROFILE=1`: 101.8 s per
 evaluation, steady across the last ten of the 30 evaluations, and 82.8 s to decode. That is one run, and the
-decode figure has no second sample; `docs/vae-30s.md` has the decoder's own measurements and method.
+decode figure has no second sample; [the decoder report](archive/vae-30s.md) has the decoder's own measurements and method.

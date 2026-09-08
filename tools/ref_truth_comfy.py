@@ -1,5 +1,5 @@
 """Ground truth for the reference-conditioning port, from ComfyUI's own H3 path (run inside the Strix Halo
-image, see docs/plan-refs.md). Writes build/ref_truth/*.npy:
+image, see CONTRIBUTING.md). Writes build/ref_truth/*.npy:
   audio_z [32,2,T] for --wav; image_z [24,1,h,w] for --image (ref2va 'match' sizing at --width x --height);
   clip_z [24,T,h,w] for the 17 frames --frames-dir/fox_%02d.png; vision_merged [n,5120], vision_deepstack
   [3,n,5120], presentation ids/tags and text states for the prompt with the image; one-step denoised video

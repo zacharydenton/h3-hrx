@@ -57,7 +57,7 @@ def decode_video(pipe, a):
 def decode_audio(pipe):
     import math
     from diffusers import AutoencoderKLMiniMaxH3Audio
-    MODELS = Path.home() / "h3-models"   # the reference tier's diffusers oracles (README, Tests)
+    MODELS = Path.home() / "h3-models"   # the reference tier's diffusers oracles (CONTRIBUTING.md)
     dev = "cuda"; fx = torch.load(ROOT / "build/fox_480p_5s_latents.pt"); audio = np.nan_to_num(fx["audio"].float().numpy())    # [2][32][T] model space (one saved frame is NaN)
     t0 = time.time(); got = pipe.decode_audio(audio); print(f"  C audio decode ({audio.shape[-1]} latents -> {got.shape[-1]} samples) in {time.time() - t0:.1f} s")
     avae = AutoencoderKLMiniMaxH3Audio.from_pretrained(str(MODELS / "audio_vae"), torch_dtype=torch.float32).to(dev).eval()

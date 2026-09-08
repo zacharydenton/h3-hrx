@@ -1,6 +1,6 @@
 """A whole ComfyUI MiniMax H3 clip with the stock workflows' settings (res_multistep, 'simple', 20 evaluations,
 cfg 1, the model's shifts): t2va, or fl2va from --first-frame. Ground truth for what a conditioned clip should
-look like. Run inside the Strix Halo ComfyUI image with the local checkout on PYTHONPATH (docs/notes.md):
+look like. Run inside the Strix Halo ComfyUI image with the local checkout on PYTHONPATH (docs/archive/notes.md):
     tools/comfy_clip.py --first-frame build/refs/fox_clean.png --out build/comfy_fl2va
 Writes frames.npy [F,H,W,3] uint8, audio.wav, video_latent.npy, audio_latent.npy; tools/pipeline.py-style mp4 muxing is
 left to ffmpeg outside the container."""

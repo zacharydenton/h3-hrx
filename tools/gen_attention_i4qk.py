@@ -5,7 +5,7 @@ int4 fragments (16 VGPRs instead of 64), a K tile is 16 keys x 16 words staged i
 become f32 through the row's Q scale (attention scale and the Hadamard's 1/128 folded in) and the key's K scale.
     ATTN_WAVES=4|8 python3 tools/gen_attention_i4qk.py
 Variants (written to experiments/): ATTN_PREFETCH=1, ATTN_DIRECT_OUT=1, ATTN_PINGPONG=1 (krea2-loom's schedule; see the
-block at the end and docs/notes.md "The 4x accounting")."""
+block at the end and docs/archive/notes.md "The 4x accounting")."""
 import os, re, sys
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
@@ -218,7 +218,7 @@ if os.environ.get("ATTN_DBUF", "1") == "1":
 def uncarry(K: str) -> str:
     """The twins take the key scale the original way (loaded after the QK^T chain): with the carried prefetch they spill
     60 bytes and run at 0.39x; an early load before the chain measured 0.77x of the carried plain kernel; the plain
-    load 0.89x (docs/notes.md)."""
+    load 0.89x (docs/archive/notes.md)."""
     if "%ks_carry" not in K: return K
     K = K.replace("  %ks_key0 = index.assume %lane_column [lt(%lane_column, %padded_tokens)] : index\n  %ks_first = view.load %ks_view[%ks_key0, %kv_head] : view<[%padded_tokens]x[%kv_head_limit]xf32> -> f32\n  %ks_last = index.sub %padded_tokens, %c1 : index\n", "")
     hdr = re.search(r"  (%final_max, %final_sum, .*?), %ks_end = scf\.for %key_tile = \[%c0 to %key_tile_count step %c1\]\((.*?), %ks_carry = %ks_first : f32\) -> \((.*?), f32\) \{\n", K)
@@ -266,7 +266,7 @@ def add_skip(K: str) -> str:
 if os.environ.get("ATTN_SKIP", "1") == "1":
     # the plain kernels keep their names; each gets a skip twin (i4qk -> i4qks: attention_i4qks_mha8, attention_i4qksl_mha8, ...)
     # chosen by the builders only when a tau is set: with the skip disabled the twin is 10-13% slower (phi copies and branch
-    # bookkeeping around the eight per-fragment branches: 897 vs 487 instructions per key tile; docs/notes.md)
+    # bookkeeping around the eight per-fragment branches: 897 vs 487 instructions per key tile; docs/archive/notes.md)
     for path in [ROOT / "kernels" / f"{STEM}.loom"] + ([ROOT / "kernels" / f"{os.environ['ATTN_DBUF_STEM']}.loom"] if os.environ.get("ATTN_DBUF_STEM", "").startswith("attention_i4qkl") else []):
         if path.exists():
             text = path.read_text(); stem_here = path.stem

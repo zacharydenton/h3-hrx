@@ -1,7 +1,7 @@
 """ComfyUI's MiniMax H3 path, timed per denoising step: its standard loaders (int8 ConvRot checkpoint, bf16
 compute), the minimax CLIP (Qwen3-VL-32B), the AV latent node, and the stock Euler sampler on the 'simple'
 schedule with the model's own shifts. No server, graph cache, previews or decode. Run inside the Strix Halo
-ComfyUI image (see docs/notes.md for the podman command); the local checkout is not needed.
+ComfyUI image (see docs/archive/notes.md for the podman command); the local checkout is not needed.
     /opt/venv/bin/python tools/bench_comfyui_h3.py --width 1344 --height 768 --length 124 --steps 3"""
 import argparse, json, logging, os, sys, time
 from pathlib import Path

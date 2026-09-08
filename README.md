@@ -1,278 +1,110 @@
 # minimax-h3-loom
 
-MiniMax H3 (Hailuo 3.0), the open-weights text/image/audio-to-video-with-sound model, running on
-AMD's Strix Halo (Radeon 8060S, `gfx1151`) with **every GPU kernel written in
-[Loom](https://github.com/ROCm/hrx-system)**, AMD's kernel language, and a C host. No PyTorch,
-no Triton, no vendor libraries at run time: the runtime dependency is the HIP runtime API for
-module load, memory and launch.
+MiniMax H3 (Hailuo 3.0) video and audio generation on AMD Strix Halo
+(Radeon 8060S, `gfx1151`). Every GPU kernel is written in
+[Loom](https://github.com/ROCm/hrx-system), with a C++ host and a C API.
+Inference uses the HIP runtime; it needs no Python, PyTorch, Triton, or vendor
+math libraries. The host reads ComfyUI-format checkpoints directly.
 
-It produces the same clips as ComfyUI's reference implementation (residual stream cosine 0.999
-through all 50 blocks against ComfyUI's own run) and, on the same GPU, it is 3.9x faster on a
-5-second 480p clip and 7.5x faster at 768p.
-
-```sh
-h3 ref.jpg voice.wav < prompt.txt        # references by extension, prompt on stdin, clip.mp4 out
-```
+Text-to-video, first-frame animation, and image/audio reference conditioning
+are supported. This is an experimental implementation tested on a 128 GB
+Radeon 8060S system; other GPUs and memory configurations are unvalidated.
 
 https://github.com/user-attachments/assets/41a98dcf-48f0-4328-a0f4-7f17119243e6
 
-Its prompt is `docs/prompts/cliff_rider_768p.txt`; H3 expects a structured prompt, and `docs/prompting.md`
-is the format.
+[Demo prompt](docs/prompts/cliff_rider_768p.txt) · [Prompt format](docs/prompting.md)
 
-## Numbers
+## Performance
 
-Per model evaluation, int8 path, Radeon 8060S, idle box (`H3_PROFILE=1`; ComfyUI measured on
-the same GPU with `tools/bench_comfyui_h3.py` in the Strix Halo ComfyUI image):
+Recorded **per model evaluation** on an idle Radeon 8060S, using int8 weights.
+ComfyUI was measured on the same GPU. These are not whole-clip timings.
 
-| clip | this repo | ComfyUI, same GPU | speedup |
+| Clip | Loom | ComfyUI | Speedup |
 | --- | ---: | ---: | ---: |
-| 1344x768, 124 frames (5 s) | 101 s | 771 s | 7.5x |
-| 864x480, 124 frames (5 s) | 26.7 s | 103 s | 3.9x |
-| 864x480, 22 frames (1 s) | 4.2 s | 3.8 s | parity |
+| 1344×768, 124 frames | 101 s | 771 s | 7.6× |
+| 864×480, 124 frames | 26.7 s | 103 s | 3.9× |
+| 864×480, 22 frames | 4.2 s | 3.8 s | 0.9× |
 
-A full 5-second 480p clip at the default 30 evaluations is about 15 minutes end to end; the same at
-768p about 55 minutes. The only public Strix Halo report for this model, ComfyUI on the same
-checkpoint ([Comfy-Org/MiniMax-H3 discussion 33](https://huggingface.co/Comfy-Org/MiniMax-H3/discussions/33)),
-is 70 to 89 s per iteration at 480p against 26.7 s here.
+A five-second clip at the default 30 evaluations takes roughly **15 minutes at
+480p** or **55 minutes at 768p**, including setup and decoding. Outputs are
+numerically checked against ComfyUI, but are not bit-identical.
+See [performance and validation](docs/performance.md) for conditions, quality
+measurements, and decoder timings.
 
-Kernel-level, 56 heads x 128, measured in `docs/`:
+## Setup
 
-| kernel | this repo | reference on the same GPU |
-| --- | ---: | ---: |
-| attention, int8 QK^T, f16 PV, 37.7k tokens | 36.9 TFLOP/s | aotriton flash (torch SDPA, contiguous) 30.8; CK-tile fp16 38.7 |
-| int8 GEMMs, H3 shapes at 37.7k rows | 41 to 45 TOPS | comfy_kitchen's int8 kernel 27 to 42; measured peak 54 |
+You need Linux, ROCm with `gfx1151` support (tested with the 7.1 series), a C++
+compiler, ffmpeg, and a built Loom compiler. The measured kernels require
+[two Loom patches included here](patches/loom/README.md).
+Python 3 and NumPy are needed for development and CPU tests.
 
-## Requirements
+From the repository root, after [building Loom](patches/loom/README.md):
 
-- **Hardware:** an AMD Strix Halo APU (Ryzen AI Max, Radeon 8060S). The int8 model, its text
-  encoder and the VAEs occupy about 48 GB of memory before activations; 128 GB is what this was
-  developed and measured on, 64 GB is the realistic floor.
-- **ROCm** with a HIP runtime for `gfx1151` (ROCm 7.1x; `scripts/env.sh` documents the runtime
-  quirk on Arch).
-- **Loom** from [ROCm/hrx-system](https://github.com/ROCm/hrx-system), built with `loom-compile`
-  (`scripts/env.sh` points at the build directory). Kernels are compiled on first use for each
-  shape into `build/kernel_cache`.
-- **ffmpeg** for the `h3` command (input decoding, output muxing).
-- **Python 3 with NumPy** for the kernel generators and the CPU tier of the tests (`H3_PYTHON`);
-  **ROCm PyTorch, diffusers and transformers** only for the GPU and reference tiers of the tests,
-  whose oracles are torch and diffusers (`H3_REFERENCE_PYTHON`). Generating a clip never touches
-  Python, and there is no export step: the host reads ComfyUI's checkpoints itself.
-- Optional, for the toy ComfyUI comparison in the test suite: **podman** and the
-  `docker.io/kyuz0/amd-strix-halo-comfyui` image (skipped when podman is absent).
+```sh
+export HRX_BUILD=/path/to/hrx-system/build
+source scripts/env.sh
+bash scripts/build_host.sh
+```
 
-## Weights
+### Weights
 
-Four files from [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3), read as they
-are: no export step and no conversion at load. The DiT checkpoint's int8 ConvRot rows run on the
-int8 GEMMs with their stored scales; its bf16 token refiner and condition projection, and the
-whole vision tower, run on bf16 kernels; the video VAE's f16 and the audio VAE's f32 tensors run
-in their own types.
+Download the four checkpoints with the Hugging Face `hf` CLI:
 
 ```sh
 hf download Comfy-Org/MiniMax-H3 --local-dir ~/comfy-models \
-    --include diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
-              text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors \
-              vae/minimax_h3_video_vae_fp16.safetensors vae/minimax_h3_audio_vae_fp32.safetensors
+  --include diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
+            text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors \
+            vae/minimax_h3_video_vae_fp16.safetensors \
+            vae/minimax_h3_audio_vae_fp32.safetensors
 ```
 
-| file | holds | on disk |
-| --- | --- | ---: |
-| `diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors` | the 50 DiT blocks, the token refiner, the embedders, the final layer, the AdaLN tables | 21 GB |
-| `text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors` | the text encoder's 50 layers, its embedding table, the vision tower | 27 GB |
-| `vae/minimax_h3_video_vae_fp16.safetensors` | the video VAE's decoder and encoder | 5.2 GB |
-| `vae/minimax_h3_audio_vae_fp32.safetensors` | the audio vocoder and encoder | 0.6 GB |
+Use `--models DIR` or `H3_MODELS` for a different location. Reference images and
+audio additionally need the ref2va checkpoint. See [setup details](docs/setup.md)
+for that download, tool paths, and the optional runtime workaround.
+Model weights have their own license; consult the
+[model repository](https://huggingface.co/Comfy-Org/MiniMax-H3).
 
-`h3 --models DIR` (or `$H3_MODELS`, default `~/comfy-models`) points at ComfyUI's models
-directory; `--dit`, `--te`, `--video-vae` and `--audio-vae` override one file each. Qwen's
-tokenizer is compiled into the library, so nothing else is downloaded.
+## Generate a clip
 
-Reference-conditioned clips (`h3 ref.jpg voice.wav ...`) run the ref2va checkpoint,
-`diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors` from the same repository
-(21 GB). `h3` picks it whenever reference files are given, and refuses to run references on the
-base checkpoint unless `--base-weights` says so.
-
-The weights are under the MiniMax H3 Community License, which permits open-weight use in the USA,
-EU, UK and South Korea; other regions apply to MiniMax for a licence. Nothing in this repository is
-derived from ComfyUI's code, which is GPL; ComfyUI is used only as the measurement oracle inside
-its own container image.
-
-## Build
+H3 expects [structured prompts](docs/prompting.md). Start with the included one:
 
 ```sh
-source scripts/env.sh          # LOOM_COMPILE, the ROCm runtime, LOOM_TARGET=gfx1151
-bash scripts/build_host.sh     # build/libh3pipe.so, build/h3, build/h3pipe, build/loomrun
-ln -s "$PWD/build/h3" ~/.local/bin/h3
+./build/h3 --width 864 --height 480 --frames 124 --steps 31 --seed 7 \
+  --out clip.mp4 < docs/prompts/cliff_rider_768p.txt
+./build/h3 --help
 ```
 
-## Use
+This writes `clip.mp4` and `clip.wav`. `--steps 31` means 30 model evaluations.
+The first run of each shape compiles kernels into `build/kernel_cache`.
+For the demo's resolution, use `--width 1344 --height 768`.
 
-**The `h3` command.** Positional files are references by extension: images become `<Picture i>`
-(encoded by the video VAE's encoder, presented to the text encoder through the vision tower),
-audio files become `<Audio j>` (the audio VAE's encoder). The prompt comes from stdin or `-p`.
-Any format ffmpeg reads; audio is resampled to 32 kHz stereo. The model wants MiniMax's three-field
-prompt structure rather than a free-form sentence: `docs/prompting.md`.
+With prompts written for the corresponding conditioning mode:
 
 ```sh
-h3 ref1.jpg voice.wav < prompt.txt
-h3 --first-frame fox.png -p "A red fox on a mossy log turns to the camera ..." --out fox.mp4
-h3 -p "..." --frames 124 --steps 31 --width 864 --height 480 --seed 0
-h3 --help
+./build/h3 --first-frame image.png --out animated.mp4 < keyframe-prompt.txt
+./build/h3 ref.jpg voice.wav --out referenced.mp4 < reference-prompt.txt
 ```
 
-Defaults are the stock ComfyUI workflow settings: `res_multistep` on the `simple` schedule, 30
-evaluations (`--steps 31` sigma grid points; ComfyUI's workflows use 20), no CFG, shifts 12/3,
-the checkpoint's int8 rows with int8 QK^T attention. The clip lands as `<out>.mp4` with `<out>.wav` beside it. Sizes are multiples
-of 32; frame counts snap to 17n + 5 (22, 39, ..., 124).
+Sizes must be multiples of 32; frame counts round up to `17n + 5`.
+The sampler defaults to `res_multistep` with the `simple` schedule and no
+classifier-free guidance. Video references are available through the C API,
+but not the CLI.
 
-**From Python.** `tools/pipeline_c.py` drives the same library through ctypes
-(`h3pipe_loom.py`) with the same flags (`--ref-image`, `--ref-audio`, `--first-frame`,
-`--latents-out`, `--no-decode`).
+## Documentation and development
 
-**From C.** `host/h3pipe.h` is the whole pipeline behind a C ABI: `h3pipe_create` (the four
-checkpoint files, kernel sources, cache, the `loom-compile` path), `h3tok_encode` (text to ids, the
-Qwen2 byte-level BPE in C), `h3pipe_encode_video` / `h3pipe_encode_audio` / `h3pipe_vision_embed`
-(references), `h3pipe_denoise` and `h3pipe_denoise_refs` (ids and references to model-space
-latents, with a progress callback), `h3pipe_decode_video` and `h3pipe_decode_audio`.
-`docs/abi.md` is the contract (sizes, layouts, references, errors, threading); `examples/` has the same
-minimal client in C, Rust (no bindgen) and Go (cgo), which produce byte-identical clips; `host/h3_cli.cpp`
-is the complete client.
+- [Setup](docs/setup.md) — dependencies, checkpoints, and configuration.
+- [Prompting](docs/prompting.md) and [other modes](docs/tricks.md) — references, audio, and stills.
+- [C API](docs/abi.md) and [examples](examples/README.md) — C, Rust, Go, and Python clients.
+- [Contributing](CONTRIBUTING.md) — repository layout, tests, and benchmarking.
+- [Performance](docs/performance.md) and [research archive](docs/archive/README.md).
 
-**Beyond video.** A 32x32 canvas and `--audio-only` turn H3 into a voice cloner and text-to-sound
-model (5 s of cloned speech in 22 to 33 s of GPU time); `--still frame.png` turns a 22-frame clip
-into an image generator and, with reference images, an image editor. `docs/tricks.md` has the
-modes, their costs, and the pieces of this repository worth taking elsewhere.
+Run `bash scripts/test.sh --cpu` for checks that need no GPU or weights.
 
-**Knobs.** `H3_PROFILE=1` prints per-stage times after every step; `H3_TRACE=1` prints and
-synchronises every launch; `--attn f16` restores f16 attention, `--attn i4` is a faster int4
-QK^T that ghosts keyframe and reference clips (do not use it for conditioned generation);
-`--base-weights` runs reference files on the base checkpoint when the ref2va one is absent;
-`--models`, `--dit`, `--te`, `--video-vae` and `--audio-vae` choose the checkpoints ($H3_MODELS).
-`H3_VAE_FAST=0` restores the original video decoder GPU kernels for comparison;
-the default uses 128x256 GEMMs, padded SwiGLU output, fused QKV normalization/rotary
-embedding and head-major 32-key attention staging
-([measurements and the 30-second target](docs/vae-30s.md)).
-The audio decoder computes four samples per thread in f32, preserving each
-sample's accumulation order and output bits.
-Unknown options, missing values and out-of-range numbers are errors, as are `--audio-only` with
-`--still` and `--no-decode` with either.
+## License and credits
 
-## Quality
+Code: [Apache-2.0](LICENSE). Model weights are licensed separately by MiniMax.
 
-The gate is ComfyUI's own run of the same step, dumped from inside its image
-(`tools/comfy_clip.py --dump-blocks`, `tests/test_comfy_parity.py`): the residual stream after
-each block, video rows only, cosine against ComfyUI.
-
-| block | int8 QK^T attention (default) | f16 attention |
-| ---: | ---: | ---: |
-| 0 to 10 | 1.0000 | 1.0000 |
-| 20 | 0.9999 | 0.9999 |
-| 30 | 0.9991 | 0.9992 |
-| 40 | 0.9942 | 0.9947 |
-| 49 | 0.9992 | 0.9993 |
-
-The 20-evaluation trajectory matches ComfyUI's to a relative error of 0.01 after five
-evaluations; the final latents end at a cosine of about 0.90, the same figure ComfyUI's own bf16
-and int8 runs reach against each other, because the last sigmas amplify any rounding difference.
-Bit-exactness is not possible: ComfyUI dequantises the int8 rows to bf16 and runs bf16 matmuls;
-this pipeline runs true int8 WMMA products with int32 accumulation and per-row scales, and int8
-QK^T attention on rotated, per-token quantised Q and K.
-
-Every encoder is checked against ComfyUI's too: audio 1.0000000, vision 0.99996, video VAE
-0.9994; the tokenizer against transformers; the text encoder's 50 layers at cosine 1.0000 after
-50 layers against transformers bf16.
-
-## How it works
-
-H3 is a 33B dense single-stream transformer over one packed sequence of text, video and audio
-rows: 50 blocks of hidden 5376, 56 attention heads of 128 with no key-value sharing, SwiGLU
-14336, AdaLN modulation per (timestep, modality) row from tables precomputed once per schedule.
-Qwen3-VL-32B is the text and image encoder; a causal 24-channel video VAE and a 40 Hz audio VAE
-are the tokenizers.
-
-**In Loom** (kernels in `kernels/`, most written by generators in `tools/gen_*.py`):
-the DiT blocks and the text encoder's 50 layers on the checkpoints' int8 ConvRot rows (int8 GEMM
-families with fused SwiGLU and class-gated residual epilogues; the AdaLN prepare kernels with the
-ConvRot Hadamard and row quantisation; RoPE with q/k RMSNorm; attention), the token refiner and
-the vision tower on their bf16 rows, the video VAE decoder's 36 blocks and heads on its f16 rows,
-the patch embedders and the final layer on their f32 rows, the three reference encoders, and the
-audio vocoder. **On the host in C++:** reading the checkpoints, layout, the AdaLN curve tables,
-the sampler, noise, patching, chunk blending and the pixel mapping, together well under a second
-per clip.
-
-The design decisions that carry the numbers, each with its measurement in `docs/notes.md`:
-
-- **An f32 residual stream and f32 LDS in the prepare kernels.** H3's residual passes f16's
-  range by block 23 and reaches 3e6 by block 36.
-- **Int8 QK^T attention** on the part's `iu8` WMMA (SageAttention's idea with this part's
-  arithmetic): Q and K per token and head, rotated by a Hadamard in the prepare kernel, f16 PV,
-  f32 online softmax. The shipped kernel is head-major with a 64-key LDS tile shared by eight
-  query tiles ([docs/attention-int8-45.md](docs/attention-int8-45.md)).
-- **256x128 GEMM tiles of 64x64 wave tiles** with unconditional staging loads and a padded
-  operand pitch whenever a row's byte pitch is a multiple of 1024 (rows at such a pitch alias in
-  the cache: the out and down projections gained 12% and 24%). Row-group selection per token
-  count ([docs/gemm-int8-tuning.md](docs/gemm-int8-tuning.md)).
-- **The checkpoints' own dtypes**, with no export step and no conversion at load: int8 rows keep
-  their stored scales, bf16 and f16 rows run on kernels of their type, and the loader only ever
-  changes layout (concatenation, the 16-row gate/up interleave, zero padding).
-- **ComfyUI's sampler and layout**, reproduced exactly: `res_multistep` on the `simple` schedule,
-  the audio carried as (sigma_v / sigma_a) x_a, keyframes and references packed between the text
-  and target streams.
-- **Why ComfyUI is slow at video sizes**, for the record: its H3 model hands torch's flash
-  attention head-strided views, on which aotriton runs at 5.8 TFLOP/s instead of the 30.8 it
-  reaches on contiguous tensors.
-
-The levers that lost are in `docs/notes.md` with their numbers too: int4 QK^T (ghosts conditioned
-clips), the step cache (0.94 latent cosine at the first threshold that skips anything), tile
-skipping, deeper LDS prefetch, 72-byte stage rows, wider raster groups, and the direct-load
-attention form.
-
-## Repository
-
-| | |
-| --- | --- |
-| `host/` | the C++ host: `h3pipe.cpp` (the pipeline behind `h3pipe.h`), `h3_cli.cpp` (`h3`), `h3tok.cpp` (tokenizer), the text encoder, VAE and runtime bindings |
-| `kernels/` | the Loom kernels; `experiments/` the measured losers, kept with their numbers |
-| `tools/` | kernel generators (`gen_*.py`), the Python driver, benches, the ComfyUI harness |
-| `tests/` | kernel tests against float64 references, host tests, the ComfyUI parity gate |
-| `reference/` | the torch reference of the block stack and the VAE decoder, the reference tier's oracles |
-| `docs/` | `abi.md` (the C ABI contract), `prompting.md` (the prompt format, with `prompts/`), `tricks.md` (voice, sound, stills, reusable pieces), `notes.md` (every measured lever, won or lost), the attention and GEMM reports, the reference-conditioning plan |
-| `examples/` | the minimal client in C, Rust and Go |
-| `assets/` | Qwen's `tokenizer.json`, compiled into `libh3pipe.so` |
-| `scripts/` | `env.sh` (toolchain and runtime paths, all overridable), `build_host.sh`, `test.sh`, `test_host.sh`, `download.sh` |
-
-## Tests
-
-```sh
-bash scripts/test.sh --cpu      # no GPU, weights or containers: Python parses, CPU host regressions, generators (CI)
-bash scripts/test.sh --quick    # plus the host build, the kernel tests on the GPU (including the production int8 attention), the tokenizer
-bash scripts/test.sh            # plus the reference tier: decoder, encoder, block, text encoder, pipeline and ComfyUI parity checks
-python3 tests/test_comfy_parity.py --require   # the ComfyUI parity gate alone (needs the dumps from tools/comfy_clip.py); without --require, missing dumps skip
-```
-
-`bash scripts/test_host.sh` is the CPU tier's host part: bounded C++ and Python regressions without
-weights or a GPU. `H3_PYTHON` names the NumPy interpreter for the CPU tier, `H3_REFERENCE_PYTHON`
-the one with torch, diffusers and transformers for the GPU kernel tests and the reference tier
-(both default to `python3`).
-
-## Limitations
-
-- One GPU family. The kernels target `gfx1151`'s wave32 WMMA; other RDNA3/3.5 parts would need
-  the tile budgets revisited and nothing has been run on them.
-- Short clips are not faster than ComfyUI: at 22 frames the sequence is short enough that launch
-  overhead and the short-sequence attention path dominate.
-- No classifier-free guidance, matching the stock workflows (cfg 1).
-- The first run of a new shape compiles its kernels (tens of seconds); they are cached after that.
-- Text-to-video, first-frame (fl2va) and reference-conditioned (ref2va) generation are supported;
-  video references are exposed by the C ABI but not by the `h3` command yet.
-
-## License and acknowledgements
-
-Apache-2.0 (see `LICENSE`). The model weights are MiniMax's, under their community license.
-
-Built on [Loom](https://github.com/ROCm/hrx-system) from AMD, whose kernel language and compiler
-this work depends on (a fork with a fragment-repack strategy and a scheduling fix is referenced in
-`docs/notes.md`). MiniMax's H3 release and paper; ComfyUI's day-0 implementation as the reference
-behaviour; SageAttention (arXiv 2410.02367) for the int8 attention idea; CK-tile's flash forward
-as the measured ceiling. A sibling of
-[krea2-loom](https://github.com/zacharydenton/krea2-loom), whose kernels, runtime and test
-discipline this repository started from.
+Built on AMD's [Loom](https://github.com/ROCm/hrx-system) and MiniMax H3, using
+ComfyUI as the numerical reference. The int8 attention follows SageAttention's
+approach. Kernel and runtime work started in
+[krea2-loom](https://github.com/zacharydenton/krea2-loom).

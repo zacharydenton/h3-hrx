@@ -73,7 +73,7 @@ def te(depths):
         got = {d: dumped(Path(tmp), "te", f"blk_{d - 1:02d}", 5120) for d in depths}
         x0 = dumped(Path(tmp), "te", "h_in", 5120)
     if not cache.exists():
-        print(f"SKIP: no {cache} (the transformers reference: see docs/notes.md, the text encoder)"); return True
+        print(f"SKIP: no {cache} (the transformers reference: see docs/archive/notes.md, the text encoder)"); return True
     want = torch.load(cache)   # [layers + 1][tokens][5120] bf16 hidden states from transformers on the same ids
     ok = True
     for d in sorted(depths):

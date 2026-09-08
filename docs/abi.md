@@ -1,6 +1,6 @@
 # The C ABI: `libh3pipe.so`
 
-`host/h3pipe.h` and `host/h3tok.h` declare the whole pipeline behind sixteen plain C functions.
+[`host/h3pipe.h`](../host/h3pipe.h) and [`host/h3tok.h`](../host/h3tok.h) declare the pipeline and tokenizer.
 Every language with a C foreign-function interface can drive it; `examples/` has working
 programs in C, Rust (no bindgen) and Go (cgo), and `h3pipe_loom.py` is the ctypes binding the
 Python tools use. `host/h3_cli.cpp` is the complete client: references, keyframes, decoding and
@@ -41,8 +41,7 @@ and exactly the required count is read or written; the rest is untouched.
 **Threading.** A session serialises its calls with an internal mutex: concurrent calls from several
 threads are safe and run one at a time. The progress callback runs on the calling thread between
 denoising steps; returning nonzero from it cancels the run, which returns `H3PIPE_CANCELLED` with
-the output buffers unspecified. Creating a session loads about 48 GB of weights (int8 path); create
-one per process and reuse it.
+the output buffers unspecified. Reuse a session across requests to retain loaded weights and compiled kernels.
 
 **Kernels.** The first call at a new shape spawns `loom-compile` (path in the config) for the kernels
 that shape needs and caches the binaries in `cache_dir`; later runs at the same shape load from the
@@ -93,10 +92,10 @@ text-to-video call.
 
 ## Configuration files
 
-`h3pipe_config` names ComfyUI's four checkpoints, read as they are (README, "Weights"):
+`h3pipe_config` names ComfyUI's four checkpoints, listed in the [setup guide](setup.md#checkpoints):
 `dit_file` (`minimax_h3_fl2va_pruned_int8_convrot.safetensors`, or the `ref2va` one for
 reference-conditioned clips), `te_file`, `video_vae_file` and `audio_vae_file`. There is no export
-step and no conversion at load: the DiT blocks' and text encoder's int8 ConvRot rows run on the
+step: the DiT blocks' and text encoder's int8 ConvRot rows run on the
 int8 GEMMs with their stored scales, the bf16 refiner, condition projection and vision tower on
 bf16 kernels, the video VAE's f16 and the audio VAE's f32 tensors in their own types. A file may
 be NULL; the calls that need it then fail with a message naming it, and each file is opened on
@@ -107,35 +106,13 @@ first use. `kernel_sources` is the repository's `kernels/`, `cache_dir` any writ
 `h3tok_create(NULL, ...)` uses the tokenizer compiled into the library (`H3_TOKENIZER=<file>`
 overrides it); passing a path reads that file instead.
 
-## Minimal client, in C
+## Clients
 
-```c
-#include "h3pipe.h"
-#include "h3tok.h"
+[Complete examples](../examples/README.md) cover C, Rust, Go, and Python,
+including error handling and output. The C++ CLI in
+[`host/h3_cli.cpp`](../host/h3_cli.cpp) also demonstrates reference preparation
+and muxing. Use [structured prompts](prompting.md) for generation.
 
-char err[4096];
-h3tok *tok = h3tok_create(NULL, err, sizeof err);   /* the tokenizer compiled into the library */
-int32_t ids[4096]; int n = h3tok_encode(tok, "A red fox on a mossy log ...", ids, 4096);   /* n > 4096: the buffer was too small */
-
-h3pipe_config cfg = { "~/comfy-models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
-                      "~/comfy-models/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
-                      "~/comfy-models/vae/minimax_h3_video_vae_fp16.safetensors",
-                      "~/comfy-models/vae/minimax_h3_audio_vae_fp32.safetensors",
-                      "kernels", "build/kernel_cache", "loom-compile", 8 };
-h3pipe_session *s; h3pipe_create(&cfg, &s, err, sizeof err);
-
-h3pipe_params p = { 480, 864, 124, 31, 0, 0, 0, 1, 0 };
-h3pipe_shape sh; if (h3pipe_shape_for(&p, &sh)) return 64;
-float *video = malloc(sizeof(float) * 24 * sh.latent_t * sh.lat_h * sh.lat_w), *audio = malloc(sizeof(float) * 64 * sh.audio_t);
-h3pipe_denoise(s, ids, n, &p, NULL, NULL, video, 24 * sh.latent_t * sh.lat_h * sh.lat_w, audio, 64 * sh.audio_t, NULL, NULL, err, sizeof err);
-
-uint8_t *frames = malloc((size_t)sh.frames * p.height * p.width * 3); float *samples = malloc(sizeof(float) * 1600 * sh.audio_t);
-h3pipe_decode_video(s, &p, video, 24 * sh.latent_t * sh.lat_h * sh.lat_w, frames, (size_t)sh.frames * p.height * p.width * 3, err, sizeof err);
-h3pipe_decode_audio(s, audio, 64 * sh.audio_t, sh.audio_t, samples, 1600 * sh.audio_t, err, sizeof err);
-h3pipe_destroy(s); h3tok_destroy(tok);
-```
-
-`examples/c/minimal.c` is this with error handling and file output; `examples/rust` and
-`examples/go` are the same program in those languages. Linking: `-L build -lh3pipe` with the
-library's directory on the runtime path (`-Wl,-rpath` or `LD_LIBRARY_PATH`), plus the ROCm
-runtime from `scripts/env.sh`.
+Link with `-L build -lh3pipe` and put the library directory on the runtime
+search path (`-Wl,-rpath` or `LD_LIBRARY_PATH`). See [setup](setup.md) for the
+ROCm and Loom toolchain configuration.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Fetch what the int8 route needs from MiniMaxAI/MiniMax-H3 into ~/h3-models: the video and audio VAEs, the tokenizer,
-# processor and scheduler configs (a few GB). The DiT blocks and the text encoder that h3 runs come from Comfy-Org/MiniMax-H3
-# (README, Weights).
+# Fetch original MiniMaxAI/MiniMax-H3 files for the reference tools into ~/h3-models:
+# VAEs, tokenizer, processor and scheduler configs. Normal inference uses the four
+# Comfy-Org/MiniMax-H3 checkpoints instead (docs/setup.md); this download is optional.
 #   scripts/download.sh [DIR] [--all]
 # --all adds the original FL2VA bf16 transformer shards (66 GB) and the bf16 Qwen3-VL-32B text encoder (64 GB), which only the
 # reference tools read. `hf download` restarts from zero on Xet repos when interrupted, so the shards are fetched with curl -C -

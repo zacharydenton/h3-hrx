@@ -72,7 +72,7 @@ def default_loom_compile() -> str:
 class H3Pipe:
     def __init__(self, dit=None, te=None, video_vae=None, audio_vae=None, cache=None, library=None, attn="i8"):
         """The four ComfyUI checkpoints as they are (h3pipe_loom.DIT / REF2VA / TE / VIDEO_VAE / AUDIO_VAE are the defaults under
-        $H3_MODELS or ~/comfy-models); attn: the DiT attention's QK^T operands, "f16", "i8" (the parity path) or "i4" (int4 ghosts conditioned clips, docs/notes.md)."""
+        $H3_MODELS or ~/comfy-models); attn: the DiT attention's QK^T operands, "f16", "i8" (the parity path) or "i4" (int4 ghosts conditioned clips, docs/archive/notes.md)."""
         native = ctypes.CDLL(str(library or os.environ.get("H3PIPE_LIB") or ROOT / "build/libh3pipe.so"))   # H3PIPE_LIB=build/libh3pipe_hrx.so: the libhrx build
         native.h3pipe_abi_version.restype = ctypes.c_uint32
         if native.h3pipe_abi_version() != _ABI: raise H3PipeError("ABI mismatch; rebuild with scripts/build_host.sh")

@@ -151,7 +151,7 @@ def widen_gather(s: str, ns: str) -> str:
     of vector<8xf16>: half the loads and half the address arithmetic per k-step,
     one hoisted row per lane instead of two. Cin_pad and Cin_stride become
     multiples of 8 so a packet never straddles a tap. Measured 1.13-1.22x on the
-    real layers (docs/notes.md, Lever 3)."""
+    real layers (docs/archive/notes.md, Lever 3)."""
     def sub(a: str, b: str) -> None:
         nonlocal s
         assert a in s, a[:70]
@@ -202,7 +202,7 @@ def widen_tile(s: str, ns: str) -> str:
     stage aliasing the dead A/W stages after the k-loop (4 workgroups/CU). 96
     VGPRs. Each row is gathered once for 128 columns instead of twice for 64:
     1.02-1.10x on the 80- and 88-channel layers, 0.82x on the 224-channel ones,
-    which is why tile_for() gives it only n_size == 128 (docs/notes.md, Lever 4)."""
+    which is why tile_for() gives it only n_size == 128 (docs/archive/notes.md, Lever 4)."""
     def sub(a: str, b: str) -> None:
         nonlocal s
         assert a in s, a[:80]
@@ -269,7 +269,7 @@ def prefetch(s: str, ns: str) -> str:
     W packet(s): each iteration stores the packets it was handed, barriers, issues
     the global loads for k+32 into registers, then runs the WMMA on the staged
     tile, so the load latency overlaps the multiply instead of stalling every
-    step. Measured 1.05-1.25x on the real layers (docs/notes.md, Lever 8). The
+    step. Measured 1.05-1.25x on the real layers (docs/archive/notes.md, Lever 8). The
     128-wide tile stages W in two passes; its loop is unrolled into two carried
     packets."""
     hdr = re.search(r"^  (%acc0[^=]*)= scf\.for %k_base = \[%c0 to %k_size step %c32\]\((.*?)\) -> \((.*?)\) \{\n", s, re.M)

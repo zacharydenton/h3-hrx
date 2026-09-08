@@ -2,7 +2,7 @@
 right after storing tile i's into the other LDS buffer, so that global latency hides behind tile i's compute (four
 loop-carried registers). The V^T packet stays loaded at the top of its tile: carrying it too (the `fv` form in
 experiments/) spills 72 bytes and runs at 0.4x. The eight-wave form also interleaves each PV fragment load with its MMA.
-Measured at 37723 tokens: 22.0 -> 24.3 TFLOP/s (docs/notes.md). Writes kernels/attention_i8qkf_mha8_* and *_mha_*.
+Measured at 37723 tokens: 22.0 -> 24.3 TFLOP/s (docs/archive/notes.md). Writes kernels/attention_i8qkf_mha8_* and *_mha_*.
     python3 tools/gen_attention_prefetch.py"""
 import re
 from pathlib import Path

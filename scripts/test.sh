@@ -16,7 +16,17 @@ step() { local name="$1"; shift; printf '\n=== %s ===\n' "$name"; if "$@"; then 
 skip() { printf '\n=== %s ===\n  skipped: %s\n' "$1" "$2"; }
 gpu() { env -u LD_LIBRARY_PATH "$REF_PY" "$@"; }    # the kernel tests drive the GPU through the Python harness (tools/kernel_test.py) against torch references
 ref() { env -u LD_LIBRARY_PATH "$REF_PY" "$@"; }
-step "tracked Python parses" bash -c 'git ls-files "*.py" | xargs "$0" -m py_compile' "$PY"
+step "Python sources parse" "$PY" - <<'PY'
+from pathlib import Path
+import py_compile
+import subprocess
+
+# Include new files and tolerate unstaged deletions during a cleanup.
+paths = subprocess.check_output(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "*.py"])
+for name in set(paths.decode().split("\0")) - {""}:
+    if Path(name).is_file():
+        py_compile.compile(name, doraise=True)
+PY
 if [ -x "${LOOM_FORMAT:-}" ] && ls kernels/*.loom >/dev/null 2>&1; then step "loom sources are canonically formatted" bash -c '"$LOOM_FORMAT" --check kernels/*.loom'; else skip "loom sources are canonically formatted" "no loom-format (scripts/env.sh)"; fi
 if [ -x "${LOOM_FORMAT:-}" ]; then
 step "generated kernels match their generators" bash -c '
@@ -61,7 +71,7 @@ step "prepare kernels, f16 and bf16 unrotated" gpu tests/test_prepare_float.py
 step "vision matmuls, bf16; matmul_f32 past 32768 rows" gpu tests/test_matmul_bf16.py
 step "C tokenizer vs transformers" ref tests/test_tokenizer.py
 if [ "$tier" = full ]; then
-  # the reference tier: model weights, exports and the reference dumps (README, Weights and Tests)
+  # The reference tier: model weights and reference dumps (CONTRIBUTING.md).
   step "DiT blocks vs the reference (the checkpoint's int8 rows)" ref tests/test_stack_parity.py --stack dit
   step "text encoder layers vs transformers" ref tests/test_stack_parity.py --stack te
   step "C pipeline (libh3pipe) vs the Python stages" ref tests/test_pipe.py --decode --audio
