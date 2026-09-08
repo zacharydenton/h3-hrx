@@ -11,14 +11,33 @@
 // The types keep their C spelling so the header and this file read the same way, and so cbindgen
 // emits them unchanged.
 #![allow(non_camel_case_types)]
-#![allow(clippy::missing_safety_doc)]
-use crate::dit::{DenoiseParams, KeyframeInput, Noise, RefInput};
+use crate::dit::{DenoiseParams, Keyframe, LatentGrid, Noise, Presented, Reference, Sampler};
 use crate::error::{code, Error};
 use crate::session::{Config, Session};
 use crate::vvae::Clip;
 use std::ffi::{c_char, c_int, c_void, CStr};
 
 pub const ABI_VERSION: u32 = 8;
+
+/// What every entry point here requires of its caller, stated once.
+///
+/// These are C functions, so the compiler cannot check any of it:
+///
+/// - A session pointer is one [`h3_create`] returned and [`h3_destroy`] has not been called on, or
+///   NULL, which is refused. It may be used from any thread but not from two at once — the lock
+///   inside serialises calls, it does not make a freed pointer valid.
+/// - Every buffer pointer is either NULL, or points to at least the number of elements its paired
+///   count says, correctly aligned and — for inputs — initialised. A NULL with a positive count is
+///   refused rather than dereferenced, but a *short* buffer cannot be detected and is undefined
+///   behaviour.
+/// - Every string is NUL-terminated and stays valid for the duration of the call.
+/// - Pointers inside `h3_ref` and `h3_keyframe` follow the same rules, with the lengths their own
+///   fields imply.
+///
+/// A returned [`h3_status`] other than `H3_OK` means nothing was written to the output buffers.
+///
+/// The same list appears at the top of `include/h3.h`, for the callers who will actually read it.
+mod contract {}
 
 /// What an entry point returns. The distinction is the caller's: `INVALID_ARGUMENT` means the request
 /// was not one this library serves, `CANCELLED` that a progress callback stopped the run, and `ERROR`
@@ -256,7 +275,12 @@ impl From<&h3_params> for DenoiseParams {
             frames: p.frames,
             steps: p.steps.max(0) as usize,
             seed: p.seed,
-            sampler: p.sampler,
+            // the ABI keeps an int here; the library's own type is an enum
+            sampler: if p.sampler == 0 {
+                Sampler::Euler
+            } else {
+                Sampler::ResMultistep
+            },
             video_shift: f64::from(p.video_shift),
             audio_shift: f64::from(p.audio_shift),
             cache_threshold: p.cache_threshold,
@@ -269,6 +293,10 @@ pub extern "C" fn h3_abi_version() -> u32 {
     ABI_VERSION
 }
 
+/// # Safety
+///
+/// `config` points to one initialised `h3_config` whose strings are NUL-terminated, and `out_session`
+/// to one writable pointer. See the requirements in the header.
 #[no_mangle]
 pub unsafe extern "C" fn h3_create(
     config: *const h3_config,
@@ -296,10 +324,14 @@ pub unsafe extern "C" fn h3_create(
             kernel_sources,
             cache_dir,
             loom_compile: loom_compile.to_string_lossy().into_owned(),
-            attn_qk_bits: if c.attn_qk_bits == 0 {
-                8
-            } else {
-                c.attn_qk_bits.max(0) as usize
+            // 0 means the default, and anything that is not a width with kernels is refused
+            attention: match c.attn_qk_bits {
+                0 => crate::dit::Attention::default(),
+                bits => {
+                    crate::dit::Attention::from_bits(bits.max(0) as usize).ok_or_else(|| {
+                        Error::Invalid(format!("attn_qk_bits {bits} is not 16, 8 or 4"))
+                    })?
+                }
             },
         })?;
         *out_session = Box::into_raw(Box::new(h3_session {
@@ -309,6 +341,10 @@ pub unsafe extern "C" fn h3_create(
     })
 }
 
+/// # Safety
+///
+/// `s` is a session from [`h3_create`] that has not been destroyed, or NULL. After this returns the
+/// pointer is dangling and must not be used again.
 #[no_mangle]
 pub unsafe extern "C" fn h3_destroy(s: *mut h3_session) {
     if !s.is_null() {
@@ -316,6 +352,9 @@ pub unsafe extern "C" fn h3_destroy(s: *mut h3_session) {
     }
 }
 
+/// # Safety
+///
+/// `params` points to one initialised `h3_params` and `out` to one writable `h3_shape`.
 #[no_mangle]
 pub unsafe extern "C" fn h3_shape_for(params: *const h3_params, out: *mut h3_shape) -> c_int {
     if params.is_null() || out.is_null() {
@@ -354,6 +393,9 @@ unsafe fn with(
     f(&mut guard)
 }
 
+/// # Safety
+///
+/// See the requirements in the header: `ids` holds `n_ids` values and `out` at least `out_elements`.
 #[no_mangle]
 pub unsafe extern "C" fn h3_text_in(
     s: *mut h3_session,
@@ -375,9 +417,14 @@ pub unsafe extern "C" fn h3_text_in(
 }
 
 /// The reference and keyframe arrays, borrowed from the caller's memory for one call.
-unsafe fn refs_of<'a>(p: *const h3_ref, n: c_int) -> Result<Vec<RefInput<'a>>, Error> {
+unsafe fn refs_of<'a>(p: *const h3_ref, n: c_int) -> Result<Vec<Reference<'a>>, Error> {
     let mut out = Vec::with_capacity(n.max(0) as usize);
     for r in slice(p, n.max(0) as usize, "refs")? {
+        let grid = LatentGrid {
+            frames: r.latent_t.max(0) as usize,
+            height: r.lat_h.max(0) as usize,
+            width: r.lat_w.max(0) as usize,
+        };
         let vlen = extent(
             "reference latents",
             &[
@@ -392,19 +439,42 @@ unsafe fn refs_of<'a>(p: *const h3_ref, n: c_int) -> Result<Vec<RefInput<'a>>, E
             &[r.audio_t, 2, crate::avae::AUDIO_CH as c_int],
         )?;
         let plen = extent("reference pixels", &[r.height, r.width, 3])?;
-        out.push(RefInput {
-            kind: r.kind,
-            video_latent: (!r.video_latent.is_null())
-                .then(|| slice_unchecked(r.video_latent, vlen)),
-            latent_t: r.latent_t,
-            lat_h: r.lat_h,
-            lat_w: r.lat_w,
-            audio_latent: (!r.audio_latent.is_null())
-                .then(|| slice_unchecked(r.audio_latent, alen)),
-            audio_t: r.audio_t,
-            pixels: (!r.pixels.is_null()).then(|| slice_unchecked(r.pixels, plen)),
-            height: r.height,
-            width: r.width,
+        let video = (!r.video_latent.is_null()).then(|| slice_unchecked(r.video_latent, vlen));
+        let audio = (!r.audio_latent.is_null()).then(|| {
+            (
+                slice_unchecked(r.audio_latent, alen),
+                r.audio_t.max(0) as usize,
+            )
+        });
+        let presented = (!r.pixels.is_null()).then(|| Presented {
+            pixels: slice_unchecked(r.pixels, plen),
+            height: r.height.max(0) as usize,
+            width: r.width.max(0) as usize,
+        });
+        // the ABI's kind tag becomes the variant; a combination the enum cannot hold is refused here
+        out.push(match r.kind {
+            0 => Reference::Image {
+                latents: video
+                    .ok_or_else(|| Error::Invalid("an image reference without latents".into()))?,
+                grid: LatentGrid { frames: 1, ..grid },
+                presented,
+            },
+            1 => {
+                let (latents, frames) = audio
+                    .ok_or_else(|| Error::Invalid("an audio reference without latents".into()))?;
+                Reference::Audio { latents, frames }
+            }
+            2 => Reference::Video {
+                latents: video
+                    .ok_or_else(|| Error::Invalid("a video reference without latents".into()))?,
+                grid,
+                audio,
+            },
+            other => {
+                return Err(Error::Invalid(format!(
+                    "reference kind {other} is not 0 (image), 1 (audio) or 2 (video)"
+                )))
+            }
         });
     }
     Ok(out)
@@ -424,7 +494,7 @@ unsafe fn keyframes_of<'a>(
     n: c_int,
     lat_h: c_int,
     lat_w: c_int,
-) -> Result<Vec<KeyframeInput<'a>>, Error> {
+) -> Result<Vec<Keyframe<'a>>, Error> {
     let vlen = extent(
         "keyframe latents",
         &[lat_h, lat_w, crate::model::LATENT_CH as c_int],
@@ -439,15 +509,20 @@ unsafe fn keyframes_of<'a>(
             &[k.audio_t, 2, crate::avae::AUDIO_CH as c_int],
         )?;
         let plen = extent("keyframe pixels", &[k.height, k.width, 3])?;
-        out.push(KeyframeInput {
+        out.push(Keyframe {
             frame_index: k.frame_index,
-            video_latent: slice_unchecked(k.video_latent, vlen),
-            audio_latent: (!k.audio_latent.is_null())
-                .then(|| slice_unchecked(k.audio_latent, alen)),
-            audio_t: k.audio_t,
-            pixels: (!k.pixels.is_null()).then(|| slice_unchecked(k.pixels, plen)),
-            height: k.height,
-            width: k.width,
+            latents: slice_unchecked(k.video_latent, vlen),
+            audio: (!k.audio_latent.is_null()).then(|| {
+                (
+                    slice_unchecked(k.audio_latent, alen),
+                    k.audio_t.max(0) as usize,
+                )
+            }),
+            presented: (!k.pixels.is_null()).then(|| Presented {
+                pixels: slice_unchecked(k.pixels, plen),
+                height: k.height.max(0) as usize,
+                width: k.width.max(0) as usize,
+            }),
         });
     }
     Ok(out)
@@ -543,6 +618,11 @@ unsafe fn denoise_into(
 /// there is one entry point rather than two, because a reference-free run is not a different call.
 /// `noise_video` and `noise_audio` are optional standard-normal draws in the output layouts, for
 /// reproducible comparisons; without them the seed's own generator is used.
+/// # Safety
+///
+/// See the requirements in the header: every pointer holds at least what its count says, and the reference and
+/// keyframe arrays hold `n_refs` and `n_keyframes` initialised structs whose own pointers follow the
+/// same rules.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn h3_denoise(
@@ -585,6 +665,9 @@ pub unsafe extern "C" fn h3_denoise(
     })
 }
 
+/// # Safety
+///
+/// See the requirements in the header.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn h3_decode_video(
@@ -621,6 +704,9 @@ pub unsafe extern "C" fn h3_decode_video(
     })
 }
 
+/// # Safety
+///
+/// See the requirements in the header: `pixels` holds `frames * height * width * 3` floats.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn h3_encode_video(
@@ -663,6 +749,9 @@ pub unsafe extern "C" fn h3_encode_video(
     })
 }
 
+/// # Safety
+///
+/// See the requirements in the header.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn h3_decode_audio(
@@ -688,6 +777,9 @@ pub unsafe extern "C" fn h3_decode_audio(
     })
 }
 
+/// # Safety
+///
+/// See the requirements in the header: `samples` holds `2 * n_samples` floats, planar stereo.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn h3_encode_audio(
@@ -716,6 +808,9 @@ pub unsafe extern "C" fn h3_encode_audio(
     })
 }
 
+/// # Safety
+///
+/// See the requirements in the header: `pixels` holds `height * width * 3` floats.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn h3_vision_embed(
@@ -759,6 +854,9 @@ pub struct h3_tokenizer {
 
 /// `tokenizer_json`: an HF tokenizer.json, or NULL for the one compiled into the library
 /// (`H3_TOKENIZER=<file>` overrides that). Returns NULL on failure; `h3_last_error` says why.
+/// # Safety
+///
+/// `tokenizer_json` is NUL-terminated or NULL.
 #[no_mangle]
 pub unsafe extern "C" fn h3_tokenizer_create(tokenizer_json: *const c_char) -> *mut h3_tokenizer {
     let built = std::panic::catch_unwind(|| {
@@ -781,6 +879,9 @@ pub unsafe extern "C" fn h3_tokenizer_create(tokenizer_json: *const c_char) -> *
     }
 }
 
+/// # Safety
+///
+/// `t` is a tokenizer from [`h3_tokenizer_create`] that has not been destroyed, or NULL.
 #[no_mangle]
 pub unsafe extern "C" fn h3_tokenizer_destroy(t: *mut h3_tokenizer) {
     if !t.is_null() {
@@ -791,6 +892,9 @@ pub unsafe extern "C" fn h3_tokenizer_destroy(t: *mut h3_tokenizer) {
 /// The number of ids the text encodes to, writing up to `capacity` of them; -1 on failure.
 ///
 /// The count is returned even when it exceeds the buffer, so a caller can size a second call to it.
+/// # Safety
+///
+/// `t` is a live tokenizer, `utf8` NUL-terminated, and `ids` holds at least `capacity` values.
 #[no_mangle]
 pub unsafe extern "C" fn h3_tokenizer_encode(
     t: *const h3_tokenizer,
@@ -818,6 +922,9 @@ pub unsafe extern "C" fn h3_tokenizer_encode(
 }
 
 /// The vocabulary size: the largest id plus one among the model's tokens.
+/// # Safety
+///
+/// `t` is a live tokenizer, or NULL.
 #[no_mangle]
 pub unsafe extern "C" fn h3_tokenizer_vocab_size(t: *const h3_tokenizer) -> c_int {
     if t.is_null() {

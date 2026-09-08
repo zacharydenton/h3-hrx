@@ -6,7 +6,20 @@
 // runtime surface is libhrx, and there is no device code in this library.
 //
 // A call returns H3_OK or a status; h3_last_error() gives the reason for the last failure on the
-// calling thread.
+// calling thread, and a status other than H3_OK means nothing was written to the output buffers.
+//
+// What every entry point requires of its caller, once:
+//
+//   - A session pointer is one h3_create returned and h3_destroy has not been called on, or NULL,
+//     which is refused. It may be used from any thread but not from two at once.
+//   - Every buffer pointer is either NULL, or points to at least the number of elements its paired
+//     count says, correctly aligned and — for inputs — initialised. A NULL with a positive count is
+//     refused rather than dereferenced; a *short* buffer cannot be detected and is undefined.
+//   - Every string is NUL-terminated and stays valid for the duration of the call.
+//   - Pointers inside h3_ref and h3_keyframe follow the same rules, with the lengths their own
+//     fields imply.
+//   - A checkpoint file must not be modified or truncated while a session holds it: it is mapped,
+//     not copied.
 //
 // GENERATED from h3/src/capi.rs by cbindgen. Do not edit; run scripts/build_host.sh.
 
@@ -136,12 +149,26 @@ const char *h3_last_error(void);
 
 uint32_t h3_abi_version(void);
 
+// # Safety
+//
+// `config` points to one initialised `h3_config` whose strings are NUL-terminated, and `out_session`
+// to one writable pointer. See the requirements in the header.
 int h3_create(const struct h3_config *config, struct h3_session **out_session);
 
+// # Safety
+//
+// `s` is a session from [`h3_create`] that has not been destroyed, or NULL. After this returns the
+// pointer is dangling and must not be used again.
 void h3_destroy(struct h3_session *s);
 
+// # Safety
+//
+// `params` points to one initialised `h3_params` and `out` to one writable `h3_shape`.
 int h3_shape_for(const struct h3_params *params, struct h3_shape *out);
 
+// # Safety
+//
+// See the requirements in the header: `ids` holds `n_ids` values and `out` at least `out_elements`.
 int h3_text_in(struct h3_session *s, const int32_t *ids, int n_ids, float *out, uintptr_t out_elements);
 
 // Prompt ids to model-space latents.
@@ -150,6 +177,11 @@ int h3_text_in(struct h3_session *s, const int32_t *ids, int n_ids, float *out, 
 // there is one entry point rather than two, because a reference-free run is not a different call.
 // `noise_video` and `noise_audio` are optional standard-normal draws in the output layouts, for
 // reproducible comparisons; without them the seed's own generator is used.
+// # Safety
+//
+// See the requirements in the header: every pointer holds at least what its count says, and the reference and
+// keyframe arrays hold `n_refs` and `n_keyframes` initialised structs whose own pointers follow the
+// same rules.
 int h3_denoise(struct h3_session *s,
                const int32_t *ids,
                int n_ids,
@@ -167,6 +199,9 @@ int h3_denoise(struct h3_session *s,
                h3_progress progress,
                void *user);
 
+// # Safety
+//
+// See the requirements in the header.
 int h3_decode_video(struct h3_session *s,
                     const struct h3_params *params,
                     const float *video_latents,
@@ -174,6 +209,9 @@ int h3_decode_video(struct h3_session *s,
                     uint8_t *frames,
                     uintptr_t frame_bytes);
 
+// # Safety
+//
+// See the requirements in the header: `pixels` holds `frames * height * width * 3` floats.
 int h3_encode_video(struct h3_session *s,
                     const float *pixels,
                     int frames,
@@ -183,6 +221,9 @@ int h3_encode_video(struct h3_session *s,
                     uintptr_t latent_elements,
                     int *latent_t);
 
+// # Safety
+//
+// See the requirements in the header.
 int h3_decode_audio(struct h3_session *s,
                     const float *audio_latents,
                     uintptr_t audio_elements,
@@ -190,6 +231,9 @@ int h3_decode_audio(struct h3_session *s,
                     float *samples,
                     uintptr_t sample_elements);
 
+// # Safety
+//
+// See the requirements in the header: `samples` holds `2 * n_samples` floats, planar stereo.
 int h3_encode_audio(struct h3_session *s,
                     const float *samples,
                     int n_samples,
@@ -197,6 +241,9 @@ int h3_encode_audio(struct h3_session *s,
                     uintptr_t latent_elements,
                     int *audio_t);
 
+// # Safety
+//
+// See the requirements in the header: `pixels` holds `height * width * 3` floats.
 int h3_vision_embed(struct h3_session *s,
                     const float *pixels,
                     int height,
@@ -209,16 +256,28 @@ int h3_vision_embed(struct h3_session *s,
 
 // `tokenizer_json`: an HF tokenizer.json, or NULL for the one compiled into the library
 // (`H3_TOKENIZER=<file>` overrides that). Returns NULL on failure; `h3_last_error` says why.
+// # Safety
+//
+// `tokenizer_json` is NUL-terminated or NULL.
 struct h3_tokenizer *h3_tokenizer_create(const char *tokenizer_json);
 
+// # Safety
+//
+// `t` is a tokenizer from [`h3_tokenizer_create`] that has not been destroyed, or NULL.
 void h3_tokenizer_destroy(struct h3_tokenizer *t);
 
 // The number of ids the text encodes to, writing up to `capacity` of them; -1 on failure.
 //
 // The count is returned even when it exceeds the buffer, so a caller can size a second call to it.
+// # Safety
+//
+// `t` is a live tokenizer, `utf8` NUL-terminated, and `ids` holds at least `capacity` values.
 int h3_tokenizer_encode(const struct h3_tokenizer *t, const char *utf8, int32_t *ids, uintptr_t capacity);
 
 // The vocabulary size: the largest id plus one among the model's tokens.
+// # Safety
+//
+// `t` is a live tokenizer, or NULL.
 int h3_tokenizer_vocab_size(const struct h3_tokenizer *t);
 
 #ifdef __cplusplus

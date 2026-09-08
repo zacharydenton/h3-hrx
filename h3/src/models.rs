@@ -43,6 +43,17 @@ impl Default for Resolver {
 }
 
 impl Resolver {
+    /// Where checkpoints are looked for by default: `H3_MODELS`, else `~/comfy-models`.
+    pub fn default_root() -> PathBuf {
+        std::env::var_os("H3_MODELS")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let home = std::env::var_os("HOME").unwrap_or_default();
+                Path::new(&home).join("comfy-models")
+            })
+    }
+
     /// `H3_MODELS`, else `~/comfy-models` when it exists; downloads allowed.
     pub fn new() -> Self {
         let dir = std::env::var_os("H3_MODELS")

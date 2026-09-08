@@ -250,10 +250,6 @@ impl AudioVae {
         })
     }
 
-    pub fn weights(&self) -> &Weights {
-        &self.weights
-    }
-
     /// The anti-aliased SnakeBeta: up two, activate, down two, through a FIR the checkpoint carries.
     #[allow(clippy::too_many_arguments)]
     fn snake_beta(

@@ -189,9 +189,10 @@ fn warms_up(repeat: u32) -> bool {
 
 fn run(opt: Options) -> Result<(), String> {
     let gpu = hrx::Gpu::open().map_err(|e| e.to_string())?;
-    let kernel = gpu
-        .load(&opt.hsaco, &opt.kernel)
-        .map_err(|e| e.to_string())?;
+    // Safety: loomrun exists to run a code object the caller names, which is the whole of its job.
+    // The contract is the operator's: --hsaco and --kernel identify the code, and --grid, --block and
+    // the operand flags describe how it is meant to be called.
+    let kernel = unsafe { gpu.load(&opt.hsaco, &opt.kernel) }.map_err(|e| e.to_string())?;
 
     // Upload in declaration order, keeping scalars and buffers in their own sequences: the export
     // reports the constant block and the binding count separately.
@@ -257,7 +258,7 @@ fn run(opt: Options) -> Result<(), String> {
 
     let warmup = warms_up(opt.repeat);
     if warmup {
-        gpu.dispatch(&kernel, opt.grid, opt.block, &scalars, &bindings)
+        unsafe { gpu.dispatch(&kernel, opt.grid, opt.block, &scalars, &bindings) }
             .map_err(|e| e.to_string())?;
         gpu.sync().map_err(|e| e.to_string())?;
     }
@@ -276,7 +277,7 @@ fn run(opt: Options) -> Result<(), String> {
                 rotated[which - 1].binding()
             };
         }
-        gpu.dispatch(&kernel, opt.grid, opt.block, &scalars, &bindings)
+        unsafe { gpu.dispatch(&kernel, opt.grid, opt.block, &scalars, &bindings) }
             .map_err(|e| e.to_string())?;
     }
     gpu.sync().map_err(|e| e.to_string())?;

@@ -60,6 +60,14 @@ impl Profile {
 }
 
 /// One launch, timed into `profile` when it is on.
+///
+/// # Safety
+///
+/// This is the crate's one call to [`hrx::Gpu::dispatch`], and it inherits its contract: `grid`,
+/// `block`, `scalars` and `bindings` must be what `kernel` was compiled for. It is not marked unsafe
+/// because every caller is a builder in this module, which compiles a kernel and launches it from one
+/// description — that pairing is the invariant, and it is why the builders exist rather than callers
+/// assembling launches by hand.
 #[allow(clippy::too_many_arguments)]
 pub fn launch(
     gpu: &hrx::Gpu,
@@ -75,12 +83,12 @@ pub fn launch(
         Some(p) if p.on => {
             gpu.sync()?;
             let started = Instant::now();
-            gpu.dispatch(kernel, grid, block, scalars, bindings)?;
+            unsafe { gpu.dispatch(kernel, grid, block, scalars, bindings)? };
             gpu.sync()?;
             *p.micros.entry(stage.to_string()).or_insert(0.0) +=
                 started.elapsed().as_secs_f64() * 1e6;
         }
-        _ => gpu.dispatch(kernel, grid, block, scalars, bindings)?,
+        _ => unsafe { gpu.dispatch(kernel, grid, block, scalars, bindings)? },
     }
     Ok(())
 }

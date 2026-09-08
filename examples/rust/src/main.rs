@@ -4,9 +4,7 @@
 //! A Rust caller does not go through the C ABI. `Session` is the library's own API — slices, borrows
 //! and `Result` — and this is what it looks like used directly. `examples/c` and `examples/go` are the
 //! C-ABI clients.
-use h3::dit::{DenoiseParams, Noise};
-use h3::session::{Config, Session};
-use h3::tokenizer::Tokenizer;
+use h3::{Config, DenoiseParams, Noise, Session, Tokenizer};
 use std::io::Write;
 
 fn main() {
@@ -35,7 +33,7 @@ fn main() {
         kernel_sources: format!("{root}/kernels").into(),
         cache_dir: format!("{root}/build/kernel_cache").into(),
         loom_compile: std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into()),
-        attn_qk_bits: 8,
+        attention: h3::Attention::I8,
     })
     .expect("session");
 

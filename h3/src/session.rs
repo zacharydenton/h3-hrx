@@ -6,13 +6,14 @@
 use crate::avae::AudioVae;
 use crate::compile::Compiler;
 use crate::dispatch::Profile;
-use crate::dit::{DenoiseParams, Dit, KeyframeInput, Latents, Noise, RefInput};
+use crate::dit::{DenoiseParams, Dit, Keyframe, Latents, Noise, Reference};
 use crate::error::{invalid, Result};
 use crate::layout::{shape_for, Shape};
 use crate::te::TextEncoder;
 use crate::vvae::{Clip, VideoVae};
 
 /// Where the four checkpoints live, and how kernels are built.
+#[derive(Clone, Debug)]
 pub struct Config {
     pub dit: Option<std::path::PathBuf>,
     pub te: Option<std::path::PathBuf>,
@@ -21,8 +22,26 @@ pub struct Config {
     pub kernel_sources: std::path::PathBuf,
     pub cache_dir: std::path::PathBuf,
     pub loom_compile: String,
-    /// the DiT attention's QK operands: 16, 8 or 4
-    pub attn_qk_bits: usize,
+    /// the DiT attention's QK operands
+    pub attention: crate::dit::Attention,
+}
+
+impl Default for Config {
+    /// The checkpoints where `H3_MODELS` or `~/comfy-models` puts them, kernels from the repository
+    /// beside the executable, and int8 attention.
+    fn default() -> Self {
+        let models = crate::models::Resolver::default_root();
+        Self {
+            dit: Some(models.join(crate::models::DIT_FL2VA)),
+            te: Some(models.join(crate::models::TE)),
+            video_vae: Some(models.join(crate::models::VIDEO_VAE)),
+            audio_vae: Some(models.join(crate::models::AUDIO_VAE)),
+            kernel_sources: "kernels".into(),
+            cache_dir: "build/kernel_cache".into(),
+            loom_compile: "loom-compile".into(),
+            attention: crate::dit::Attention::default(),
+        }
+    }
 }
 
 pub struct Session {
@@ -38,9 +57,6 @@ pub struct Session {
 
 impl Session {
     pub fn new(config: Config) -> Result<Self> {
-        if !matches!(config.attn_qk_bits, 4 | 8 | 16) {
-            return invalid("attn_qk_bits must be 4, 8 or 16");
-        }
         let compiler = Compiler::new(
             config.loom_compile.clone(),
             config.kernel_sources.clone(),
@@ -70,11 +86,11 @@ impl Session {
         (!report.is_empty()).then_some(report)
     }
 
-    /// The attention width this session was created with. The stack is built for it, so it is not a
+    /// The attention this session was created with. The stack is built for it, so it is not a
     /// per-run parameter — and a run that quietly ignored it would make a precision comparison
     /// meaningless rather than wrong in any visible way.
-    pub fn attn_qk_bits(&self) -> usize {
-        self.config.attn_qk_bits
+    pub fn attention(&self) -> crate::dit::Attention {
+        self.config.attention
     }
 
     /// The shapes a request produces, or `None` when it is not one this model serves.
@@ -177,12 +193,12 @@ impl Session {
         ids: &[i32],
         p: &DenoiseParams,
         noise: Noise<'_>,
-        refs: &[RefInput<'_>],
-        kfs: &[KeyframeInput<'_>],
+        refs: &[Reference<'_>],
+        kfs: &[Keyframe<'_>],
         progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
     ) -> Result<Latents> {
         // the attention width is the session's, set once at creation: the stack is built for it
-        let qk_bits = self.config.attn_qk_bits;
+        let qk_bits = self.config.attention.bits();
         let (gpu, c, prof, dit, te) = self.prompt_pair()?;
         dit.denoise(
             gpu, c, prof, te, ids, p, qk_bits, noise, refs, kfs, progress,
@@ -273,10 +289,10 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dit::{KeyframeInput, RefInput};
+    use crate::dit::{Keyframe, LatentGrid, Reference};
     use crate::vvae::Clip;
 
-    fn config(bits: usize) -> Config {
+    fn config(attention: crate::dit::Attention) -> Config {
         Config {
             dit: None,
             te: None,
@@ -285,7 +301,7 @@ mod tests {
             kernel_sources: "kernels".into(),
             cache_dir: "build/kernel_cache".into(),
             loom_compile: "loom-compile".into(),
-            attn_qk_bits: bits,
+            attention,
         }
     }
 
@@ -318,51 +334,53 @@ mod tests {
     #[test]
     fn a_reference_must_match_the_buffers_it_names() {
         let z = vec![0.0f32; crate::model::LATENT_CH * 4 * 4];
-        let image = RefInput {
-            kind: 0,
-            video_latent: Some(&z),
-            latent_t: 1,
-            lat_h: 4,
-            lat_w: 4,
-            audio_latent: None,
-            audio_t: 0,
-            pixels: None,
-            height: 0,
-            width: 0,
+        let grid = LatentGrid {
+            frames: 1,
+            height: 4,
+            width: 4,
         };
-        assert!(image.check(0).is_ok());
+        assert!(Reference::Image {
+            latents: &z,
+            grid,
+            presented: None
+        }
+        .check(0)
+        .is_ok());
         // latents that do not cover the grid claimed
-        assert!(RefInput { lat_h: 8, ..image }.check(0).is_err());
-        // a visual reference with no latents at all
-        assert!(RefInput {
-            video_latent: None,
-            ..image
+        assert!(Reference::Image {
+            latents: &z,
+            grid: LatentGrid { height: 8, ..grid },
+            presented: None
         }
         .check(0)
         .is_err());
-        // an audio reference needs audio
-        assert!(RefInput {
-            kind: 1,
-            video_latent: None,
-            ..image
+        // an audio reference whose latents are short of its frame count
+        assert!(Reference::Audio {
+            latents: &z,
+            frames: 10_000
         }
         .check(0)
         .is_err());
-        // and an unknown kind is refused rather than silently treated as visual
-        assert!(RefInput { kind: 7, ..image }.check(0).is_err());
+        // A video reference with a soundtrack is expressible; an image with one is not, and an audio
+        // reference carrying video latents is not either. Those were the combinations a kind tag with
+        // optional fields allowed.
+        assert!(Reference::Video {
+            latents: &z,
+            grid,
+            audio: None
+        }
+        .check(0)
+        .is_ok());
     }
 
     #[test]
     fn a_keyframe_must_sit_on_the_generations_grid() {
         let z = vec![0.0f32; crate::model::LATENT_CH * 16 * 16];
-        let kf = KeyframeInput {
+        let kf = Keyframe {
             frame_index: 0,
-            video_latent: &z,
-            audio_latent: None,
-            audio_t: 0,
-            pixels: None,
-            height: 0,
-            width: 0,
+            latents: &z,
+            presented: None,
+            audio: None,
         };
         assert!(kf.check(0, 16, 16).is_ok());
         assert!(
@@ -373,13 +391,17 @@ mod tests {
     }
 
     #[test]
-    fn only_the_three_attention_widths_are_accepted() {
-        for bad in [0, 1, 2, 7, 9, 32] {
-            let e = Session::new(config(bad));
-            assert!(
-                matches!(e, Err(crate::error::Error::Invalid(_))),
-                "{bad} bits should be refused"
-            );
+    fn only_the_three_attention_widths_exist() {
+        use crate::dit::Attention;
+        // the type is the check now: a width that has no kernels cannot be named
+        for bad in [0usize, 1, 2, 7, 9, 32] {
+            assert_eq!(Attention::from_bits(bad), None, "{bad} bits");
         }
+        for (bits, want) in [(16, Attention::F16), (8, Attention::I8), (4, Attention::I4)] {
+            assert_eq!(Attention::from_bits(bits), Some(want));
+            assert_eq!(want.bits(), bits);
+        }
+        assert_eq!(Attention::default(), Attention::I8);
+        let _ = config(Attention::F16);
     }
 }

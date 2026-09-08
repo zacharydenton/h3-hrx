@@ -308,7 +308,16 @@ impl Gpu {
         }
     }
 
-    pub fn load(&self, path: &Path, symbol: &str) -> Result<Kernel> {
+    /// Loads a code object and looks up one of its exports.
+    ///
+    /// # Safety
+    ///
+    /// The file is machine code that will run on the device with no sandbox between it and every
+    /// other allocation this process holds. Loading one is trusting whoever produced it, exactly as
+    /// `dlopen` is: a code object that reads or writes outside the bindings it is given corrupts
+    /// memory, and nothing here can tell that it will. Load only code objects this process compiled,
+    /// or that come from a source you would equally trust with a shared library.
+    pub unsafe fn load(&self, path: &Path, symbol: &str) -> Result<Kernel> {
         let c_path = CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|_| Error(format!("{} contains a NUL", path.display())))?;
         let c_family = CString::new(TARGET_FAMILY).unwrap();
@@ -362,7 +371,21 @@ impl Gpu {
     /// `scalars` are the kernel's by-value arguments in declaration order and `bindings` its buffer
     /// arguments in declaration order. The export reports how many bytes of constants it wants and how
     /// many bindings it has; a mismatch is a caller error and is reported as one rather than dispatched.
-    pub fn dispatch(
+    /// Runs a kernel.
+    ///
+    /// # Safety
+    ///
+    /// A [`View`] proves that the allocation it names is still alive. It proves nothing about what
+    /// the kernel does with it. The device code addresses its bindings itself, from the scalars it is
+    /// given and from indices it computes, so a grid, a block size or a scalar that disagrees with
+    /// the kernel's own expectations reads or writes outside them — the length in a binding is
+    /// descriptive, not enforced.
+    ///
+    /// The caller must know that `kernel` is the kernel it thinks it is, and that `grid`, `block`,
+    /// `scalars` and `bindings` are the shapes it was compiled for. In this workspace that knowledge
+    /// lives in `h3::dispatch`, whose builders compile a kernel and launch it from the same
+    /// description; nothing else should call this directly.
+    pub unsafe fn dispatch(
         &self,
         kernel: &Kernel,
         grid: [u32; 3],

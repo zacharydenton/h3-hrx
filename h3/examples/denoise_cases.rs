@@ -18,7 +18,9 @@
 //!   out <dir>
 use h3::compile::Compiler;
 use h3::dispatch::Profile;
-use h3::dit::{DenoiseParams, Dit, KeyframeInput, Noise, RefInput};
+use h3::dit::{
+    Attention, DenoiseParams, Dit, Keyframe, LatentGrid, Noise, Presented, Reference, Sampler,
+};
 use h3::te::TextEncoder;
 use std::io::Write;
 
@@ -68,28 +70,16 @@ struct OwnedKeyframe {
     width: i32,
 }
 
+#[derive(Default)]
 struct Case {
     name: String,
     ids: Vec<i32>,
-    qk_bits: usize,
+    /// int8 by default, as `Attention::default()` is
+    attention: Attention,
     p: DenoiseParams,
     noise: Option<(Vec<f32>, Vec<f32>)>,
     refs: Vec<OwnedRef>,
     kfs: Vec<OwnedKeyframe>,
-}
-
-impl Default for Case {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            ids: Vec::new(),
-            qk_bits: 8,
-            p: DenoiseParams::default(),
-            noise: None,
-            refs: Vec::new(),
-            kfs: Vec::new(),
-        }
-    }
 }
 
 fn main() {
@@ -117,7 +107,10 @@ fn main() {
                 }
             }
             "out" => out_dir = f[1].to_string(),
-            "attn" => cases.last_mut().expect("a case first").qk_bits = f[1].parse().unwrap(),
+            "attn" => {
+                cases.last_mut().expect("a case first").attention =
+                    Attention::from_bits(f[1].parse().unwrap()).expect("16, 8 or 4")
+            }
             "case" => cases.push(Case {
                 name: f[1].into(),
                 ids: ids.clone(),
@@ -132,7 +125,11 @@ fn main() {
             "steps" => {
                 let c = cases.last_mut().expect("a case first");
                 c.p.steps = f[1].parse().unwrap();
-                c.p.sampler = f[2].parse().unwrap();
+                c.p.sampler = if f[2] == "0" {
+                    Sampler::Euler
+                } else {
+                    Sampler::ResMultistep
+                };
                 c.p.seed = f[3].parse().unwrap();
                 c.p.cache_threshold = f[4].parse().unwrap();
             }
@@ -180,33 +177,51 @@ fn main() {
     let mut prof = Profile::from_env();
 
     for case in &cases {
-        let refs: Vec<RefInput<'_>> = case
+        let refs: Vec<Reference<'_>> = case
             .refs
             .iter()
-            .map(|r| RefInput {
-                kind: r.kind,
-                video_latent: r.video.as_deref(),
-                latent_t: r.latent_t,
-                lat_h: r.lat_h,
-                lat_w: r.lat_w,
-                audio_latent: r.audio.as_deref(),
-                audio_t: r.audio_t,
-                pixels: r.pixels.as_deref(),
-                height: r.height,
-                width: r.width,
+            .map(|r| {
+                let grid = LatentGrid {
+                    frames: r.latent_t.max(0) as usize,
+                    height: r.lat_h.max(0) as usize,
+                    width: r.lat_w.max(0) as usize,
+                };
+                let presented = r.pixels.as_deref().map(|pixels| Presented {
+                    pixels,
+                    height: r.height as usize,
+                    width: r.width as usize,
+                });
+                let audio = r.audio.as_deref().map(|z| (z, r.audio_t.max(0) as usize));
+                match r.kind {
+                    0 => Reference::Image {
+                        latents: r.video.as_deref().expect("image latents"),
+                        grid: LatentGrid { frames: 1, ..grid },
+                        presented,
+                    },
+                    1 => {
+                        let (latents, frames) = audio.expect("audio latents");
+                        Reference::Audio { latents, frames }
+                    }
+                    _ => Reference::Video {
+                        latents: r.video.as_deref().expect("video latents"),
+                        grid,
+                        audio,
+                    },
+                }
             })
             .collect();
-        let kfs: Vec<KeyframeInput<'_>> = case
+        let kfs: Vec<Keyframe<'_>> = case
             .kfs
             .iter()
-            .map(|k| KeyframeInput {
+            .map(|k| Keyframe {
                 frame_index: k.frame_index,
-                video_latent: &k.video,
-                audio_latent: k.audio.as_deref(),
-                audio_t: k.audio_t,
-                pixels: k.pixels.as_deref(),
-                height: k.height,
-                width: k.width,
+                latents: &k.video,
+                audio: k.audio.as_deref().map(|z| (z, k.audio_t.max(0) as usize)),
+                presented: k.pixels.as_deref().map(|pixels| Presented {
+                    pixels,
+                    height: k.height as usize,
+                    width: k.width as usize,
+                }),
             })
             .collect();
         let noise = match &case.noise {
@@ -225,7 +240,7 @@ fn main() {
                 &mut te,
                 &case.ids,
                 &case.p,
-                case.qk_bits,
+                case.attention.bits(),
                 noise,
                 &refs,
                 &kfs,

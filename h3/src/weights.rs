@@ -133,7 +133,9 @@ impl Weights {
         path: impl AsRef<std::path::Path>,
         plan: impl FnOnce(&Checkpoint, &mut BTreeMap<String, Recipe>) -> Result<()>,
     ) -> Result<Self> {
-        let file = Checkpoint::open(path)?;
+        // Safety: the caller's, and stated on Session and Checkpoint::open — the checkpoint must not
+        // be modified while this Weights lives.
+        let file = unsafe { Checkpoint::open(path) }?;
         let mut recipes = BTreeMap::new();
         plan(&file, &mut recipes)?;
         Ok(Self {
@@ -766,7 +768,7 @@ mod tests {
         file.write_all(header.as_bytes()).unwrap();
         file.write_all(&blob).unwrap();
         drop(file);
-        Checkpoint::open(&path).unwrap()
+        unsafe { Checkpoint::open(&path) }.unwrap()
     }
 
     fn f32_bytes(values: &[f32]) -> Vec<u8> {

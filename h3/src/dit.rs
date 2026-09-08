@@ -247,6 +247,48 @@ impl Dit {
     }
 }
 
+/// The QK operands' width. The stack is built for it, so it belongs to the session, not a run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Attention {
+    /// f16 operands: the widest, and what the reference comparison uses
+    F16,
+    /// int8: the parity path, and the default
+    #[default]
+    I8,
+    /// int4: least operand traffic, and it ghosts conditioned clips
+    I4,
+}
+
+impl Attention {
+    pub fn bits(self) -> usize {
+        match self {
+            Self::F16 => 16,
+            Self::I8 => 8,
+            Self::I4 => 4,
+        }
+    }
+
+    /// The three the kernels exist for; anything else is a caller's mistake.
+    pub fn from_bits(bits: usize) -> Option<Self> {
+        match bits {
+            16 => Some(Self::F16),
+            8 => Some(Self::I8),
+            4 => Some(Self::I4),
+            _ => None,
+        }
+    }
+}
+
+/// How a step advances.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Sampler {
+    /// Euler on each stream's own schedule, as diffusers does it
+    Euler,
+    /// ComfyUI's res_multistep over the pack on the video sigma grid, which the stock workflows use
+    #[default]
+    ResMultistep,
+}
+
 /// What a run asks for. The shifts and the sampler are the schedule's, the threshold the step cache's.
 #[derive(Clone, Copy, Debug)]
 pub struct DenoiseParams {
@@ -255,8 +297,7 @@ pub struct DenoiseParams {
     pub frames: i32,
     pub steps: usize,
     pub seed: u64,
-    /// 0 Euler, 1 res_multistep
-    pub sampler: i32,
+    pub sampler: Sampler,
     pub video_shift: f64,
     pub audio_shift: f64,
     pub cache_threshold: f32,
@@ -270,7 +311,7 @@ impl Default for DenoiseParams {
             frames: 90,
             steps: 30,
             seed: 0,
-            sampler: 1,
+            sampler: Sampler::ResMultistep,
             video_shift: 12.0,
             audio_shift: 3.0,
             cache_threshold: 0.0,
@@ -317,68 +358,125 @@ struct CacheBuffers {
     metric: std::sync::Arc<hrx::Kernel>,
 }
 
-/// A reference the pack conditions on, in presentation order.
-pub struct RefInput<'a> {
-    /// 0 image, 1 audio, 2 video
-    pub kind: i32,
-    pub video_latent: Option<&'a [f32]>,
-    pub latent_t: i32,
-    pub lat_h: i32,
-    pub lat_w: i32,
-    pub audio_latent: Option<&'a [f32]>,
-    pub audio_t: i32,
-    /// pixels for the vision tower, when this reference is also presented to the text encoder
-    pub pixels: Option<&'a [f32]>,
-    pub height: i32,
-    pub width: i32,
+/// A latent grid: the extent of a reference's own latents.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LatentGrid {
+    pub frames: usize,
+    pub height: usize,
+    pub width: usize,
 }
 
-impl RefInput<'_> {
-    /// The buffers against the dimensions they claim.
-    pub fn check(&self, i: usize) -> crate::error::Result<()> {
-        let at = |what: &str| format!("reference {i}: {what}");
-        match self.kind {
-            0 | 2 => {
-                let t = if self.kind == 0 { 1 } else { self.latent_t };
-                let need = LATENT_CH
-                    * (t.max(0) as usize)
-                    * (self.lat_h.max(0) as usize)
-                    * (self.lat_w.max(0) as usize);
-                let Some(z) = self.video_latent else {
-                    return crate::error::invalid(at("a visual reference without latents"));
-                };
-                if need == 0 || z.len() < need {
-                    return crate::error::invalid(at(&format!(
-                        "latents of {t}x{}x{} need {need} floats, {} given",
-                        self.lat_h,
-                        self.lat_w,
-                        z.len()
-                    )));
-                }
-            }
-            1 => {}
-            other => return crate::error::invalid(at(&format!("unknown kind {other}"))),
+impl LatentGrid {
+    pub fn elements(&self) -> usize {
+        LATENT_CH * self.frames * self.height * self.width
+    }
+}
+
+/// An image as the text encoder is shown it, alongside a visual reference's latents.
+#[derive(Clone, Copy, Debug)]
+pub struct Presented<'a> {
+    pub pixels: &'a [f32],
+    pub height: usize,
+    pub width: usize,
+}
+
+/// A reference the pack conditions on, in presentation order.
+///
+/// An enum rather than a kind tag with optional fields: an audio reference has no latent grid and an
+/// image has no soundtrack, and the combinations that used to be constructible — a kind of 1 carrying
+/// video latents, a visual kind carrying none — cannot be written down here at all.
+#[derive(Clone, Copy, Debug)]
+pub enum Reference<'a> {
+    /// One latent frame, optionally presented to the text encoder as pixels
+    Image {
+        latents: &'a [f32],
+        grid: LatentGrid,
+        presented: Option<Presented<'a>>,
+    },
+    /// `[2][32][frames]`
+    Audio { latents: &'a [f32], frames: usize },
+    /// A clip, with its own soundtrack if it has one
+    Video {
+        latents: &'a [f32],
+        grid: LatentGrid,
+        audio: Option<(&'a [f32], usize)>,
+    },
+}
+
+impl Reference<'_> {
+    /// The tag the packed layout orders by: 0 image, 1 audio, 2 video.
+    pub(crate) fn kind(&self) -> i32 {
+        match self {
+            Self::Image { .. } => 0,
+            Self::Audio { .. } => 1,
+            Self::Video { .. } => 2,
         }
-        if self.kind == 1 || self.audio_latent.is_some() {
-            let need = 2 * crate::avae::AUDIO_CH * self.audio_t.max(0) as usize;
-            let Some(z) = self.audio_latent else {
-                return crate::error::invalid(at("an audio reference without latents"));
-            };
+    }
+
+    pub(crate) fn grid(&self) -> LatentGrid {
+        match self {
+            Self::Image { grid, .. } => LatentGrid { frames: 1, ..*grid },
+            Self::Video { grid, .. } => *grid,
+            Self::Audio { .. } => LatentGrid {
+                frames: 0,
+                height: 0,
+                width: 0,
+            },
+        }
+    }
+
+    pub(crate) fn video_latents(&self) -> Option<&[f32]> {
+        match self {
+            Self::Image { latents, .. } | Self::Video { latents, .. } => Some(latents),
+            Self::Audio { .. } => None,
+        }
+    }
+
+    pub(crate) fn audio_latents(&self) -> Option<(&[f32], usize)> {
+        match self {
+            Self::Audio { latents, frames } => Some((latents, *frames)),
+            Self::Video { audio, .. } => *audio,
+            Self::Image { .. } => None,
+        }
+    }
+
+    pub(crate) fn presented(&self) -> Option<Presented<'_>> {
+        match self {
+            Self::Image { presented, .. } => *presented,
+            _ => None,
+        }
+    }
+
+    /// The buffers against the extents they claim.
+    pub fn check(&self, i: usize) -> crate::error::Result<()> {
+        let at = |what: String| crate::error::Error::Invalid(format!("reference {i}: {what}"));
+        if let Some(z) = self.video_latents() {
+            let need = self.grid().elements();
             if need == 0 || z.len() < need {
-                return crate::error::invalid(at(&format!(
-                    "audio latents need {need} floats, {} given",
+                return Err(at(format!(
+                    "latents for {:?} need {need} floats, {} given",
+                    self.grid(),
                     z.len()
                 )));
             }
         }
-        if let Some(px) = self.pixels {
-            let need = (self.height.max(0) as usize) * (self.width.max(0) as usize) * 3;
-            if need == 0 || px.len() < need {
-                return crate::error::invalid(at(&format!(
+        if let Some((z, frames)) = self.audio_latents() {
+            let need = 2 * crate::avae::AUDIO_CH * frames;
+            if need == 0 || z.len() < need {
+                return Err(at(format!(
+                    "audio latents for {frames} frames need {need} floats, {} given",
+                    z.len()
+                )));
+            }
+        }
+        if let Some(p) = self.presented() {
+            let need = p.height * p.width * 3;
+            if need == 0 || p.pixels.len() < need {
+                return Err(at(format!(
                     "pixels of {}x{} need {need} floats, {} given",
-                    self.height,
-                    self.width,
-                    px.len()
+                    p.height,
+                    p.width,
+                    p.pixels.len()
                 )));
             }
         }
@@ -386,45 +484,48 @@ impl RefInput<'_> {
     }
 }
 
-/// A keyframe: one latent frame pinned at a frame index, optionally with audio and pixels.
-pub struct KeyframeInput<'a> {
+/// A keyframe: one latent frame pinned at a frame index, on the generation's own latent grid.
+#[derive(Clone, Copy, Debug)]
+pub struct Keyframe<'a> {
+    /// 0 for the first frame, or `frames - 1` after snapping for the last
     pub frame_index: i32,
-    pub video_latent: &'a [f32],
-    pub audio_latent: Option<&'a [f32]>,
-    pub audio_t: i32,
-    pub pixels: Option<&'a [f32]>,
-    pub height: i32,
-    pub width: i32,
+    /// `[24][1][lat_h][lat_w]`, on the grid the run itself uses
+    pub latents: &'a [f32],
+    /// the same frame as pixels, for the encoder's presentation
+    pub presented: Option<Presented<'a>>,
+    /// optional, and never denoised
+    pub audio: Option<(&'a [f32], usize)>,
 }
 
-impl KeyframeInput<'_> {
-    /// The buffers against the generation's own latent grid, which is what a keyframe sits on.
+impl Keyframe<'_> {
+    /// The buffers against the generation's grid, which is what a keyframe sits on.
     pub fn check(&self, i: usize, lat_h: i32, lat_w: i32) -> crate::error::Result<()> {
+        let at = |what: String| crate::error::Error::Invalid(format!("keyframe {i}: {what}"));
         let need = LATENT_CH * (lat_h.max(0) as usize) * (lat_w.max(0) as usize);
-        if need == 0 || self.video_latent.len() < need {
-            return crate::error::invalid(format!(
-                "keyframe {i}: latents on the {lat_h}x{lat_w} grid need {need} floats, {} given",
-                self.video_latent.len()
-            ));
+        if need == 0 || self.latents.len() < need {
+            return Err(at(format!(
+                "latents on the {lat_h}x{lat_w} grid need {need} floats, {} given",
+                self.latents.len()
+            )));
         }
-        if let Some(z) = self.audio_latent {
-            let want = 2 * crate::avae::AUDIO_CH * self.audio_t.max(0) as usize;
+        if let Some((z, frames)) = self.audio {
+            let want = 2 * crate::avae::AUDIO_CH * frames;
             if want == 0 || z.len() < want {
-                return crate::error::invalid(format!(
-                    "keyframe {i}: audio latents need {want} floats, {} given",
+                return Err(at(format!(
+                    "audio latents for {frames} frames need {want} floats, {} given",
                     z.len()
-                ));
+                )));
             }
         }
-        if let Some(px) = self.pixels {
-            let want = (self.height.max(0) as usize) * (self.width.max(0) as usize) * 3;
-            if want == 0 || px.len() < want {
-                return crate::error::invalid(format!(
-                    "keyframe {i}: pixels of {}x{} need {want} floats, {} given",
-                    self.height,
-                    self.width,
-                    px.len()
-                ));
+        if let Some(p) = self.presented {
+            let want = p.height * p.width * 3;
+            if want == 0 || p.pixels.len() < want {
+                return Err(at(format!(
+                    "pixels of {}x{} need {want} floats, {} given",
+                    p.height,
+                    p.width,
+                    p.pixels.len()
+                )));
             }
         }
         Ok(())
@@ -598,8 +699,8 @@ impl Dit {
         // the QK operands' width, from the session's configuration: 16, 8 or 4
         qk_bits: usize,
         noise: Noise<'_>,
-        refs: &[RefInput<'_>],
-        kfs: &[KeyframeInput<'_>],
+        refs: &[Reference<'_>],
+        kfs: &[Keyframe<'_>],
         mut progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
     ) -> Result<Latents> {
         let sh = crate::layout::shape_for(p.height, p.width, p.frames)
@@ -612,21 +713,24 @@ impl Dit {
         let n = ids.len();
         let lay_refs: Vec<crate::layout::Ref> = refs
             .iter()
-            .map(|r| crate::layout::Ref {
-                kind: r.kind,
-                latent_t: r.latent_t,
-                lat_h: r.lat_h,
-                lat_w: r.lat_w,
-                audio_t: r.audio_t,
-                has_audio: r.audio_latent.is_some(),
+            .map(|r| {
+                let g = r.grid();
+                crate::layout::Ref {
+                    kind: r.kind(),
+                    latent_t: g.frames as i32,
+                    lat_h: g.height as i32,
+                    lat_w: g.width as i32,
+                    audio_t: r.audio_latents().map_or(0, |(_, n)| n as i32),
+                    has_audio: r.audio_latents().is_some(),
+                }
             })
             .collect();
         let lay_kfs: Vec<crate::layout::Keyframe> = kfs
             .iter()
             .map(|k| crate::layout::Keyframe {
                 frame_index: k.frame_index,
-                audio_t: k.audio_t,
-                has_audio: k.audio_latent.is_some(),
+                audio_t: k.audio.map_or(0, |(_, n)| n as i32),
+                has_audio: k.audio.is_some(),
             })
             .collect();
         let mut lay = crate::layout::Layout::new(
@@ -682,7 +786,7 @@ impl Dit {
             sh.lat_w as usize,
             sh.audio_t as usize,
         );
-        let res = p.sampler == 1;
+        let res = p.sampler == Sampler::ResMultistep;
         let (shift_v, shift_a) = (
             if p.video_shift > 0.0 {
                 p.video_shift
@@ -863,6 +967,16 @@ impl Dit {
             }
         }
 
+        if let Some(c) = cache.as_ref() {
+            if crate::stack::env_once("H3_CACHE_TRACE").is_some() {
+                eprintln!(
+                    "  step cache: {} of {} evaluations skipped",
+                    c.skipped(),
+                    sv.timesteps.len()
+                );
+            }
+        }
+
         let mut video = vec![0.0f32; LATENT_CH * t_len * h * w];
         let mut audio = vec![0.0f32; 2 * AUDIO_CH * a];
         crate::sampler::rows_to_tensor(&vrows, &mut video, t_len, h, w);
@@ -890,8 +1004,8 @@ impl Dit {
         prof: &mut Profile,
         te: &TextEncoder,
         ids: &[i32],
-        refs: &[RefInput<'_>],
-        kfs: &[KeyframeInput<'_>],
+        refs: &[Reference<'_>],
+        kfs: &[Keyframe<'_>],
     ) -> Result<Vec<(VisionSpan, crate::vision::Embedding)>> {
         let mut runs: Vec<(usize, usize)> = Vec::new();
         for (i, id) in ids.iter().enumerate() {
@@ -905,15 +1019,13 @@ impl Dit {
         }
         let mut pics: Vec<(&[f32], usize, usize)> = Vec::new();
         for kf in kfs {
-            if let Some(px) = kf.pixels {
-                pics.push((px, kf.height as usize, kf.width as usize));
+            if let Some(p) = kf.presented {
+                pics.push((p.pixels, p.height, p.width));
             }
         }
         for rf in refs {
-            if rf.kind == 0 {
-                if let Some(px) = rf.pixels {
-                    pics.push((px, rf.height as usize, rf.width as usize));
-                }
+            if let Some(p) = rf.presented() {
+                pics.push((p.pixels, p.height, p.width));
             }
         }
         if pics.len() > runs.len() {
@@ -958,8 +1070,8 @@ impl Dit {
         c: &Compiler,
         prof: &mut Profile,
         lay: &crate::layout::Layout,
-        refs: &[RefInput<'_>],
-        kfs: &[KeyframeInput<'_>],
+        refs: &[Reference<'_>],
+        kfs: &[Keyframe<'_>],
         seed: u64,
         in32: &mut [f32],
     ) -> Result<()> {
@@ -967,10 +1079,10 @@ impl Dit {
             // a keyframe presents as a one-frame image reference
             let (video_latent, audio_latent) = if sg.kind == 3 {
                 let kf = &kfs[sg.index];
-                (Some(kf.video_latent), kf.audio_latent)
+                (Some(kf.latents), kf.audio.map(|(z, _)| z))
             } else {
                 let rf = &refs[sg.index];
-                (rf.video_latent, rf.audio_latent)
+                (rf.video_latents(), rf.audio_latents().map(|(z, _)| z))
             };
             if sg.audio {
                 let Some(al) = audio_latent else {
@@ -1116,6 +1228,17 @@ impl Dit {
             }
         }
         let change = cache.consider(step, d, m);
+        // H3_CACHE_TRACE: the decision per step, as the C printed it. Without it the threshold is
+        // impossible to choose — the useful range is narrow and depends on the prompt.
+        if crate::stack::env_once("H3_CACHE_TRACE").is_some() {
+            eprintln!(
+                "  step {}: block-0 change {:.4}, accumulated {:.4} -> {}",
+                step + 1,
+                change.relative,
+                change.accumulated,
+                if change.skip { "cached" } else { "full" }
+            );
+        }
         gpu.d2d(&cb.prev, &seq.x, n * 4)?;
         if change.skip {
             axpy(

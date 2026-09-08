@@ -77,14 +77,29 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    /// Maps a checkpoint and reads its header.
+    ///
+    /// # Safety
+    ///
+    /// The file is mapped, not copied — a 30 GB checkpoint has to be, and every tensor is read
+    /// through the mapping as the upload needs it. So the file must not be modified or truncated
+    /// while the returned `Checkpoint` lives:
+    ///
+    /// - Modifying it changes bytes this crate has already validated. The header says a tensor is
+    ///   `[5376][14336]` of bf16 and the reader trusts that from then on.
+    /// - Truncating it turns a mapped page into a `SIGBUS`, which no `Result` can carry: the process
+    ///   dies at the read.
+    ///
+    /// Nothing in the filesystem enforces this and nothing here can check it, which is why this is
+    /// `unsafe` rather than a comment claiming the file is immutable. [`crate::Session`] states the
+    /// same requirement in its own documentation, and is the safe entry point that relies on it.
+    pub unsafe fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path).map_err(|source| Error::Open {
             path: path.clone(),
             source,
         })?;
-        // Safety: the checkpoint is treated as immutable for the process's lifetime. A concurrent
-        // writer would be a violation, which is true of the C implementation this replaces as well.
+        // Safety: the caller's, and stated above.
         let map = unsafe { Mmap::map(&file) }.map_err(|source| Error::Open {
             path: path.clone(),
             source,
@@ -128,9 +143,6 @@ impl Checkpoint {
         })
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
     pub fn entries(&self) -> &BTreeMap<String, Entry> {
         &self.entries
     }
@@ -312,7 +324,7 @@ mod tests {
             ],
             None,
         );
-        let ck = Checkpoint::open(&path).unwrap();
+        let ck = unsafe { Checkpoint::open(&path) }.unwrap();
         let gate = ck.at("gate").unwrap();
         assert_eq!(gate.dtype, Dtype::I8);
         assert_eq!(gate.shape, vec![2, 4]);
@@ -331,7 +343,7 @@ mod tests {
         let dir = tmp();
         let path = dir.path().join("c.safetensors");
         write_checkpoint(&path, &[("a", "F16", vec![1], vec![0, 0])], None);
-        let ck = Checkpoint::open(&path).unwrap();
+        let ck = unsafe { Checkpoint::open(&path) }.unwrap();
         let message = ck
             .at("blocks.0.attn.qkv_proj.weight")
             .unwrap_err()
@@ -348,7 +360,7 @@ mod tests {
         let dir = tmp();
         let path = dir.path().join("c.safetensors");
         write_checkpoint(&path, &[("gate", "I8", vec![32, 8], vec![0u8; 256])], None);
-        let ck = Checkpoint::open(&path).unwrap();
+        let ck = unsafe { Checkpoint::open(&path) }.unwrap();
         let message = ck
             .at_checked("gate", Dtype::F16, &[32, 8])
             .unwrap_err()
@@ -370,20 +382,20 @@ mod tests {
         let short = dir.path().join("short.safetensors");
         File::create(&short).unwrap().write_all(b"abc").unwrap();
         assert!(matches!(
-            Checkpoint::open(&short),
+            unsafe { Checkpoint::open(&short) },
             Err(Error::Header { .. })
         ));
 
         let missing = dir.path().join("nope.safetensors");
         assert!(matches!(
-            Checkpoint::open(&missing),
+            unsafe { Checkpoint::open(&missing) },
             Err(Error::Open { .. })
         ));
 
         // a header length that runs past the file
         let bad = dir.path().join("bad.safetensors");
         write_checkpoint(&bad, &[("a", "F16", vec![1], vec![0, 0])], Some(1 << 20));
-        assert!(matches!(Checkpoint::open(&bad), Err(Error::Header { .. })));
+        assert!(matches!(unsafe { Checkpoint::open(&bad) }, Err(Error::Header { .. })));
     }
 
     #[test]
@@ -398,7 +410,7 @@ mod tests {
         file.write_all(header).unwrap();
         file.write_all(&[0u8; 16]).unwrap(); // far short of 256
         drop(file);
-        assert!(Checkpoint::open(&path).is_err());
+        assert!(unsafe { Checkpoint::open(&path) }.is_err());
     }
 
     #[test]
@@ -417,7 +429,7 @@ mod tests {
             file.write_all(&[0u8; 4]).unwrap();
             drop(file);
             assert!(
-                Checkpoint::open(&path).is_err(),
+                unsafe { Checkpoint::open(&path) }.is_err(),
                 "shape [{spelling}] should be rejected"
             );
         }
@@ -435,7 +447,7 @@ mod tests {
             ],
             None,
         );
-        let ck = Checkpoint::open(&path).unwrap();
+        let ck = unsafe { Checkpoint::open(&path) }.unwrap();
         let scalar = ck.at("scalar").unwrap();
         assert_eq!((scalar.elements(), scalar.rows(), scalar.bytes), (1, 1, 4));
         let empty = ck.at("empty").unwrap();
@@ -510,7 +522,7 @@ mod tests {
         let dir = tmp();
         let path = dir.path().join("c.safetensors");
         write_checkpoint(&path, &[("a", "F32", vec![4096], vec![7u8; 16384])], None);
-        let ck = Checkpoint::open(&path).unwrap();
+        let ck = unsafe { Checkpoint::open(&path) }.unwrap();
         let entry = ck.at("a").unwrap();
         let bytes = ck.bytes(entry);
         // Both hints are advisory and must leave the data readable either way.

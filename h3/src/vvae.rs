@@ -111,10 +111,6 @@ impl VideoVae {
         })
     }
 
-    pub fn weights(&self) -> &Weights {
-        &self.weights
-    }
-
     /// Builds the stack, the two projections and the buffers for one latent grid, if the last call was
     /// for a different one.
     fn ensure(&mut self, gpu: &hrx::Gpu, c: &Compiler, grid: Grid) -> Result<()> {

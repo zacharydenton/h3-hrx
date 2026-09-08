@@ -209,7 +209,10 @@ impl Compiler {
         if !path.exists() {
             self.compile(stem, symbol, cfg, &path)?;
         }
-        let kernel = Arc::new(gpu.load(&path, symbol)?);
+        // Safety: the code object was produced by this process's own loom-compile, from a source in
+        // `sources` and a configuration this crate wrote, under a name that hashes all of it. A file
+        // in the cache under that name is one this build made.
+        let kernel = Arc::new(unsafe { gpu.load(&path, symbol)? });
         self.loaded
             .lock()
             .expect("not poisoned")

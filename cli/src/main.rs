@@ -12,10 +12,10 @@
 mod media;
 mod resize;
 
-use h3::dit::{DenoiseParams, KeyframeInput, Noise, RefInput};
-use h3::session::{Config, Session};
-use h3::tokenizer::Tokenizer;
-use h3::vvae::Clip;
+use h3::{
+    Attention as Attn16, Clip, Config, DenoiseParams, Keyframe, LatentGrid, Noise, Presented,
+    Reference, Sampler as Sampler16, Session, Tokenizer,
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -364,8 +364,8 @@ fn run(cli: Cli) -> Result<()> {
         steps: cli.steps as usize,
         seed: cli.seed,
         sampler: match cli.sampler {
-            Sampler::Euler => 0,
-            Sampler::ResMultistep => 1,
+            Sampler::Euler => Sampler16::Euler,
+            Sampler::ResMultistep => Sampler16::ResMultistep,
         },
         ..DenoiseParams::default()
     };
@@ -463,10 +463,10 @@ fn run(cli: Cli) -> Result<()> {
         kernel_sources: sources,
         cache_dir: cache,
         loom_compile,
-        attn_qk_bits: match cli.attn {
-            Attn::F16 => 16,
-            Attn::I8 => 8,
-            Attn::I4 => 4,
+        attention: match cli.attn {
+            Attn::F16 => Attn16::F16,
+            Attn::I8 => Attn16::I8,
+            Attn::I4 => Attn16::I4,
         },
     };
 
@@ -522,47 +522,41 @@ fn run(cli: Cli) -> Result<()> {
         );
     }
 
-    let keyframes: Vec<KeyframeInput<'_>> = keyframe
+    let keyframes: Vec<Keyframe<'_>> = keyframe
         .iter()
         .zip(keyframe_latents.iter())
-        .map(|(k, z)| KeyframeInput {
+        .map(|(k, z)| Keyframe {
             frame_index: 0,
-            video_latent: z,
-            pixels: Some(&k.pixels),
-            height: k.h,
-            width: k.w,
-            audio_latent: None,
-            audio_t: 0,
+            latents: z,
+            presented: Some(Presented {
+                pixels: &k.pixels,
+                height: k.h as usize,
+                width: k.w as usize,
+            }),
+            audio: None,
         })
         .collect();
-    let mut refs: Vec<RefInput<'_>> = ref_images
+    let mut refs: Vec<Reference<'_>> = ref_images
         .iter()
         .zip(image_latents.iter())
-        .map(|(im, z)| RefInput {
-            kind: 0,
-            video_latent: Some(z),
-            latent_t: 1,
-            lat_h: im.h / 16,
-            lat_w: im.w / 16,
-            audio_latent: None,
-            audio_t: 0,
-            pixels: Some(&im.pixels),
-            height: im.h,
-            width: im.w,
+        .map(|(im, z)| Reference::Image {
+            latents: z,
+            grid: LatentGrid {
+                frames: 1,
+                height: (im.h / 16) as usize,
+                width: (im.w / 16) as usize,
+            },
+            presented: Some(Presented {
+                pixels: &im.pixels,
+                height: im.h as usize,
+                width: im.w as usize,
+            }),
         })
         .collect();
     for (z, t) in &audio_latents {
-        refs.push(RefInput {
-            kind: 1,
-            video_latent: None,
-            latent_t: 0,
-            lat_h: 0,
-            lat_w: 0,
-            audio_latent: Some(z),
-            audio_t: *t as i32,
-            pixels: None,
-            height: 0,
-            width: 0,
+        refs.push(Reference::Audio {
+            latents: z,
+            frames: *t,
         });
     }
 

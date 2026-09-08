@@ -9,7 +9,20 @@ header = """// C ABI for the whole MiniMax H3 text -> video + audio pipeline wit
 // runtime surface is libhrx, and there is no device code in this library.
 //
 // A call returns H3_OK or a status; h3_last_error() gives the reason for the last failure on the
-// calling thread.
+// calling thread, and a status other than H3_OK means nothing was written to the output buffers.
+//
+// What every entry point requires of its caller, once:
+//
+//   - A session pointer is one h3_create returned and h3_destroy has not been called on, or NULL,
+//     which is refused. It may be used from any thread but not from two at once.
+//   - Every buffer pointer is either NULL, or points to at least the number of elements its paired
+//     count says, correctly aligned and — for inputs — initialised. A NULL with a positive count is
+//     refused rather than dereferenced; a *short* buffer cannot be detected and is undefined.
+//   - Every string is NUL-terminated and stays valid for the duration of the call.
+//   - Pointers inside h3_ref and h3_keyframe follow the same rules, with the lengths their own
+//     fields imply.
+//   - A checkpoint file must not be modified or truncated while a session holds it: it is mapped,
+//     not copied.
 //
 // GENERATED from h3/src/capi.rs by cbindgen. Do not edit; run scripts/build_host.sh."""
 include_guard = "H3_LOOM_H"

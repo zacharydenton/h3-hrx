@@ -18,7 +18,8 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let which = args.next().expect("usage: plan_dump <plan> <checkpoint>");
     let path = args.next().expect("usage: plan_dump <plan> <checkpoint>");
-    let ck = Checkpoint::open(&path).expect("open");
+    // Safety: a diagnostic run over a file the operator named and is not writing to.
+    let ck = unsafe { Checkpoint::open(&path) }.expect("open");
     let mut table: BTreeMap<String, Recipe> = BTreeMap::new();
     match which.as_str() {
         "dit" => h3::plan::dit::plan(&ck, &mut table).expect("plan"),

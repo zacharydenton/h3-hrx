@@ -18,7 +18,8 @@ fn main() {
     let path = std::env::args()
         .nth(1)
         .expect("usage: checkpoint_dump file.safetensors");
-    let ck = Checkpoint::open(&path).expect("open");
+    // Safety: a diagnostic run over a file the operator named and is not writing to.
+    let ck = unsafe { Checkpoint::open(&path) }.expect("open");
     for (name, entry) in ck.entries() {
         let bytes = ck.bytes(entry);
         let (sum, weighted) = digest(bytes);

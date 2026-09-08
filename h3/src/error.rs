@@ -16,6 +16,8 @@ pub enum Error {
     Compile(#[from] compile::Error),
     #[error(transparent)]
     Runtime(#[from] hrx::Error),
+    #[error("tokenizer: {0}")]
+    Tokenizer(#[from] crate::tokenizer::Error),
     /// The caller asked for something it may not: a shape the model does not do, a missing checkpoint.
     #[error("{0}")]
     Invalid(String),
