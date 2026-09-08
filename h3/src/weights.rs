@@ -481,6 +481,63 @@ pub fn widen_padded(ck: &Checkpoint, name: &str, n_out: usize) -> Result<Recipe>
     })
 }
 
+/// Rounds `n` up to a multiple of `m`.
+pub fn up(n: usize, m: usize) -> usize {
+    n.div_ceil(m) * m
+}
+
+/// A causal 3-D conv weight `[Cout][Cin][3][3][3]` as the implicit GEMM's operand rows
+/// `[Cout_pad][taps * Cin_pad]`, taps in `(t, y, x)` order with the channel innermost, zero-padded.
+///
+/// `taps` is 27 for the clip form and 9 for the image form, which keeps only the last temporal tap.
+pub fn conv3d_taps(
+    ck: &Checkpoint,
+    name: &str,
+    cout: usize,
+    cin: usize,
+    taps: usize,
+) -> Result<Recipe> {
+    let entry = ck.at(name)?;
+    if entry.dtype != Dtype::F16 {
+        return layout(format!("conv3d_taps on {:?}", entry.dtype));
+    }
+    if taps != 27 && taps != 9 {
+        return layout("conv3d_taps: taps must be 27 or 9");
+    }
+    let (cin_pad, cout_pad) = (up(cin, 8), up(cout, 64));
+    let k = up(taps * cin_pad, 32);
+    let name = name.to_string();
+    Ok(Recipe::Built {
+        bytes: cout_pad * k * 2,
+        build: Box::new(move |ck| {
+            let src = ck.bytes(ck.at(&name)?);
+            let mut out = vec![0u8; cout_pad * k * 2];
+            for oc in 0..cout {
+                for ic in 0..cin {
+                    for t in 0..3 {
+                        if taps == 9 && t != 2 {
+                            continue;
+                        }
+                        for y in 0..3 {
+                            for x in 0..3 {
+                                let tap = if taps == 27 {
+                                    (t * 3 + y) * 3 + x
+                                } else {
+                                    y * 3 + x
+                                };
+                                let from = ((((oc * cin + ic) * 3 + t) * 3 + y) * 3 + x) * 2;
+                                let to = (oc * k + tap * cin_pad + ic) * 2;
+                                out[to..to + 2].copy_from_slice(&src[from..from + 2]);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        }),
+    })
+}
+
 /// The f32 `[N, 1]` per-row scales of concatenated int8 operands, in the rows' order.
 pub fn scales_rows(ck: &Checkpoint, parts: &[&str]) -> Result<Recipe> {
     widen_f32(ck, parts)
