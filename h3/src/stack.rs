@@ -64,6 +64,13 @@ impl StackDims {
 
 /// The AdaLN rows a layer modulates with: a table and a gate for each of the two residual writes.
 #[derive(Clone, Copy)]
+/// One layer's modulation, as the kernels read it.
+///
+/// The sizes are not optional and are not checked by the runtime: a table is `(scale, shift)` per
+/// class, so each `table_*` must hold **two** rows of the hidden width per class, and each `gate_*` one
+/// row per class. A buffer half that size reads past its allocation and produces a plausible-looking
+/// wrong answer rather than a fault — a stack whose blocks modulate with a scale alone still needs a
+/// `2 * hidden` zero table, not a `hidden` one.
 pub struct LayerCond {
     pub table_msa: BufferRef,
     pub gate_msa: BufferRef,

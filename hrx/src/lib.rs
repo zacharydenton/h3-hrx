@@ -230,9 +230,29 @@ impl Gpu {
     }
 
     pub fn d2d(&self, dst: &Buffer, src: &Buffer, bytes: usize) -> Result<()> {
+        self.d2d_at(dst, 0, src, 0, bytes)
+    }
+
+    /// A device copy into or out of the middle of an allocation — a row range of a packed sequence,
+    /// or one half of a two-row table.
+    pub fn d2d_at(
+        &self,
+        dst: &Buffer,
+        dst_offset: usize,
+        src: &Buffer,
+        src_offset: usize,
+        bytes: usize,
+    ) -> Result<()> {
         unsafe {
             check(
-                sys::hrx_stream_copy_buffer(self.inner.stream, src.raw, 0, dst.raw, 0, bytes),
+                sys::hrx_stream_copy_buffer(
+                    self.inner.stream,
+                    src.raw,
+                    src_offset,
+                    dst.raw,
+                    dst_offset,
+                    bytes,
+                ),
                 "hrx_stream_copy_buffer",
             )
         }
