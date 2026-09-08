@@ -2,4 +2,5 @@
 pub mod checkpoint;
 pub mod model;
 pub mod plan;
+pub mod tokenizer;
 pub mod weights;
