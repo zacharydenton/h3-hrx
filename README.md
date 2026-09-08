@@ -16,6 +16,9 @@ h3 ref.jpg voice.wav < prompt.txt        # references by extension, prompt on st
 
 https://github.com/user-attachments/assets/41a98dcf-48f0-4328-a0f4-7f17119243e6
 
+Its prompt is `docs/prompts/cliff_rider_768p.txt`; H3 expects a structured prompt, and `docs/prompting.md`
+is the format.
+
 ## Numbers
 
 Per model evaluation, int8 path, Radeon 8060S, idle box (`H3_PROFILE=1`; ComfyUI measured on
@@ -106,7 +109,8 @@ ln -s "$PWD/build/h3" ~/.local/bin/h3
 **The `h3` command.** Positional files are references by extension: images become `<Picture i>`
 (encoded by the video VAE's encoder, presented to the text encoder through the vision tower),
 audio files become `<Audio j>` (the audio VAE's encoder). The prompt comes from stdin or `-p`.
-Any format ffmpeg reads; audio is resampled to 32 kHz stereo.
+Any format ffmpeg reads; audio is resampled to 32 kHz stereo. The model wants MiniMax's three-field
+prompt structure rather than a free-form sentence: `docs/prompting.md`.
 
 ```sh
 h3 ref1.jpg voice.wav < prompt.txt
@@ -228,10 +232,10 @@ attention form.
 | --- | --- |
 | `host/` | the C++ host: `h3pipe.cpp` (the pipeline behind `h3pipe.h`), `h3_cli.cpp` (`h3`), `h3tok.cpp` (tokenizer), the text encoder, VAE and runtime bindings |
 | `kernels/` | the Loom kernels; `experiments/` the measured losers, kept with their numbers |
-| `tools/` | kernel generators (`gen_*.py`), weight exports (`export_*.py`, the reference tier's oracles), the Python driver, benches, the ComfyUI harness |
+| `tools/` | kernel generators (`gen_*.py`), the Python driver, benches, the ComfyUI harness |
 | `tests/` | kernel tests against float64 references, host tests, the ComfyUI parity gate |
 | `reference/` | the torch reference of the block stack and the VAE decoder, the reference tier's oracles |
-| `docs/` | `abi.md` (the C ABI contract), `tricks.md` (voice, sound, stills, reusable pieces), `notes.md` (every measured lever, won or lost), the attention and GEMM reports, the reference-conditioning plan |
+| `docs/` | `abi.md` (the C ABI contract), `prompting.md` (the prompt format, with `prompts/`), `tricks.md` (voice, sound, stills, reusable pieces), `notes.md` (every measured lever, won or lost), the attention and GEMM reports, the reference-conditioning plan |
 | `examples/` | the minimal client in C, Rust and Go |
 | `assets/` | Qwen's `tokenizer.json`, compiled into `libh3pipe.so` |
 | `scripts/` | `env.sh` (toolchain and runtime paths, all overridable), `build_host.sh`, `test.sh`, `test_host.sh`, `download.sh` |

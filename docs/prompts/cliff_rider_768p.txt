@@ -1,0 +1,5 @@
+integrated_multimodal_description: [Shot 1] Live-action, cinematic, a wide tracking shot follows a lone armored rider galloping along the crest of a sea cliff at golden hour. The camera trucks right with large amplitude at fast speed, holding the rider in the left third of the frame as her dark cape snaps behind her and the horse's hooves throw up wet grass and spray. Below the cliff edge, heavy swells break white against black rock. Storm clouds move across snow-capped mountains on the horizon while low sun breaks through in visible shafts, lighting her polished steel pauldrons and the horse's dark flank. The camera pedestals up with small amplitude near the end, opening the drop between the rider and the surf below.
+
+overall_soundscape: Hooves strike wet stone in a fast, steady rhythm while heavy surf booms against the rocks far below. Wind pushes hard and continuously across the frame, and leather and metal creak with each stride as the cape snaps in the gusts.
+
+non_diegetic_music: Low sustained strings at a slow tempo beneath a rising brass line, with timpani entering on the downbeats and increasing in volume through to the end.
