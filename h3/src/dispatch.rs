@@ -36,7 +36,7 @@ impl Profile {
 
 /// One launch, timed into `profile` when it is on.
 #[allow(clippy::too_many_arguments)]
-fn launch(
+pub fn launch(
     gpu: &hrx::Gpu,
     kernel: &hrx::Kernel,
     profile: Option<&mut Profile>,

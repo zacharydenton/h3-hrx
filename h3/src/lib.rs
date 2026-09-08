@@ -5,5 +5,6 @@ pub mod dispatch;
 pub mod model;
 pub mod models;
 pub mod plan;
+pub mod stack;
 pub mod tokenizer;
 pub mod weights;

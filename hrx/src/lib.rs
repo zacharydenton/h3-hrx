@@ -201,6 +201,34 @@ impl Gpu {
         }
     }
 
+    /// Reads back from a view rather than a whole allocation, which is how the pipeline inspects rows
+    /// it handed a kernel at an offset.
+    pub fn d2h_ref(&self, src: sys::BufferRef, dst: &mut [u8]) -> Result<()> {
+        if dst.is_empty() {
+            return Ok(());
+        }
+        if dst.len() > src.length {
+            return Err(Error(format!(
+                "read of {} bytes from a {}-byte view",
+                dst.len(),
+                src.length
+            )));
+        }
+        self.sync()?;
+        unsafe {
+            check(
+                sys::hrx_synchronous_d2h(
+                    self.inner.device,
+                    src.buffer,
+                    src.offset,
+                    dst.as_mut_ptr() as *mut c_void,
+                    dst.len(),
+                ),
+                "hrx_synchronous_d2h",
+            )
+        }
+    }
+
     pub fn d2d(&self, dst: &Buffer, src: &Buffer, bytes: usize) -> Result<()> {
         unsafe {
             check(
