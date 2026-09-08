@@ -185,8 +185,11 @@ mod tests {
         let r = Resolver::new()
             .with_dir(Some(dir.path().to_path_buf()))
             .offline(true);
-        let message = r.find(AUDIO_VAE).unwrap_err().to_string();
-        assert!(message.contains(AUDIO_VAE), "{message}");
+        // A name the repository does not have, so the result cannot depend on what this machine
+        // happens to have cached.
+        const ABSENT: &str = "vae/not-a-real-checkpoint.safetensors";
+        let message = r.find(ABSENT).unwrap_err().to_string();
+        assert!(message.contains(ABSENT), "{message}");
         assert!(message.contains(dir.path().to_str().unwrap()), "{message}");
         assert!(message.contains("Hugging Face cache"), "{message}");
     }

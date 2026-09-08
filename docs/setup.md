@@ -60,7 +60,12 @@ and no `LD_LIBRARY_PATH` entry is needed.
 
 ## Checkpoints
 
-Follow the [base checkpoint download](../README.md#weights). Approximate file sizes:
+Follow the [base checkpoint download](../README.md#weights); `h3` fetches them on
+first use if they are not already present. They are resolved from a models
+directory, then the shared Hugging Face cache, then the hub, so a copy that
+already exists anywhere is reused. `tools/link_hf_cache.py --apply` registers an
+existing ComfyUI models directory in the cache by symlink, which costs no disk
+and works when the two are on different filesystems. Approximate file sizes:
 
 | Checkpoint | Contents | Disk size |
 | --- | --- | ---: |

@@ -158,10 +158,17 @@ class ReviewRegressions(unittest.TestCase):
                  "vae/minimax_h3_video_vae_fp16.safetensors", "vae/minimax_h3_audio_vae_fp32.safetensors"]
         for name, want in zip(("DIT", "TE", "VIDEO_VAE", "AUDIO_VAE"), files):
             self.assertTrue(str(getattr(h3pipe_loom, name)).endswith(want), name)
-        for path in ("cli/src/main.rs", "examples/c/minimal.c", "examples/rust/src/main.rs", "examples/go/main.go", "README.md"):
+        # h3/src/models.rs is where the paths live for the Rust side; the clients that still spell them
+        # out must agree with it.
+        for path in ("h3/src/models.rs", "examples/c/minimal.c", "examples/rust/src/main.rs", "examples/go/main.go", "README.md"):
             text = (ROOT / path).read_text()
             for want in files: self.assertIn(want, text, f"{path} does not name {want}")
-            self.assertIn("H3_MODELS", text, path)
+        # the command resolves through that module rather than joining paths of its own
+        cli = (ROOT / "cli/src/main.rs").read_text()
+        for want in ("h3::models::DIT_FL2VA", "h3::models::TE", "h3::models::VIDEO_VAE", "h3::models::AUDIO_VAE"):
+            self.assertIn(want, cli, f"cli/src/main.rs does not use {want}")
+        for path in ("examples/c/minimal.c", "examples/rust/src/main.rs", "examples/go/main.go", "README.md"):
+            self.assertIn("H3_MODELS", (ROOT / path).read_text(), path)
 
     def test_cache_invalidation_and_failed_compile(self):
         with tempfile.TemporaryDirectory() as tmp:

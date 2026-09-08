@@ -49,19 +49,30 @@ bash scripts/build_host.sh
 
 ### Weights
 
-Download the four checkpoints with the Hugging Face `hf` CLI:
+`h3` fetches what it needs on first use, into the shared Hugging Face cache:
 
 ```sh
-hf download Comfy-Org/MiniMax-H3 --local-dir ~/comfy-models \
+h3 -p "..."          # downloads the four checkpoints if they are not already here
+```
+
+Checkpoints are looked for in a models directory first (`--models DIR` or
+`H3_MODELS`, default `~/comfy-models`), then in the Hugging Face cache, and only
+then on the hub, so an existing copy is reused wherever it lives. `--offline`
+stops at what is already on disk. To fetch them ahead of time:
+
+```sh
+hf download Comfy-Org/MiniMax-H3 \
   --include diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
             text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors \
             vae/minimax_h3_video_vae_fp16.safetensors \
             vae/minimax_h3_audio_vae_fp32.safetensors
 ```
 
-Use `--models DIR` or `H3_MODELS` for a different location. Reference images and
-audio additionally need the ref2va checkpoint. See [setup details](docs/setup.md)
-for that download, tool paths, and the optional runtime workaround.
+If you already have them in a ComfyUI models directory,
+`python3 tools/link_hf_cache.py --apply` registers them in the cache by symlink
+rather than downloading them again. Reference images and audio additionally need
+the ref2va checkpoint. See [setup details](docs/setup.md) for that download and
+tool paths.
 Model weights have their own license; consult the
 [model repository](https://huggingface.co/Comfy-Org/MiniMax-H3).
 

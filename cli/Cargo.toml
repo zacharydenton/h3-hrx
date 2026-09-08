@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+h3 = { path = "../h3" }
 clap = { version = "4", features = ["derive"] }
 
 [profile.release]

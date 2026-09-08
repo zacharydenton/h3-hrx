@@ -87,9 +87,14 @@ struct Cli {
     #[arg(long, value_enum, default_value = "res_multistep")]
     sampler: Sampler,
 
-    /// ComfyUI's models directory (default $H3_MODELS, else ~/comfy-models)
+    /// A models directory (default $H3_MODELS, else ~/comfy-models); checkpoints not found there come
+    /// from the shared Hugging Face cache, and are downloaded into it if they are not there either
     #[arg(long, value_name = "DIR")]
     models: Option<PathBuf>,
+
+    /// Use only checkpoints already on disk; never download
+    #[arg(long)]
+    offline: bool,
 
     #[arg(long, value_name = "FILE")]
     dit: Option<PathBuf>,
@@ -296,43 +301,40 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
 
-    // ComfyUI's models directory: the four checkpoints, read as they are
-    let models = cli.models.clone().unwrap_or_else(|| {
-        std::env::var_os("H3_MODELS")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()))
-                    .join("comfy-models")
-            })
-    });
-    let dit_base = models.join("diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors");
-    let dit_ref2va =
-        models.join("diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors");
+    // The checkpoints: a models directory first, then the shared Hugging Face cache, then the hub.
+    // --offline stops at what is already on disk instead of downloading.
+    let resolver = h3::models::Resolver::new()
+        .with_dir(cli.models.clone())
+        .offline(cli.offline);
     let want_refs = !image_files.is_empty() || !audio_files.is_empty();
-    let have_ref2va = dit_ref2va.exists();
-    let ref2va = want_refs && have_ref2va && !cli.base_weights;
-    if want_refs && !have_ref2va && !cli.base_weights && cli.dit.is_none() {
+    // The reference-conditioned checkpoint is only used when it is already here: substituting the base
+    // one changes what the model does, so that is said out loud rather than done quietly.
+    let ref2va_path = want_refs
+        .then(|| resolver.find_local(h3::models::DIT_REF2VA))
+        .flatten();
+    let ref2va = ref2va_path.is_some() && !cli.base_weights;
+    if want_refs && ref2va_path.is_none() && !cli.base_weights && cli.dit.is_none() {
         usage!(
             "reference files need the ref2va checkpoint, {} (README, Weights); --base-weights runs the base checkpoint anyway",
-            dit_ref2va.display()
+            h3::models::DIT_REF2VA
         );
     }
-    let dit = cli
-        .dit
-        .clone()
-        .unwrap_or(if ref2va { dit_ref2va } else { dit_base });
-    let te = cli.te.clone().unwrap_or_else(|| {
-        models.join("text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors")
-    });
-    let video_vae = cli
-        .video_vae
-        .clone()
-        .unwrap_or_else(|| models.join("vae/minimax_h3_video_vae_fp16.safetensors"));
-    let audio_vae = cli
-        .audio_vae
-        .clone()
-        .unwrap_or_else(|| models.join("vae/minimax_h3_audio_vae_fp32.safetensors"));
+    let resolve = |explicit: &Option<PathBuf>, relative: &str| -> Result<PathBuf> {
+        match explicit {
+            Some(path) => Ok(path.clone()),
+            None => resolver
+                .find(relative)
+                .map_err(|e| UsageError(e.to_string()).into()),
+        }
+    };
+    let dit = match (&cli.dit, ref2va.then(|| ref2va_path.clone()).flatten()) {
+        (Some(path), _) => path.clone(),
+        (None, Some(path)) => path,
+        (None, None) => resolve(&None, h3::models::DIT_FL2VA)?,
+    };
+    let te = resolve(&cli.te, h3::models::TE)?;
+    let video_vae = resolve(&cli.video_vae, h3::models::VIDEO_VAE)?;
+    let audio_vae = resolve(&cli.audio_vae, h3::models::AUDIO_VAE)?;
     if !dit.exists() {
         usage!(
             "{} not found (README, Weights; --models or --dit)",
