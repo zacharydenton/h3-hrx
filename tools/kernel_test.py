@@ -13,7 +13,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 HRX_BUILD = Path(os.environ.get("HRX_BUILD", Path.home() / "code/hrx-system/build-cuda"))
 LOOM_COMPILE = HRX_BUILD / "loom/src/loom/tools/loom-compile/loom-compile"
-LOOMRUN = ROOT / "build/loomrun"
+LOOMRUN = Path(os.environ.get("H3_LOOMRUN") or ROOT / "build/loomrun")   # H3_LOOMRUN: compare launchers
 TARGET = os.environ.get("LOOM_TARGET", "gfx1151")
 
 

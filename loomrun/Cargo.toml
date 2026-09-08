@@ -1,0 +1,15 @@
+[package]
+name = "loomrun"
+version = "0.1.0"
+edition = "2021"
+description = "launch one Loom-compiled kernel on the GPU and dump its buffers"
+
+[[bin]]
+name = "loomrun"
+path = "src/main.rs"
+
+[dependencies]
+hrx = { path = "../hrx" }
+
+[profile.release]
+opt-level = 2

@@ -1,0 +1,8 @@
+[package]
+name = "hrx"
+version = "0.1.0"
+edition = "2021"
+description = "libhrx bindings: the GPU runtime this project dispatches Loom kernels through"
+
+[lib]
+path = "src/lib.rs"

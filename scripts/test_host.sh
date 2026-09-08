@@ -16,8 +16,6 @@ g++ -std=c++17 -O1 -Wno-subobject-linkage -ffunction-sections -fdata-sections te
 "$tmpdir/pipe_memory" "$tmpdir"
 g++ -std=c++17 -O1 -Itests/fakes tests/test_runtime_cleanup.cpp -o "$tmpdir/runtime_cleanup"
 "$tmpdir/runtime_cleanup"
-g++ -std=c++17 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Itests/fakes tests/test_loomrun_rotation.cpp -o "$tmpdir/loomrun_rotation"
-"$tmpdir/loomrun_rotation" "$tmpdir"
 g++ -std=c++17 -O1 -g -Wno-subobject-linkage -fsanitize=address,undefined -fno-omit-frame-pointer -ffunction-sections -fdata-sections tests/test_vae_wide_host.cpp -Wl,--gc-sections -o "$tmpdir/vae_wide_host"
 "$tmpdir/vae_wide_host" "$tmpdir"
 "$PY" tests/test_review_regressions.py

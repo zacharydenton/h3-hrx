@@ -9,11 +9,14 @@ Run commands from the repository root unless stated otherwise.
   smaller memory configurations have not been validated.
 - ROCm with HIP headers, runtime, and `hipcc`; the tested installation is in
   `/opt/rocm`. Set `ROCM_PATH` or `HIPCC` for another installation.
-- `g++` for the host/tokenizer build and CPU tests; ffmpeg for input decoding
-- `cargo` (Rust) for the `h3` command in `cli/`; `scripts/build_host.sh` skips it
-  and still builds the library and `h3pipe` when cargo is missing
-  and MP4/WAV output.
+- `g++` for the host/tokenizer build and CPU tests.
+- ffmpeg for input decoding and MP4/WAV output.
+- `cargo` (Rust) for the `h3` command in `cli/` and the `loomrun` kernel launcher
+  in `loomrun/`; `scripts/build_host.sh` skips both and still builds the library
+  and `h3pipe` when cargo is missing.
 - [Loom with the included compiler patches](../patches/loom/README.md).
+  `loomrun` links `libhrx` from that build and dispatches through it, so the
+  kernel tests need neither HIP headers nor `hipcc`.
 - For downloads, the Hugging Face CLI (`python3 -m pip install huggingface_hub`
   in a Python environment). For development, Python 3 with NumPy. Inference
   itself runs without Python.
@@ -51,10 +54,9 @@ An unpatched HRX runtime fails to initialize on a ROCr older than the
 `HSA_AMD_AGENT_INFO_PM4_EMULATION` attribute, including the distribution's
 HSA 1.18: `hrx_gpu_initialize` returns `INVALID_ARGUMENT` from
 `hsa_agent_get_info`. `patches/loom/0003-amdgpu-pm4-emulation-query-optional.patch`
-fixes that; with it applied the HRX backend runs on the stock system runtime and
-produces frames and samples bit-identical to the HIP backend. `H3_ROCM_RUNTIME_DIR`
-remains available to put a replacement runtime on `LD_LIBRARY_PATH` before
-sourcing `env.sh`, but is no longer required for this failure.
+fixes that. With it applied, HRX runs on the stock system runtime and produces
+frames and samples bit-identical to the HIP backend, so no replacement runtime
+and no `LD_LIBRARY_PATH` entry is needed.
 
 ## Checkpoints
 
