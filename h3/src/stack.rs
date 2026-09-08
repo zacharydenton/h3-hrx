@@ -78,6 +78,43 @@ pub struct LayerCond {
     pub gate_mlp: BufferRef,
 }
 
+/// The constant rows a stack modulates with when it does not really modulate.
+///
+/// A stack with no AdaLN still hands the kernels a table and a gate; these are the identity ones. Both
+/// are sized for the widest consumer in the pipeline rather than the caller at hand, because the cost
+/// is a fraction of a megabyte and the failure mode of guessing too small is an out-of-bounds read that
+/// produces a plausible wrong answer instead of a fault.
+pub struct Constants {
+    /// `HID` ones: a residual gate of one, and the per-head norm weights of a stack with none
+    pub ones: Arc<hrx::Buffer>,
+    /// `2 * TE_FFN` zeros: a (scale, shift) table of zero at any width the pipeline uses
+    pub zeros: Arc<hrx::Buffer>,
+}
+
+impl Constants {
+    pub fn new(gpu: &hrx::Gpu) -> Result<Self> {
+        let ones = gpu.alloc(HID * 4)?;
+        let row: Vec<u8> = (0..HID).flat_map(|_| 1.0f32.to_le_bytes()).collect();
+        gpu.h2d(&ones, &row)?;
+        let zeros = gpu.alloc(2 * TE_FFN * 4)?;
+        gpu.memset(&zeros, 0, 2 * TE_FFN * 4)?;
+        Ok(Self {
+            ones: Arc::new(ones),
+            zeros: Arc::new(zeros),
+        })
+    }
+
+    /// The layer conditioning of a stack that neither shifts nor gates: a zero table and a gate of one.
+    pub fn identity(&self) -> LayerCond {
+        LayerCond {
+            table_msa: self.zeros.binding(),
+            gate_msa: self.ones.binding(),
+            table_mlp: self.zeros.binding(),
+            gate_mlp: self.ones.binding(),
+        }
+    }
+}
+
 /// One layer's weights, already on the device.
 pub struct Block {
     pub qkv_q: Arc<hrx::Buffer>,

@@ -9,11 +9,10 @@ use crate::compile::Compiler;
 use crate::dispatch::{Conv3d, Gemm, GroupNormSilu, Matmul, Prepare, Profile, Tile};
 use crate::error::{other, Result};
 use crate::model::*;
-use crate::stack::{LayerCond, Stack, StackDims};
+use crate::stack::{Constants, LayerCond, Stack, StackDims};
 use crate::tiles;
 use crate::weights::Weights;
 use half::slice::HalfFloatSliceExt;
-use std::sync::Arc;
 
 /// A latent grid: temporal length and the spatial extent in latent voxels.
 ///
@@ -82,8 +81,7 @@ struct Built {
 
 pub struct VideoVae {
     weights: Weights,
-    ones: Arc<hrx::Buffer>,
-    zeros: hrx::Buffer,
+    constants: Constants,
     built: Option<Built>,
     /// post_quant_conv, a 24x24 matrix and a bias applied per voxel on the host
     pq_w: Vec<f32>,
@@ -98,16 +96,8 @@ pub struct VideoVae {
 impl VideoVae {
     pub fn open(gpu: &hrx::Gpu, path: impl AsRef<std::path::Path>) -> Result<Self> {
         let weights = Weights::open(path, crate::plan::vvae::plan)?;
-        // the attention's per-head norms are ones for this stack, and the AdaLN tables are zero: it
+        // the attention's per-head norms are ones for this stack, and its AdaLN tables are zero: it
         // modulates with a learned per-block scale alone
-        let ones = Arc::new(gpu.alloc(VAE_HID * 4)?);
-        let one_row: Vec<u8> = (0..VAE_HID).flat_map(|_| 1.0f32.to_le_bytes()).collect();
-        gpu.h2d(&ones, &one_row)?;
-        // A modulation table is (scale, shift) per class, so the norm kernel reads two rows of the
-        // hidden width from it — not one. Half of that is an out-of-bounds read whose effect is a
-        // garbage shift, small enough to look like rounding.
-        let zeros = gpu.alloc(2 * VAE_HID * 4)?;
-        gpu.memset(&zeros, 0, 2 * VAE_HID * 4)?;
         Ok(Self {
             pq_w: weights.host_f32("vae.post_quant_conv.w", LATENT_CH * LATENT_CH)?,
             pq_b: weights.host_f32("vae.post_quant_conv.b", LATENT_CH)?,
@@ -116,8 +106,7 @@ impl VideoVae {
             enc_mean: weights.host_f32("venc.latents_mean", LATENT_CH)?,
             enc_std: weights.host_f32("venc.latents_std", LATENT_CH)?,
             weights,
-            ones,
-            zeros,
+            constants: Constants::new(gpu)?,
             built: None,
         })
     }
@@ -144,7 +133,7 @@ impl VideoVae {
             &self.weights,
             |i| format!("blocks.{i}."),
             false,
-            self.ones.clone(),
+            self.constants.ones.clone(),
             "vae",
         )?;
         let t = stack.capacity();
@@ -263,7 +252,7 @@ impl VideoVae {
             w_in.binding(),
             None,
             b.x.binding(),
-            Some((self.ones.binding(), b.cls.binding())),
+            Some((self.constants.ones.binding(), b.cls.binding())),
             Some(b_in.binding()),
         )?;
         // the four register tokens follow the voxels, then a zero cls row
@@ -273,7 +262,7 @@ impl VideoVae {
         gpu.d2d_at(&b.x, n * VAE_HID * 4, &reg, 0, VAE_REG * VAE_HID * 4)?;
 
         // every block modulates with its own learned scale and no shift
-        let zeros = self.zeros.binding();
+        let zeros = self.constants.zeros.binding();
         let scales: Vec<(hrx::sys::BufferRef, hrx::sys::BufferRef)> = (0..b.stack.layers())
             .map(|i| {
                 let blk = b.stack.block(i);
