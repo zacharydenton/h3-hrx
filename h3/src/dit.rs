@@ -7,7 +7,7 @@
 //! text encoder: the encoder produces 5120-wide rows, and it is the DiT that projects them to 5376 and
 //! refines them in place at the front of its own sequence.
 use crate::compile::{Cfg, Compiler};
-use crate::dispatch::{axpy, checked, Matmul16, Profile};
+use crate::dispatch::{axpy, checked, Classes, Matmul16, NormMod, Profile};
 use crate::error::{invalid, Result};
 use crate::model::*;
 use crate::rope::VisionSpan;
@@ -51,10 +51,10 @@ struct Seq {
     capacity: usize,
     x: hrx::Buffer,
     /// the per-row timestep class the modulated kernels index with
-    cls: hrx::Buffer,
+    cls: Classes,
     /// all zeros: what the single-class GEMMs index their gate table with
-    cls0: hrx::Buffer,
-    tcls: hrx::Buffer,
+    cls0: Classes,
+    tcls: Classes,
     cos: hrx::Buffer,
     sin: hrx::Buffer,
     /// the embedders' f32 input rows, `[rows][96]` at the widest
@@ -68,7 +68,7 @@ struct Refiner {
     tokens: usize,
     cos: hrx::Buffer,
     sin: hrx::Buffer,
-    norm: std::sync::Arc<hrx::Kernel>,
+    norm: NormMod,
 }
 
 pub struct Dit {
@@ -117,9 +117,9 @@ impl Dit {
         self.seq = Some(Seq {
             capacity: t,
             x: zeroed(t * HID * 4)?,
-            cls: zeroed(t * 4)?,
-            cls0: zeroed(t * 4)?,
-            tcls: zeroed(t * 4)?,
+            cls: Classes::zeroed(gpu, t)?,
+            cls0: Classes::zeroed(gpu, t)?,
+            tcls: Classes::zeroed(gpu, t)?,
             cos: gpu.alloc(t * ROPE_HALF * 4)?,
             sin: gpu.alloc(t * ROPE_HALF * 4)?,
             in32: gpu.alloc(t * VIDEO_PATCH * 4)?,
@@ -150,24 +150,12 @@ impl Dit {
         let sin = gpu.alloc(n * ROPE_HALF * 4)?;
         gpu.h2d(&cos, crate::vvae::as_bytes(&vec![1.0f32; n * ROPE_HALF]))?;
         gpu.memset(&sin, 0, n * ROPE_HALF * 4)?;
-        let ns = "h3.norm_mod_f32.";
-        let cfg: Cfg = vec![
-            (format!("{ns}width"), HID.to_string()),
-            (
-                format!("{ns}lanes"),
-                lanes_for(HID)
-                    .expect("a lane count for the hidden width")
-                    .to_string(),
-            ),
-            (format!("{ns}eps"), crate::compile::num(1e-5)),
-            (format!("{ns}classes"), "1".into()),
-        ];
         self.refiner = Some(Refiner {
             stack,
             tokens: n,
             cos,
             sin,
-            norm: c.get(gpu, "norm_mod_f32", "h3_norm_mod_f32", &cfg)?,
+            norm: NormMod::build(c, gpu, HID, 1e-5, 1)?,
         });
         Ok(())
     }
@@ -211,7 +199,7 @@ impl Dit {
             gpu,
             prof,
             seq.x.binding(),
-            seq.cls0.binding(),
+            seq.cls0.slice(0, n),
             r.cos.binding(),
             r.sin.binding(),
             &cond_fn,
@@ -219,23 +207,17 @@ impl Dit {
             None,
         )?;
         // the refiner modulates with a single class, so its table is the two zero rows
-        checked(
+        r.norm.run(
             gpu,
-            &r.norm,
             Some(prof),
             "refiner final norm",
-            [n as u32, 1, 1],
-            [lanes_for(HID).expect("a lane count") as u32, 1, 1],
-            &[n as u32],
-            &[
-                seq.x.binding(),
-                self.weights
-                    .at(gpu, "h3.refiner.final_norm", HID * 4)?
-                    .binding(),
-                self.constants.zeros.binding(),
-                seq.cls0.binding(),
-            ],
-            &[n * HID * 4, HID * 4, 2 * HID * 4, n * 4],
+            n,
+            seq.x.binding(),
+            self.weights
+                .at(gpu, "h3.refiner.final_norm", HID * 4)?
+                .binding(),
+            self.constants.zeros.binding(),
+            seq.cls0.slice(0, n),
         )?;
         Ok(())
     }
@@ -348,7 +330,7 @@ struct Blocks {
     stack: Stack,
     tokens: usize,
     qk_bits: usize,
-    final_norm: std::sync::Arc<hrx::Kernel>,
+    final_norm: NormMod,
     /// the text rows, kept so they can be restored each step
     text_copy: hrx::Buffer,
 }
@@ -462,13 +444,21 @@ impl Reference<'_> {
     pub fn check(&self, i: usize) -> crate::error::Result<()> {
         let at = |what: String| crate::error::Error::Invalid(format!("reference {i}: {what}"));
         if let Some(z) = self.video_latents() {
-            let Some(need) = self.grid().elements() else {
-                return Err(at(format!("latents for {:?} overflow a usize", self.grid())));
+            let g = self.grid();
+            // the latents are packed as 2x2 patches, four spatial neighbours to a row, so an odd
+            // extent has a half patch at its edge and the packing indexes past the rows it sized
+            if !g.height.is_multiple_of(2) || !g.width.is_multiple_of(2) {
+                return Err(at(format!(
+                    "a {}x{} latent grid is not whole 2x2 patches",
+                    g.height, g.width
+                )));
+            }
+            let Some(need) = g.elements() else {
+                return Err(at(format!("latents for {g:?} overflow a usize")));
             };
             if need == 0 || z.len() < need {
                 return Err(at(format!(
-                    "latents for {:?} need {need} floats, {} given",
-                    self.grid(),
+                    "latents for {g:?} need {need} floats, {} given",
                     z.len()
                 )));
             }
@@ -643,20 +633,12 @@ impl Dit {
             self.constants.ones.clone(),
             "dit",
         )?;
-        let ns = "h3.norm_mod_f32.";
-        let lanes = lanes_for(HID).expect("a lane count for the hidden width");
-        let cfg: Cfg = vec![
-            (format!("{ns}width"), HID.to_string()),
-            (format!("{ns}lanes"), lanes.to_string()),
-            (format!("{ns}eps"), crate::compile::num(1e-5)),
-            // the final head has only the video and audio timestep classes
-            (format!("{ns}classes"), "2".into()),
-        ];
         self.blocks = Some(Blocks {
             stack,
             tokens,
             qk_bits: qk,
-            final_norm: c.get(gpu, "norm_mod_f32", "h3_norm_mod_f32", &cfg)?,
+            // the final head has only the video and audio timestep classes
+            final_norm: NormMod::build(c, gpu, HID, 1e-5, 2)?,
             text_copy: gpu.alloc(seq_capacity(tokens) * HID * 4)?,
         });
         Ok(())
@@ -788,12 +770,13 @@ impl Dit {
 
         // the packed layout's per-row tables
         {
-            let seq = self.seq.as_ref().expect("sized above");
-            gpu.h2d_at(&seq.cls, 0, as_i32_bytes(&lay.adaln_rows))?;
-            gpu.h2d_at(&seq.tcls, 0, as_i32_bytes(&lay.tclass))?;
-            let inv = &self.cond.as_ref().expect("ready").inv_freq;
             let (mut cos, mut sin) = (vec![0.0f32; s * ROPE_HALF], vec![0.0f32; s * ROPE_HALF]);
+            let inv = &self.cond.as_ref().expect("ready").inv_freq;
             crate::rope::dit(&lay.pos, inv, &mut cos, &mut sin);
+            let seq = self.seq.as_mut().expect("sized above");
+            seq.cls.write(gpu, &lay.adaln_rows, CLASSES)?;
+            // the final head has only the video and audio timestep classes
+            seq.tcls.write(gpu, &lay.tclass, 2)?;
             gpu.h2d_at(&seq.cos, 0, crate::vvae::as_bytes(&cos))?;
             gpu.h2d_at(&seq.sin, 0, crate::vvae::as_bytes(&sin))?;
         }
@@ -918,26 +901,15 @@ impl Dit {
                 let b = self.blocks.as_ref().expect("built above");
                 let cond = self.cond.as_ref().expect("ready");
                 // two classes here, the video and audio timesteps, so four table rows
-                checked(
+                b.final_norm.run(
                     gpu,
-                    &b.final_norm,
                     Some(prof),
                     "final norm",
-                    [generated as u32, 1, 1],
-                    [lanes_for(HID).expect("a lane count") as u32, 1, 1],
-                    &[generated as u32],
-                    &[
-                        seq.x.slice(lr * HID * 4, generated * HID * 4),
-                        self.weights.at(gpu, "h3.final.norm", HID * 4)?.binding(),
-                        cond.final_table.binding(),
-                        seq.tcls.slice(lr * 4, generated * 4),
-                    ],
-                    &[
-                        generated * HID * 4,
-                        HID * 4,
-                        4 * HID * 4,
-                        generated * 4,
-                    ],
+                    generated,
+                    seq.x.slice(lr * HID * 4, generated * HID * 4),
+                    self.weights.at(gpu, "h3.final.norm", HID * 4)?.binding(),
+                    cond.final_table.binding(),
+                    seq.tcls.slice(lr, generated),
                 )?;
             }
             {
@@ -1217,7 +1189,7 @@ impl Dit {
         let b = blocks.as_mut().expect("built above");
         let (x, cls, cos, sin) = (
             seq.x.binding(),
-            seq.cls.binding(),
+            seq.cls.slice(0, s),
             seq.cos.binding(),
             seq.sin.binding(),
         );
@@ -1316,14 +1288,28 @@ fn layer_cond(mods: &hrx::Buffer, i: usize) -> crate::stack::LayerCond<'_> {
     }
 }
 
-/// An i32 slice's bytes, for the per-row class tables.
-fn as_i32_bytes(v: &[i32]) -> &[u8] {
-    bytemuck::cast_slice(v)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reference_grid_is_whole_patches() {
+        let grid = |height, width| LatentGrid {
+            frames: 1,
+            height,
+            width,
+        };
+        let lat = vec![0.0f32; LATENT_CH * 8 * 8];
+        let of = |g| Reference::Image {
+            latents: &lat,
+            grid: g,
+            presented: None,
+        };
+        of(grid(4, 4)).check(0).expect("an even grid");
+        // 3x2 sizes its rows as (3/2)*(2/2) = 1 and then packs a second row of patches into it
+        assert!(of(grid(3, 2)).check(0).is_err(), "an odd height");
+        assert!(of(grid(4, 3)).check(0).is_err(), "an odd width");
+    }
 
     #[test]
     fn the_refiner_has_no_rope_and_one_class() {

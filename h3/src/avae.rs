@@ -7,7 +7,7 @@
 //! stereo at a time, since the model is mono and the two channels are independent.
 use crate::compile::{Cfg, Compiler};
 use crate::dispatch::{axpy, checked, MatmulF32, Profile};
-use crate::error::{other, Result};
+use crate::error::{invalid, other, Result};
 use crate::model::THREADS;
 use crate::weights::Weights;
 use hrx::View;
@@ -362,6 +362,17 @@ impl AudioVae {
         let l_out = t * HOP;
         self.ensure_dec(gpu, t)?;
 
+        if samples.len() < 2 * l_out {
+            return invalid(format!(
+                "{audio_t} audio latents decode to {} samples, {} given",
+                2 * l_out,
+                samples.len()
+            ));
+        }
+        // Both channels are staged and committed together. The second one can fail after the first
+        // has been decoded, and a caller that got an error back would otherwise find half its buffer
+        // rewritten and half of it as it was.
+        let mut staged = vec![0.0f32; 2 * l_out];
         for ch in 0..2 {
             // undo the latent normalisation into the [32][T] the first projection reads
             let mut input = vec![0.0f32; AUDIO_CH * t];
@@ -619,12 +630,14 @@ impl AudioVae {
             if len != l_out {
                 return other(format!("audio length {len} != {l_out}"));
             }
-            let mut out = vec![0.0f32; l_out];
             gpu.sync()?;
-            gpu.d2h_ref(r2b, crate::vvae::as_bytes_mut(&mut out))?;
-            for (i, v) in out.iter().enumerate() {
-                samples[ch * l_out + i] = v.clamp(-1.0, 1.0);
-            }
+            gpu.d2h_ref(
+                r2b,
+                crate::vvae::as_bytes_mut(&mut staged[ch * l_out..(ch + 1) * l_out]),
+            )?;
+        }
+        for (out, v) in samples.iter_mut().zip(&staged) {
+            *out = v.clamp(-1.0, 1.0);
         }
         Ok(())
     }

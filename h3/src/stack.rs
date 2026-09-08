@@ -6,7 +6,7 @@
 //! count and the QK^T width, and whether a projection needs a `prepare` at all follows from whether the
 //! kernel before it already wrote its operand at the right pitch.
 use crate::compile::{num, Cfg, Compiler};
-use crate::dispatch::{checked, Gemm, Prepare, Profile, Tile};
+use crate::dispatch::{checked, ClassRows, Gemm, Prepare, Profile, Tile};
 use crate::model::*;
 use crate::weights::Weights;
 use hrx::View;
@@ -719,7 +719,7 @@ impl Stack {
         }
     }
 
-    /// `x`: f32 `[capacity][hidden]`, rows past `tokens` untouched. `cls`: i32 `[tokens]`.
+    /// `x`: f32 `[capacity][hidden]`, rows past `tokens` untouched. `cls`: a checked class per row.
     /// `cos`/`sin`: f32 `[tokens][rope_dim/2]`.
     #[allow(clippy::too_many_arguments)]
     pub fn forward<'a>(
@@ -727,7 +727,7 @@ impl Stack {
         gpu: &hrx::Gpu,
         prof: &mut Profile,
         x: View<'_>,
-        cls: View<'_>,
+        cls: ClassRows<'_>,
         cos: View<'_>,
         sin: View<'_>,
         cond: &dyn Fn(usize) -> LayerCond<'a>,

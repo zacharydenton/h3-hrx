@@ -33,8 +33,13 @@ pub const ABI_VERSION: u32 = 8;
 /// - Every string is NUL-terminated and stays valid for the duration of the call.
 /// - Pointers inside `h3_ref` and `h3_keyframe` follow the same rules, with the lengths their own
 ///   fields imply.
+/// - A call's input and output buffers do not overlap. Inputs are read from the caller's memory
+///   rather than copied into the library, and a frame buffer is hundreds of megabytes.
 ///
-/// A returned [`h3_status`] other than `H3_OK` means nothing was written to the output buffers.
+/// A returned [`h3_status`] of `H3_INVALID_ARGUMENT` means nothing was written to the output
+/// buffers: arguments are checked before any work starts. A failure raised once a call is under way,
+/// including a cancellation, can leave a decode's output partly written — the video decoder commits
+/// each temporal chunk as it finishes — so read an output buffer only after `H3_OK`.
 ///
 /// The same list appears at the top of `include/h3.h`, for the callers who will actually read it.
 mod contract {}
@@ -210,6 +215,10 @@ unsafe fn path(p: *const c_char) -> Option<std::path::PathBuf> {
 }
 
 /// A caller's input buffer as a slice.
+///
+/// Borrowed, not copied: the ABI's contract is that a buffer stays alive and unaliased for the
+/// duration of the call, and a video frame or a clip of latents is hundreds of megabytes that the
+/// pipeline would otherwise stage twice.
 ///
 /// `from_raw_parts` requires a non-null pointer to `n` initialised elements. A NULL with a positive
 /// count breaks that before anything inside can check it, and the panic guard would not catch the
@@ -413,9 +422,9 @@ pub unsafe extern "C" fn h3_text_in(
             return Err(Error::Invalid("ids must hold at least one token".into()));
         }
         enough("text_in out", out_elements, n * crate::model::HID)?;
-        let ids = slice(ids, n, "ids")?.to_vec();
+        let ids = slice(ids, n, "ids")?;
         let rows = out_slice(out, n * crate::model::HID, "text_in out")?;
-        with(s, |session| session.text_in(&ids, rows))
+        with(s, |session| session.text_in(ids, rows))
     })
 }
 
@@ -580,7 +589,7 @@ unsafe fn denoise_into(
     enough("video latents", video_elements, vlen)?;
     enough("audio latents", audio_elements, alen)?;
 
-    let ids = slice(ids, n, "ids")?.to_vec();
+    let ids = slice(ids, n, "ids")?;
     let dp = DenoiseParams::from(p);
     let noise = Noise {
         video: (!noise_video.is_null()).then(|| slice_unchecked(noise_video, vlen)),
@@ -600,7 +609,7 @@ unsafe fn denoise_into(
     let audio_out = out_slice(audio_latents, alen, "audio latents")?;
     let out = with(s, |session| {
         let latents = session.denoise(
-            &ids,
+            ids,
             &dp,
             noise,
             &refs,
@@ -702,9 +711,9 @@ pub unsafe extern "C" fn h3_decode_video(
         let pixels = extent("frames", &[sh.frames, p.height, p.width, 3])?;
         enough("video latents", video_elements, vlen)?;
         enough("frames", frame_bytes, pixels)?;
-        let z = slice(video_latents, vlen, "video latents")?.to_vec();
+        let z = slice(video_latents, vlen, "video latents")?;
         let out = out_slice(frames, pixels, "frames")?;
-        with(s, |session| session.decode_video(&sh, &z, out))
+        with(s, |session| session.decode_video(&sh, z, out))
     })
 }
 
@@ -734,9 +743,9 @@ pub unsafe extern "C" fn h3_encode_video(
                 "frames, height and width are required".into(),
             ));
         }
-        let px = slice(pixels, f * h * w * 3, "pixels")?.to_vec();
+        let px = slice(pixels, f * h * w * 3, "pixels")?;
         let clip = Clip {
-            pixels: &px,
+            pixels: px,
             frames: f,
             height: h,
             width: w,
@@ -776,9 +785,9 @@ pub unsafe extern "C" fn h3_decode_audio(
         let slen = 2 * t * crate::avae::HOP;
         enough("audio latents", audio_elements, alen)?;
         enough("samples", sample_elements, slen)?;
-        let z = slice(audio_latents, alen, "audio latents")?.to_vec();
+        let z = slice(audio_latents, alen, "audio latents")?;
         let out = out_slice(samples, slen, "samples")?;
-        with(s, |session| session.decode_audio(&z, t, out))
+        with(s, |session| session.decode_audio(z, t, out))
     })
 }
 
@@ -800,9 +809,9 @@ pub unsafe extern "C" fn h3_encode_audio(
         if n == 0 {
             return Err(Error::Invalid("n_samples must be at least one".into()));
         }
-        let x = slice(samples, 2 * n, "samples")?.to_vec();
+        let x = slice(samples, 2 * n, "samples")?;
         with(s, |session| {
-            let (z, t) = session.encode_audio(&x, n)?;
+            let (z, t) = session.encode_audio(x, n)?;
             enough("audio latents", latent_elements, z.len())?;
             let out = out_slice(latents, z.len(), "audio latents")?;
             out.copy_from_slice(&z);
@@ -832,9 +841,9 @@ pub unsafe extern "C" fn h3_vision_embed(
 ) -> c_int {
     guard(|| {
         let (h, w) = (height.max(0) as usize, width.max(0) as usize);
-        let px = slice(pixels, h * w * 3, "pixels")?.to_vec();
+        let px = slice(pixels, h * w * 3, "pixels")?;
         with(s, |session| {
-            let e = session.vision_embed(&px, h, w)?;
+            let e = session.vision_embed(px, h, w)?;
             // both outputs are established before either is written: returning a failure after
             // having modified one would break the promise that a non-OK status touched nothing
             enough("merged", merged_elements, e.merged.len())?;

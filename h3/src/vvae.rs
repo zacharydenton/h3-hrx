@@ -75,8 +75,12 @@ struct Built {
     a_q: hrx::Buffer,
     a_s: hrx::Buffer,
     out16: hrx::Buffer,
-    cls: hrx::Buffer,
+    cls: crate::dispatch::Classes,
     norm_table: hrx::Buffer,
+    /// the host side of the two transfers a clip makes, kept so a tiled decode does not allocate
+    /// them again for every tile
+    stage_in: Vec<half::f16>,
+    stage_out: Vec<half::f16>,
 }
 
 pub struct VideoVae {
@@ -141,8 +145,7 @@ impl VideoVae {
         gpu.memset(&x, 0, t * VAE_HID * 4)?;
         let in16 = gpu.alloc(t * VAE_KIN * 2)?;
         gpu.memset(&in16, 0, t * VAE_KIN * 2)?;
-        let cls = gpu.alloc(t * 4)?;
-        gpu.memset(&cls, 0, t * 4)?;
+        let cls = crate::dispatch::Classes::zeroed(gpu, t)?;
 
         // the rotary table over this grid; the register and cls rows keep the identity rotation
         let (mut cos_h, mut sin_h) = (
@@ -204,12 +207,16 @@ impl VideoVae {
             in16,
             cls,
             norm_table,
+            stage_in: vec![half::f16::ZERO; grid.voxels() * VAE_KIN],
+            stage_out: vec![half::f16::ZERO; grid.voxels() * VAE_OUT],
         });
         Ok(())
     }
 
     /// One clip: model-space latents `[24][ft][h][w]` to ImageNet-space frames
     /// `[3][ft*4][h*16][w*16]`.
+    /// `frames` is resized to the clip and overwritten; it is an argument rather than a return so a
+    /// tiled decode can hand back the same allocation for every tile.
     pub fn decode_clip(
         &mut self,
         gpu: &hrx::Gpu,
@@ -217,31 +224,38 @@ impl VideoVae {
         prof: &mut Profile,
         z: &[f32],
         grid: Grid,
-    ) -> Result<Vec<f32>> {
+        frames: &mut Vec<f32>,
+    ) -> Result<()> {
         self.ensure(gpu, c, grid)?;
         let (n, nt) = (grid.voxels(), grid.tokens());
 
         // post_quant_conv is a 24x24 matrix per voxel, small enough to stay on the host; the result
         // goes up as f16 padded to the GEMM's K of 64, the pad left at zero
-        let mut in16 = vec![half::f16::ZERO; n * VAE_KIN];
+        let Self {
+            built,
+            pq_w,
+            pq_b,
+            weights,
+            constants,
+            ..
+        } = self;
+        let b = built.as_mut().expect("built above");
+        let in16 = &mut b.stage_in;
         for v in 0..n {
             for o in 0..LATENT_CH {
-                let mut acc = self.pq_b[o];
+                let mut acc = pq_b[o];
                 for i in 0..LATENT_CH {
-                    acc += self.pq_w[o * LATENT_CH + i] * z[i * n + v];
+                    acc += pq_w[o * LATENT_CH + i] * z[i * n + v];
                 }
                 in16[v * VAE_KIN + o] = half::f16::from_f32(acc);
             }
         }
 
-        let b = self.built.as_mut().expect("built above");
-        gpu.h2d(&b.in16, as_bytes_f16(&in16))?;
+        gpu.h2d(&b.in16, as_bytes_f16(&b.stage_in))?;
         gpu.memset(&b.x, 0, nt * VAE_HID * 4)?;
 
-        let w_in = self
-            .weights
-            .at(gpu, "vae.proj_in.w", VAE_HID * VAE_KIN * 2)?;
-        let b_in = self.weights.at(gpu, "vae.proj_in.b", VAE_HID * 4)?;
+        let w_in = weights.at(gpu, "vae.proj_in.w", VAE_HID * VAE_KIN * 2)?;
+        let b_in = weights.at(gpu, "vae.proj_in.b", VAE_HID * 4)?;
         b.proj_in.run(
             gpu,
             Some(prof),
@@ -251,17 +265,15 @@ impl VideoVae {
             w_in.binding(),
             None,
             b.x.binding(),
-            Some((self.constants.ones.binding(), b.cls.binding())),
+            Some((constants.ones.binding(), b.cls.all())),
             Some(b_in.binding()),
         )?;
         // the four register tokens follow the voxels, then a zero cls row
-        let reg = self
-            .weights
-            .at(gpu, "vae.register_tokens", VAE_REG * VAE_HID * 4)?;
+        let reg = weights.at(gpu, "vae.register_tokens", VAE_REG * VAE_HID * 4)?;
         gpu.d2d_at(&b.x, n * VAE_HID * 4, &reg, 0, VAE_REG * VAE_HID * 4)?;
 
         // every block modulates with its own learned scale and no shift
-        let zeros = self.constants.zeros.binding();
+        let zeros = constants.zeros.binding();
         // The buffers first, not views of them: a view borrows its allocation, and one borrowed from
         // the stack would conflict with the mutable borrow the forward pass takes.
         let scale_buffers: Vec<(std::sync::Arc<hrx::Buffer>, std::sync::Arc<hrx::Buffer>)> =
@@ -292,14 +304,14 @@ impl VideoVae {
         };
         let (x, cls, cos, sin) = (
             b.x.binding(),
-            b.cls.binding(),
+            b.cls.all(),
             b.cos.binding(),
             b.sin.binding(),
         );
         b.stack
             .forward(gpu, prof, x, cls, cos, sin, &cond, 0, None)?;
 
-        let w_norm = self.weights.at(gpu, "vae.norm_out.w", VAE_HID * 4)?;
+        let w_norm = weights.at(gpu, "vae.norm_out.w", VAE_HID * 4)?;
         b.norm_out.run(
             gpu,
             Some(prof),
@@ -310,10 +322,8 @@ impl VideoVae {
             b.a_q.binding(),
             Some(b.a_s.binding()),
         )?;
-        let w_out = self
-            .weights
-            .at(gpu, "vae.proj_out.w", VAE_OUT * VAE_HID * 2)?;
-        let b_out = self.weights.at(gpu, "vae.proj_out.b", VAE_OUT * 4)?;
+        let w_out = weights.at(gpu, "vae.proj_out.w", VAE_OUT * VAE_HID * 2)?;
+        let b_out = weights.at(gpu, "vae.proj_out.b", VAE_OUT * 4)?;
         b.proj_out.run(
             gpu,
             Some(prof),
@@ -329,13 +339,17 @@ impl VideoVae {
 
         // read straight into the f16 buffer the unpatchify converts from, rather than into bytes and
         // then through a second allocation
-        let mut out16 = vec![half::f16::ZERO; n * VAE_OUT];
+        let out16 = &mut b.stage_out;
         gpu.sync()?;
-        gpu.d2h_ref(b.out16.slice(0, out16.len() * 2), bytes_mut(&mut out16))?;
+        gpu.d2h_ref(
+            b.out16.slice(0, n * VAE_OUT * 2),
+            bytes_mut(&mut out16[..n * VAE_OUT]),
+        )?;
 
         // unpatchify: token (t, y, x) holds [3][4][16][16]
         let (ftt, fh, fw) = grid.frames();
-        let mut frames = vec![0.0f32; 3 * ftt * fh * fw];
+        frames.clear();
+        frames.resize(3 * ftt * fh * fw, 0.0);
         for t in 0..grid.ft {
             for y in 0..grid.h {
                 for x in 0..grid.w {
@@ -355,7 +369,7 @@ impl VideoVae {
                 }
             }
         }
-        Ok(frames)
+        Ok(())
     }
 
     /// One clip in spatial tiles, blended in pixel space — the released VAE's `tiled_decode`.
@@ -366,19 +380,22 @@ impl VideoVae {
         prof: &mut Profile,
         z: &[f32],
         grid: Grid,
-    ) -> Result<Vec<f32>> {
+        frames: &mut Vec<f32>,
+    ) -> Result<()> {
         let (ft, h, w) = (grid.ft, grid.h, grid.w);
         let (frames_n, height, width) = grid.frames();
         let (ys, yo) = tiles::split_tiles(height);
         let (xs, xo) = tiles::split_tiles(width);
         if ys.len() == 1 && xs.len() == 1 {
-            return self.decode_clip(gpu, c, prof, z, grid);
+            return self.decode_clip(gpu, c, prof, z, grid, frames);
         }
-        let mut frames = vec![0.0f32; 3 * frames_n * height * width];
+        frames.clear();
+        frames.resize(3 * frames_n * height * width, 0.0);
         let (th, tw) = (height.min(256), width.min(256));
         let (lh, lw) = (th / VAE_PS, tw / VAE_PS);
         let mut above: Vec<Vec<f32>> = vec![Vec::new(); xs.len()];
         let mut row: Vec<Vec<f32>> = vec![Vec::new(); xs.len()];
+        let mut tile: Vec<f32> = Vec::new();
         let mut latent = vec![0.0f32; LATENT_CH * ft * lh * lw];
 
         for iy in 0..ys.len() {
@@ -393,8 +410,18 @@ impl VideoVae {
                         }
                     }
                 }
-                row[ix] = self.decode_clip(gpu, c, prof, &latent, Grid { ft, h: lh, w: lw })?;
-                let mut tile = row[ix].clone();
+                self.decode_clip(
+                    gpu,
+                    c,
+                    prof,
+                    &latent,
+                    Grid { ft, h: lh, w: lw },
+                    &mut row[ix],
+                )?;
+                // the neighbours blend against the tile as it was decoded, so the copy this writes
+                // into is the one that gets faded; `tile` keeps its allocation across tiles
+                tile.clear();
+                tile.extend_from_slice(&row[ix]);
                 if iy > 0 {
                     tiles::blend_pixels(&mut tile, &above[ix], yo[iy - 1], true, frames_n, th, tw);
                 }
@@ -423,7 +450,7 @@ impl VideoVae {
             }
             std::mem::swap(&mut above, &mut row);
         }
-        Ok(frames)
+        Ok(())
     }
 
     /// The whole clip: latents `[24][T][H][W]` in, RGB bytes `[frames][H*16][W*16][3]` out.
@@ -481,16 +508,20 @@ impl VideoVae {
             *decoded += nf;
         };
 
+        // one allocation each, reused by every chunk: a chunk of a 480p clip is over a hundred
+        // megabytes, and the last chunk is the only one that is a different size
+        let (mut z, mut clip, mut chunk) = (Vec::new(), Vec::new(), Vec::new());
         for i in 0..plan.chunks {
             let start = i * VAE_CHUNK;
             let ft = (VAE_CHUNK + VAE_OVERLAP).min(tp - start);
-            let mut z = vec![0.0f32; LATENT_CH * ft * h * w];
+            z.clear();
+            z.resize(LATENT_CH * ft * h * w, 0.0);
             for ch in 0..LATENT_CH {
                 let src = (ch * tp + start) * h * w;
                 let dst = ch * ft * h * w;
                 z[dst..dst + ft * h * w].copy_from_slice(&zp[src..src + ft * h * w]);
             }
-            let clip = self.decode_spatial(gpu, c, prof, &z, Grid { ft, h, w })?;
+            self.decode_spatial(gpu, c, prof, &z, Grid { ft, h, w }, &mut clip)?;
             let clip_frames = ft * VAE_TRATIO;
             for j in 0..2 {
                 let f0 = j * plan.chunk_frames + plan.pre;
@@ -502,7 +533,8 @@ impl VideoVae {
                     continue;
                 }
                 let nf = f1 - f0;
-                let mut chunk = vec![0.0f32; 3 * nf * plane];
+                chunk.clear();
+                chunk.resize(3 * nf * plane, 0.0);
                 for ch in 0..3 {
                     let src = (ch * clip_frames + f0) * plane;
                     chunk[ch * nf * plane..(ch + 1) * nf * plane]
@@ -514,7 +546,8 @@ impl VideoVae {
                     }
                     append(&chunk, nf, nf, &mut decoded);
                 } else {
-                    overlap = chunk;
+                    // the swap hands the old overlap back as the next chunk's allocation
+                    std::mem::swap(&mut overlap, &mut chunk);
                     have_overlap = true;
                 }
             }

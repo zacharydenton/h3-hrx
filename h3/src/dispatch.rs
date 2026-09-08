@@ -130,6 +130,154 @@ pub(crate) fn checked(
     unsafe { launch(gpu, kernel, profile, stage, grid, block, scalars, bindings) }
 }
 
+/// The most buffers any of these kernels binds.
+const MAX_BINDINGS: usize = 8;
+
+/// One launch's bindings and the extents they must cover, built on the stack.
+///
+/// The pair travels together because [`checked`] reads them in step, and building them as two
+/// `Vec`s meant two allocations per launch — of which a denoising step makes thousands. Every
+/// kernel binds at least one buffer, so the first one also fills the slots that stay unused.
+struct Args<'v> {
+    views: [View<'v>; MAX_BINDINGS],
+    need: [usize; MAX_BINDINGS],
+    n: usize,
+}
+
+impl<'v> Args<'v> {
+    fn new(view: View<'v>, need: usize) -> Self {
+        let mut args = Self {
+            views: [view; MAX_BINDINGS],
+            need: [0; MAX_BINDINGS],
+            n: 1,
+        };
+        args.need[0] = need;
+        args
+    }
+
+    fn push(&mut self, view: View<'v>, need: usize) {
+        assert!(self.n < MAX_BINDINGS, "more than {MAX_BINDINGS} bindings");
+        self.views[self.n] = view;
+        self.need[self.n] = need;
+        self.n += 1;
+    }
+
+    fn views(&self) -> &[View<'v>] {
+        &self.views[..self.n]
+    }
+
+    fn need(&self) -> &[usize] {
+        &self.need[..self.n]
+    }
+}
+
+/// One `i32` per row, each of them a row of a modulation table.
+///
+/// The prepare, residual GEMM and `norm_mod_f32` kernels take that value as a table index under an
+/// `index.assume` — `lt(%cls_idx0, %classes)` — so the device does not range-check it, and a class
+/// past the table's rows reads memory the table does not own. Checking the values at the launch
+/// would mean reading the buffer back from the device, which is a synchronise on every dispatch.
+///
+/// So the check happens where the values are written, and the bound they were checked against
+/// travels with them in this type. A kernel takes these rows only when its own table is at least
+/// that wide, which is what [`ClassRows::against`] decides. The buffer is only ever written here,
+/// so a `Classes` that exists has been checked.
+pub struct Classes {
+    buf: hrx::Buffer,
+    capacity: usize,
+    /// how many leading rows hold checked values; the rest of the allocation is not offered
+    written: usize,
+    /// every written value is less than this
+    bound: usize,
+}
+
+impl Classes {
+    /// `rows` of class zero, which is a row of every table.
+    pub fn zeroed(gpu: &hrx::Gpu, rows: usize) -> Result<Self> {
+        let bytes = rows.max(1) * 4;
+        let buf = gpu.alloc(bytes)?;
+        gpu.memset(&buf, 0, bytes)?;
+        Ok(Self {
+            buf,
+            capacity: rows,
+            written: rows,
+            bound: 1,
+        })
+    }
+
+    /// Uploads `values` as the leading rows, refusing any that is not a row of a `classes`-row table.
+    ///
+    /// A refusal leaves nothing offered: the rows are marked unwritten first, so a caller that
+    /// ignores the error cannot bind the stale ones.
+    pub fn write(&mut self, gpu: &hrx::Gpu, values: &[i32], classes: usize) -> Result<()> {
+        self.written = 0;
+        checkable(values, classes, self.capacity)?;
+        gpu.h2d_at(&self.buf, 0, bytemuck::cast_slice(values))?;
+        self.written = values.len();
+        self.bound = classes;
+        Ok(())
+    }
+
+    /// Every row that has been checked.
+    pub fn all(&self) -> ClassRows<'_> {
+        self.slice(0, self.written)
+    }
+
+    /// `rows` of them from `from`, which is how a stage takes the classes of its own span.
+    pub fn slice(&self, from: usize, rows: usize) -> ClassRows<'_> {
+        assert!(from + rows <= self.written, "class rows past what was written");
+        ClassRows {
+            view: self.buf.slice(from * 4, rows * 4),
+            rows,
+            bound: self.bound,
+        }
+    }
+}
+
+/// What [`Classes::write`] accepts, without a device: rows that fit, each one a row of the table.
+fn checkable(values: &[i32], classes: usize, capacity: usize) -> Result<()> {
+    if values.len() > capacity {
+        return Err(crate::compile::Error::Io(format!(
+            "{} classes do not fit {capacity} rows",
+            values.len()
+        )));
+    }
+    if let Some(bad) = values.iter().find(|v| **v < 0 || **v as usize >= classes) {
+        return Err(crate::compile::Error::Io(format!(
+            "class {bad} is not one of the {classes} a table has"
+        )));
+    }
+    Ok(())
+}
+
+/// A run of checked class rows, and the table width they were checked against.
+#[derive(Clone, Copy)]
+pub struct ClassRows<'a> {
+    view: View<'a>,
+    rows: usize,
+    bound: usize,
+}
+
+impl<'a> ClassRows<'a> {
+    /// The binding, once the kernel's own table has been found wide enough for these values and long
+    /// enough for its launch.
+    fn against(&self, stage: &str, tokens: usize, classes: usize) -> Result<View<'a>> {
+        if self.rows < tokens {
+            return Err(crate::compile::Error::Io(format!(
+                "{stage}: {tokens} rows want a class each, {} given",
+                self.rows
+            )));
+        }
+        if self.bound > classes {
+            return Err(crate::compile::Error::Io(format!(
+                "{stage}: classes checked against {} rows, the table has {classes}",
+                self.bound
+            )));
+        }
+        Ok(self.view)
+    }
+}
+
 /// Produces a GEMM's A operand: `norm` and `lnorm` normalise and modulate the f32 residual stream,
 /// `plain` narrows an existing f16 row. The int8 forms also write a per-token scale; the float ones
 /// write rows and nothing else.
@@ -201,28 +349,26 @@ impl Prepare {
         stage: &str,
         tokens: u32,
         x: View<'_>,
-        norm: Option<(View<'_>, View<'_>, View<'_>)>,
+        norm: Option<(View<'_>, View<'_>, ClassRows<'_>)>,
         a_q: View<'_>,
         a_s: Option<View<'_>>,
     ) -> Result<()> {
         let t = tokens as usize;
-        let mut bindings = vec![x];
         // the norm forms read the f32 residual stream; `plain` narrows an f16 row that a GEMM
         // already wrote
         let in_bytes = if self.form == "plain" { 2 } else { 4 };
-        let mut required = vec![t * self.width * in_bytes];
+        let mut args = Args::new(x, t * self.width * in_bytes);
         if self.form != "plain" {
             let (weight, table, cls) =
                 norm.expect("a norm prepare needs its weight, table and class");
-            bindings.extend([weight, table, cls]);
             // the norm's weight, its (scale, shift) table per class, and a class per row
-            required.extend([self.width * 4, 2 * self.classes * self.width * 4, t * 4]);
+            args.push(weight, self.width * 4);
+            args.push(table, 2 * self.classes * self.width * 4);
+            args.push(cls.against(stage, t, self.classes)?, t * 4);
         }
-        bindings.push(a_q);
-        required.push(t * self.out_stride * elem_bits(&self.elem) / 8);
+        args.push(a_q, t * self.out_stride * elem_bits(&self.elem) / 8);
         if quantised(&self.elem) {
-            bindings.push(a_s.expect("an int8 prepare writes a token scale"));
-            required.push(t * 4);
+            args.push(a_s.expect("an int8 prepare writes a token scale"), t * 4);
         }
         checked(
             gpu,
@@ -232,8 +378,8 @@ impl Prepare {
             [tokens, 1, 1],
             [self.lanes as u32, 1, 1],
             &[tokens],
-            &bindings,
-            &required,
+            args.views(),
+            args.need(),
         )
     }
 }
@@ -384,7 +530,7 @@ impl Gemm {
         w_q: View<'_>,
         scales: Option<(View<'_>, View<'_>)>,
         out: View<'_>,
-        residual: Option<(View<'_>, View<'_>)>,
+        residual: Option<(View<'_>, ClassRows<'_>)>,
         bias: Option<View<'_>>,
     ) -> Result<()> {
         let t = tokens as usize;
@@ -392,23 +538,21 @@ impl Gemm {
         // Both operands are pitched to `k_stride` in the operand's element type, and every access is
         // guarded to the token count, so the row extent is `t` rather than the grid's rounded-up
         // cover. The int8 forms read the same rows as packed quads, which is the same byte count.
-        let mut bindings = vec![a_q, w_q];
-        let mut required = vec![t * self.k_stride * bytes, self.n * self.k_stride * bytes];
+        let mut args = Args::new(a_q, t * self.k_stride * bytes);
+        args.push(w_q, self.n * self.k_stride * bytes);
         if quantised(&self.elem) {
             let (w_s, a_s) = scales.expect("an int8 GEMM needs its weight and token scales");
-            bindings.extend([w_s, a_s]);
-            required.extend([self.n * 4, t * 4]);
+            args.push(w_s, self.n * 4);
+            args.push(a_s, t * 4);
         }
-        bindings.push(out);
-        required.push(t * self.out_width * self.out_bytes);
+        args.push(out, t * self.out_width * self.out_bytes);
         if self.resid {
             let (gate, cls) = residual.expect("a residual GEMM needs its gate and class rows");
-            bindings.extend([gate, cls]);
-            required.extend([self.classes * self.n * 4, t * 4]);
+            args.push(gate, self.classes * self.n * 4);
+            args.push(cls.against(stage, t, self.classes)?, t * 4);
         }
         if self.bias {
-            bindings.push(bias.expect("a biased GEMM needs its bias"));
-            required.push(self.n * 4);
+            args.push(bias.expect("a biased GEMM needs its bias"), self.n * 4);
         }
         checked(
             gpu,
@@ -422,8 +566,8 @@ impl Gemm {
             ],
             [self.threads, 1, 1],
             &[tokens],
-            &bindings,
-            &required,
+            args.views(),
+            args.need(),
         )
     }
 
@@ -506,7 +650,6 @@ impl Conv3d {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
         gpu: &hrx::Gpu,
@@ -522,16 +665,12 @@ impl Conv3d {
         // input rows at their channel pitch, the folded taps as [cout_pad][k_size], an f32 bias per
         // output channel, and the output rows — all f16 but the bias
         let plane = m * self.cout_pad * 2;
-        let mut required = vec![
-            self.in_rows * self.cin_stride * 2,
-            self.cout_pad * self.k_size * 2,
-            self.cout_pad * 4,
-            plane,
-        ];
-        let mut bindings = vec![a, w, b, out];
+        let mut args = Args::new(a, self.in_rows * self.cin_stride * 2);
+        args.push(w, self.cout_pad * self.k_size * 2);
+        args.push(b, self.cout_pad * 4);
+        args.push(out, plane);
         if let Some(r) = residual {
-            bindings.push(r);
-            required.push(plane);
+            args.push(r, plane);
         }
         checked(
             gpu,
@@ -541,8 +680,8 @@ impl Conv3d {
             [(self.cout_pad / 64) as u32, m.div_ceil(64) as u32, 1],
             [256, 1, 1],
             &[m as u32],
-            &bindings,
-            &required,
+            args.views(),
+            args.need(),
         )
     }
 }
@@ -830,13 +969,16 @@ impl Matmul16 {
             lambda.is_some(),
             "only the resid form takes a lambda"
         );
-        // the activations are f16 and the weight rows bf16, both two bytes wide; the bias and the
-        // residual form's lambda are one f32 per output column
-        let mut required = vec![m * self.k * 2, self.n * self.k * 2, self.n * 4, m * self.n * 2];
-        let mut bindings = vec![a, w, bias, out];
+        // the weight rows are bf16 as stored, and the bias and the residual form's lambda are one
+        // f32 per output column. The stream the other operands carry is the kind's: `resid` reads
+        // and writes the f16 stream, and the three that end a chain take f32 in and out.
+        let stream = if self.resid { 2 } else { 4 };
+        let mut args = Args::new(a, m * self.k * stream);
+        args.push(w, self.n * self.k * 2);
+        args.push(bias, self.n * 4);
+        args.push(out, m * self.n * stream);
         if let Some(l) = lambda {
-            bindings.push(l);
-            required.push(self.n * 4);
+            args.push(l, self.n * 4);
         }
         checked(
             gpu,
@@ -846,8 +988,70 @@ impl Matmul16 {
             [(self.n / 64) as u32, m.div_ceil(64) as u32, 1],
             [256, 1, 1],
             &[m as u32],
-            &bindings,
-            &required,
+            args.views(),
+            args.need(),
+        )
+    }
+}
+
+/// The modulated RMS norm: `x[row] = rmsnorm(x[row]) * weight * (1 + scale[cls[row]]) + shift[cls[row]]`.
+///
+/// The DiT's final norm and the refiner's, which are the two places a stack's own blocks do not do
+/// the modulating. Its table is `[2 * classes][width]` f32 — a scale row and a shift row per class.
+pub struct NormMod {
+    kernel: Arc<hrx::Kernel>,
+    width: usize,
+    lanes: usize,
+    classes: usize,
+}
+
+impl NormMod {
+    pub fn build(c: &Compiler, gpu: &hrx::Gpu, width: usize, eps: f64, classes: usize) -> Result<Self> {
+        let lanes = lanes_for(width).ok_or_else(|| {
+            crate::compile::Error::Io(format!("no norm_mod lane count for width {width}"))
+        })?;
+        let ns = "h3.norm_mod_f32.";
+        let cfg: Cfg = vec![
+            (format!("{ns}width"), width.to_string()),
+            (format!("{ns}lanes"), lanes.to_string()),
+            (format!("{ns}eps"), num(eps)),
+            (format!("{ns}classes"), classes.to_string()),
+        ];
+        Ok(Self {
+            kernel: c.get(gpu, "norm_mod_f32", "h3_norm_mod_f32", &cfg)?,
+            width,
+            lanes,
+            classes,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        gpu: &hrx::Gpu,
+        profile: Option<&mut Profile>,
+        stage: &str,
+        rows: usize,
+        x: View<'_>,
+        weight: View<'_>,
+        table: View<'_>,
+        cls: ClassRows<'_>,
+    ) -> Result<()> {
+        checked(
+            gpu,
+            &self.kernel,
+            profile,
+            stage,
+            [rows as u32, 1, 1],
+            [self.lanes as u32, 1, 1],
+            &[rows as u32],
+            &[x, weight, table, cls.against(stage, rows, self.classes)?],
+            &[
+                rows * self.width * 4,
+                self.width * 4,
+                2 * self.classes * self.width * 4,
+                rows * 4,
+            ],
         )
     }
 }
@@ -904,6 +1108,17 @@ impl LayerNorm16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_class_is_a_row_of_the_table_it_indexes() {
+        assert!(checkable(&[0, 1, 2], 3, 8).is_ok());
+        // the kernel assumes the index is in range, so these are what stands between a caller's
+        // mistake and a read outside the modulation table
+        assert!(checkable(&[0, 3], 3, 8).is_err(), "a class past the table");
+        assert!(checkable(&[-1], 3, 8).is_err(), "a negative class");
+        assert!(checkable(&[0; 9], 3, 8).is_err(), "more rows than fit");
+        assert!(checkable(&[0], 1, 8).is_ok(), "the single-class table");
+    }
 
     /// The stem names, which decide which kernel source is compiled. Built without a GPU by
     /// reproducing the same string the builder does.

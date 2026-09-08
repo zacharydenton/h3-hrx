@@ -9,7 +9,10 @@ header = """// C ABI for the whole MiniMax H3 text -> video + audio pipeline wit
 // runtime surface is libhrx, and there is no device code in this library.
 //
 // A call returns H3_OK or a status; h3_last_error() gives the reason for the last failure on the
-// calling thread, and a status other than H3_OK means nothing was written to the output buffers.
+// calling thread. H3_INVALID_ARGUMENT means nothing was written to the output buffers: arguments
+// are checked before any work starts. A failure raised once a call is under way, a cancellation
+// included, can leave a decode's output partly written — the video decoder commits each temporal
+// chunk as it finishes — so read an output buffer only after H3_OK.
 //
 // What every entry point requires of its caller, once:
 //
@@ -21,6 +24,8 @@ header = """// C ABI for the whole MiniMax H3 text -> video + audio pipeline wit
 //   - Every string is NUL-terminated and stays valid for the duration of the call.
 //   - Pointers inside h3_ref and h3_keyframe follow the same rules, with the lengths their own
 //     fields imply.
+//   - A call's input and output buffers do not overlap: inputs are read from the caller's memory
+//     rather than copied into the library.
 //   - A checkpoint file must not be modified or truncated while a session holds it: it is mapped,
 //     not copied.
 //

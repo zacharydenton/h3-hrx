@@ -255,7 +255,10 @@ impl Weights {
                         gpu.h2d_at(buffer, i * CHUNK, chunk).map_err(device)?;
                     }
                 } else {
-                    // gathered at the pitch, through a zeroed staging buffer so the pad stays zero
+                    // Gathered at the pitch, through a staging buffer zeroed once. Every row's first
+                    // `row_bytes` are overwritten before that row is sent, and the pad past them is
+                    // never written at all, so it stays zero for the life of the buffer — refilling
+                    // it between chunks would rewrite every staged byte a second time.
                     let per = (CHUNK / (*pitch_bytes).max(1)).max(1);
                     let mut stage = vec![0u8; per * pitch_bytes];
                     let (mut staged, mut written) = (0usize, 0usize);
@@ -279,7 +282,6 @@ impl Weights {
                                 .map_err(device)?;
                                 written += staged;
                                 staged = 0;
-                                stage.fill(0);
                             }
                         }
                     }

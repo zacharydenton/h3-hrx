@@ -53,7 +53,7 @@ struct Built {
     x: hrx::Buffer,
     cos: hrx::Buffer,
     sin: hrx::Buffer,
-    cls: hrx::Buffer,
+    cls: crate::dispatch::Classes,
     ds: hrx::Buffer,
 }
 
@@ -147,8 +147,7 @@ impl TextEncoder {
         let t = stack.capacity();
         let x = gpu.alloc(t * TE_HID * 4)?;
         gpu.memset(&x, 0, t * TE_HID * 4)?;
-        let cls = gpu.alloc(t * 4)?;
-        gpu.memset(&cls, 0, t * 4)?;
+        let cls = crate::dispatch::Classes::zeroed(gpu, t)?;
 
         let positions = rope::mrope_positions(n, &signature_spans(spans));
         let (mut cos_h, mut sin_h) = (
@@ -197,7 +196,7 @@ impl TextEncoder {
         let cond_fn = |_: usize| crate::stack::LayerCond { ..cond };
         let (x, cls, cos, sin) = (
             b.x.binding(),
-            b.cls.binding(),
+            b.cls.all(),
             b.cos.binding(),
             b.sin.binding(),
         );

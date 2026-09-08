@@ -40,10 +40,17 @@ written, so check the count against the capacity (or call with capacity 0 to siz
 or a frame count outside 1..1048576; check it before allocating from the shape.
 
 **Ownership.** The caller allocates every buffer and keeps it alive for the duration of the call;
-the library never keeps a pointer past the call except the session's own state. Latent, frame and
+the library never keeps a pointer past the call except the session's own state. Inputs are read from
+the caller's memory rather than copied, so a call's input and output buffers must not overlap. Latent, frame and
 sample buffers must be at least the sizes below; pass their element counts, and the library
 refuses short ones rather than writing past them. A larger buffer (a pooled one, say) is accepted
 and exactly the required count is read or written; the rest is untouched.
+
+**On failure.** Arguments are validated before any output is written, so `H3_INVALID_ARGUMENT`
+always leaves the output buffers as they were. A failure raised once a call is under way — a device
+error, or a cancellation — can leave a decode's output partly written, because the video decoder
+commits each temporal chunk as it finishes rather than staging a whole clip. Read an output buffer
+only after `H3_OK`.
 
 **Threading.** A session serialises its calls with an internal mutex: concurrent calls from several
 threads are safe and run one at a time. The progress callback runs on the calling thread between
