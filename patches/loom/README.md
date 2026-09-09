@@ -1,9 +1,8 @@
 # Loom compiler used by this project
 
-This project uses three local changes on top of `ROCm/hrx-system` commit
-`c9855b47e96e7eb1cbb5b81b1de973762982ae95` — two in the compiler, which the
-measured kernels need, and one in the runtime, without which nothing here starts
-on a stock ROCr. The patches preserve them without requiring access to a local branch:
+These four patches apply on top of `ROCm/hrx-system` commit
+`c9855b47e96e7eb1cbb5b81b1de973762982ae95`. They preserve the compiler and runtime
+changes needed by this project without requiring access to a local branch.
 
 1. `0001-amdgpu-fragment-repack.patch` — `v_permlanex16` cross-lane lowering
    and an f32-to-f16 matrix-fragment repack in registers (original commit
@@ -23,6 +22,14 @@ on a stock ROCr. The patches preserve them without requiring access to a local b
    not optional. Not upstream: it is
    [`pm4-emulation-query-optional`](https://github.com/zacharydenton/hrx-system/tree/pm4-emulation-query-optional)
    on a fork of `ROCm/hrx-system`.
+4. `0004-vopd-source-cache-banks.patch` — check VOPD register banks by the
+   hardware operand cache. FMAMK addends use SRC2, whose bank mask is 1;
+   treating their encoded VSRC1 field as SRC1 admitted illegal dual instructions
+   and corrupted vision GELU outputs. The fix covers mixed FMAMK/FMAC pairs in
+   both allocation constraints and native emission, while preserving legal
+   pairing. Fork commit
+   [`675cc43bc`](https://github.com/zacharydenton/hrx-system/commit/675cc43bc).
+   See the [reproducer and GPU evidence](../../experiments/vision_gelu_vopd/README.md).
 
 From this project's root, create a separate compiler checkout:
 
@@ -53,10 +60,14 @@ bash scripts/test.sh
 `libhrx_src_libhrx_hrx` builds `libhrx.so`. Nothing here links it, and nothing
 here needs this build at all: the model and its tests take a digest-verified
 `libhrx` and `loom-compile` from the HRX bundle. What this checkout is for is
-rebuilding that compiler — these three patches are the only record of how it
-differs from upstream, and two of them are codegen changes the recorded kernel
-measurements depend on. `LOOM_COMPILE` substitutes the result for the bundle's.
+rebuilding that compiler. Patches 0001–0003 reproduce the source changes used
+for the recorded measurements; patch 0004 adds the VOPD correctness fix.
+`LOOM_COMPILE` substitutes the result for the bundle's compiler. The currently
+pinned bundle does not contain patch 0004; merely applying these patches does
+not change the compiler selected by the model.
 
-The three patches reproduce the committed compiler source used for the recorded
-measurements. A compiler rebuild from a fresh checkout has not been repeated
-recently. The patches retain their upstream source license headers.
+Validated on 2026-09-09: all four patches apply in order to the pinned revision.
+The compiler fix was built in an isolated checkout and passed 17 generator tests,
+16 native AMDGPU/schedule fixture suites, and all 15 H3 GPU kernel tests. The
+previously failing shared vision GELU kernel matched all 4,160 baseline outputs
+bitwise. The patches retain their upstream source license headers.

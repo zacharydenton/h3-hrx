@@ -1,0 +1,488 @@
+From 675cc43bcdcd7cdd7ab6d34ed9fbbfb6ff33a6e3 Mon Sep 17 00:00:00 2001
+From: Zach Denton <z@chdenton.com>
+Date: Wed, 9 Sep 2026 10:30:31 +0200
+Subject: [PATCH] [Loom] Check VOPD register banks by operand cache
+
+FMAMK encodes its addend in VSRC1 but reads it through SRC2, whose bank mask is 1 rather than 3. Comparing encoded fields admitted illegal FMAMK pairs and missed conflicts between FMAMK addends and tied FMAC accumulators.
+
+Describe the register feeding each operand cache in the component tables and use that mapping in both placement relations and native packet legality. Preserve legal dual operations, including pairs whose encoded VSRC1 operands use different caches, and report SRC2 bank conflicts explicitly.
+
+Add placement, assembly, and diagnostic regressions. Four assembly cases fail before the fix and pass afterward. Validation: 17 generator tests, 16 native/schedule fixture suites, and 15 downstream GPU kernel tests. The previously failing BF16 GELU family now matches all 4160 baseline outputs bitwise; LLVM accepts its emitted VOPD instructions.
+---
+ .../amdgpu_vopd_component_tables.py           |  74 +++++----
+ .../amdgpu_vopd_component_tables_test.py      |  21 +++
+ .../target/arch/amdgpu/planning/vopd_data.h   |  13 ++
+ .../target/arch/amdgpu/planning/vopd_plan.c   |  67 +++++---
+ .../target/arch/amdgpu/planning/vopd_plan.h   |   4 +-
+ .../test/assembly_vopd_profiles.loom-test     | 143 ++++++++++++++++++
+ .../native/amdgpu/test/vopd_plan.loom-test    |  16 ++
+ 7 files changed, 293 insertions(+), 45 deletions(-)
+
+diff --git a/loom/py/loom/gen/target/arch/amdgpu/descriptors/amdgpu_vopd_component_tables.py b/loom/py/loom/gen/target/arch/amdgpu/descriptors/amdgpu_vopd_component_tables.py
+index 6750d671e..bb1be7e11 100644
+--- a/loom/py/loom/gen/target/arch/amdgpu/descriptors/amdgpu_vopd_component_tables.py
++++ b/loom/py/loom/gen/target/arch/amdgpu/descriptors/amdgpu_vopd_component_tables.py
+@@ -88,6 +88,11 @@ _PLACEMENT_VALUE_RESULT = "LOOM_LOW_PLACEMENT_PAIR_VALUE_RESULT"
+ _PLACEMENT_DIFFERENT_MASKED = "LOOM_LOW_PLACEMENT_RELATION_DIFFERENT_MASKED_LOCATION"
+ _PLACEMENT_DISJOINT = "LOOM_LOW_PLACEMENT_RELATION_DISJOINT_STORAGE"
+ 
++_CACHE_NONE = "LOOM_AMDGPU_VOPD_CACHE_REGISTER_NONE"
++_CACHE_SRC0 = "LOOM_AMDGPU_VOPD_CACHE_REGISTER_SRC0"
++_CACHE_VSRC1 = "LOOM_AMDGPU_VOPD_CACHE_REGISTER_VSRC1"
++_CACHE_DESTINATION = "LOOM_AMDGPU_VOPD_CACHE_REGISTER_DESTINATION"
++
+ _XML_INSTRUCTION_DERIVED = object()
+ 
+ 
+@@ -741,6 +746,32 @@ def _component_source_operand_index(
+     raise ValueError(f"AMDGPU VOPD component '{component.descriptor_key}' has unsupported source form '{component.form}'")
+ 
+ 
++def _component_source_caches(component: _VopdComponentDefinition) -> tuple[str, str, str]:
++    # Encoded VSRC1 is SRC2 for FMAMK, while an accumulating instruction reads
++    # its tied destination through SRC2. Literals do not consume a VGPR cache.
++    return {
++        _FORM_TIED_ACCUMULATE: (_CACHE_SRC0, _CACHE_VSRC1, _CACHE_DESTINATION),
++        _FORM_FMAAK_LITERAL: (_CACHE_SRC0, _CACHE_VSRC1, _CACHE_NONE),
++        _FORM_FMAMK_LITERAL: (_CACHE_SRC0, _CACHE_NONE, _CACHE_VSRC1),
++        _FORM_BINARY_VGPR: (_CACHE_SRC0, _CACHE_VSRC1, _CACHE_NONE),
++        _FORM_CNDMASK_VCC: (_CACHE_SRC0, _CACHE_VSRC1, _CACHE_NONE),
++        _FORM_REGISTER_MOV: (_CACHE_SRC0, _CACHE_NONE, _CACHE_NONE),
++        _FORM_INLINE_MOV: (_CACHE_NONE, _CACHE_NONE, _CACHE_NONE),
++    }[component.form]
++
++
++def _placement_cache_ref(
++    pair_component: str,
++    component: _VopdComponentDefinition,
++    cache_register: str,
++    flags: frozenset[str],
++) -> _VopdPairPlacementValueRef:
++    if cache_register == _CACHE_DESTINATION:
++        return _placement_result_ref(pair_component)
++    source_mask = {_CACHE_SRC0: _SOURCE_SRC0, _CACHE_VSRC1: _SOURCE_VSRC1}[cache_register]
++    return _placement_source_ref(pair_component, component, _source_mask_for_component_orientation(source_mask, flags))
++
++
+ def _component_operand_count(component: _VopdComponentDefinition) -> int:
+     if component.form == _FORM_TIED_ACCUMULATE:
+         return max(component.operand_layout) + 1
+@@ -840,6 +871,21 @@ def _pair_placement_relations(
+             location_mask=0x1,
+         )
+     ]
++    for cache, (first_cache, second_cache, bank_mask) in enumerate(zip(_component_source_caches(first_component), _component_source_caches(second_component), (0x3, 0x3, 0x1), strict=True)):
++        if _CACHE_NONE in (first_cache, second_cache):
++            continue
++        if first_cache == second_cache == _CACHE_DESTINATION:
++            continue  # Already covered by destination parity.
++        if cache == 0 and not _components_share_source_cache(first_component, second_component, _SOURCE_SRC0, first_component_flags, second_component_flags):
++            continue
++        relations.append(
++            _VopdPairPlacementRelation(
++                result=_placement_cache_ref(_PLACEMENT_COMPONENT_FIRST, first_component, first_cache, first_component_flags),
++                source=_placement_cache_ref(_PLACEMENT_COMPONENT_SECOND, second_component, second_cache, second_component_flags),
++                kind=_PLACEMENT_DIFFERENT_MASKED,
++                location_mask=bank_mask,
++            )
++        )
+     for source_mask in (_SOURCE_SRC0, _SOURCE_VSRC1):
+         first_source_mask = _source_mask_for_component_orientation(
+             source_mask,
+@@ -854,33 +900,6 @@ def _pair_placement_relations(
+             second_component,
+             second_source_mask,
+         )
+-        if (
+-            first_has_source
+-            and second_has_source
+-            and _components_share_source_cache(
+-                first_component,
+-                second_component,
+-                source_mask,
+-                first_component_flags,
+-                second_component_flags,
+-            )
+-        ):
+-            relations.append(
+-                _VopdPairPlacementRelation(
+-                    result=_placement_source_ref(
+-                        _PLACEMENT_COMPONENT_FIRST,
+-                        first_component,
+-                        first_source_mask,
+-                    ),
+-                    source=_placement_source_ref(
+-                        _PLACEMENT_COMPONENT_SECOND,
+-                        second_component,
+-                        second_source_mask,
+-                    ),
+-                    kind=_PLACEMENT_DIFFERENT_MASKED,
+-                    location_mask=0x3,
+-                )
+-            )
+         if second_has_source:
+             relations.append(
+                 _VopdPairPlacementRelation(
+@@ -1294,6 +1313,7 @@ def _component_rule_initializer(
+             f"                .vsrc1_index = {vsrc1_index},",
+             "            },",
+             f"        .source_register_mask = {component.source_register_mask},",
++            "        .source_cache_registers = {" + ", ".join(_component_source_caches(component)) + "},",
+             f"        .flags = {_component_flags_initializer(rule.flags)},",
+             "    },",
+         ]
+diff --git a/loom/py/loom/gen/target/arch/amdgpu/descriptors/amdgpu_vopd_component_tables_test.py b/loom/py/loom/gen/target/arch/amdgpu/descriptors/amdgpu_vopd_component_tables_test.py
+index 157a688b8..4861b6aac 100644
+--- a/loom/py/loom/gen/target/arch/amdgpu/descriptors/amdgpu_vopd_component_tables_test.py
++++ b/loom/py/loom/gen/target/arch/amdgpu/descriptors/amdgpu_vopd_component_tables_test.py
+@@ -12,6 +12,27 @@ from loom.gen.target.arch.amdgpu.descriptors import amdgpu_vopd_component_tables
+ from loom.target.arch.amdgpu.target_info import sorted_descriptor_set_infos
+ 
+ 
++@pytest.mark.parametrize(
++    ("first", "second", "expected_sources"),
++    [
++        ("fmamk_f32", "fmamk_f32", {("operand", 0, "operand", 0, 3), ("operand", 1, "operand", 1, 1)}),
++        ("fmamk_f32", "fmac_f32", {("operand", 0, "operand", 1, 3), ("operand", 1, "result", 0, 1)}),
++        ("fmac_f32", "fmamk_f32", {("operand", 1, "operand", 0, 3), ("result", 0, "operand", 1, 1)}),
++        ("fmamk_f32", "fmaak_f32", {("operand", 0, "operand", 0, 3)}),
++        ("fmamk_f32", "mul_f32", {("operand", 0, "operand", 0, 3)}),
++        ("fmaak_f32", "fmaak_f32", {("operand", 0, "operand", 0, 3), ("operand", 1, "operand", 1, 3)}),
++        ("fmac_f32", "fmac_f32", {("operand", 1, "operand", 1, 3), ("operand", 2, "operand", 2, 3)}),
++    ],
++)
++def test_pair_placement_compares_actual_operand_caches(first, second, expected_sources) -> None:
++    tables = amdgpu_vopd_component_tables
++    components = {c.descriptor_key: c for c in tables._component_definitions()}
++    relations = tables._pair_placement_relations(components[f"amdgpu.v_{first}"], components[f"amdgpu.v_{second}"], frozenset(), frozenset())
++    kinds = {tables._PLACEMENT_VALUE_OPERAND: "operand", tables._PLACEMENT_VALUE_RESULT: "result"}
++    bank_relations = {(kinds[r.result.kind], r.result.index, kinds[r.source.kind], r.source.index, r.location_mask) for r in relations if r.kind == tables._PLACEMENT_DIFFERENT_MASKED}
++    assert bank_relations == expected_sources | {("result", 0, "result", 0, 1)}
++
++
+ def test_vopd_descriptor_set_groups_follow_target_info() -> None:
+     descriptor_set_infos = sorted_descriptor_set_infos()
+ 
+diff --git a/loom/src/loom/target/arch/amdgpu/planning/vopd_data.h b/loom/src/loom/target/arch/amdgpu/planning/vopd_data.h
+index 2c64abcbc..4fc009804 100644
+--- a/loom/src/loom/target/arch/amdgpu/planning/vopd_data.h
++++ b/loom/src/loom/target/arch/amdgpu/planning/vopd_data.h
+@@ -31,6 +31,16 @@ typedef enum loom_amdgpu_vopd_component_source_bits_e {
+ } loom_amdgpu_vopd_component_source_bits_t;
+ typedef uint8_t loom_amdgpu_vopd_component_source_mask_t;
+ 
++// Physical register feeding one of the SRC0/SRC1/SRC2 operand caches. Encoded
++// field names do not identify the cache: FMAMK's VSRC1 is an SRC2 addend, and
++// tied accumulators read the destination through SRC2.
++typedef enum loom_amdgpu_vopd_cache_register_e {
++  LOOM_AMDGPU_VOPD_CACHE_REGISTER_NONE = 0,
++  LOOM_AMDGPU_VOPD_CACHE_REGISTER_SRC0 = 1,
++  LOOM_AMDGPU_VOPD_CACHE_REGISTER_VSRC1 = 2,
++  LOOM_AMDGPU_VOPD_CACHE_REGISTER_DESTINATION = 3,
++} loom_amdgpu_vopd_cache_register_t;
++
+ typedef enum loom_amdgpu_vopd_component_rule_flag_bits_e {
+   // Component rule has no additional planning capabilities.
+   LOOM_AMDGPU_VOPD_COMPONENT_FLAG_NONE = 0u,
+@@ -60,6 +70,9 @@ typedef struct loom_amdgpu_vopd_component_rule_t {
+   loom_amdgpu_vopd_component_operand_layout_t operands;
+   // Source operand slots that contain real VGPRs.
+   loom_amdgpu_vopd_component_source_mask_t source_register_mask;
++  // Register selectors for SRC0, SRC1 and SRC2, respectively. Their bank masks
++  // are 3, 3 and 1. NONE denotes a literal or an unused cache.
++  uint8_t source_cache_registers[3];
+   // Descriptor-derived component planning capabilities.
+   loom_amdgpu_vopd_component_rule_flags_t flags;
+ } loom_amdgpu_vopd_component_rule_t;
+diff --git a/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c b/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c
+index 4c2c9e680..10bd49c97 100644
+--- a/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c
++++ b/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.c
+@@ -246,6 +246,8 @@ static const loom_amdgpu_vopd_register_constraint_flag_name_t
+          IREE_SVL("src0_bank")},
+         {LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_VSRC1_BANK,
+          IREE_SVL("vsrc1_bank")},
++        {LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_SRC2_BANK,
++         IREE_SVL("src2_bank")},
+         {LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_X_DESTINATION_Y_SRC0,
+          IREE_SVL("x_destination_y_src0_alias")},
+         {LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_X_DESTINATION_Y_VSRC1,
+@@ -972,6 +974,21 @@ static bool loom_amdgpu_vopd_components_share_source_cache(
+                            LOOM_AMDGPU_VOPD_COMPONENT_FLAG_DUAL_MOV_SRC2_CACHE);
+ }
+ 
++static uint16_t loom_amdgpu_vopd_cache_register(
++    const loom_amdgpu_vopd_candidate_component_t* component, uint8_t selector) {
++  switch (selector) {
++    case LOOM_AMDGPU_VOPD_CACHE_REGISTER_SRC0:
++      return component->src0;
++    case LOOM_AMDGPU_VOPD_CACHE_REGISTER_VSRC1:
++      return component->vsrc1;
++    case LOOM_AMDGPU_VOPD_CACHE_REGISTER_DESTINATION:
++      return component->vdst;
++    default:
++      IREE_ASSERT_UNREACHABLE("cache must select a register");
++      return 0;
++  }
++}
++
+ static loom_amdgpu_vopd_register_constraint_flags_t
+ loom_amdgpu_vopd_register_constraint_flags(
+     const loom_amdgpu_vopd_candidate_pair_t* candidate) {
+@@ -979,23 +996,39 @@ loom_amdgpu_vopd_register_constraint_flags(
+   if (((candidate->x.vdst ^ candidate->y.vdst) & 1u) == 0) {
+     flags |= LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_DESTINATION_PARITY;
+   }
+-  const loom_amdgpu_vopd_component_source_mask_t paired_source_registers =
+-      candidate->x.rule->source_register_mask &
+-      candidate->y.rule->source_register_mask;
+-  if (iree_any_bit_set(paired_source_registers,
+-                       LOOM_AMDGPU_VOPD_COMPONENT_SOURCE_SRC0) &&
+-      loom_amdgpu_vopd_components_share_source_cache(
+-          &candidate->x, &candidate->y,
+-          LOOM_AMDGPU_VOPD_COMPONENT_SOURCE_SRC0) &&
+-      !loom_amdgpu_vopd_bank_compatible(candidate->x.src0, candidate->y.src0,
+-                                        3)) {
+-    flags |= LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_SRC0_BANK;
+-  }
+-  if (iree_any_bit_set(paired_source_registers,
+-                       LOOM_AMDGPU_VOPD_COMPONENT_SOURCE_VSRC1) &&
+-      !loom_amdgpu_vopd_bank_compatible(candidate->x.vsrc1, candidate->y.vsrc1,
+-                                        3)) {
+-    flags |= LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_VSRC1_BANK;
++  static const uint16_t bank_masks[] = {3, 3, 1};
++  static const loom_amdgpu_vopd_register_constraint_flags_t bank_flags[] = {
++      LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_SRC0_BANK,
++      LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_VSRC1_BANK,
++      LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_SRC2_BANK,
++  };
++  for (iree_host_size_t cache = 0; cache < IREE_ARRAYSIZE(bank_masks);
++       ++cache) {
++    const uint8_t x = candidate->x.rule->source_cache_registers[cache];
++    const uint8_t y = candidate->y.rule->source_cache_registers[cache];
++    if (x == LOOM_AMDGPU_VOPD_CACHE_REGISTER_NONE ||
++        y == LOOM_AMDGPU_VOPD_CACHE_REGISTER_NONE) {
++      continue;
++    }
++    // On profiles with separate dual-MOV caches, the Y move uses SRC2.
++    // Neither move reads another cache, so only the SRC0 intersection changes.
++    if (cache == 0 && !loom_amdgpu_vopd_components_share_source_cache(
++                          &candidate->x, &candidate->y,
++                          LOOM_AMDGPU_VOPD_COMPONENT_SOURCE_SRC0)) {
++      continue;
++    }
++    // Tied accumulators both read their destinations through SRC2; destination
++    // parity already checks this case and owns its diagnostic.
++    if (x == LOOM_AMDGPU_VOPD_CACHE_REGISTER_DESTINATION &&
++        y == LOOM_AMDGPU_VOPD_CACHE_REGISTER_DESTINATION) {
++      continue;
++    }
++    if (!loom_amdgpu_vopd_bank_compatible(
++            loom_amdgpu_vopd_cache_register(&candidate->x, x),
++            loom_amdgpu_vopd_cache_register(&candidate->y, y),
++            bank_masks[cache])) {
++      flags |= bank_flags[cache];
++    }
+   }
+   if (iree_any_bit_set(candidate->y.rule->source_register_mask,
+                        LOOM_AMDGPU_VOPD_COMPONENT_SOURCE_SRC0) &&
+diff --git a/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.h b/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.h
+index a977fde59..7cc0825e7 100644
+--- a/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.h
++++ b/loom/src/loom/target/arch/amdgpu/planning/vopd_plan.h
+@@ -63,7 +63,7 @@ typedef enum loom_amdgpu_vopd_register_constraint_flag_bits_e {
+   LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_DESTINATION_PARITY = 1u << 0,
+   // Component SRC0 VGPRs occupy the same register bank.
+   LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_SRC0_BANK = 1u << 1,
+-  // Component VSRC1 VGPRs occupy the same register bank.
++  // Component SRC1 cache VGPRs occupy the same register bank.
+   LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_VSRC1_BANK = 1u << 2,
+   // X destination aliases the Y SRC0 VGPR.
+   LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_X_DESTINATION_Y_SRC0 = 1u << 3,
+@@ -73,6 +73,8 @@ typedef enum loom_amdgpu_vopd_register_constraint_flag_bits_e {
+   LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_Y_DESTINATION_X_SRC0 = 1u << 5,
+   // Y destination aliases the X VSRC1 VGPR.
+   LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_Y_DESTINATION_X_VSRC1 = 1u << 6,
++  // Component SRC2 cache VGPRs occupy the same register bank.
++  LOOM_AMDGPU_VOPD_REGISTER_CONSTRAINT_FLAG_SRC2_BANK = 1u << 7,
+ } loom_amdgpu_vopd_register_constraint_flag_bits_t;
+ typedef uint8_t loom_amdgpu_vopd_register_constraint_flags_t;
+ 
+diff --git a/loom/src/loom/target/emit/native/amdgpu/test/assembly_vopd_profiles.loom-test b/loom/src/loom/target/emit/native/amdgpu/test/assembly_vopd_profiles.loom-test
+index 19ede724c..788c1e9c8 100644
+--- a/loom/src/loom/target/emit/native/amdgpu/test/assembly_vopd_profiles.loom-test
++++ b/loom/src/loom/target/emit/native/amdgpu/test/assembly_vopd_profiles.loom-test
+@@ -114,3 +114,146 @@ low.func.def target<amdgpu.gfx12_5.generic.core>(@target) @gfx12_5_generic_vopd_
+   v_dual_min_num_f32 v4, v0, v1 :: v_dual_min_num_f32 v5, v2, v3
+   v_dual_max_num_f32 v6, v0, v1 :: v_dual_max_num_f32 v7, v2, v3
+   s_endpgm
++
++// ====
++
++// Same-parity FMAMK addends conflict in SRC2 even when they differ modulo four.
++// RUN: emit amdgpu-assembly @fmamk_same_src2_bank strategy=source fixed=%lhs0:physical_register:1:1 fixed=%addend0:physical_register:0:1 fixed=%lhs1:physical_register:3:1 fixed=%addend1:physical_register:2:1 fixed=%next0:physical_register:4:1 fixed=%next1:physical_register:5:1
++amdgpu.target<gfx1151> @target {subgroup_size = 32}
++low.func.def target<amdgpu.rdna3_5.core>(@target) @fmamk_same_src2_bank(%resource: reg<amdgpu.sgpr x4>, %vaddr: reg<amdgpu.vgpr>, %soffset: reg<amdgpu.sgpr>, %lhs0: reg<amdgpu.vgpr>, %addend0: reg<amdgpu.vgpr>, %lhs1: reg<amdgpu.vgpr>, %addend1: reg<amdgpu.vgpr>) asm {
++  %next0 = v_fmamk_f32 %lhs0, %addend0, 1027024659
++  %next1 = v_fmamk_f32 %lhs1, %addend1, 1027024659
++  buffer_store_dword %next0, %resource, %vaddr, %soffset
++  buffer_store_dword %next1, %resource, %vaddr, %soffset {offset = 4}
++  return
++}
++
++// ----
++  v_fmamk_f32 v4, v1, 0x3d372713, v0
++  v_fmamk_f32 v5, v3, 0x3d372713, v2
++  buffer_store_dword v4, v6, s[0:3], s4 offen offset:0
++  buffer_store_dword v5, v6, s[0:3], s4 offen offset:4
++  s_waitcnt_vscnt vscnt(0)
++  s_endpgm
++
++// ====
++
++// Opposite-parity addends retain dual FMAMK.
++// RUN: emit amdgpu-assembly @fmamk_distinct_src2_banks strategy=source fixed=%lhs0:physical_register:1:1 fixed=%addend0:physical_register:0:1 fixed=%lhs1:physical_register:2:1 fixed=%addend1:physical_register:3:1 fixed=%next0:physical_register:4:1 fixed=%next1:physical_register:5:1
++amdgpu.target<gfx1151> @target {subgroup_size = 32}
++low.func.def target<amdgpu.rdna3_5.core>(@target) @fmamk_distinct_src2_banks(%resource: reg<amdgpu.sgpr x4>, %vaddr: reg<amdgpu.vgpr>, %soffset: reg<amdgpu.sgpr>, %lhs0: reg<amdgpu.vgpr>, %addend0: reg<amdgpu.vgpr>, %lhs1: reg<amdgpu.vgpr>, %addend1: reg<amdgpu.vgpr>) asm {
++  %next0 = v_fmamk_f32 %lhs0, %addend0, 1027024659
++  %next1 = v_fmamk_f32 %lhs1, %addend1, 1027024659
++  buffer_store_dword %next0, %resource, %vaddr, %soffset
++  buffer_store_dword %next1, %resource, %vaddr, %soffset {offset = 4}
++  return
++}
++
++// ----
++  v_dual_fmamk_f32 v4, v1, 0x3d372713, v0 :: v_dual_fmamk_f32 v5, v2, 0x3d372713, v3
++  buffer_store_dword v4, v6, s[0:3], s4 offen offset:0
++  buffer_store_dword v5, v6, s[0:3], s4 offen offset:4
++  s_waitcnt_vscnt vscnt(0)
++  s_endpgm
++
++// ====
++
++// FMAMK addends and FMAC tied accumulators share SRC2.
++// RUN: emit amdgpu-assembly @fmamk_fmac_same_src2_bank strategy=source fixed=%lhs0:physical_register:1:1 fixed=%addend0:physical_register:7:1 fixed=%lhs1:physical_register:3:1 fixed=%rhs1:physical_register:0:1 fixed=%acc1:physical_register:5:1 fixed=%next0:physical_register:4:1 fixed=%next1:physical_register:5:1
++amdgpu.target<gfx1151> @target {subgroup_size = 32}
++low.func.def target<amdgpu.rdna3_5.core>(@target) @fmamk_fmac_same_src2_bank(%resource: reg<amdgpu.sgpr x4>, %vaddr: reg<amdgpu.vgpr>, %soffset: reg<amdgpu.sgpr>, %lhs0: reg<amdgpu.vgpr>, %addend0: reg<amdgpu.vgpr>, %lhs1: reg<amdgpu.vgpr>, %rhs1: reg<amdgpu.vgpr>, %acc1: reg<amdgpu.vgpr>) asm {
++  %next0 = v_fmamk_f32 %lhs0, %addend0, 1027024659
++  %next1 = v_fmac_f32 %acc1, %lhs1, %rhs1
++  buffer_store_dword %next0, %resource, %vaddr, %soffset
++  buffer_store_dword %next1, %resource, %vaddr, %soffset {offset = 4}
++  return
++}
++
++// ----
++  v_fmamk_f32 v4, v1, 0x3d372713, v7
++  v_fmac_f32 v5, v3, v0
++  buffer_store_dword v4, v2, s[0:3], s4 offen offset:0
++  buffer_store_dword v5, v2, s[0:3], s4 offen offset:4
++  s_waitcnt_vscnt vscnt(0)
++  s_endpgm
++
++// ====
++
++// Mixed FMAMK/FMAC stays paired when its SRC2 banks differ.
++// RUN: emit amdgpu-assembly @fmamk_fmac_distinct_src2_banks strategy=source fixed=%lhs0:physical_register:1:1 fixed=%addend0:physical_register:6:1 fixed=%lhs1:physical_register:3:1 fixed=%rhs1:physical_register:0:1 fixed=%acc1:physical_register:5:1 fixed=%next0:physical_register:4:1 fixed=%next1:physical_register:5:1
++amdgpu.target<gfx1151> @target {subgroup_size = 32}
++low.func.def target<amdgpu.rdna3_5.core>(@target) @fmamk_fmac_distinct_src2_banks(%resource: reg<amdgpu.sgpr x4>, %vaddr: reg<amdgpu.vgpr>, %soffset: reg<amdgpu.sgpr>, %lhs0: reg<amdgpu.vgpr>, %addend0: reg<amdgpu.vgpr>, %lhs1: reg<amdgpu.vgpr>, %rhs1: reg<amdgpu.vgpr>, %acc1: reg<amdgpu.vgpr>) asm {
++  %next0 = v_fmamk_f32 %lhs0, %addend0, 1027024659
++  %next1 = v_fmac_f32 %acc1, %lhs1, %rhs1
++  buffer_store_dword %next0, %resource, %vaddr, %soffset
++  buffer_store_dword %next1, %resource, %vaddr, %soffset {offset = 4}
++  return
++}
++
++// ----
++  v_dual_fmamk_f32 v4, v1, 0x3d372713, v6 :: v_dual_fmac_f32 v5, v3, v0
++  buffer_store_dword v4, v2, s[0:3], s4 offen offset:0
++  buffer_store_dword v5, v2, s[0:3], s4 offen offset:4
++  s_waitcnt_vscnt vscnt(0)
++  s_endpgm
++
++// ====
++
++// The SRC2 conflict check also applies with the accumulating component first.
++// RUN: emit amdgpu-assembly @fmac_fmamk_same_src2_bank strategy=source fixed=%lhs0:physical_register:1:1 fixed=%rhs0:physical_register:0:1 fixed=%acc0:physical_register:4:1 fixed=%lhs1:physical_register:3:1 fixed=%addend1:physical_register:6:1 fixed=%next0:physical_register:4:1 fixed=%next1:physical_register:5:1
++amdgpu.target<gfx1151> @target {subgroup_size = 32}
++low.func.def target<amdgpu.rdna3_5.core>(@target) @fmac_fmamk_same_src2_bank(%resource: reg<amdgpu.sgpr x4>, %vaddr: reg<amdgpu.vgpr>, %soffset: reg<amdgpu.sgpr>, %lhs0: reg<amdgpu.vgpr>, %rhs0: reg<amdgpu.vgpr>, %acc0: reg<amdgpu.vgpr>, %lhs1: reg<amdgpu.vgpr>, %addend1: reg<amdgpu.vgpr>) asm {
++  %next0 = v_fmac_f32 %acc0, %lhs0, %rhs0
++  %next1 = v_fmamk_f32 %lhs1, %addend1, 1027024659
++  buffer_store_dword %next0, %resource, %vaddr, %soffset
++  buffer_store_dword %next1, %resource, %vaddr, %soffset {offset = 4}
++  return
++}
++
++// ----
++  v_fmac_f32 v4, v1, v0
++  v_fmamk_f32 v5, v3, 0x3d372713, v6
++  buffer_store_dword v4, v2, s[0:3], s4 offen offset:0
++  buffer_store_dword v5, v2, s[0:3], s4 offen offset:4
++  s_waitcnt_vscnt vscnt(0)
++  s_endpgm
++
++// ====
++
++// Encoded VSRC1 values in the same bank may pair when routed to distinct caches.
++// RUN: emit amdgpu-assembly @fmamk_sub_separate_caches strategy=source fixed=%lhs0:physical_register:1:1 fixed=%addend0:physical_register:0:1 fixed=%lhs1:physical_register:3:1 fixed=%rhs1:physical_register:4:1 fixed=%next0:physical_register:6:1 fixed=%next1:physical_register:7:1
++amdgpu.target<gfx1151> @target {subgroup_size = 32}
++low.func.def target<amdgpu.rdna3_5.core>(@target) @fmamk_sub_separate_caches(%resource: reg<amdgpu.sgpr x4>, %vaddr: reg<amdgpu.vgpr>, %soffset: reg<amdgpu.sgpr>, %lhs0: reg<amdgpu.vgpr>, %addend0: reg<amdgpu.vgpr>, %lhs1: reg<amdgpu.vgpr>, %rhs1: reg<amdgpu.vgpr>) asm {
++  %next0 = v_fmamk_f32 %lhs0, %addend0, 1027024659
++  %next1 = v_sub_f32 %lhs1, %rhs1
++  buffer_store_dword %next0, %resource, %vaddr, %soffset
++  buffer_store_dword %next1, %resource, %vaddr, %soffset {offset = 4}
++  return
++}
++
++// ----
++  v_dual_fmamk_f32 v6, v1, 0x3d372713, v0 :: v_dual_sub_f32 v7, v3, v4
++  buffer_store_dword v6, v2, s[0:3], s4 offen offset:0
++  buffer_store_dword v7, v2, s[0:3], s4 offen offset:4
++  s_waitcnt_vscnt vscnt(0)
++  s_endpgm
++
++// ====
++
++// SRC1 retains four banks; same parity alone does not block ordinary operands.
++// RUN: emit amdgpu-assembly @fmaak_distinct_src1_banks strategy=source fixed=%lhs0:physical_register:1:1 fixed=%rhs0:physical_register:0:1 fixed=%lhs1:physical_register:3:1 fixed=%rhs1:physical_register:2:1 fixed=%next0:physical_register:4:1 fixed=%next1:physical_register:5:1
++amdgpu.target<gfx1151> @target {subgroup_size = 32}
++low.func.def target<amdgpu.rdna3_5.core>(@target) @fmaak_distinct_src1_banks(%resource: reg<amdgpu.sgpr x4>, %vaddr: reg<amdgpu.vgpr>, %soffset: reg<amdgpu.sgpr>, %lhs0: reg<amdgpu.vgpr>, %rhs0: reg<amdgpu.vgpr>, %lhs1: reg<amdgpu.vgpr>, %rhs1: reg<amdgpu.vgpr>) asm {
++  %next0 = v_fmaak_f32 %lhs0, %rhs0, 1027024659
++  %next1 = v_fmaak_f32 %lhs1, %rhs1, 1027024659
++  buffer_store_dword %next0, %resource, %vaddr, %soffset
++  buffer_store_dword %next1, %resource, %vaddr, %soffset {offset = 4}
++  return
++}
++
++// ----
++  v_dual_fmaak_f32 v4, v1, v0, 0x3d372713 :: v_dual_fmaak_f32 v5, v3, v2, 0x3d372713
++  buffer_store_dword v4, v6, s[0:3], s4 offen offset:0
++  buffer_store_dword v5, v6, s[0:3], s4 offen offset:4
++  s_waitcnt_vscnt vscnt(0)
++  s_endpgm
+diff --git a/loom/src/loom/target/emit/native/amdgpu/test/vopd_plan.loom-test b/loom/src/loom/target/emit/native/amdgpu/test/vopd_plan.loom-test
+index 2a620074a..58aeb75d7 100644
+--- a/loom/src/loom/target/emit/native/amdgpu/test/vopd_plan.loom-test
++++ b/loom/src/loom/target/emit/native/amdgpu/test/vopd_plan.loom-test
+@@ -462,3 +462,19 @@ low.func.def target<amdgpu.rdna4.gfx125x.core>(@gfx1250_target) @gfx1250_vopd_pl
+ 
+ // ----
+ {"format":"loom.amdgpu.vopd_plan.v0","function":"gfx1250_vopd_plan_address_state_insertion","target":"gfx1250_target","descriptor_set":"amdgpu.rdna4.gfx125x.core","pair_count":0,"rejection_count":1,"packet_count":4,"pairs":[],"rejections":[{"index":0,"reason":"second_packet_has_insertion","block":0,"first":{"packet":1,"node":1,"descriptor":"amdgpu.v_mov_b32","op_id":8,"op":"mov_b32","vdst":4,"src0":0,"vsrc1":0,"flags":0,"literal_u32":null},"second":{"packet":2,"node":2,"descriptor":"amdgpu.v_max_i32","op_id":23,"op":"max_i32","vdst":5,"src0":2,"vsrc1":3,"flags":0,"literal_u32":null}}],"packets":[{"index":0,"role":"none","pair":null},{"index":1,"role":"none","pair":null},{"index":2,"role":"none","pair":null},{"index":3,"role":"none","pair":null}]}
++
++// ====
++
++// Same-parity FMAMK addends conflict in SRC2 even when they differ modulo four.
++// RUN: emit amdgpu-vopd-plan-json @fmamk_same_src2_bank strategy=source fixed=%lhs0:physical_register:1:1 fixed=%addend0:physical_register:0:1 fixed=%lhs1:physical_register:3:1 fixed=%addend1:physical_register:2:1 fixed=%next0:physical_register:4:1 fixed=%next1:physical_register:5:1
++amdgpu.target<gfx1151> @target {subgroup_size = 32}
++low.func.def target<amdgpu.rdna3_5.core>(@target) @fmamk_same_src2_bank(%resource: reg<amdgpu.sgpr x4>, %vaddr: reg<amdgpu.vgpr>, %soffset: reg<amdgpu.sgpr>, %lhs0: reg<amdgpu.vgpr>, %addend0: reg<amdgpu.vgpr>, %lhs1: reg<amdgpu.vgpr>, %addend1: reg<amdgpu.vgpr>) asm {
++  %next0 = v_fmamk_f32 %lhs0, %addend0, 1027024659
++  %next1 = v_fmamk_f32 %lhs1, %addend1, 1027024659
++  buffer_store_dword %next0, %resource, %vaddr, %soffset
++  buffer_store_dword %next1, %resource, %vaddr, %soffset {offset = 4}
++  return
++}
++
++// ----
++{"format":"loom.amdgpu.vopd_plan.v0","function":"fmamk_same_src2_bank","target":"target","descriptor_set":"amdgpu.rdna3_5.core","pair_count":0,"rejection_count":1,"packet_count":5,"pairs":[],"rejections":[{"index":0,"reason":"register_constraints","register_constraints":["src2_bank"],"block":0,"first":{"packet":0,"node":0,"descriptor":"amdgpu.v_fmamk_f32","op_id":2,"op":"fmamk_f32","vdst":4,"src0":1,"vsrc1":0,"flags":1,"literal_u32":1027024659},"second":{"packet":1,"node":1,"descriptor":"amdgpu.v_fmamk_f32","op_id":2,"op":"fmamk_f32","vdst":5,"src0":3,"vsrc1":2,"flags":1,"literal_u32":1027024659}}],"packets":[{"index":0,"role":"none","pair":null},{"index":1,"role":"none","pair":null},{"index":2,"role":"none","pair":null},{"index":3,"role":"none","pair":null},{"index":4,"role":"none","pair":null}]}
+-- 
+2.55.0
+

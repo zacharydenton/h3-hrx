@@ -4,13 +4,23 @@ The rejected vision family exposes a bug in Loom's native AMDGPU VOPD planner.
 The template preserves the GELU arithmetic. Its different register allocation
 causes the planner to combine two FMAs whose addends use the same SRC2 bank.
 
+The fix is preserved in
+[`0004-vopd-source-cache-banks.patch`](../../patches/loom/0004-vopd-source-cache-banks.patch)
+and fork commit
+[`675cc43bc`](https://github.com/zacharydenton/hrx-system/commit/675cc43bc).
+The rebuilt compiler passes both cases below. On gfx1151, all three shared
+vision epilogues match the original baseline bitwise (4,160 outputs each), and
+all 15 H3 GPU kernel tests pass. The pinned native bundle still contains the
+original compiler; use the [patched compiler build](../../patches/loom/README.md)
+through `LOOM_COMPILE` to select the fix.
+
 ## Minimal CPU reproducer
 
 ```sh
 loom-check experiments/vision_gelu_vopd/bank_conflict.loom-test
 ```
 
-With the tested compiler, the conflicting case fails and the legal control
+With the original bundled compiler, the conflicting case fails and the legal control
 passes. This is an expected-failing compiler regression fixture, outside the
 model's test suite. It needs no GPU, model weights, or generated sources.
 
