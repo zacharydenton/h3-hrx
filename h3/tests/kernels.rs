@@ -24,8 +24,21 @@ impl Harness {
         scalars: &[u64],
         data: &[Vec<u8>],
     ) -> Vec<Vec<u8>> {
+        self.run_module(stem, stem, cfg, grid, threads, scalars, data)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn run_module(
+        &mut self,
+        module: &str,
+        stem: &str,
+        cfg: &[(&str, String)],
+        grid: [u32; 3],
+        threads: u32,
+        scalars: &[u64],
+        data: &[Vec<u8>],
+    ) -> Vec<Vec<u8>> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let path = root.join("kernels").join(format!("{stem}.loom"));
+        let path = root.join("kernels").join(format!("{module}.loom"));
         let path = if path.is_file() {
             path
         } else {
@@ -45,6 +58,27 @@ impl Harness {
                 &hrx::bundle::cache_root().unwrap().join("kernels"),
             )
             .unwrap();
+        let baseline = std::env::var_os("H3_KERNEL_BASELINE")
+            .filter(|_| module != stem)
+            .map(|dir| {
+                let source = std::fs::read_to_string(Path::new(&dir).join(format!("{stem}.loom")))
+                    .expect("baseline kernel source");
+                let mut old = hrx::loom::Request::new(&source, &symbol);
+                old.config = request.config.clone();
+                let old_path = self
+                    .compiler
+                    .compile(&old, &hrx::bundle::cache_root().unwrap().join("kernels"))
+                    .unwrap();
+                eprintln!(
+                    "artifact {stem}: {}",
+                    if std::fs::read(&old_path).unwrap() == std::fs::read(&path).unwrap() {
+                        "identical"
+                    } else {
+                        "changed"
+                    }
+                );
+                old_path
+            });
         // Safety: trusted checked-in source compiled through HRX. Every test below
         // sizes the bindings from the same dimensions passed as kernel configuration.
         let kernel = unsafe { self.stream.load(&path, &symbol).unwrap() };
@@ -67,10 +101,83 @@ impl Harness {
             .iter()
             .map(|&v| self.stream.read_queued(v).unwrap())
             .collect();
-        reads
+        let result: Vec<Vec<u8>> = reads
             .into_iter()
             .map(|r| r.wait(&mut self.stream).unwrap())
-            .collect()
+            .collect();
+        if let Some(path) = baseline {
+            let old = unsafe { self.stream.load(&path, &symbol).unwrap() };
+            for (buffer, bytes) in buffers.iter().zip(data) {
+                self.stream.upload_queued(buffer, 0, bytes).unwrap();
+            }
+            let old_constants = Constants::indices(&old, &indices).unwrap();
+            unsafe {
+                self.stream
+                    .dispatch(&old, grid, [threads, 1, 1], &old_constants, &bindings)
+                    .unwrap();
+            }
+            for (i, binding) in bindings.iter().enumerate() {
+                let actual = self
+                    .stream
+                    .read_queued(*binding)
+                    .unwrap()
+                    .wait(&mut self.stream)
+                    .unwrap();
+                assert!(
+                    actual == result[i],
+                    "baseline mismatch: {stem}, binding {i}, config {cfg:?}"
+                );
+            }
+            if std::env::var_os("H3_KERNEL_TIMING").is_some() {
+                let mut sequences = Vec::new();
+                for (k, c) in [(&old, &old_constants), (&kernel, &constants)] {
+                    let mut sequence = self.stream.sequence().unwrap();
+                    for _ in 0..128 {
+                        // Safety: the same validated bindings as the numerical comparison.
+                        unsafe {
+                            sequence
+                                .dispatch(k, grid, [threads, 1, 1], c, &bindings)
+                                .unwrap();
+                        }
+                    }
+                    sequences.push(sequence.finish().unwrap());
+                }
+                for sequence in &mut sequences {
+                    self.stream.launch_sequence(sequence).unwrap();
+                }
+                self.stream.synchronize().unwrap();
+                let mut times = [Vec::new(), Vec::new()];
+                for batch in 0..10 {
+                    for order in 0..2 {
+                        let version = (batch + order) % 2;
+                        for (buffer, bytes) in buffers.iter().zip(data) {
+                            self.stream.upload_queued(buffer, 0, bytes).unwrap();
+                        }
+                        self.stream.synchronize().unwrap();
+                        let start = std::time::Instant::now();
+                        for _ in 0..8 {
+                            self.stream
+                                .launch_sequence(&mut sequences[version])
+                                .unwrap();
+                        }
+                        self.stream.synchronize().unwrap();
+                        times[version].push(start.elapsed().as_secs_f64());
+                    }
+                }
+                for values in &mut times {
+                    values.sort_by(f64::total_cmp);
+                }
+                let old = (times[0][4] + times[0][5]) / 2.;
+                let new = (times[1][4] + times[1][5]) / 2.;
+                eprintln!(
+                    "timing {stem}: ratio={:.5} old_us={:.3} new_us={:.3} config={cfg:?}",
+                    new / old,
+                    old * 1e6 / 1024.,
+                    new * 1e6 / 1024.
+                );
+            }
+        }
+        result
     }
 }
 fn bytes<T: bytemuck::Pod>(v: &[T]) -> Vec<u8> {
@@ -342,8 +449,9 @@ fn vision_bf16_matmuls_match_rounded_operands_and_epilogues() {
         } else {
             vec![bytes(&input), bytes(&w), bytes(&b), vec![0; m * n * 4]]
         };
+        let stem = format!("matmul_{kind}_bf16_wmma");
         let out = h.run(
-            &format!("matmul_{kind}_bf16_wmma"),
+            &stem,
             &cfg(&[("k_size", k), ("n_size", n)]),
             [1, m.div_ceil(64) as u32, 1],
             256,
@@ -417,7 +525,8 @@ fn float_preparation_normalizes_large_values_and_respects_padded_pitch() {
                 };
                 data.push(vec![0; tokens * stride * 2]);
                 let last = data.len() - 1;
-                let out = h.run(
+                let out = h.run_module(
+                    &format!("prepare_{dtype}_family"),
                     &stem,
                     &config,
                     [tokens as u32, 1, 1],
@@ -512,7 +621,12 @@ fn rotary_qk_norm_matches_cpu_for_all_head_layouts_and_copies_v() {
             ("k_offset", offset),
         ]);
         config.push(("eps", "1e-5".into()));
-        let out = h.run(
+        let out = h.run_module(
+            if stem == "rope_qknorm_f16" {
+                stem
+            } else {
+                "rope_head_family"
+            },
             stem,
             &config,
             [tokens as u32, 1, 1],
@@ -550,7 +664,8 @@ fn quantized_gemms_match_integer_dot_products_bias_and_residual_classes() {
                         if tile == 128 && pad != 0 {
                             continue;
                         }
-                        let (m, k, n) = (17usize, 128usize, 128usize);
+                        // Padded cases cross the 256-row workgroup boundary.
+                        let (m, k, n) = (if pad == 0 { 17usize } else { 257 }, 128usize, 128usize);
                         let stride = k + pad;
                         let a: Vec<i8> =
                             (0..m * stride).map(|i| ((i * 3 % 15) as i8) - 7).collect();
@@ -636,7 +751,12 @@ fn quantized_gemms_match_integer_dot_products_bias_and_residual_classes() {
                         if biased {
                             data.push(bytes(&bias));
                         }
-                        let out = h.run(
+                        let out = h.run_module(
+                            if tile == 256 {
+                                "gemm_packed_256"
+                            } else {
+                                &stem
+                            },
                             &stem,
                             &config,
                             [1, m.div_ceil(tile) as u32, 1],
@@ -743,7 +863,15 @@ fn attention_matches_scaled_dot_product_for_the_shipped_layouts() {
             } else {
                 [tokens.div_ceil(block) as u32, heads as u32, 1]
             };
-            let out = h.run(
+            let module = if causal || stem.contains("t32") {
+                stem
+            } else if d == 64 {
+                "attention_mha64_family"
+            } else {
+                "attention_mha_family"
+            };
+            let out = h.run_module(
+                module,
                 stem,
                 &config,
                 grid,
@@ -949,7 +1077,8 @@ fn int8_qk_attention_matches_the_attention_its_operands_define() {
             ("out_stride", stride),
         ]);
         config.push(("scale", "1.0".into()));
-        let out = h.run(
+        let out = h.run_module(
+            "attention_i8qk_family",
             "attention_i8qk_mha_lds_f16_wmma",
             &config,
             [tokens.div_ceil(block) as u32, heads as u32, 1],
@@ -979,7 +1108,7 @@ fn float_gemms_match_rounded_operands_across_modes_and_epilogues() {
     for bf in [false, true] {
         for mode in ["plain", "resid", "swiglu"] {
             for biased in [false, true] {
-                let (m, k, n) = (17usize, 128usize, 128usize);
+                let (m, k, n) = (if biased { 257usize } else { 17 }, 128usize, 128usize);
                 let stride = k + 64;
                 let narrow = |v: f32| {
                     if bf {
@@ -1077,7 +1206,9 @@ fn float_gemms_match_rounded_operands_across_modes_and_epilogues() {
                         full
                     }
                 };
-                let out = h.run(
+                let module = format!("gemm_{}_family", if bf { "bf16" } else { "f16" });
+                let out = h.run_module(
+                    if mode == "swiglu" { &stem } else { &module },
                     &stem,
                     &config,
                     [1, m.div_ceil(256) as u32, 1],
@@ -1092,6 +1223,377 @@ fn float_gemms_match_rounded_operands_across_modes_and_epilogues() {
                 };
                 eprintln!("checking {stem}");
                 close(&got, &want, 3e-3, 3e-3);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn packed_attention_families_preserve_wave_layouts_and_skip_decisions() {
+    let mut h = Harness::new();
+    for bits in [4usize, 8] {
+        for waves in [4usize, 8] {
+            for skip in [false, true] {
+                if skip && bits == 8 {
+                    continue;
+                }
+                let (tokens, heads, d) = (97usize, 2usize, 128usize);
+                let block = 16 * waves;
+                let capacity = (tokens + 16).div_ceil(block) * block;
+                let stride = heads * d;
+                let codes = |seed: usize| {
+                    (0..capacity * stride)
+                        .map(|i| {
+                            if i / stride < tokens {
+                                ((i * 37 + seed) % 7) as i8 - 3
+                            } else {
+                                0
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let q = codes(1);
+                let k = codes(3);
+                let pack = |values: &[i8]| {
+                    if bits == 8 {
+                        values.iter().map(|&v| v as u8).collect::<Vec<_>>()
+                    } else {
+                        values
+                            .chunks_exact(2)
+                            .map(|v| (v[0] as u8 & 15) | ((v[1] as u8 & 15) << 4))
+                            .collect()
+                    }
+                };
+                let scales: Vec<f32> = (0..capacity * heads)
+                    .map(|i| if i / heads < tokens { 0.02 } else { 0. })
+                    .collect();
+                let v: Vec<f16> = values(tokens * stride, 0.3)
+                    .into_iter()
+                    .map(f16::from_f32)
+                    .collect();
+                let mut vt = vec![f16::ZERO; stride * capacity];
+                for t in 0..tokens {
+                    for c in 0..stride {
+                        vt[c * capacity + t] = v[t * stride + c];
+                    }
+                }
+                let mut want = vec![0.; tokens * stride];
+                for row in 0..tokens {
+                    for head in 0..heads {
+                        let scores: Vec<f64> = (0..tokens)
+                            .map(|col| {
+                                let dot: i32 = (0..d)
+                                    .map(|j| {
+                                        i32::from(q[row * stride + head * d + j])
+                                            * i32::from(k[col * stride + head * d + j])
+                                    })
+                                    .sum();
+                                f64::from(dot)
+                                    * f64::from(scales[row * heads + head])
+                                    * f64::from(scales[col * heads + head])
+                            })
+                            .collect();
+                        let top = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                        let p: Vec<_> = scores.iter().map(|s| (s - top).exp()).collect();
+                        let total: f64 = p.iter().sum();
+                        for j in 0..d {
+                            want[row * stride + head * d + j] = (0..tokens)
+                                .map(|col| p[col] / total * v[col * stride + head * d + j].to_f64())
+                                .sum();
+                        }
+                    }
+                }
+                let kind = format!("i{bits}qk{}", if skip { "s" } else { "" });
+                let stem = format!(
+                    "attention_{kind}_mha{}_lds_f16_wmma",
+                    if waves == 8 { "8" } else { "" }
+                );
+                let mut config = cfg(&[
+                    ("q_stride", stride),
+                    ("kv_stride", stride),
+                    ("out_stride", stride),
+                    ("tokens", tokens),
+                    ("token_capacity", capacity),
+                ]);
+                config.push(("scale", "1.0".into()));
+                // A large tau keeps all tiles and permits an independent exact-attention oracle.
+                if skip {
+                    config.push(("skip_tau", "1000.0".into()));
+                }
+                let data = vec![
+                    pack(&q),
+                    bytes(&scales),
+                    pack(&k),
+                    bytes(&scales),
+                    bytes(&vt),
+                    vec![0; capacity * stride * 2],
+                ];
+                let out = h.run_module(
+                    &format!("attention_{kind}_family"),
+                    &stem,
+                    &config,
+                    [tokens.div_ceil(block) as u32, heads as u32, 1],
+                    32 * waves as u32,
+                    &[tokens as u64, heads as u64],
+                    &data,
+                );
+                close(
+                    &halves(&out[5], false)[..tokens * stride],
+                    &want,
+                    3e-4,
+                    0.03,
+                );
+                if skip {
+                    // Exercise actual skipping as well; the baseline comparison checks decisions.
+                    config.last_mut().unwrap().1 = "0.0".into();
+                    let out = h.run_module(
+                        &format!("attention_{kind}_family"),
+                        &stem,
+                        &config,
+                        [tokens.div_ceil(block) as u32, heads as u32, 1],
+                        32 * waves as u32,
+                        &[tokens as u64, heads as u64],
+                        &data,
+                    );
+                    assert!(halves(&out[5], false)[..tokens * stride]
+                        .iter()
+                        .all(|x| x.is_finite()));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn convolution_family_matches_causal_reflected_gather_and_residual() {
+    let mut h = Harness::new();
+    for taps in [1usize, 3] {
+        for stride in [1usize, 2] {
+            for residual in [false, true] {
+                let (frames, height, width, cin, pitch, n) =
+                    (3usize, 6usize, 6usize, 8usize, 16usize, 64usize);
+                let tstride = if taps == 1 { 1 } else { 2 };
+                let tout = (frames - 1) / tstride + 1;
+                let ho = height / stride;
+                let wo = width / stride;
+                let m = tout * ho * wo;
+                let k = (9 * taps * cin).div_ceil(32) * 32;
+                let input: Vec<_> = values(frames * height * width * pitch, 0.3)
+                    .into_iter()
+                    .map(f16::from_f32)
+                    .collect();
+                let weight: Vec<_> = values(n * k, 0.15).into_iter().map(f16::from_f32).collect();
+                let bias = values(n, 0.05);
+                let prior: Vec<_> = values(m * n, 0.1).into_iter().map(f16::from_f32).collect();
+                let reflect = |x: isize, size: usize| {
+                    if x < 0 {
+                        (-x) as usize
+                    } else if x as usize >= size {
+                        2 * size - 2 - x as usize
+                    } else {
+                        x as usize
+                    }
+                };
+                let mut want = vec![0.; m * n];
+                for row in 0..m {
+                    let t = row / (ho * wo);
+                    let y = row / wo % ho;
+                    let x = row % wo;
+                    for c in 0..n {
+                        let mut sum = f64::from(bias[c]);
+                        for dt in 0..taps {
+                            let ti = (t * tstride + if taps == 1 { 2 } else { dt }) as isize - 2;
+                            if ti < 0 {
+                                continue;
+                            }
+                            for dy in 0..3 {
+                                for dx in 0..3 {
+                                    let yi = reflect(
+                                        (y * stride + dy) as isize
+                                            - if stride == 1 { 1 } else { 0 },
+                                        height,
+                                    );
+                                    let xi = reflect(
+                                        (x * stride + dx) as isize
+                                            - if stride == 1 { 1 } else { 0 },
+                                        width,
+                                    );
+                                    for ch in 0..cin {
+                                        sum += input[((ti as usize * height + yi) * width + xi)
+                                            * pitch
+                                            + ch]
+                                            .to_f64()
+                                            * weight[c * k + ((dt * 3 + dy) * 3 + dx) * cin + ch]
+                                                .to_f64();
+                                    }
+                                }
+                            }
+                        }
+                        want[row * n + c] = sum
+                            + if residual {
+                                prior[row * n + c].to_f64()
+                            } else {
+                                0.
+                            };
+                    }
+                }
+                let stem = if residual {
+                    "conv3d_f16_wmma_add"
+                } else {
+                    "conv3d_f16_wmma"
+                };
+                let config = cfg(&[
+                    ("frames", frames),
+                    ("height", height),
+                    ("width", width),
+                    ("stride", stride),
+                    ("tstride", tstride),
+                    ("taps_t", taps),
+                    ("cin_pad", cin),
+                    ("cin_stride", pitch),
+                    ("rows_bound", (frames * height * width).div_ceil(64) * 64),
+                    ("k_size", k),
+                    ("n_size", n),
+                ]);
+                let mut data = vec![
+                    bytes(&input),
+                    bytes(&weight),
+                    bytes(&bias),
+                    bytes(&vec![f16::from_f32(123.); m * n + 64]),
+                ];
+                if residual {
+                    data.push(bytes(&prior));
+                }
+                let out = h.run_module(
+                    "conv3d_f16_family",
+                    stem,
+                    &config,
+                    [1, m.div_ceil(64) as u32, 1],
+                    256,
+                    &[m as u64],
+                    &data,
+                );
+                let got = halves(&out[3], false);
+                close(&got[..m * n], &want, 0.001, 0.002);
+                assert!(got[m * n..].iter().all(|&v| v == 123.));
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn quantized_preparation_matches_group_rotation_and_packing() {
+    let mut h = Harness::new();
+    for bits in [4usize, 8] {
+        for kind in ["plain", "norm", "lnorm"] {
+            if bits == 4 && kind == "lnorm" {
+                continue;
+            }
+            let (tokens, width, stride, lanes) = (3usize, 512usize, 640usize, 64usize);
+            let input = values(tokens * width, 0.4);
+            let weights = vec![1.0f32; width];
+            let table = vec![0.0f32; 2 * width];
+            let classes = vec![0i32; tokens];
+            let mut want = vec![0.; tokens * width];
+            for row in 0..tokens {
+                let x: Vec<f64> = input[row * width..(row + 1) * width]
+                    .iter()
+                    .map(|&v| {
+                        if kind == "plain" {
+                            f16::from_f32(v).to_f64()
+                        } else {
+                            f64::from(v)
+                        }
+                    })
+                    .collect();
+                let mean = if kind == "lnorm" {
+                    x.iter().sum::<f64>() / width as f64
+                } else {
+                    0.
+                };
+                let variance = x.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / width as f64;
+                for col in 0..width {
+                    want[row * width + col] = (0..256)
+                        .map(|j| {
+                            let sign = (0..4).fold(1., |s, digit| {
+                                if ((col % 256) >> (2 * digit) & 3) + (j >> (2 * digit) & 3) == 3 {
+                                    -s
+                                } else {
+                                    s
+                                }
+                            });
+                            let value = x[col / 256 * 256 + j];
+                            sign * if kind == "plain" {
+                                value
+                            } else {
+                                (value - mean) / (variance + 1e-5).sqrt()
+                            }
+                        })
+                        .sum::<f64>()
+                        / 16.;
+                }
+            }
+            let mut config = cfg(&[("width", width), ("out_stride", stride), ("lanes", lanes)]);
+            let mut data = if kind == "plain" {
+                vec![bytes(
+                    &input.iter().copied().map(f16::from_f32).collect::<Vec<_>>(),
+                )]
+            } else {
+                config.extend([("eps", "1e-5".into()), ("classes", "1".into())]);
+                vec![
+                    bytes(&input),
+                    bytes(&weights),
+                    bytes(&table),
+                    bytes(&classes),
+                ]
+            };
+            let output = data.len();
+            data.push(vec![0x55; tokens * stride * bits / 8]);
+            data.push(vec![0; tokens * 4]);
+            let stem = format!("prepare_{kind}_i{bits}");
+            let module = format!("prepare_i{bits}_family");
+            let out = h.run_module(
+                &module,
+                &stem,
+                &config,
+                [tokens as u32, 1, 1],
+                lanes as u32,
+                &[tokens as u64],
+                &data,
+            );
+            let scales = floats(&out[output + 1]);
+            let qmax = if bits == 4 { 7. } else { 127. };
+            for row in 0..tokens {
+                let max = want[row * width..(row + 1) * width]
+                    .iter()
+                    .map(|v| v.abs())
+                    .fold(0., f64::max);
+                close(&[scales[row]], &[max / qmax], 1e-7, 1e-4);
+                for col in 0..width {
+                    let i = row * stride + col;
+                    let q = if bits == 8 {
+                        i32::from(out[output][i] as i8)
+                    } else {
+                        let n = (out[output][i / 2] >> ((i % 2) * 4)) & 15;
+                        if n >= 8 {
+                            i32::from(n) - 16
+                        } else {
+                            i32::from(n)
+                        }
+                    };
+                    let expected = (want[row * width + col] / scales[row]).clamp(-qmax, qmax);
+                    assert!(
+                        (f64::from(q) - expected).abs() <= 0.501,
+                        "{stem} row {row} col {col}: {q} vs {expected}"
+                    );
+                }
+                assert!(out[output]
+                    [(row * stride + width) * bits / 8..(row + 1) * stride * bits / 8]
+                    .iter()
+                    .all(|&v| v == 0x55));
             }
         }
     }

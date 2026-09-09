@@ -152,7 +152,7 @@ pub fn embed(
     ];
     let attn = c.get(
         gpu,
-        "attention_mha_lds_f16_wmma",
+        "attention_mha_family",
         "h3_attention_mha_lds_f16_wmma",
         &attn_cfg,
     )?;

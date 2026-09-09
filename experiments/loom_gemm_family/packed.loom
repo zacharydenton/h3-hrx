@@ -1,0 +1,73 @@
+// One packed matrix motif, specialized by register width and epilogue.
+amdgpu.target<gfx11-generic> @probe_gfx11 {subgroup_size = 32}
+
+config.decl @probe.registers : %value: index where [range(%value, 2, 4), mul(%value, 2)]
+
+config.decl @probe.epilogue : %value: index where [range(%value, 0, 1)]
+
+template.decl @probe.schema(%registers: index) -> (encoding<schema>)
+
+template.def<@probe.schema> @i4_schema(%registers: index) -> (encoding<schema>) where [eq(%registers, 2)] {
+  %schema = encoding.define #encoding.operand<element_format=i4, payload_elements=16, payload_registers=2> : encoding<schema>
+  template.return %schema : encoding<schema>
+}
+
+template.def<@probe.schema> @i8_schema(%registers: index) -> (encoding<schema>) where [eq(%registers, 4)] {
+  %schema = encoding.define #encoding.operand<element_format=i8, payload_elements=16, payload_registers=4> : encoding<schema>
+  template.return %schema : encoding<schema>
+}
+
+template.decl @probe.dot(%registers: index, %schema: encoding<schema>, %av: view<32x16xi32>, %bv: view<32x16xi32>, %lane: index, %column: index, %init: vector<8xi32>) -> (vector<8xi32>)
+
+template.def<@probe.dot> @packed_dot(%registers: index, %schema: encoding<schema>, %av: view<32x16xi32>, %bv: view<32x16xi32>, %lane: index, %column: index, %init: vector<8xi32>) -> (vector<8xi32>) {
+  %sixteen = index.constant 16 : index
+  %a = vector.load %av[%lane, %column] : view<32x16xi32> -> vector<[%registers]xi32>
+  %b = vector.load %bv[%lane, %column] : view<32x16xi32> -> vector<[%registers]xi32>
+  %lhs = vector.fragment<lhs> %a shape [%sixteen, %sixteen] using {schema = %schema : encoding<schema>} : vector<[%registers]xi32>
+  %rhs = vector.fragment<rhs> %b shape [%sixteen, %sixteen] using {schema = %schema : encoding<schema>} : vector<[%registers]xi32>
+  %acc = vector.mma %lhs, %rhs, %init : vector<[%registers]xi32>, vector<[%registers]xi32>, vector<8xi32>
+  template.return %acc : vector<8xi32>
+}
+
+template.decl @probe.finish(%mode: index, %value: vector<8xi32>) -> (vector<8xi32>)
+
+template.def<@probe.finish> @plain(%mode: index, %value: vector<8xi32>) -> (vector<8xi32>) where [eq(%mode, 0)] {
+  template.return %value : vector<8xi32>
+}
+
+template.def<@probe.finish> @double(%mode: index, %value: vector<8xi32>) -> (vector<8xi32>) where [eq(%mode, 1)] {
+  %result = vector.addi %value, %value : vector<8xi32>
+  template.return %result : vector<8xi32>
+}
+
+kernel.def target(@probe_gfx11) export("packed_probe") @packed_probe() {
+  %one = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%a: buffer, %b: buffer, %out: buffer) {
+  %zero = index.constant 0 : index
+  %one = index.constant 1 : index
+  %offset = index.constant 0 : offset
+  %sixteen = index.constant 16 : index
+  %registers = config.get @probe.registers : index
+  %schema = template.apply<@probe.schema>(%registers) : (index) -> (encoding<schema>)
+  %mode = config.get @probe.epilogue : index
+  %steps = index.div %sixteen, %registers : index
+  %lane = kernel.subgroup.lane.id : index
+  %ag = buffer.assume.memory_space<global> %a : buffer
+  %bg = buffer.assume.memory_space<global> %b : buffer
+  %og = buffer.assume.memory_space<global> %out : buffer
+  %av = buffer.view %ag[%offset] : buffer -> view<32x16xi32>
+  %bv = buffer.view %bg[%offset] : buffer -> view<32x16xi32>
+  %ov = buffer.view %og[%offset] : buffer -> view<32x8xi32>
+  %zeros = vector.constant 0 : vector<8xi32>
+  %init = vector.fragment<init> %zeros shape [%sixteen, %sixteen] : vector<8xi32>
+  %acc = scf.for %step = [%zero to %steps step %one](%running = %init : vector<8xi32>) -> (vector<8xi32>) unroll {
+    %column = index.mul %step, %registers : index
+    %next = template.apply<@probe.dot>(%registers, %schema, %av, %bv, %lane, %column, %running) : (index, encoding<schema>, view<32x16xi32>, view<32x16xi32>, index, index, vector<8xi32>) -> (vector<8xi32>)
+    scf.yield %next : vector<8xi32>
+  }
+  %result = template.apply<@probe.finish>(%mode, %acc) : (index, vector<8xi32>) -> (vector<8xi32>)
+  vector.store %result, %ov[%lane, %zero] : vector<8xi32>, view<32x8xi32>
+  kernel.return
+}

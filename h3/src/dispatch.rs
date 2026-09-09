@@ -343,7 +343,12 @@ impl Prepare {
             format!("{ns}out_stride"),
             if out_stride != 0 { out_stride } else { width }.to_string(),
         ));
-        let kernel = c.get(gpu, &stem, &format!("h3_{stem}"), &cfg)?;
+        let module = if stem == "prepare_plain16_i8" {
+            stem.clone()
+        } else {
+            format!("prepare_{elem}_family")
+        };
+        let kernel = c.get(gpu, &module, &format!("h3_{stem}"), &cfg)?;
         Ok(Self {
             kernel,
             lanes,
@@ -516,7 +521,14 @@ impl Gemm {
             cfg.push((format!("{ns}out_stride"), stride.to_string()));
             out_width = stride;
         }
-        let kernel = c.get(gpu, &stem, &format!("h3_{stem}"), &cfg)?;
+        let module = if tile == Tile::Plain && quantised(elem) {
+            "gemm_packed_256".into()
+        } else if tile == Tile::Plain && mode != "swiglu" {
+            format!("gemm_{elem}_family")
+        } else {
+            stem.clone()
+        };
+        let kernel = c.get(gpu, &module, &format!("h3_{stem}"), &cfg)?;
         Ok(Self {
             kernel,
             n: n_size,
@@ -649,7 +661,7 @@ impl Conv3d {
             (format!("{ns}n_size"), cout_pad.to_string()),
         ];
         Ok(Self {
-            kernel: c.get(gpu, stem, &format!("h3_{stem}"), &cfg)?,
+            kernel: c.get(gpu, "conv3d_f16_family", &format!("h3_{stem}"), &cfg)?,
             cout_pad,
             in_rows: frames * h * w,
             cin_stride,
@@ -1167,7 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn gemm_stems_name_kernels_that_exist() {
+    fn gemm_modules_export_the_selected_kernels() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
         for (elem, mode, bias, gate_first, tile) in [
             ("i8", "plain", false, true, Tile::Plain),
@@ -1188,22 +1200,35 @@ mod tests {
             ("f16", "plain", true, true, Tile::Wide),
         ] {
             let stem = gemm_stem(elem, mode, bias, gate_first, tile);
+            let module = if tile == Tile::Plain && quantised(elem) {
+                "gemm_packed_256".into()
+            } else if tile == Tile::Plain && mode != "swiglu" {
+                format!("gemm_{elem}_family")
+            } else {
+                stem.clone()
+            };
+            let source = std::fs::read_to_string(root.join(format!("{module}.loom"))).unwrap();
             assert!(
-                root.join(format!("{stem}.loom")).exists(),
-                "no kernel source for {stem}"
+                source.contains(&format!("export(\"h3_{stem}\")")),
+                "{module} does not export {stem}"
             );
         }
     }
 
     #[test]
-    fn prepare_stems_name_kernels_that_exist() {
+    fn prepare_modules_export_the_selected_kernels() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
-        for elem in ["i8", "f16", "bf16"] {
+        for elem in ["i4", "i8", "f16", "bf16"] {
+            let source =
+                std::fs::read_to_string(root.join(format!("prepare_{elem}_family.loom"))).unwrap();
             for form in ["norm", "lnorm", "plain"] {
+                if elem == "i4" && form == "lnorm" {
+                    continue;
+                }
                 let stem = format!("prepare_{form}_{elem}");
                 assert!(
-                    root.join(format!("{stem}.loom")).exists(),
-                    "no source for {stem}"
+                    source.contains(&format!("export(\"h3_{stem}\")")),
+                    "prepare_{elem}_family does not export {stem}"
                 );
             }
         }

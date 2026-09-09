@@ -1,52 +1,9 @@
-// MHA attention with int4 QK^T (SageAttention-style operands) and K/V tiles staged in LDS: one workgroup of four waves
-// per (16 query rows, key-value head); wave w owns query head kv_head*4 + w. Each
-// 16-key tile of K and V is loaded once, coalesced (a lane reads 32 contiguous bytes),
-// into LDS and serves all four heads; K's rhs fragments are assembled from the LDS rows
-// (lane = key, 16 contiguous channels), V's as dense rhs loads from the tile rows (the tile's [key][channel] layout is the rhs' logical [k][n]). Online
-// softmax with running max and sum per lane group, eight accumulators for the 128
-// output channels, f16 out. q [tokens][q_stride], k and v [tokens][kv_stride] (natural
-// layout, no transpose needed), token_capacity >= tokens + 16 with zero headroom.
-//
-amdgpu.target<gfx11-generic> @h3_attention_i8qk_mha8_lds_f16_wmma_gfx11 {subgroup_size = 32}
+// Shared bodies; exported wrappers retain the original launch and configuration contracts.
 
-config.decl @h3.attention_i8qk_mha8_lds_f16_wmma.q_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
+template.decl @h3.shared_attention_i4qk_mha8_lds_f16_wmma(%token_count: index, %qi: buffer, %qs: buffer, %ki: buffer, %ks: buffer, %v: buffer, %out: buffer, %cfg_q_stride: index, %cfg_kv_stride: index, %cfg_out_stride: index, %cfg_tokens: index, %cfg_token_capacity: index, %cfg_scale: f32, %waves: index, %split_staging: i1, %q_tile_offset: offset, %lds_bytes: offset)
 
-config.decl @h3.attention_i8qk_mha8_lds_f16_wmma.kv_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
-
-config.decl @h3.attention_i8qk_mha8_lds_f16_wmma.out_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
-
-config.decl @h3.attention_i8qk_mha8_lds_f16_wmma.tokens : %value: index where [range(%value, 1, 65536)]
-
-config.decl @h3.attention_i8qk_mha8_lds_f16_wmma.token_capacity : %value: index where [range(%value, 32, 1048576), mul(%value, 16)]
-
-config.decl @h3.attention_i8qk_mha8_lds_f16_wmma.scale : f32
-
-kernel.def target(@h3_attention_i8qk_mha8_lds_f16_wmma_gfx11) export("h3_attention_i8qk_mha8_lds_f16_wmma") @h3_attention_i8qk_mha8_lds_f16_wmma(%token_count: index, %kv_head_count: index) {
-  %c1 = index.constant 1 : index
-  %c15 = index.constant 15 : index
-  %c16 = index.constant 16 : index
-  %c63 = index.constant 63 : index
-  %c64 = index.constant 64 : index
-  %c127 = index.constant 127 : index
-  %c128 = index.constant 128 : index
-  %c255 = index.constant 255 : index
-  %c256 = index.constant 256 : index
-  %c512 = index.constant 512 : index
-  %tokens0 = config.get @h3.attention_i8qk_mha8_lds_f16_wmma.tokens : index
-  %rounded = index.add %tokens0, %c127 : index
-  %tiles = index.div %rounded, %c128 : index
-  kernel.launch.config workgroups(%tiles, %kv_head_count, %c1) workgroup_size(%c256, %c1, %c1) : index
-} launch(%token_count: index, %qi: buffer, %qs: buffer, %ki: buffer, %ks: buffer, %v: buffer, %out: buffer) {
-  %q_stride0 = config.get @h3.attention_i8qk_mha8_lds_f16_wmma.q_stride : index
-  %kv_stride0 = config.get @h3.attention_i8qk_mha8_lds_f16_wmma.kv_stride : index
-  %out_stride0 = config.get @h3.attention_i8qk_mha8_lds_f16_wmma.out_stride : index
-  %tokens0 = config.get @h3.attention_i8qk_mha8_lds_f16_wmma.tokens : index
-  %padded_tokens = config.get @h3.attention_i8qk_mha8_lds_f16_wmma.token_capacity : index
-  %scale = config.get @h3.attention_i8qk_mha8_lds_f16_wmma.scale : f32
+template.def<@h3.shared_attention_i4qk_mha8_lds_f16_wmma> @h3_body_attention_i4qk_mha8_lds_f16_wmma(%token_count: index, %qi: buffer, %qs: buffer, %ki: buffer, %ks: buffer, %v: buffer, %out: buffer, %cfg_q_stride: index, %cfg_kv_stride: index, %cfg_out_stride: index, %cfg_tokens: index, %cfg_token_capacity: index, %cfg_scale: f32, %waves: index, %split_staging: i1, %q_tile_offset: offset, %lds_bytes: offset) {
   %c0 = index.constant 0 : index
-  %c20 = index.constant 20 : index
-  %c24 = index.constant 24 : index
-  %c28 = index.constant 28 : index
   %c1 = index.constant 1 : index
   %c2 = index.constant 2 : index
   %c3 = index.constant 3 : index
@@ -75,14 +32,12 @@ kernel.def target(@h3_attention_i8qk_mha8_lds_f16_wmma_gfx11) export("h3_attenti
   %c_nf = index.constant 8 : index
   %c0_offset = index.constant 0 : offset
   %k_tile_offset = index.constant 0 : offset
-  %v_tile_offset = index.constant 4608 : offset
-  %scratch_offset = index.constant 16896 : offset
-  %kbuf_bytes = index.constant 2304 : offset
+  %v_tile_offset = index.constant 2560 : offset
+  %scratch_offset = index.constant 14848 : offset
+  %kbuf_bytes = index.constant 1280 : offset
   %vbuf_bytes = index.constant 6144 : offset
   // the result stage aliases the K/V tiles: it is used only after the loop's final barrier
   %result_offset = index.constant 0 : offset
-  %q_tile_offset = index.constant 20992 : offset
-  %lds_bytes = index.constant 20992 : offset
   %m = index.constant 16 : index
   %n = index.constant 16 : index
   %k_frag = index.constant 16 : index
@@ -112,11 +67,11 @@ kernel.def target(@h3_attention_i8qk_mha8_lds_f16_wmma_gfx11) export("h3_attenti
   %i32_32 = scalar.constant 32 : i32
   %zero_vector = vector.splat %zero_f32 : vector<8xf32>
   %negative_vector = vector.splat %negative_large : vector<8xf32>
-  %scale_vector = vector.splat %scale : vector<8xf32>
+  %scale_vector = vector.splat %cfg_scale : vector<8xf32>
 
   %tile_id = kernel.workgroup.id<x> : index
   %kv_head_raw = kernel.workgroup.id<y> : index
-  %kv_head_limit = index.div %kv_stride0, %cd : index
+  %kv_head_limit = index.div %cfg_kv_stride, %cd : index
   %kv_head = index.rem %kv_head_raw, %kv_head_limit : index
   %workitem = kernel.workitem.id<x> : index
   %wave0 = kernel.subgroup.id : index
@@ -126,19 +81,19 @@ kernel.def target(@h3_attention_i8qk_mha8_lds_f16_wmma_gfx11) export("h3_attenti
   %lane_group = index.div %lane, %c16 : index
   %lane_group_even = index.cmp eq, %lane_group, %c0 : index
   // this wave's query head, and its channels in q and out
-  %head_limit = index.div %out_stride0, %cd : index
-  %rounded = index.add %tokens0, %c15 : index
+  %head_limit = index.div %cfg_out_stride, %cd : index
+  %rounded = index.add %cfg_tokens, %c15 : index
   %tiles_per_image = index.div %rounded, %c16 : index
   // MHA: this wave is query tile 8 * workgroup + wave of head kv_head (tiles past the sequence write nothing)
   %head = index.rem %kv_head, %head_limit : index
-  %tile4 = index.mul %tile_id, %c8 : index
+  %tile4 = index.mul %tile_id, %waves : index
   %tile_in_image0 = index.add %tile4, %wave : index
   %tile_limit = index.sub %tiles_per_image, %c1 : index
   %tile_in_image = index.min %tile_in_image0, %tile_limit : index
   %head_base0 = index.mul %head, %cd : index
   %kv_base0 = index.mul %kv_head, %cd : index
   %query_origin0 = index.mul %tile_in_image, %c16 : index
-  %tile_origin_limit = index.sub %padded_tokens, %c16 : index
+  %tile_origin_limit = index.sub %cfg_token_capacity, %c16 : index
 
   %qi_global = buffer.assume.memory_space<global> %qi : buffer
   %qs_global = buffer.assume.memory_space<global> %qs : buffer
@@ -147,21 +102,21 @@ kernel.def target(@h3_attention_i8qk_mha8_lds_f16_wmma_gfx11) export("h3_attenti
   %v_global = buffer.assume.memory_space<global> %v : buffer
   %out_global = buffer.assume.memory_space<global> %out : buffer
   // int4 operands: [tokens][heads * 16] i32 words (8 codes each), scales [tokens][heads] f32
-  %qi_words = index.div %q_stride0, %c4 : index
-  %ki_words = index.div %kv_stride0, %c4 : index
-  %qi_view = buffer.view %qi_global[%c0_offset] : buffer -> view<[%padded_tokens]x[%qi_words]xi32>
-  %ki_view = buffer.view %ki_global[%c0_offset] : buffer -> view<[%padded_tokens]x[%ki_words]xi32>
-  %qs_view = buffer.view %qs_global[%c0_offset] : buffer -> view<[%padded_tokens]x[%head_limit]xf32>
-  %ks_view = buffer.view %ks_global[%c0_offset] : buffer -> view<[%padded_tokens]x[%kv_head_limit]xf32>
-  %i8_schema = encoding.define #encoding.operand<element_format=i8, payload_elements=16, payload_registers=4> : encoding<schema>
+  %qi_words = index.div %cfg_q_stride, %c8 : index
+  %ki_words = index.div %cfg_kv_stride, %c8 : index
+  %qi_view = buffer.view %qi_global[%c0_offset] : buffer -> view<[%cfg_token_capacity]x[%qi_words]xi32>
+  %ki_view = buffer.view %ki_global[%c0_offset] : buffer -> view<[%cfg_token_capacity]x[%ki_words]xi32>
+  %qs_view = buffer.view %qs_global[%c0_offset] : buffer -> view<[%cfg_token_capacity]x[%head_limit]xf32>
+  %ks_view = buffer.view %ks_global[%c0_offset] : buffer -> view<[%cfg_token_capacity]x[%kv_head_limit]xf32>
+  %i4_schema = encoding.define #encoding.operand<element_format=i4, payload_elements=16, payload_registers=2> : encoding<schema>
   %zero_i32x8 = vector.constant 0 : vector<8xi32>
   %init_i = vector.fragment<init> %zero_i32x8 shape [%m, %n] : vector<8xi32>
-  %v_view = buffer.view %v_global[%c0_offset] : buffer -> view<[%kv_stride0]x[%padded_tokens]xf16>
-  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%token_count]x[%out_stride0]xf16>
+  %v_view = buffer.view %v_global[%c0_offset] : buffer -> view<[%cfg_kv_stride]x[%cfg_token_capacity]xf16>
+  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%token_count]x[%cfg_out_stride]xf16>
 
   %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
   // K and V tiles: 16 keys x 128 channels, rows padded to 136 halves
-  %k_tile = buffer.view %lds[%k_tile_offset] : buffer -> view<16x36xi32>
+  %k_tile = buffer.view %lds[%k_tile_offset] : buffer -> view<16x20xi32>
   %v_tile = buffer.view %lds[%v_tile_offset] : buffer -> view<128x24xf16>
   %wave_scratch_bytes = index.constant 512 : offset
   %wave_scratch_offset0 = index.scale %wave, %wave_scratch_bytes : index, offset -> offset
@@ -176,16 +131,16 @@ kernel.def target(@h3_attention_i8qk_mha8_lds_f16_wmma_gfx11) export("h3_attenti
   %st_lane = index.rem %workitem, %c_klanes : index
   %st_key = index.div %st_lane, %c_nf : index
   %st_chunk0 = index.rem %st_lane, %c_nf : index
-  %st_chunk = index.mul %st_chunk0, %c4 : index
-  %kv_word0 = index.mul %kv_head, %c32 : index
+  %st_chunk = index.mul %st_chunk0, %c2 : index
+  %kv_word0 = index.mul %kv_head, %c16 : index
   %st_col0 = index.add %kv_word0, %st_chunk : index
-  %kv_col_limit = index.sub %kv_stride0, %c16 : index
-  %ki_col_limit = index.sub %ki_words, %c4 : index
-  %st_col = index.assume %st_col0 [le(%st_col0, %ki_col_limit), mul(%st_col0, 4)] : index
+  %kv_col_limit = index.sub %cfg_kv_stride, %c16 : index
+  %ki_col_limit = index.sub %ki_words, %c2 : index
+  %st_col = index.assume %st_col0 [le(%st_col0, %ki_col_limit), mul(%st_col0, 2)] : index
   // V staging: lane -> (key = workitem mod 16, channel chunk = workitem / 16), transposed into LDS
   %st_key_v = index.rem %st_lane, %c16 : index
   %st_chan_v = index.add %kv_base0, %st_lane : index
-  %st_chan_limit = index.sub %kv_stride0, %c1 : index
+  %st_chan_limit = index.sub %cfg_kv_stride, %c1 : index
   %st_chan = index.assume %st_chan_v [le(%st_chan_v, %st_chan_limit)] : index
   %st_chunk_v0 = index.div %st_lane, %c16 : index
   %st_is_k = index.cmp ult, %workitem, %c_klanes : index
@@ -197,128 +152,138 @@ kernel.def target(@h3_attention_i8qk_mha8_lds_f16_wmma_gfx11) export("h3_attenti
   %key_tile_count = index.add %tiles_per_image, %c0 : index
 
   %q_row0 = index.add %query_origin0, %lane_column : index
-  %q_row = index.assume %q_row0 [lt(%q_row0, %padded_tokens)] : index
-  %q_wbase = index.mul %head, %c32 : index
-  %q_word_limit = index.sub %qi_words, %c4 : index
+  %q_row = index.assume %q_row0 [lt(%q_row0, %cfg_token_capacity)] : index
+  %q_wbase = index.mul %head, %c16 : index
+  %q_word_limit = index.sub %qi_words, %c2 : index
   %q_word0a = index.add %q_wbase, %c0 : index
-  %q_word0 = index.assume %q_word0a [le(%q_word0a, %q_word_limit), mul(%q_word0a, 4)] : index
-  %qd0 = vector.load %qi_view[%q_row, %q_word0] : view<[%padded_tokens]x[%qi_words]xi32> -> vector<4xi32>
-  %lhs0 = vector.fragment<lhs> %qd0 shape [%m, %k_frag] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
-  %q_word1a = index.add %q_wbase, %c4 : index
-  %q_word1 = index.assume %q_word1a [le(%q_word1a, %q_word_limit), mul(%q_word1a, 4)] : index
-  %qd1 = vector.load %qi_view[%q_row, %q_word1] : view<[%padded_tokens]x[%qi_words]xi32> -> vector<4xi32>
-  %lhs1 = vector.fragment<lhs> %qd1 shape [%m, %k_frag] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
-  %q_word2a = index.add %q_wbase, %c8 : index
-  %q_word2 = index.assume %q_word2a [le(%q_word2a, %q_word_limit), mul(%q_word2a, 4)] : index
-  %qd2 = vector.load %qi_view[%q_row, %q_word2] : view<[%padded_tokens]x[%qi_words]xi32> -> vector<4xi32>
-  %lhs2 = vector.fragment<lhs> %qd2 shape [%m, %k_frag] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
-  %q_word3a = index.add %q_wbase, %c12 : index
-  %q_word3 = index.assume %q_word3a [le(%q_word3a, %q_word_limit), mul(%q_word3a, 4)] : index
-  %qd3 = vector.load %qi_view[%q_row, %q_word3] : view<[%padded_tokens]x[%qi_words]xi32> -> vector<4xi32>
-  %lhs3 = vector.fragment<lhs> %qd3 shape [%m, %k_frag] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
-  %q_word4a = index.add %q_wbase, %c16 : index
-  %q_word4 = index.assume %q_word4a [le(%q_word4a, %q_word_limit), mul(%q_word4a, 4)] : index
-  %qd4 = vector.load %qi_view[%q_row, %q_word4] : view<[%padded_tokens]x[%qi_words]xi32> -> vector<4xi32>
-  %lhs4 = vector.fragment<lhs> %qd4 shape [%m, %k_frag] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
-  %q_word5a = index.add %q_wbase, %c20 : index
-  %q_word5 = index.assume %q_word5a [le(%q_word5a, %q_word_limit), mul(%q_word5a, 4)] : index
-  %qd5 = vector.load %qi_view[%q_row, %q_word5] : view<[%padded_tokens]x[%qi_words]xi32> -> vector<4xi32>
-  %lhs5 = vector.fragment<lhs> %qd5 shape [%m, %k_frag] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
-  %q_word6a = index.add %q_wbase, %c24 : index
-  %q_word6 = index.assume %q_word6a [le(%q_word6a, %q_word_limit), mul(%q_word6a, 4)] : index
-  %qd6 = vector.load %qi_view[%q_row, %q_word6] : view<[%padded_tokens]x[%qi_words]xi32> -> vector<4xi32>
-  %lhs6 = vector.fragment<lhs> %qd6 shape [%m, %k_frag] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
-  %q_word7a = index.add %q_wbase, %c28 : index
-  %q_word7 = index.assume %q_word7a [le(%q_word7a, %q_word_limit), mul(%q_word7a, 4)] : index
-  %qd7 = vector.load %qi_view[%q_row, %q_word7] : view<[%padded_tokens]x[%qi_words]xi32> -> vector<4xi32>
-  %lhs7 = vector.fragment<lhs> %qd7 shape [%m, %k_frag] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
+  %q_word0 = index.assume %q_word0a [le(%q_word0a, %q_word_limit), mul(%q_word0a, 2)] : index
+  %qd0 = vector.load %qi_view[%q_row, %q_word0] : view<[%cfg_token_capacity]x[%qi_words]xi32> -> vector<2xi32>
+  %lhs0 = vector.fragment<lhs> %qd0 shape [%m, %k_frag] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+  %q_word1a = index.add %q_wbase, %c2 : index
+  %q_word1 = index.assume %q_word1a [le(%q_word1a, %q_word_limit), mul(%q_word1a, 2)] : index
+  %qd1 = vector.load %qi_view[%q_row, %q_word1] : view<[%cfg_token_capacity]x[%qi_words]xi32> -> vector<2xi32>
+  %lhs1 = vector.fragment<lhs> %qd1 shape [%m, %k_frag] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+  %q_word2a = index.add %q_wbase, %c4 : index
+  %q_word2 = index.assume %q_word2a [le(%q_word2a, %q_word_limit), mul(%q_word2a, 2)] : index
+  %qd2 = vector.load %qi_view[%q_row, %q_word2] : view<[%cfg_token_capacity]x[%qi_words]xi32> -> vector<2xi32>
+  %lhs2 = vector.fragment<lhs> %qd2 shape [%m, %k_frag] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+  %q_word3a = index.add %q_wbase, %c6 : index
+  %q_word3 = index.assume %q_word3a [le(%q_word3a, %q_word_limit), mul(%q_word3a, 2)] : index
+  %qd3 = vector.load %qi_view[%q_row, %q_word3] : view<[%cfg_token_capacity]x[%qi_words]xi32> -> vector<2xi32>
+  %lhs3 = vector.fragment<lhs> %qd3 shape [%m, %k_frag] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+  %q_word4a = index.add %q_wbase, %c8 : index
+  %q_word4 = index.assume %q_word4a [le(%q_word4a, %q_word_limit), mul(%q_word4a, 2)] : index
+  %qd4 = vector.load %qi_view[%q_row, %q_word4] : view<[%cfg_token_capacity]x[%qi_words]xi32> -> vector<2xi32>
+  %lhs4 = vector.fragment<lhs> %qd4 shape [%m, %k_frag] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+  %q_word5a = index.add %q_wbase, %c10 : index
+  %q_word5 = index.assume %q_word5a [le(%q_word5a, %q_word_limit), mul(%q_word5a, 2)] : index
+  %qd5 = vector.load %qi_view[%q_row, %q_word5] : view<[%cfg_token_capacity]x[%qi_words]xi32> -> vector<2xi32>
+  %lhs5 = vector.fragment<lhs> %qd5 shape [%m, %k_frag] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+  %q_word6a = index.add %q_wbase, %c12 : index
+  %q_word6 = index.assume %q_word6a [le(%q_word6a, %q_word_limit), mul(%q_word6a, 2)] : index
+  %qd6 = vector.load %qi_view[%q_row, %q_word6] : view<[%cfg_token_capacity]x[%qi_words]xi32> -> vector<2xi32>
+  %lhs6 = vector.fragment<lhs> %qd6 shape [%m, %k_frag] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+  %q_word7a = index.add %q_wbase, %c14 : index
+  %q_word7 = index.assume %q_word7a [le(%q_word7a, %q_word_limit), mul(%q_word7a, 2)] : index
+  %qd7 = vector.load %qi_view[%q_row, %q_word7] : view<[%cfg_token_capacity]x[%qi_words]xi32> -> vector<2xi32>
+  %lhs7 = vector.fragment<lhs> %qd7 shape [%m, %k_frag] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
   // this lane's query rows are origin + 2e + lane_group: their Q scales (attention scale and 1/128 folded in)
   %qs_row0a = index.add %query_origin0, %c0 : index
   %qs_row0b = index.add %qs_row0a, %lane_group : index
-  %qs_row0 = index.assume %qs_row0b [lt(%qs_row0b, %padded_tokens)] : index
-  %qs0 = view.load %qs_view[%qs_row0, %head] : view<[%padded_tokens]x[%head_limit]xf32> -> f32
+  %qs_row0 = index.assume %qs_row0b [lt(%qs_row0b, %cfg_token_capacity)] : index
+  %qs0 = view.load %qs_view[%qs_row0, %head] : view<[%cfg_token_capacity]x[%head_limit]xf32> -> f32
   %qs_row1a = index.add %query_origin0, %c2 : index
   %qs_row1b = index.add %qs_row1a, %lane_group : index
-  %qs_row1 = index.assume %qs_row1b [lt(%qs_row1b, %padded_tokens)] : index
-  %qs1 = view.load %qs_view[%qs_row1, %head] : view<[%padded_tokens]x[%head_limit]xf32> -> f32
+  %qs_row1 = index.assume %qs_row1b [lt(%qs_row1b, %cfg_token_capacity)] : index
+  %qs1 = view.load %qs_view[%qs_row1, %head] : view<[%cfg_token_capacity]x[%head_limit]xf32> -> f32
   %qs_row2a = index.add %query_origin0, %c4 : index
   %qs_row2b = index.add %qs_row2a, %lane_group : index
-  %qs_row2 = index.assume %qs_row2b [lt(%qs_row2b, %padded_tokens)] : index
-  %qs2 = view.load %qs_view[%qs_row2, %head] : view<[%padded_tokens]x[%head_limit]xf32> -> f32
+  %qs_row2 = index.assume %qs_row2b [lt(%qs_row2b, %cfg_token_capacity)] : index
+  %qs2 = view.load %qs_view[%qs_row2, %head] : view<[%cfg_token_capacity]x[%head_limit]xf32> -> f32
   %qs_row3a = index.add %query_origin0, %c6 : index
   %qs_row3b = index.add %qs_row3a, %lane_group : index
-  %qs_row3 = index.assume %qs_row3b [lt(%qs_row3b, %padded_tokens)] : index
-  %qs3 = view.load %qs_view[%qs_row3, %head] : view<[%padded_tokens]x[%head_limit]xf32> -> f32
+  %qs_row3 = index.assume %qs_row3b [lt(%qs_row3b, %cfg_token_capacity)] : index
+  %qs3 = view.load %qs_view[%qs_row3, %head] : view<[%cfg_token_capacity]x[%head_limit]xf32> -> f32
   %qs_row4a = index.add %query_origin0, %c8 : index
   %qs_row4b = index.add %qs_row4a, %lane_group : index
-  %qs_row4 = index.assume %qs_row4b [lt(%qs_row4b, %padded_tokens)] : index
-  %qs4 = view.load %qs_view[%qs_row4, %head] : view<[%padded_tokens]x[%head_limit]xf32> -> f32
+  %qs_row4 = index.assume %qs_row4b [lt(%qs_row4b, %cfg_token_capacity)] : index
+  %qs4 = view.load %qs_view[%qs_row4, %head] : view<[%cfg_token_capacity]x[%head_limit]xf32> -> f32
   %qs_row5a = index.add %query_origin0, %c10 : index
   %qs_row5b = index.add %qs_row5a, %lane_group : index
-  %qs_row5 = index.assume %qs_row5b [lt(%qs_row5b, %padded_tokens)] : index
-  %qs5 = view.load %qs_view[%qs_row5, %head] : view<[%padded_tokens]x[%head_limit]xf32> -> f32
+  %qs_row5 = index.assume %qs_row5b [lt(%qs_row5b, %cfg_token_capacity)] : index
+  %qs5 = view.load %qs_view[%qs_row5, %head] : view<[%cfg_token_capacity]x[%head_limit]xf32> -> f32
   %qs_row6a = index.add %query_origin0, %c12 : index
   %qs_row6b = index.add %qs_row6a, %lane_group : index
-  %qs_row6 = index.assume %qs_row6b [lt(%qs_row6b, %padded_tokens)] : index
-  %qs6 = view.load %qs_view[%qs_row6, %head] : view<[%padded_tokens]x[%head_limit]xf32> -> f32
+  %qs_row6 = index.assume %qs_row6b [lt(%qs_row6b, %cfg_token_capacity)] : index
+  %qs6 = view.load %qs_view[%qs_row6, %head] : view<[%cfg_token_capacity]x[%head_limit]xf32> -> f32
   %qs_row7a = index.add %query_origin0, %c14 : index
   %qs_row7b = index.add %qs_row7a, %lane_group : index
-  %qs_row7 = index.assume %qs_row7b [lt(%qs_row7b, %padded_tokens)] : index
-  %qs7 = view.load %qs_view[%qs_row7, %head] : view<[%padded_tokens]x[%head_limit]xf32> -> f32
+  %qs_row7 = index.assume %qs_row7b [lt(%qs_row7b, %cfg_token_capacity)] : index
+  %qs7 = view.load %qs_view[%qs_row7, %head] : view<[%cfg_token_capacity]x[%head_limit]xf32> -> f32
   %qs_vec = vector.from_elements %qs0, %qs1, %qs2, %qs3, %qs4, %qs5, %qs6, %qs7 : vector<8xf32>
-  %ks_key0 = index.assume %lane_column [lt(%lane_column, %padded_tokens)] : index
-  %ks_first = view.load %ks_view[%ks_key0, %kv_head] : view<[%padded_tokens]x[%kv_head_limit]xf32> -> f32
-  %ks_last = index.sub %padded_tokens, %c1 : index
+  %ks_key0 = index.assume %lane_column [lt(%lane_column, %cfg_token_capacity)] : index
+  %ks_first = view.load %ks_view[%ks_key0, %kv_head] : view<[%cfg_token_capacity]x[%kv_head_limit]xf32> -> f32
+  %ks_last = index.sub %cfg_token_capacity, %c1 : index
   %final_max, %final_sum, %final0, %final1, %final2, %final3, %final4, %final5, %final6, %final7, %ks_end = scf.for %key_tile = [%c0 to %key_tile_count step %c1](%row_max = %negative_vector : vector<8xf32>, %row_sum = %zero_vector : vector<8xf32>, %acc0 = %init : vector<8xf32>, %acc1 = %init : vector<8xf32>, %acc2 = %init : vector<8xf32>, %acc3 = %init : vector<8xf32>, %acc4 = %init : vector<8xf32>, %acc5 = %init : vector<8xf32>, %acc6 = %init : vector<8xf32>, %acc7 = %init : vector<8xf32>, %ks_carry = %ks_first : f32) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, f32) {
     %key_origin1 = index.mul %key_tile, %c16 : index
     %key_origin0 = index.assume %key_origin1 [le(%key_origin1, %tile_origin_limit), mul(%key_origin1, 16)] : index
     %buf = index.rem %key_tile, %c2 : index
     %kb_off = index.scale %buf, %kbuf_bytes : index, offset -> offset
-    %k_tile_b = buffer.view %lds[%kb_off] : buffer -> view<16x36xi32>
+    %k_tile_b = buffer.view %lds[%kb_off] : buffer -> view<16x20xi32>
     %vb_off0 = index.scale %buf, %vbuf_bytes : index, offset -> offset
     %vb_off = index.add %v_tile_offset, %vb_off0 : offset
     %v_tile_b = buffer.view %lds[%vb_off] : buffer -> view<128x24xf16>
-    // stage K and V tiles (rows past the sequence are zero headroom)
-    scf.if %st_is_k {
-      %st_row0 = index.add %key_origin0, %st_key : index
-      %st_row = index.assume %st_row0 [lt(%st_row0, %padded_tokens)] : index
-      %k_chunk = vector.load %ki_view[%st_row, %st_col] : view<[%padded_tokens]x[%ki_words]xi32> -> vector<4xi32>
-      vector.store %k_chunk, %k_tile_b[%st_key, %st_chunk] : vector<4xi32>, view<16x36xi32>
+    scf.if %split_staging {
+      // stage K and V tiles (rows past the sequence are zero headroom)
+      scf.if %st_is_k {
+        %st_row0 = index.add %key_origin0, %st_key : index
+        %st_row = index.assume %st_row0 [lt(%st_row0, %cfg_token_capacity)] : index
+        %k_chunk = vector.load %ki_view[%st_row, %st_col] : view<[%cfg_token_capacity]x[%ki_words]xi32> -> vector<2xi32>
+        vector.store %k_chunk, %k_tile_b[%st_key, %st_chunk] : vector<2xi32>, view<16x20xi32>
+      } else {
+        %v_chunk = vector.load %v_view[%st_chan, %key_origin0] : view<[%cfg_kv_stride]x[%cfg_token_capacity]xf16> -> vector<16xf16>
+        vector.store %v_chunk, %v_tile_b[%st_lane, %c0] : vector<16xf16>, view<128x24xf16>
+      }
     } else {
-      %v_chunk = vector.load %v_view[%st_chan, %key_origin0] : view<[%kv_stride0]x[%padded_tokens]xf16> -> vector<16xf16>
+      // stage K and V tiles (rows past the sequence are zero headroom)
+      %st_row0 = index.add %key_origin0, %st_key : index
+      %st_row = index.assume %st_row0 [lt(%st_row0, %cfg_token_capacity)] : index
+      %k_chunk = vector.load %ki_view[%st_row, %st_col] : view<[%cfg_token_capacity]x[%ki_words]xi32> -> vector<2xi32>
+      %v_chunk = vector.load %v_view[%st_chan, %key_origin0] : view<[%cfg_kv_stride]x[%cfg_token_capacity]xf16> -> vector<16xf16>
+      vector.store %k_chunk, %k_tile_b[%st_key, %st_chunk] : vector<2xi32>, view<16x20xi32>
       vector.store %v_chunk, %v_tile_b[%st_lane, %c0] : vector<16xf16>, view<128x24xf16>
     }
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
     %local_key = index.add %key_origin0, %lane_column : index
-    %key_valid = index.cmp ult, %local_key, %tokens0 : index
+    %key_valid = index.cmp ult, %local_key, %cfg_tokens : index
     %local_key_safe = index.min %local_key, %tile_origin_limit : index
-    %k_data0 = vector.load %k_tile_b[%lane_column, %c0] : view<16x36xi32> -> vector<4xi32>
-    %rhs0 = vector.fragment<rhs> %k_data0 shape [%k_frag, %n] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
-    %qk0 = vector.mma %lhs0, %rhs0, %init_i : vector<4xi32>, vector<4xi32>, vector<8xi32>
-    %k_data1 = vector.load %k_tile_b[%lane_column, %c4] : view<16x36xi32> -> vector<4xi32>
-    %rhs1 = vector.fragment<rhs> %k_data1 shape [%k_frag, %n] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
-    %qk1 = vector.mma %lhs1, %rhs1, %qk0 : vector<4xi32>, vector<4xi32>, vector<8xi32>
-    %k_data2 = vector.load %k_tile_b[%lane_column, %c8] : view<16x36xi32> -> vector<4xi32>
-    %rhs2 = vector.fragment<rhs> %k_data2 shape [%k_frag, %n] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
-    %qk2 = vector.mma %lhs2, %rhs2, %qk1 : vector<4xi32>, vector<4xi32>, vector<8xi32>
-    %k_data3 = vector.load %k_tile_b[%lane_column, %c12] : view<16x36xi32> -> vector<4xi32>
-    %rhs3 = vector.fragment<rhs> %k_data3 shape [%k_frag, %n] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
-    %qk3 = vector.mma %lhs3, %rhs3, %qk2 : vector<4xi32>, vector<4xi32>, vector<8xi32>
-    %k_data4 = vector.load %k_tile_b[%lane_column, %c16] : view<16x36xi32> -> vector<4xi32>
-    %rhs4 = vector.fragment<rhs> %k_data4 shape [%k_frag, %n] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
-    %qk4 = vector.mma %lhs4, %rhs4, %qk3 : vector<4xi32>, vector<4xi32>, vector<8xi32>
-    %k_data5 = vector.load %k_tile_b[%lane_column, %c20] : view<16x36xi32> -> vector<4xi32>
-    %rhs5 = vector.fragment<rhs> %k_data5 shape [%k_frag, %n] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
-    %qk5 = vector.mma %lhs5, %rhs5, %qk4 : vector<4xi32>, vector<4xi32>, vector<8xi32>
-    %k_data6 = vector.load %k_tile_b[%lane_column, %c24] : view<16x36xi32> -> vector<4xi32>
-    %rhs6 = vector.fragment<rhs> %k_data6 shape [%k_frag, %n] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
-    %qk6 = vector.mma %lhs6, %rhs6, %qk5 : vector<4xi32>, vector<4xi32>, vector<8xi32>
-    %k_data7 = vector.load %k_tile_b[%lane_column, %c28] : view<16x36xi32> -> vector<4xi32>
-    %rhs7 = vector.fragment<rhs> %k_data7 shape [%k_frag, %n] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
-    %raw_scores_i = vector.mma %lhs7, %rhs7, %qk6 : vector<4xi32>, vector<4xi32>, vector<8xi32>
+    %k_data0 = vector.load %k_tile_b[%lane_column, %c0] : view<16x20xi32> -> vector<2xi32>
+    %rhs0 = vector.fragment<rhs> %k_data0 shape [%k_frag, %n] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+    %qk0 = vector.mma %lhs0, %rhs0, %init_i : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %k_data1 = vector.load %k_tile_b[%lane_column, %c2] : view<16x20xi32> -> vector<2xi32>
+    %rhs1 = vector.fragment<rhs> %k_data1 shape [%k_frag, %n] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+    %qk1 = vector.mma %lhs1, %rhs1, %qk0 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %k_data2 = vector.load %k_tile_b[%lane_column, %c4] : view<16x20xi32> -> vector<2xi32>
+    %rhs2 = vector.fragment<rhs> %k_data2 shape [%k_frag, %n] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+    %qk2 = vector.mma %lhs2, %rhs2, %qk1 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %k_data3 = vector.load %k_tile_b[%lane_column, %c6] : view<16x20xi32> -> vector<2xi32>
+    %rhs3 = vector.fragment<rhs> %k_data3 shape [%k_frag, %n] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+    %qk3 = vector.mma %lhs3, %rhs3, %qk2 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %k_data4 = vector.load %k_tile_b[%lane_column, %c8] : view<16x20xi32> -> vector<2xi32>
+    %rhs4 = vector.fragment<rhs> %k_data4 shape [%k_frag, %n] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+    %qk4 = vector.mma %lhs4, %rhs4, %qk3 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %k_data5 = vector.load %k_tile_b[%lane_column, %c10] : view<16x20xi32> -> vector<2xi32>
+    %rhs5 = vector.fragment<rhs> %k_data5 shape [%k_frag, %n] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+    %qk5 = vector.mma %lhs5, %rhs5, %qk4 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %k_data6 = vector.load %k_tile_b[%lane_column, %c12] : view<16x20xi32> -> vector<2xi32>
+    %rhs6 = vector.fragment<rhs> %k_data6 shape [%k_frag, %n] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+    %qk6 = vector.mma %lhs6, %rhs6, %qk5 : vector<2xi32>, vector<2xi32>, vector<8xi32>
+    %k_data7 = vector.load %k_tile_b[%lane_column, %c14] : view<16x20xi32> -> vector<2xi32>
+    %rhs7 = vector.fragment<rhs> %k_data7 shape [%k_frag, %n] using {schema = %i4_schema : encoding<schema>} : vector<2xi32>
+    %raw_scores_i = vector.mma %lhs7, %rhs7, %qk6 : vector<2xi32>, vector<2xi32>, vector<8xi32>
     %raw_scores = vector.sitofp %raw_scores_i : vector<8xi32> to vector<8xf32>
-    %ks_key = index.assume %local_key_safe [lt(%local_key_safe, %padded_tokens)] : index
+    %ks_key = index.assume %local_key_safe [lt(%local_key_safe, %cfg_token_capacity)] : index
     %ks_vec = vector.splat %ks_carry : vector<8xf32>
     %qk_scaled = vector.mulf<reassoc|nnan|ninf|nsz|contract> %raw_scores, %qs_vec : vector<8xf32>
     %scaled0 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %qk_scaled, %ks_vec : vector<8xf32>
@@ -392,8 +357,8 @@ kernel.def target(@h3_attention_i8qk_mha8_lds_f16_wmma_gfx11) export("h3_attenti
     %next7 = vector.mma %probability, %v7, %rescaled7 : vector<16xf16>, vector<16xf16>, vector<8xf32>
     %ks_key_n0 = index.add %local_key, %c16 : index
     %ks_key_n1 = index.min %ks_key_n0, %ks_last : index
-    %ks_key_n = index.assume %ks_key_n1 [lt(%ks_key_n1, %padded_tokens)] : index
-    %ks_next = view.load %ks_view[%ks_key_n, %kv_head] : view<[%padded_tokens]x[%kv_head_limit]xf32> -> f32
+    %ks_key_n = index.assume %ks_key_n1 [lt(%ks_key_n1, %cfg_token_capacity)] : index
+    %ks_next = view.load %ks_view[%ks_key_n, %kv_head] : view<[%cfg_token_capacity]x[%kv_head_limit]xf32> -> f32
     scf.yield %next_max, %next_sum, %next0, %next1, %next2, %next3, %next4, %next5, %next6, %next7, %ks_next : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, f32
   }
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
@@ -420,7 +385,7 @@ kernel.def target(@h3_attention_i8qk_mha8_lds_f16_wmma_gfx11) export("h3_attenti
   %publish_row0 = index.div %lane, %c4 : index
   %publish_col_group = index.rem %lane, %c4 : index
   %publish_col = index.mul %publish_col_group, %c4 : index
-  %publish_limit = index.sub %out_stride0, %c4 : index
+  %publish_limit = index.sub %cfg_out_stride, %c4 : index
   scf.for %fragment = [%c0 to %c_nf step %c1] {
     %is1 = index.cmp eq, %fragment, %c1 : index
     %pick1 = scf.select %is1, %out1, %out0 : vector<8xf32>
@@ -446,17 +411,105 @@ kernel.def target(@h3_attention_i8qk_mha8_lds_f16_wmma_gfx11) export("h3_attenti
       %row_offset = index.mul %half, %c8 : index
       %publish_row = index.add %publish_row0, %row_offset : index
       %local_row = index.add %query_origin0, %publish_row : index
-      %present = index.cmp ult, %local_row, %tokens0 : index
+      %present = index.cmp ult, %local_row, %cfg_tokens : index
       %in_range = index.cmp ult, %local_row, %token_count : index
       %writes = scalar.andi %present, %in_range : i1
       scf.if %writes {
         %global_row = index.assume %local_row [lt(%local_row, %token_count)] : index
         %values = vector.load %result_view[%publish_row, %publish_col] : view<16x16xf32> -> vector<4xf32>
         %halves = vector.fptrunc %values : vector<4xf32> to vector<4xf16>
-        vector.store %halves, %out_view[%global_row, %out_column] : vector<4xf16>, view<[%token_count]x[%out_stride0]xf16>
+        vector.store %halves, %out_view[%global_row, %out_column] : vector<4xf16>, view<[%token_count]x[%cfg_out_stride]xf16>
       }
     }
     kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
   }
+  template.return
+}
+
+amdgpu.target<gfx11-generic> @h3_attention_i4qk_mha_lds_f16_wmma_gfx11 {subgroup_size = 32}
+
+config.decl @h3.attention_i4qk_mha_lds_f16_wmma.q_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
+
+config.decl @h3.attention_i4qk_mha_lds_f16_wmma.kv_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
+
+config.decl @h3.attention_i4qk_mha_lds_f16_wmma.out_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
+
+config.decl @h3.attention_i4qk_mha_lds_f16_wmma.tokens : %value: index where [range(%value, 1, 65536)]
+
+config.decl @h3.attention_i4qk_mha_lds_f16_wmma.token_capacity : %value: index where [range(%value, 32, 1048576), mul(%value, 16)]
+
+config.decl @h3.attention_i4qk_mha_lds_f16_wmma.scale : f32
+
+kernel.def target(@h3_attention_i4qk_mha_lds_f16_wmma_gfx11) export("h3_attention_i4qk_mha_lds_f16_wmma") @h3_attention_i4qk_mha_lds_f16_wmma(%token_count: index, %kv_head_count: index) {
+  %c1 = index.constant 1 : index
+  %c15 = index.constant 15 : index
+  %c16 = index.constant 16 : index
+  %c63 = index.constant 63 : index
+  %c64 = index.constant 64 : index
+  %c127 = index.constant 127 : index
+  %c128 = index.constant 128 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %c512 = index.constant 512 : index
+  %tokens0 = config.get @h3.attention_i4qk_mha_lds_f16_wmma.tokens : index
+  %rounded = index.add %tokens0, %c63 : index
+  %tiles = index.div %rounded, %c64 : index
+  kernel.launch.config workgroups(%tiles, %kv_head_count, %c1) workgroup_size(%c128, %c1, %c1) : index
+} launch(%token_count: index, %qi: buffer, %qs: buffer, %ki: buffer, %ks: buffer, %v: buffer, %out: buffer) {
+  %cfg_q_stride = config.get @h3.attention_i4qk_mha_lds_f16_wmma.q_stride : index
+  %cfg_kv_stride = config.get @h3.attention_i4qk_mha_lds_f16_wmma.kv_stride : index
+  %cfg_out_stride = config.get @h3.attention_i4qk_mha_lds_f16_wmma.out_stride : index
+  %cfg_tokens = config.get @h3.attention_i4qk_mha_lds_f16_wmma.tokens : index
+  %cfg_token_capacity = config.get @h3.attention_i4qk_mha_lds_f16_wmma.token_capacity : index
+  %cfg_scale = config.get @h3.attention_i4qk_mha_lds_f16_wmma.scale : f32
+  %waves = index.constant 4 : index
+  %split_staging = scalar.constant false : i1
+  %q_tile_offset = index.constant 16896 : offset
+  %lds_bytes = index.constant 16896 : offset
+  template.apply<@h3.shared_attention_i4qk_mha8_lds_f16_wmma>(%token_count, %qi, %qs, %ki, %ks, %v, %out, %cfg_q_stride, %cfg_kv_stride, %cfg_out_stride, %cfg_tokens, %cfg_token_capacity, %cfg_scale, %waves, %split_staging, %q_tile_offset, %lds_bytes) : (index, buffer, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, f32, index, i1, offset, offset)
+  kernel.return
+}
+
+amdgpu.target<gfx11-generic> @h3_attention_i4qk_mha8_lds_f16_wmma_gfx11 {subgroup_size = 32}
+
+config.decl @h3.attention_i4qk_mha8_lds_f16_wmma.q_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
+
+config.decl @h3.attention_i4qk_mha8_lds_f16_wmma.kv_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
+
+config.decl @h3.attention_i4qk_mha8_lds_f16_wmma.out_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
+
+config.decl @h3.attention_i4qk_mha8_lds_f16_wmma.tokens : %value: index where [range(%value, 1, 65536)]
+
+config.decl @h3.attention_i4qk_mha8_lds_f16_wmma.token_capacity : %value: index where [range(%value, 32, 1048576), mul(%value, 16)]
+
+config.decl @h3.attention_i4qk_mha8_lds_f16_wmma.scale : f32
+
+kernel.def target(@h3_attention_i4qk_mha8_lds_f16_wmma_gfx11) export("h3_attention_i4qk_mha8_lds_f16_wmma") @h3_attention_i4qk_mha8_lds_f16_wmma(%token_count: index, %kv_head_count: index) {
+  %c1 = index.constant 1 : index
+  %c15 = index.constant 15 : index
+  %c16 = index.constant 16 : index
+  %c63 = index.constant 63 : index
+  %c64 = index.constant 64 : index
+  %c127 = index.constant 127 : index
+  %c128 = index.constant 128 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %c512 = index.constant 512 : index
+  %tokens0 = config.get @h3.attention_i4qk_mha8_lds_f16_wmma.tokens : index
+  %rounded = index.add %tokens0, %c127 : index
+  %tiles = index.div %rounded, %c128 : index
+  kernel.launch.config workgroups(%tiles, %kv_head_count, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%token_count: index, %qi: buffer, %qs: buffer, %ki: buffer, %ks: buffer, %v: buffer, %out: buffer) {
+  %cfg_q_stride = config.get @h3.attention_i4qk_mha8_lds_f16_wmma.q_stride : index
+  %cfg_kv_stride = config.get @h3.attention_i4qk_mha8_lds_f16_wmma.kv_stride : index
+  %cfg_out_stride = config.get @h3.attention_i4qk_mha8_lds_f16_wmma.out_stride : index
+  %cfg_tokens = config.get @h3.attention_i4qk_mha8_lds_f16_wmma.tokens : index
+  %cfg_token_capacity = config.get @h3.attention_i4qk_mha8_lds_f16_wmma.token_capacity : index
+  %cfg_scale = config.get @h3.attention_i4qk_mha8_lds_f16_wmma.scale : f32
+  %waves = index.constant 8 : index
+  %split_staging = scalar.constant true : i1
+  %q_tile_offset = index.constant 18944 : offset
+  %lds_bytes = index.constant 18944 : offset
+  template.apply<@h3.shared_attention_i4qk_mha8_lds_f16_wmma>(%token_count, %qi, %qs, %ki, %ks, %v, %out, %cfg_q_stride, %cfg_kv_stride, %cfg_out_stride, %cfg_tokens, %cfg_token_capacity, %cfg_scale, %waves, %split_staging, %q_tile_offset, %lds_bytes) : (index, buffer, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, f32, index, i1, offset, offset)
   kernel.return
 }

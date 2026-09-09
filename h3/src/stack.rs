@@ -465,7 +465,11 @@ impl Stack {
             let ns = format!("h3.{stem}.");
             Some(c.get(
                 gpu,
-                stem,
+                if d.head_dim == 64 || d.rope_dim == 128 {
+                    "rope_head_family"
+                } else {
+                    stem
+                },
                 &format!("h3_{stem}"),
                 &vec![
                     (format!("{ns}row_stride"), d.qkv().to_string()),
@@ -527,38 +531,49 @@ impl Stack {
         }
 
         let attention = {
-            let mut stem = if d.causal {
-                "attention_gqa8c_lds_f16_wmma".to_string()
+            let (mut module, mut stem) = if d.causal {
+                (
+                    "attention_gqa8c_lds_f16_wmma",
+                    "attention_gqa8c_lds_f16_wmma",
+                )
             } else if d.head_dim == 64 {
                 if waves == 8 {
-                    "attention_mha648_lds_f16_wmma".into()
+                    ("attention_mha64_family", "attention_mha648_lds_f16_wmma")
                 } else {
-                    "attention_mha64_lds_f16_wmma".into()
+                    ("attention_mha64_family", "attention_mha64_lds_f16_wmma")
                 }
             } else if waves == 8 {
-                "attention_mha8_lds_f16_wmma".into()
+                ("attention_mha_family", "attention_mha8_lds_f16_wmma")
             } else {
-                "attention_mha_lds_f16_wmma".into()
+                ("attention_mha_family", "attention_mha_lds_f16_wmma")
             };
             if fused_qkv {
-                stem = "attention_mha64hm32_lds_f16_wmma".into();
+                module = "attention_mha64hm32_lds_f16_wmma";
+                stem = module;
             } else if fast && waves == 4 {
-                stem = "attention_mha64t32_lds_f16_wmma".into();
+                module = "attention_mha64t32_lds_f16_wmma";
+                stem = module;
             }
             if qk_int {
-                stem = if qk_head_major {
+                (module, stem) = if qk_head_major {
                     // Head-major operands; 64 shared keys amortise softmax and loop overhead.
-                    "attention_i8qkhm_mha8_k64_lds_f16_wmma".into()
+                    (
+                        "attention_i8qkhm_mha8_k64_lds_f16_wmma",
+                        "attention_i8qkhm_mha8_k64_lds_f16_wmma",
+                    )
                 } else if d.attn_i4 {
                     if tokens >= 20000 {
-                        "attention_i4qkl_mha8_lds_f16_wmma".into()
+                        (
+                            "attention_i4qkl_mha8_lds_f16_wmma",
+                            "attention_i4qkl_mha8_lds_f16_wmma",
+                        )
                     } else if waves == 8 {
-                        "attention_i4qk_mha8_lds_f16_wmma".into()
+                        ("attention_i4qk_family", "attention_i4qk_mha8_lds_f16_wmma")
                     } else {
-                        "attention_i4qk_mha_lds_f16_wmma".into()
+                        ("attention_i4qk_family", "attention_i4qk_mha_lds_f16_wmma")
                     }
                 } else {
-                    "attention_i8qk_mha_lds_f16_wmma".into()
+                    ("attention_i8qk_family", "attention_i8qk_mha_lds_f16_wmma")
                 };
             }
             // H3_ATTN_SKIP_TAU selects the skip twin at that tau; the twins exist for int4 only.
@@ -568,9 +583,16 @@ impl Stack {
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(0.0);
             let skip = d.attn_i4 && tau > 0.0;
-            if skip {
-                stem = stem.replace("i4qk", "i4qks");
-            }
+            let stem = if skip {
+                stem.replace("i4qk", "i4qks")
+            } else {
+                stem.into()
+            };
+            let module = if skip {
+                module.replace("i4qk", "i4qks")
+            } else {
+                module.into()
+            };
             let ns = format!("h3.{stem}.");
             let mut acfg: Cfg = vec![
                 (format!("{ns}q_stride"), d.inner().to_string()),
@@ -592,7 +614,7 @@ impl Stack {
             if skip {
                 acfg.push((format!("{ns}skip_tau"), num(tau)));
             }
-            c.get(gpu, &stem, &format!("h3_{stem}"), &acfg)?
+            c.get(gpu, &module, &format!("h3_{stem}"), &acfg)?
         };
 
         let t = capacity;

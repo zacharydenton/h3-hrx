@@ -1,0 +1,32 @@
+// Reproducer: specialization fixes the caller's vector width, but the template
+// argument still has a dynamic width when inline-callables compares the types.
+amdgpu.target<gfx11-generic> @probe_gfx11 {subgroup_size = 32}
+
+config.decl @probe.registers : %value: index where [range(%value, 2, 4), mul(%value, 2)]
+
+template.decl @probe.first(%width: index, %value: vector<[%width]xi32>) -> (i32)
+
+template.def<@probe.first> @first(%width: index, %value: vector<[%width]xi32>) -> (i32) {
+  %zero = index.constant 0 : index
+  %result = vector.extract %value[%zero] : vector<[%width]xi32> -> i32
+  template.return %result : i32
+}
+
+kernel.def target(@probe_gfx11) export("dynamic_argument") @dynamic_argument() {
+  %one = index.constant 1 : index
+  %threads = index.constant 32 : index
+  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%input: buffer, %output: buffer) {
+  %zero = index.constant 0 : index
+  %offset = index.constant 0 : offset
+  %width = config.get @probe.registers : index
+  %lane = kernel.subgroup.lane.id : index
+  %ig = buffer.assume.memory_space<global> %input : buffer
+  %og = buffer.assume.memory_space<global> %output : buffer
+  %iv = buffer.view %ig[%offset] : buffer -> view<32x4xi32>
+  %ov = buffer.view %og[%offset] : buffer -> view<32xi32>
+  %value = vector.load %iv[%lane, %zero] : view<32x4xi32> -> vector<[%width]xi32>
+  %result = template.apply<@probe.first>(%width, %value) : (index, vector<[%width]xi32>) -> (i32)
+  view.store %result, %ov[%lane] : i32, view<32xi32>
+  kernel.return
+}
