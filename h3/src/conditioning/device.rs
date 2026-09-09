@@ -1,13 +1,12 @@
 //! Prepared AdaLN projections. Only the eight timestep coefficients cross the
 //! host boundary per launch; weights and the resulting tables stay on device.
-use std::sync::Arc;
 
 use crate::compile::Compiler;
 use crate::error::{invalid, Result};
 use crate::model::*;
 
 pub(crate) struct Projection {
-    kernel: Arc<hrx::Kernel>,
+    kernel: crate::compile::Kernel,
     weights: hrx::Buffer,
     bias: hrx::Buffer,
     maps: Vec<hrx::Buffer>,
@@ -122,6 +121,7 @@ impl Projection {
         if timesteps.len() != self.maps.len() || output.bytes() < self.output_bytes {
             return invalid("AdaLN output or timestep shape mismatch");
         }
+        let kernel = self.kernel.resolve(stream)?;
         for (te, map) in timesteps.iter().zip(&self.maps) {
             let mut constants = hrx::Constants::new();
             for &value in te {
@@ -132,7 +132,7 @@ impl Projection {
             // unique output within the checked allocation, across all launches.
             unsafe {
                 stream.dispatch(
-                    &self.kernel,
+                    &kernel,
                     [self.count.div_ceil(256) as u32, 1, 1],
                     [256, 1, 1],
                     &constants,

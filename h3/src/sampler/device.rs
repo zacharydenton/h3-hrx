@@ -1,6 +1,5 @@
 //! Resident Euler latents. Multistep keeps its f64 CPU implementation until the
 //! packaged Loom compiler supports the required f64 operations on gfx1151.
-use std::sync::Arc;
 
 use crate::compile::Compiler;
 use crate::error::{invalid, Result};
@@ -9,8 +8,8 @@ use crate::model::{AUDIO_CH, FINAL_N, VIDEO_PATCH};
 pub(crate) struct Euler {
     pub audio: hrx::Buffer,
     pub video: hrx::Buffer,
-    audio_kernel: Arc<hrx::Kernel>,
-    video_kernel: Arc<hrx::Kernel>,
+    audio_kernel: crate::compile::Kernel,
+    video_kernel: crate::compile::Kernel,
     audio_rows: usize,
     video_rows: usize,
 }
@@ -71,9 +70,13 @@ impl Euler {
         if head.len() < (self.audio_rows + self.video_rows) * FINAL_N * 4 {
             return invalid("Euler head output is too short");
         }
+        let kernels = (
+            self.audio_kernel.resolve(stream)?,
+            self.video_kernel.resolve(stream)?,
+        );
         for (kernel, buffer, (sigma, ratio)) in [
-            (&self.audio_kernel, &self.audio, audio),
-            (&self.video_kernel, &self.video, video),
+            (&kernels.0, &self.audio, audio),
+            (&kernels.1, &self.video, video),
         ] {
             let mut constants = hrx::Constants::new();
             constants.push(sigma)?;

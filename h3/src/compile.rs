@@ -3,7 +3,13 @@
 //! One kernel per (stem, source text, symbol, backend, target, config, compiler binary): the cache
 //! file name is a digest of all of them, so neither an edited kernel source nor a replaced
 //! `libloomc` ever reuses a stale binary. `hrx::loom` computes the digest and owns the cache; what
-//! is here is the choice of source and configuration.
+//! is here is the choice of source, configuration and target — the target being whatever the stream's
+//! device reports, so a machine with a different GPU compiles for itself and files the result apart.
+//!
+//! Asking for a kernel and building it are separate steps. [`Compiler::get`] only records the
+//! request; the outstanding set is compiled in parallel by [`Compiler::flush`], or by the first
+//! launch that needs one of them. A stack asks for its forty-odd kernels before it builds any, so a
+//! cold cache spends its time on several threads rather than one.
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
@@ -76,6 +82,123 @@ fn trim(s: &str) -> String {
     t.strip_suffix('.').unwrap_or(t).to_string()
 }
 
+/// One kernel, asked for and not yet built.
+///
+/// Compiling is what a cold cache costs, and the requests are independent of one another, so
+/// [`Compiler::get`] records the request and returns this rather than stopping to build it. The
+/// outstanding set is then compiled together, on as many threads as the compiler allows, by
+/// [`Compiler::flush`] or by the first launch that needs any one of them. A handle is a pair of
+/// pointers: copy it into as many structures as the kernel is used from.
+#[derive(Clone)]
+pub struct Kernel {
+    cell: Arc<OnceLock<Arc<hrx::Kernel>>>,
+    queue: Arc<Queue>,
+}
+
+impl Kernel {
+    /// The loaded kernel, building the outstanding batch if this is the first call that needs it.
+    pub(crate) fn resolve(&self, stream: &mut hrx::Stream) -> Result<Arc<hrx::Kernel>> {
+        if let Some(kernel) = self.cell.get() {
+            return Ok(kernel.clone());
+        }
+        self.queue.flush(stream)?;
+        // Every queued request fills its own cell, so a batch that reported success built this one.
+        self.cell
+            .get()
+            .cloned()
+            .ok_or_else(|| Error::Io("a kernel outlived the compiler that queued it".into()))
+    }
+}
+
+/// One outstanding request: what to compile, and the handle waiting for it.
+struct Request {
+    tag: String,
+    module: hrx::loom::Module,
+    spec: hrx::loom::Specialization,
+    cells: Vec<Arc<OnceLock<Arc<hrx::Kernel>>>>,
+}
+
+/// The requests not yet built, and the kernels already loaded.
+///
+/// Shared by the compiler and every handle it has issued, so a handle can build its own batch
+/// without holding a borrow of the compiler and without a lifetime of its own.
+struct Queue {
+    cache: PathBuf,
+    pending: Mutex<Vec<Request>>,
+    loaded: Mutex<HashMap<String, Arc<hrx::Kernel>>>,
+}
+
+impl Queue {
+    /// Build everything outstanding: compile off the device, then load in order.
+    ///
+    /// Compilation is pure — source, configuration and target to bytes — so it runs on several
+    /// threads at once. Loading is not: it takes the stream, and the stream is not shared.
+    fn flush(&self, stream: &mut hrx::Stream) -> Result<()> {
+        let requests = std::mem::take(&mut *self.pending.lock().expect("kernel queue poisoned"));
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let artifacts = compile_all(&requests, &Compiler::cache_dir(&self.cache)?);
+        let mut loaded = self.loaded.lock().expect("compiler cache poisoned");
+        for (request, artifact) in requests.into_iter().zip(artifacts) {
+            // Safety: verified artifact from trusted model source and configured compiler.
+            let kernel = Arc::new(unsafe { stream.load_artifact(&artifact?)? });
+            let kernel = loaded.entry(request.tag).or_insert(kernel).clone();
+            for cell in request.cells {
+                let _ = cell.set(kernel.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Compiles every request, in request order, on `workers()` threads.
+///
+/// Each result is that request's own, so one kernel that will not build is reported as itself rather
+/// than cancelling the batch — the caller sees the same error it would have seen building alone.
+fn compile_all(
+    requests: &[Request],
+    cache: &Path,
+) -> Vec<std::result::Result<hrx::loom::Artifact, hrx::Error>> {
+    let mut results: Vec<Option<_>> = (0..requests.len()).map(|_| None).collect();
+    let threads = workers().min(requests.len());
+    if threads < 2 {
+        return requests
+            .iter()
+            .map(|r| r.module.compile(&r.spec, cache))
+            .collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<Mutex<&mut Option<_>>> = results.iter_mut().map(Mutex::new).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(request) = requests.get(i) else {
+                    break;
+                };
+                **slots[i].lock().expect("compile slot poisoned") =
+                    Some(request.module.compile(&request.spec, cache));
+            });
+        }
+    });
+    results
+        .into_iter()
+        .map(|slot| slot.expect("every request was compiled"))
+        .collect()
+}
+
+/// How many kernels to build at once.
+///
+/// Each worker holds its own compiler workspace, so this trades memory for latency at a point where
+/// the process is otherwise about to sit on the checkpoint's page faults anyway. Bounded rather than
+/// taken whole: past a handful of threads the artifact cache and the allocator dominate.
+fn workers() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(8)
+}
+
 /// Model-specific source selection and loaded exports. Compilation, integrity,
 /// process locks and publication are provided by the shared HRX crate.
 pub struct Compiler {
@@ -83,9 +206,8 @@ pub struct Compiler {
     modules: Mutex<HashMap<String, hrx::loom::Module>>,
     sources: PathBuf,
     source_cache: Mutex<HashMap<String, Arc<str>>>,
-    cache: PathBuf,
     compiler: OnceLock<hrx::loom::Compiler>,
-    loaded: Mutex<HashMap<String, Arc<hrx::Kernel>>>,
+    queue: Arc<Queue>,
 }
 impl Compiler {
     pub fn new(
@@ -98,16 +220,31 @@ impl Compiler {
             modules: Mutex::new(HashMap::new()),
             sources: sources.into(),
             source_cache: Mutex::new(HashMap::new()),
-            cache: cache.into(),
             compiler: OnceLock::new(),
-            loaded: Mutex::new(HashMap::new()),
+            queue: Arc::new(Queue {
+                cache: cache.into(),
+                pending: Mutex::new(Vec::new()),
+                loaded: Mutex::new(HashMap::new()),
+            }),
         }
     }
-    fn compiler(&self) -> Result<&hrx::loom::Compiler> {
+    /// The compiler, built on first use for `target`.
+    ///
+    /// The target selects the Loom profile — which descriptor sets a kernel's hand-written low asm
+    /// may name — and it is part of the artifact cache key, so it has to be the architecture the
+    /// kernels will actually run on. [`Compiler::get`] passes the stream's own, which is what the
+    /// device reports; only [`Compiler::tag`], which has no device to ask, leaves it unset and takes
+    /// the crate's default. Whichever comes first fixes it for this `Compiler`.
+    fn compiler(&self, target: Option<&hrx::Target>) -> Result<&hrx::loom::Compiler> {
         if let Some(c) = self.compiler.get() {
             return Ok(c);
         }
-        let compiler = hrx::loom::Compiler::resolve(self.library.as_deref())?;
+        let options = hrx::loom::CompilerOptions {
+            target: target.cloned().unwrap_or_default(),
+            workers: std::num::NonZeroUsize::new(workers()).expect("at least one worker"),
+            ..Default::default()
+        };
+        let compiler = hrx::loom::Compiler::with_options(self.library.as_deref(), options)?;
         let _ = self.compiler.set(compiler);
         Ok(self.compiler.get().expect("compiler initialized"))
     }
@@ -139,54 +276,82 @@ impl Compiler {
     /// Where compiled artifacts go. An empty `cache` means the caller expressed no preference, and
     /// gets the shared per-user one; resolving it here rather than at the call sites keeps a
     /// `Compiler::new(_, _, "")` from quietly writing a cache into the process's current directory.
-    fn cache_dir(&self) -> Result<PathBuf> {
-        if self.cache.as_os_str().is_empty() {
+    fn cache_dir(cache: &Path) -> Result<PathBuf> {
+        if cache.as_os_str().is_empty() {
             Ok(hrx::bundle::cache_root()?.join("h3/kernels/hrx-v1"))
         } else {
-            Ok(self.cache.join("hrx-v1"))
+            Ok(cache.join("hrx-v1"))
         }
     }
 
-    fn module(&self, stem: &str) -> Result<hrx::loom::Module> {
+    fn module(&self, target: Option<&hrx::Target>, stem: &str) -> Result<hrx::loom::Module> {
         let mut modules = self.modules.lock().expect("module cache poisoned");
         if let Some(module) = modules.get(stem) {
             return Ok(module.clone());
         }
         let source = self.source(stem)?;
-        let module = self.compiler()?.module(&source);
+        let module = self.compiler(target)?.module(&source);
         modules.insert(stem.into(), module.clone());
         Ok(module)
     }
     pub fn tag(&self, stem: &str, symbol: &str, cfg: &Cfg) -> Result<String> {
         let mut request = hrx::loom::Specialization::new(symbol);
         request.config = config(stem, cfg)?;
-        Ok(self.module(stem)?.key(&request)?)
+        Ok(self.module(None, stem)?.key(&request)?)
     }
 
+    /// Ask for a kernel. What comes back is a handle, not yet a kernel: see [`Kernel`].
+    ///
+    /// The stream is read for its target and not otherwise touched, so a builder can ask for its
+    /// whole set of kernels before the first of them is built.
     pub fn get(
         &self,
         stream: &mut hrx::Stream,
         stem: &str,
         symbol: &str,
         cfg: &Cfg,
-    ) -> Result<Arc<hrx::Kernel>> {
-        let module = self.module(stem)?;
-        let mut request = hrx::loom::Specialization::new(symbol);
-        request.config = config(stem, cfg)?;
-        let tag = module.key(&request)?;
+    ) -> Result<Kernel> {
+        let module = self.module(Some(stream.target()), stem)?;
+        let mut spec = hrx::loom::Specialization::new(symbol);
+        spec.config = config(stem, cfg)?;
+        let tag = module.key(&spec)?;
+        let cell = Arc::new(OnceLock::new());
+        let handle = Kernel {
+            cell: cell.clone(),
+            queue: self.queue.clone(),
+        };
         if let Some(kernel) = self
+            .queue
             .loaded
             .lock()
             .expect("compiler cache poisoned")
             .get(&tag)
         {
-            return Ok(kernel.clone());
+            let _ = cell.set(kernel.clone());
+            return Ok(handle);
         }
-        let artifact = module.compile(&request, &self.cache_dir()?)?;
-        // Safety: verified artifact from trusted model source and configured compiler.
-        let kernel = Arc::new(unsafe { stream.load_artifact(&artifact)? });
-        let mut loaded = self.loaded.lock().expect("compiler cache poisoned");
-        Ok(loaded.entry(tag).or_insert(kernel).clone())
+        let mut pending = self.queue.pending.lock().expect("kernel queue poisoned");
+        // The same kernel asked for twice within one batch is compiled once and shared, which is why
+        // the stack's fifty blocks cost what one does.
+        if let Some(request) = pending.iter_mut().find(|r| r.tag == tag) {
+            request.cells.push(cell);
+        } else {
+            pending.push(Request {
+                tag,
+                module,
+                spec,
+                cells: vec![cell],
+            });
+        }
+        Ok(handle)
+    }
+
+    /// Build every kernel asked for so far.
+    ///
+    /// A builder calls this once it has asked for its whole set, so that a kernel that will not
+    /// compile is reported where it was configured rather than at the launch that first needs it.
+    pub fn flush(&self, stream: &mut hrx::Stream) -> Result<()> {
+        self.queue.flush(stream)
     }
 }
 

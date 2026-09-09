@@ -8,7 +8,6 @@ use crate::compile::{num, Cfg, Compiler};
 use crate::model::*;
 use hrx::View;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Instant;
 
 pub type Result<T> = std::result::Result<T, crate::compile::Error>;
@@ -122,7 +121,7 @@ pub fn upload_at(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn checked(
     stream: &mut hrx::Stream,
-    kernel: &hrx::Kernel,
+    kernel: &crate::compile::Kernel,
     profile: Option<&mut Profile>,
     stage: &str,
     grid: [u32; 3],
@@ -144,12 +143,15 @@ pub(crate) fn checked(
             )));
         }
     }
+    // The kernel is built here if its batch has not been built already, which is what makes the
+    // handle safe to hold: nothing can dispatch one that was never compiled.
+    let kernel = kernel.resolve(stream)?;
     // Safety: every binding is at least as long as the extent this kernel was compiled to address,
     // checked immediately above, and the grid, block and scalars come from the same builder that
     // compiled it.
     unsafe {
         launch(
-            stream, kernel, profile, stage, grid, block, scalars, bindings,
+            stream, &kernel, profile, stage, grid, block, scalars, bindings,
         )
     }
 }
@@ -320,7 +322,7 @@ impl<'a> ClassRows<'a> {
 /// `plain` narrows an existing f16 row. The int8 forms also write a per-token scale; the float ones
 /// write rows and nothing else.
 pub struct Prepare {
-    kernel: Arc<hrx::Kernel>,
+    kernel: crate::compile::Kernel,
     lanes: usize,
     form: String,
     elem: String,
@@ -429,7 +431,7 @@ impl Prepare {
 
 /// A GEMM of the int8, f16 or bf16 family for one (K, N, row group).
 pub struct Gemm {
-    kernel: Arc<hrx::Kernel>,
+    kernel: crate::compile::Kernel,
     n: usize,
     resid: bool,
     bias: bool,
@@ -633,7 +635,7 @@ impl Gemm {
 /// form takes a residual as a fifth binding, which is how a ResNet block's second convolution and its
 /// skip are one dispatch.
 pub struct Conv3d {
-    kernel: Arc<hrx::Kernel>,
+    kernel: crate::compile::Kernel,
     cout_pad: usize,
     /// the extents the kernel was compiled from
     in_rows: usize,
@@ -741,8 +743,8 @@ impl Conv3d {
 /// The split is not an optimisation detail — the statistics are over a whole (frame, group) plane, so
 /// they have to land before any element is scaled.
 pub struct GroupNormSilu {
-    stats: Arc<hrx::Kernel>,
-    silu: Arc<hrx::Kernel>,
+    stats: crate::compile::Kernel,
+    silu: crate::compile::Kernel,
     frames: usize,
     rows: usize,
     channels: usize,
@@ -832,7 +834,7 @@ impl GroupNormSilu {
 
 /// A biased f16 matmul with f16 in and out: the encoder's 1x1 shortcuts and its posterior head.
 pub struct Matmul {
-    kernel: Arc<hrx::Kernel>,
+    kernel: crate::compile::Kernel,
     k_size: usize,
     n_size: usize,
 }
@@ -893,7 +895,7 @@ impl Matmul {
 /// The plain f32 matmul the heads and the patch projections use: no tiling, no quantisation, just the
 /// arithmetic in the order the checkpoint stores it.
 pub struct MatmulF32 {
-    kernel: Arc<hrx::Kernel>,
+    kernel: crate::compile::Kernel,
     k: usize,
     n: usize,
 }
@@ -983,7 +985,7 @@ pub fn axpy(
 /// function and are not interchangeable: the tower's MLP uses the tanh approximation and its mergers
 /// the error function.
 pub struct Matmul16 {
-    kernel: Arc<hrx::Kernel>,
+    kernel: crate::compile::Kernel,
     k: usize,
     n: usize,
     resid: bool,
@@ -1069,7 +1071,7 @@ impl Matmul16 {
 /// The DiT's final norm and the refiner's, which are the two places a stack's own blocks do not do
 /// the modulating. Its table is `[2 * classes][width]` f32 — a scale row and a shift row per class.
 pub struct NormMod {
-    kernel: Arc<hrx::Kernel>,
+    kernel: crate::compile::Kernel,
     width: usize,
     lanes: usize,
     classes: usize,
@@ -1134,7 +1136,7 @@ impl NormMod {
 
 /// LayerNorm reading an f16 stream and writing f32, which is what the vision tower's blocks take.
 pub struct LayerNorm16 {
-    kernel: Arc<hrx::Kernel>,
+    kernel: crate::compile::Kernel,
     width: usize,
 }
 

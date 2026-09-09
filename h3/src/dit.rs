@@ -396,7 +396,7 @@ struct CacheBuffers {
     prev: hrx::Buffer,
     resid: hrx::Buffer,
     partials: hrx::Buffer,
-    metric: std::sync::Arc<hrx::Kernel>,
+    metric: crate::compile::Kernel,
 }
 
 /// A latent grid: the extent of a reference's own latents.

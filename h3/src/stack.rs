@@ -175,14 +175,14 @@ pub struct Stack {
     gemm_out: Gemm,
     gemm_down: Gemm,
 
-    qkv_rope: Option<Arc<hrx::Kernel>>,
+    qkv_rope: Option<crate::compile::Kernel>,
     qkv_group: u32,
-    rope: Option<Arc<hrx::Kernel>>,
-    attention: Arc<hrx::Kernel>,
-    colmean: Option<Arc<hrx::Kernel>>,
-    prep_q: Option<Arc<hrx::Kernel>>,
-    prep_k: Option<Arc<hrx::Kernel>>,
-    transpose: Option<Arc<hrx::Kernel>>,
+    rope: Option<crate::compile::Kernel>,
+    attention: crate::compile::Kernel,
+    colmean: Option<crate::compile::Kernel>,
+    prep_q: Option<crate::compile::Kernel>,
+    prep_k: Option<crate::compile::Kernel>,
+    transpose: Option<crate::compile::Kernel>,
 
     a_q: hrx::Buffer,
     a_s: hrx::Buffer,
@@ -681,6 +681,11 @@ impl Stack {
         } else {
             None
         };
+
+        // Every kernel this stack will launch has now been asked for, and none of them has been
+        // built. Building them here rather than at the launches that need them compiles the whole
+        // set at once, and reports a kernel that will not build against the shape that configured it.
+        c.flush(stream)?;
 
         Ok(Self {
             d,
