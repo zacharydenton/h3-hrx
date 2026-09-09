@@ -46,6 +46,12 @@ impl Default for Config {
     }
 }
 
+/// One model, held open: the checkpoints mapped, the weights uploaded as stages ask for them, and
+/// the kernels compiled for the shapes seen so far. Reuse a session across requests rather than
+/// opening one per request — that is what keeps the weights resident and the kernels compiled.
+///
+/// Every method takes `&mut self`, so the borrow checker serialises the calls; nothing here needs a
+/// lock of its own.
 pub struct Session {
     gpu: hrx::Gpu,
     compiler: Compiler,
@@ -193,6 +199,10 @@ impl Session {
     }
 
     /// The refined text rows the blocks see, `[n][5376]`.
+    ///
+    /// `out` must hold at least that many floats; a longer one — a pooled buffer, say — is accepted
+    /// and only the rows the request needs are written. Inputs are read from the caller's memory
+    /// rather than copied, so `ids` and `out` must not overlap.
     pub fn text_in(&mut self, ids: &[i32], out: &mut [f32]) -> Result<()> {
         // checked before a checkpoint is opened: a bad request should cost nothing
         if ids.is_empty() {
@@ -308,6 +318,14 @@ impl Session {
         crate::vision::embed(gpu, compiler, prof, te.weights(), pixels, height, width)
     }
 
+    /// Model-space latents to `[frames][height][width][3]` RGB8.
+    ///
+    /// Arguments are checked before anything is written, so an [`Error::Invalid`] leaves `out` as it
+    /// was. A failure raised once the decode is under way — a device error, or a cancelled run —
+    /// can leave it *partly* written, because the decoder commits each temporal chunk as it
+    /// finishes rather than staging a whole clip. Read `out` only after this returns `Ok`.
+    ///
+    /// `latents` and `out` must not overlap.
     pub fn decode_video(&mut self, shape: &Shape, latents: &[f32], out: &mut [u8]) -> Result<()> {
         self.vvae()?;
         let Self {

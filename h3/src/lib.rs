@@ -77,7 +77,6 @@ pub mod vvae;
 #[doc(hidden)]
 pub mod weights;
 
-pub mod capi;
 pub mod error;
 pub mod models;
 pub mod session;

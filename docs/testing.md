@@ -32,7 +32,7 @@ The GPU suite compares independent scalar CPU references against:
   residual addition and untouched output guards.
 
 Workspace unit tests cover model shapes, checkpoint layouts, CPU sampling,
-tokenization, compiler/source behavior, dispatch bounds, and C ABI contracts.
+tokenization, compiler/source behavior and dispatch bounds.
 The C smoke test in the shared HRX repository builds against generated H3 and
 Krea headers and loads both model libraries in one process. Rustler remains an
 application adapter under `examples/rustler`.

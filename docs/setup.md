@@ -37,8 +37,7 @@ bash scripts/build_host.sh
 at a pinned mirror, and `HRX_OFFLINE` refuses the network outright. `HRX_LOOM_LIBRARY`
 selects a developer `libloomc.so` in place of the bundle’s.
 
-The build produces `build/libh3.so`, `build/h3` and `include/h3.h`, the last copied from what the Cargo build generated — an ordinary
-`cargo build` leaves the checkout alone. An installed binary carries the Loom
+The build produces `target/release/h3`, linked as `build/h3`. An installed binary carries the Loom
 sources and the tokenizer inside it and caches compiled kernels per user under
 `$XDG_CACHE_HOME/hrx`; `h3 --root DIR` opts back into a working tree's
 `h3/kernels/` and `build/kernel_cache` instead.

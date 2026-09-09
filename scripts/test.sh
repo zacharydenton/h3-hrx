@@ -6,10 +6,6 @@ case "${1:---cpu}" in --cpu) gpu=0;; --gpu|--quick) gpu=1;; *) echo 'usage: scri
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-generated_header=$(mktemp)
-trap 'rm -- "$generated_header"' EXIT
-cargo run --quiet -p h3 --example export_header > "$generated_header"
-diff -u include/h3.h "$generated_header"
 if [ "$gpu" = 1 ]; then
   cargo test -p h3 -- --ignored --test-threads=1
 fi

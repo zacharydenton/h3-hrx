@@ -20,7 +20,7 @@ Recorded on the Radeon 8060S on 2026-09-07: five seconds of audio at 32×32
 cost about 0.6 s per evaluation from text alone, or 1.1 s with a five-second
 voice reference. At 30 evaluations that is approximately 18 s or 33 s of
 **denoising**, excluding weight loading, text encoding, and decoding. A
-resident [C API session](abi.md) reuses loaded weights across requests.
+resident `Session` reuses loaded weights and compiled kernels across requests.
 
 ## Still images
 
@@ -46,7 +46,7 @@ still generates a clip before selecting the frame.
 - Positional images and audio files select ref2va. Images become `<Picture i>`
   and audio becomes `<Audio j>` in the prompt presentation.
 - Video references and keyframes beyond frame zero are exposed by the
-  [C API](abi.md), but not the CLI. Last-frame generation is unvalidated here.
+  Rust API, but not the CLI. Last-frame generation is unvalidated here.
 
 For reusable kernels and numerical results, see the
 [repository map](../CONTRIBUTING.md#repository-layout) and

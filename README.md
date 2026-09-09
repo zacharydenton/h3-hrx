@@ -54,7 +54,7 @@ bash scripts/build_host.sh
 
 The pinned native release includes the Loom consolidation fixes. It is hosted
 in the private HRX repository; the commands above prepare it locally. See
-[shared HRX integration](docs/shared-hrx.md) for overrides, offline use, C ABI and
+[shared HRX integration](docs/shared-hrx.md) for overrides, offline use and
 Rustler. Kernel sources and the tokenizer are embedded in installed binaries;
 the default compiler cache is in the writable per-user HRX cache. `--root`
 selects a developer source/cache tree explicitly.
@@ -112,14 +112,14 @@ With prompts written for the corresponding conditioning mode:
 
 Sizes must be multiples of 32; frame counts round up to `17n + 5`.
 The sampler defaults to `res_multistep` with the `simple` schedule and no
-classifier-free guidance. Video references are available through the C API,
+classifier-free guidance. Video references are available through the Rust API,
 but not the CLI.
 
 ## Documentation and development
 
 - [Setup](docs/setup.md) — dependencies, checkpoints, and configuration.
 - [Prompting](docs/prompting.md) and [other modes](docs/tricks.md) — references, audio, and stills.
-- [C API](docs/abi.md) and [examples](examples/README.md) — C, Rust, Go, and Elixir clients.
+- [Examples](examples/README.md) — the `h3` crate from Rust, and a Rustler adapter for Elixir.
 - [Contributing](CONTRIBUTING.md) — repository layout, tests, and benchmarking.
 - [Performance](docs/performance.md) and [research archive](docs/archive/README.md).
 

@@ -29,11 +29,11 @@ terse style, and why `R` is bound to this module: the stack checks call the refe
 from __future__ import annotations
 
 import argparse
-import ctypes
 import json
 import math
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -64,239 +64,59 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 # --------------------------------------------------------------------------------------------------
-# The C ABI: libh3.so through ctypes
+# The host, through the parity_dump example
 # --------------------------------------------------------------------------------------------------
 
-_ABI = 9
-_F32P, _U8P, _I32P = ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_int32)
-PROGRESS = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_double)
-
-
-class Config(ctypes.Structure):
-    _fields_ = [("dit_file", ctypes.c_char_p), ("te_file", ctypes.c_char_p), ("video_vae_file", ctypes.c_char_p), ("audio_vae_file", ctypes.c_char_p),
-                ("kernel_sources", ctypes.c_char_p), ("cache_dir", ctypes.c_char_p), ("loom_library", ctypes.c_char_p), ("attn_qk_bits", ctypes.c_int)]
-
-
-MODELS = Path(os.environ.get("H3_MODELS") or Path.home() / "comfy-models")   # ComfyUI's models directory: the four checkpoints, read as they are
+MODELS = Path(os.environ.get("H3_MODELS") or Path.home() / "comfy-models")
 DIT = MODELS / "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"
-REF2VA = MODELS / "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+DIT_REF = MODELS / "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"
 TE = MODELS / "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
 VIDEO_VAE = MODELS / "vae/minimax_h3_video_vae_fp16.safetensors"
 AUDIO_VAE = MODELS / "vae/minimax_h3_audio_vae_fp32.safetensors"
 
-
-class Ref(ctypes.Structure):
-    _fields_ = [("kind", ctypes.c_int), ("video_latent", _F32P), ("latent_t", ctypes.c_int), ("lat_h", ctypes.c_int), ("lat_w", ctypes.c_int), ("audio_latent", _F32P), ("audio_t", ctypes.c_int), ("pixels", _F32P), ("height", ctypes.c_int), ("width", ctypes.c_int)]
-
-
-class Keyframe(ctypes.Structure):
-    _fields_ = [("frame_index", ctypes.c_int), ("video_latent", _F32P), ("pixels", _F32P), ("height", ctypes.c_int), ("width", ctypes.c_int), ("audio_latent", _F32P), ("audio_t", ctypes.c_int)]
-
-
-class Params(ctypes.Structure):
-    _fields_ = [("height", ctypes.c_int), ("width", ctypes.c_int), ("frames", ctypes.c_int), ("steps", ctypes.c_int), ("seed", ctypes.c_uint64),
-                ("video_shift", ctypes.c_float), ("audio_shift", ctypes.c_float), ("sampler", ctypes.c_int), ("cache_threshold", ctypes.c_float)]
-
-
-class Shape(ctypes.Structure):
-    _fields_ = [("frames", ctypes.c_int), ("latent_t", ctypes.c_int), ("lat_h", ctypes.c_int), ("lat_w", ctypes.c_int), ("audio_t", ctypes.c_int), ("text_rows_max", ctypes.c_int)]
+DUMP = ROOT / "target/release/examples/parity_dump"
 
 
 class H3Error(RuntimeError):
     pass
 
 
-def _f32(value, name: str, ndim, last=None, first=None) -> np.ndarray:
-    """A contiguous float32 array whose rank (one of `ndim`) and leading/trailing extents match, or a ValueError naming it.
-    Every array crosses the C boundary as a raw pointer, so the shape is checked here explicitly (never by assert: python -O drops those)."""
-    x = np.ascontiguousarray(np.asarray(value, dtype=np.float32))
-    dims = (ndim,) if isinstance(ndim, int) else tuple(ndim)
-    if x.ndim not in dims: raise ValueError(f"{name} must have {' or '.join(map(str, dims))} dimensions, got shape {x.shape}")
-    if first is not None and tuple(x.shape[:len(first)]) != tuple(first): raise ValueError(f"{name} must start with shape {tuple(first)}, got {x.shape}")
-    if last is not None and x.shape[-1] != last: raise ValueError(f"{name} must end in {last} channels, got shape {x.shape}")
-    if x.size == 0: raise ValueError(f"{name} is empty: shape {x.shape}")
-    return x
+def host(command: str, out: Path, dumps: Path | None = None, env: dict | None = None, **flags) -> Path:
+    """Run one `parity_dump` command. Python never links the library: it writes the inputs as files,
+    the host writes its artefacts as files, and everything below reads them back. There is no
+    foreign-function boundary here to drift out of step with the crate."""
+    if not DUMP.is_file():
+        raise H3Error(f"{DUMP} is missing; cargo build --release -p h3 --example parity_dump")
+    argv = [str(DUMP), command, "--out", str(out)]
+    for key, value in flags.items():
+        if value is None:
+            continue
+        argv += [f"--{key.replace('_', '-')}", str(value)]
+    environment = dict(os.environ)
+    environment.update(env or {})
+    if dumps is not None:
+        dumps.mkdir(parents=True, exist_ok=True)
+        environment["H3_DUMP_BLOCKS"] = str(dumps)
+        environment["H3_DUMP_CALL"] = "0"
+    out.mkdir(parents=True, exist_ok=True)
+    done = subprocess.run(argv, capture_output=True, text=True, env=environment)
+    if done.returncode:
+        raise H3Error((done.stderr or done.stdout).strip() or f"{command} exited {done.returncode}")
+    return out
 
 
-def _canvas(name: str, height: int, width: int, limit: int = 2048):
-    if height % 32 or width % 32 or height < 32 or width < 32 or height > limit or width > limit:
-        raise ValueError(f"{name} height and width must be multiples of 32 up to {limit}, got {height}x{width}")
+def host_shape(height: int, width: int, frames: int) -> dict:
+    """The model's own sizing, so nothing here reimplements the 17n+5 snapping or the /16 grids."""
+    argv = [str(DUMP), "shape", "--height", str(height), "--width", str(width), "--frames", str(frames)]
+    done = subprocess.run(argv, capture_output=True, text=True)
+    if done.returncode:
+        raise H3Error((done.stderr or done.stdout).strip())
+    return json.loads(done.stdout)
 
 
-def _last_error(lib) -> str:
-    """The library's message for the last failing call on this thread."""
-    lib.h3_last_error.restype = ctypes.c_char_p
-    return (lib.h3_last_error() or b"").decode(errors="replace") or "unknown error"
-
-
-class H3:
-    def __init__(self, dit=None, te=None, video_vae=None, audio_vae=None, cache=None, library=None, attn="i8"):
-        """The four ComfyUI checkpoints as they are (h3_loom.DIT / REF2VA / TE / VIDEO_VAE / AUDIO_VAE are the defaults under
-        $H3_MODELS or ~/comfy-models); attn: the DiT attention's QK^T operands, "f16", "i8" (the parity path) or "i4" (int4 ghosts conditioned clips, docs/archive/notes.md)."""
-        native = ctypes.CDLL(str(library or os.environ.get("H3_LIB") or ROOT / "build/libh3.so"))   # H3_LIB=<path> selects another build
-        native.h3_abi_version.restype = ctypes.c_uint32
-        native.h3_last_error.restype = ctypes.c_char_p
-        if native.h3_abi_version() != _ABI: raise H3Error("ABI mismatch; rebuild with scripts/build_host.sh")
-        native.h3_create.argtypes = [ctypes.POINTER(Config), ctypes.POINTER(ctypes.c_void_p)]
-        native.h3_destroy.argtypes = [ctypes.c_void_p]
-        native.h3_shape_for.argtypes = [ctypes.POINTER(Params), ctypes.POINTER(Shape)]
-        native.h3_text_in.argtypes = [ctypes.c_void_p, _I32P, ctypes.c_int, _F32P, ctypes.c_size_t]
-        native.h3_decode_video.argtypes = [ctypes.c_void_p, ctypes.POINTER(Params), _F32P, ctypes.c_size_t, _U8P, ctypes.c_size_t]
-        native.h3_decode_audio.argtypes = [ctypes.c_void_p, _F32P, ctypes.c_size_t, ctypes.c_int, _F32P, ctypes.c_size_t]
-        native.h3_denoise.argtypes = [ctypes.c_void_p, _I32P, ctypes.c_int, ctypes.POINTER(Params), ctypes.POINTER(Keyframe), ctypes.c_int, ctypes.POINTER(Ref), ctypes.c_int, _F32P, _F32P, _F32P, ctypes.c_size_t, _F32P, ctypes.c_size_t, PROGRESS, ctypes.c_void_p]
-        native.h3_encode_video.argtypes = [ctypes.c_void_p, _F32P, ctypes.c_int, ctypes.c_int, ctypes.c_int, _F32P, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int)]
-        native.h3_vision_embed.argtypes = [ctypes.c_void_p, _F32P, ctypes.c_int, ctypes.c_int, _F32P, ctypes.c_size_t, _F32P, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int)]
-        native.h3_encode_audio.argtypes = [ctypes.c_void_p, _F32P, ctypes.c_int, _F32P, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int)]
-        self._native = native
-        cfg = Config(os.fsencode(dit or DIT), os.fsencode(te or TE), os.fsencode(video_vae or VIDEO_VAE), os.fsencode(audio_vae or AUDIO_VAE),
-                     os.fsencode(ROOT / "h3/kernels"), os.fsencode(cache or ROOT / "build/kernel_cache"), os.fsencode(os.environ.get("HRX_LOOM_LIBRARY", "")), {"i4": 4, "i8": 8, "f16": 16}[attn])
-        handle = ctypes.c_void_p()
-        if native.h3_create(ctypes.byref(cfg), ctypes.byref(handle)): raise H3Error(_last_error(native))
-        self._handle = handle
-
-    def close(self):
-        if getattr(self, "_handle", None): self._native.h3_destroy(self._handle); self._handle = None
-
-    def __del__(self):
-        try: self.close()
-        except Exception: pass
-
-    @staticmethod
-    def params(height=480, width=864, frames=124, steps=31, seed=0, video_shift=0.0, audio_shift=0.0, cache_threshold=0.0, sampler="res_multistep") -> Params:
-        """steps = sigma grid points (steps - 1 evaluations); the defaults are res_multistep on the simple schedule with 30 evaluations (ComfyUI's stock workflows use 20)."""
-        return Params(height, width, frames, steps, seed, video_shift, audio_shift, {"euler": 0, "res_multistep": 1}[sampler], cache_threshold)
-
-    def shape(self, p: Params) -> Shape:
-        s = Shape()
-        if self._native.h3_shape_for(ctypes.byref(p), ctypes.byref(s)): raise ValueError(f"invalid parameters: height and width must be multiples of 32, frames >= 1 (got {p.height}x{p.width}, {p.frames} frames)")
-        return s
-
-    def text_in(self, ids) -> np.ndarray:
-        ids = np.ascontiguousarray(np.asarray(ids, dtype=np.int32)); out = np.zeros((ids.size, 5376), np.float32)
-        if self._native.h3_text_in(self._handle, ids.ctypes.data_as(_I32P), ids.size, out.ctypes.data_as(_F32P), out.size): raise H3Error(_last_error(self._native))
-        return out
-
-    def denoise(self, ids, p: Params, noise_video=None, noise_audio=None, progress=None, refs=None, keyframes=None):
-        """-> (video latents [24][T][H][W], audio latents [2][32][audio_t]) in model space. refs: list of dicts in presentation
-        order, {"kind": "image"|"audio"|"video", "video": [24][T][h][w] latents, "audio": [2][32][audio_t] latents} (ref2va)."""
-        ids = np.ascontiguousarray(np.asarray(ids, dtype=np.int32)).ravel(); s = self.shape(p)
-        if ids.size < 1: raise ValueError("ids must hold at least one token")
-        video = np.zeros((24, s.latent_t, s.lat_h, s.lat_w), np.float32); audio = np.zeros((2, 32, s.audio_t), np.float32)
-        nv = None if noise_video is None else _f32(noise_video, "noise_video", 4, first=video.shape)
-        na = None if noise_audio is None else _f32(noise_audio, "noise_audio", 3, first=audio.shape)
-        cb = PROGRESS(lambda user, step, steps, sec: int(bool(progress(step, steps, sec))) if progress else 0)
-        keep = []; rarr = (Ref * max(1, len(refs or [])))()
-        for i, r in enumerate(refs or []):
-            if r.get("kind") not in ("image", "audio", "video"): raise ValueError(f"ref {i} kind must be image, audio or video, got {r.get('kind')!r}")
-            kind = {"image": 0, "audio": 1, "video": 2}[r["kind"]]; rarr[i].kind = kind
-            if kind != 1:
-                v = _f32(r.get("video"), f"ref {i} video latents", 4, first=(24,)); keep.append(v)
-                if kind == 0 and v.shape[1] != 1: raise ValueError(f"ref {i} image latents must have shape [24][1][lat_h][lat_w], got {v.shape}")
-                if v.shape[2] < 2 or v.shape[3] < 2 or v.shape[2] % 2 or v.shape[3] % 2: raise ValueError(f"ref {i} video latents need even lat_h and lat_w of at least 2, got {v.shape}")
-                rarr[i].video_latent = v.ctypes.data_as(_F32P); rarr[i].latent_t, rarr[i].lat_h, rarr[i].lat_w = int(v.shape[1]), int(v.shape[2]), int(v.shape[3])
-            if kind == 0 and r.get("pixels") is not None:
-                px = _f32(r["pixels"], f"ref {i} pixels", 3, last=3); _canvas(f"ref {i} pixels", px.shape[0], px.shape[1]); keep.append(px)
-                if (px.shape[0] // 16, px.shape[1] // 16) != (int(v.shape[2]), int(v.shape[3])): raise ValueError(f"ref {i} pixels {px.shape[:2]} do not match its latents {v.shape}")
-                rarr[i].pixels = px.ctypes.data_as(_F32P); rarr[i].height, rarr[i].width = int(px.shape[0]), int(px.shape[1])
-            if kind == 1 and r.get("audio") is None: raise ValueError(f"ref {i} audio needs audio latents")
-            if kind != 0 and r.get("audio") is not None:
-                a = _f32(r["audio"], f"ref {i} audio latents", 3, first=(2, 32)); keep.append(a)
-                rarr[i].audio_latent = a.ctypes.data_as(_F32P); rarr[i].audio_t = int(a.shape[2])
-        karr = (Keyframe * max(1, len(keyframes or [])))()
-        for i, k in enumerate(keyframes or []):
-            karr[i].frame_index = int(k["frame_index"])
-            v = np.ascontiguousarray(np.asarray(k.get("video"), dtype=np.float32))
-            expected = (24, 1, s.lat_h, s.lat_w)
-            if v.shape != expected: raise ValueError(f"keyframe video must have shape {expected}, got {v.shape}")
-            keep.append(v); karr[i].video_latent = v.ctypes.data_as(_F32P)
-            if k.get("pixels") is not None:
-                px = np.ascontiguousarray(np.asarray(k["pixels"], dtype=np.float32))
-                if px.ndim != 3 or px.shape[2] != 3 or px.shape[0] != p.height or px.shape[1] != p.width: raise ValueError(f"keyframe pixels must have shape [{p.height}][{p.width}][3] (the canvas), got {px.shape}")
-                keep.append(px); karr[i].pixels = px.ctypes.data_as(_F32P); karr[i].height, karr[i].width = int(px.shape[0]), int(px.shape[1])
-            if k.get("audio") is not None:
-                a = np.ascontiguousarray(np.asarray(k["audio"], dtype=np.float32))
-                if a.ndim != 3 or a.shape[:2] != (2, 32) or a.shape[2] < 1: raise ValueError("keyframe audio must have shape [2][32][audio_t >= 1]")
-                keep.append(a); karr[i].audio_latent = a.ctypes.data_as(_F32P); karr[i].audio_t = int(a.shape[2])
-        rc = self._native.h3_denoise(self._handle, ids.ctypes.data_as(_I32P), ids.size, ctypes.byref(p),
-                                     karr if keyframes else None, len(keyframes or []),
-                                     rarr if refs else None, len(refs or []),
-                                     None if nv is None else nv.ctypes.data_as(_F32P), None if na is None else na.ctypes.data_as(_F32P),
-                                     video.ctypes.data_as(_F32P), video.size, audio.ctypes.data_as(_F32P), audio.size, cb, None)
-        if rc: raise H3Error(_last_error(self._native))
-        return video, audio
-
-    def decode_video(self, p: Params, video) -> np.ndarray:
-        s = self.shape(p); v = _f32(video, "video latents", 4, first=(24, s.latent_t, s.lat_h, s.lat_w)); frames = np.zeros((s.frames, p.height, p.width, 3), np.uint8)
-        if self._native.h3_decode_video(self._handle, ctypes.byref(p), v.ctypes.data_as(_F32P), v.size, frames.ctypes.data_as(_U8P), frames.size): raise H3Error(_last_error(self._native))
-        return frames
-
-    def encode_video(self, pixels) -> np.ndarray:
-        """pixels [frames][H][W][3] (or [H][W][3]) in [0, 1] -> model-space video latents [24][latent_t][H/16][W/16] from the VAE encoder in Loom."""
-        x = _f32(pixels, "pixels", (3, 4), last=3); x = x[None] if x.ndim == 3 else x; F, H, W = int(x.shape[0]), int(x.shape[1]), int(x.shape[2]); _canvas("pixels", H, W)
-        TL = 1 if F == 1 else 5 * ((F + 16) // 17) - 3; z = np.zeros((24, TL, H // 16, W // 16), np.float32); t = ctypes.c_int(0)
-        if self._native.h3_encode_video(self._handle, x.ctypes.data_as(_F32P), F, H, W, z.ctypes.data_as(_F32P), z.size, ctypes.byref(t)): raise H3Error(_last_error(self._native))
-        return z[:, :t.value]
-
-    def vision_embed(self, pixels):
-        """pixels [H][W][3] in [0, 1] (H, W multiples of 32) -> (merged [tokens][5120], deepstack [3][tokens][5120]) from the vision tower."""
-        x = _f32(pixels, "pixels", 3, last=3); H, W = int(x.shape[0]), int(x.shape[1]); _canvas("pixels", H, W); m = (H // 32) * (W // 32)
-        merged = np.zeros((m, 5120), np.float32); ds = np.zeros((3, m, 5120), np.float32); t = ctypes.c_int(0)
-        if self._native.h3_vision_embed(self._handle, x.ctypes.data_as(_F32P), H, W, merged.ctypes.data_as(_F32P), merged.size, ds.ctypes.data_as(_F32P), ds.size, ctypes.byref(t)): raise H3Error(_last_error(self._native))
-        return merged, ds
-
-    def encode_audio(self, samples) -> np.ndarray:
-        """Stereo float samples [2][n] at 32 kHz -> model-space audio latents [2][32][ceil(n / 800)] (the audio VAE's encoder in Loom)."""
-        x = _f32(samples, "samples", 2, first=(2,))
-        n = x.shape[1]; T = (n + 799) // 800; z = np.zeros((2, 32, T), np.float32); t_out = ctypes.c_int(0)
-        if self._native.h3_encode_audio(self._handle, x.ctypes.data_as(_F32P), n, z.ctypes.data_as(_F32P), z.size, ctypes.byref(t_out)): raise H3Error(_last_error(self._native))
-        return z[:, :, :t_out.value]
-
-    def decode_audio(self, audio) -> np.ndarray:
-        a = _f32(audio, "audio latents", 3, first=(2, 32)); audio_t = a.shape[-1]; samples = np.zeros((2, audio_t * 800), np.float32)
-        if self._native.h3_decode_audio(self._handle, a.ctypes.data_as(_F32P), a.size, audio_t, samples.ctypes.data_as(_F32P), samples.size): raise H3Error(_last_error(self._native))
-        return samples
-
-
-# --------------------------------------------------------------------------------------------------
-# Prompt ids, and H3's reference presentation
-# --------------------------------------------------------------------------------------------------
-
-VISION_START, VISION_END = 151652, 151653
-_lib = None
-def _native():
-    """The tokenizer in libh3.so. NULL selects the vocabulary compiled into the library."""
-    global _lib
-    if _lib is None:
-        _lib = ctypes.CDLL(str(os.environ.get("H3_LIB") or ROOT / "build/libh3.so"))
-        _lib.h3_tokenizer_create.restype = ctypes.c_void_p
-        _lib.h3_tokenizer_create.argtypes = [ctypes.c_char_p]
-        _lib.h3_tokenizer_encode.restype = ctypes.c_int
-        _lib.h3_tokenizer_encode.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_size_t]
-        _lib.h3_last_error.restype = ctypes.c_char_p
-        _lib._tok = _lib.h3_tokenizer_create(None)
-        if not _lib._tok:
-            raise RuntimeError(_lib.h3_last_error().decode())
-    return _lib
-
-
-def encode_text(text: str) -> list:
-    """h3_tokenizer_encode returns the count the text needs even when the buffer is smaller: size the buffer to it."""
-    lib = _native(); utf8 = text.encode("utf-8"); cap = 8192; buf = (ctypes.c_int32 * cap)(); n = lib.h3_tokenizer_encode(lib._tok, utf8, buf, cap)
-    if n < 0: raise RuntimeError("h3_tokenizer_encode failed")
-    if n > cap:
-        cap = n; buf = (ctypes.c_int32 * cap)()
-        if lib.h3_tokenizer_encode(lib._tok, utf8, buf, cap) != n: raise RuntimeError("h3_tokenizer_encode failed")
-    return [int(buf[i]) for i in range(n)]
-def encode_presentation(prompt: str, images=(), audios: int = 0, videos=()) -> list:
-    """images: merged vision token counts per reference image; videos: lists of (token_count, timestamp) per block."""
-    ids = []
-    for i, n in enumerate(images):
-        ids += encode_text("<Picture %d>: " % (i + 1)) + [VISION_START] + [-1] * int(n) + [VISION_END]
-    for k, blocks in enumerate(videos):
-        ids += encode_text("<Video %d>: " % (k + 1))
-        for n, ts in blocks: ids += encode_text("<%.1f seconds>" % ts) + [VISION_START] + [-1] * int(n) + [VISION_END]
-    for j in range(audios): ids += encode_text("<Audio %d>: " % (j + 1))
-    return ids + encode_text(prompt)
+def read_f32(path: Path, width: int | None = None) -> np.ndarray:
+    values = np.fromfile(path, dtype=np.float32)
+    return values.reshape(-1, width) if width else values
 
 
 # --------------------------------------------------------------------------------------------------
@@ -725,19 +545,28 @@ def compare(a) -> list:
 
     D = Path(a.truth); dit = a.dit or str(DIT)
     dump = Path(a.dump or D / f"mine_{Path(dit).stem}_{a.attn}"); dump.mkdir(parents=True, exist_ok=True)
-    os.environ["H3_DUMP_DIR"] = str(dump)
-    if a.mode == "blocks": os.environ["H3_DUMP_BLOCKS"] = str(dump)
-    pipe = H3(dit=dit, attn=a.attn)
-    p = H3.params(height=a.height, width=a.width, frames=a.frames, steps=2 if a.mode == "blocks" else 21, seed=a.seed, sampler="res_multistep"); sh = pipe.shape(p)
+    work = dump / "host"; work.mkdir(parents=True, exist_ok=True)
+    sh = host_shape(a.height, a.width, a.frames)
+    steps = 2 if a.mode == "blocks" else 21
     nv = np.load(D / "noise_video.npy").astype(np.float32); na = np.load(D / "noise_audio.npy").astype(np.float32)   # ComfyUI's pack: video [24,T,H,W], audio [32, 2, A]
-    kfs, toks = [], []
+    nv.tofile(work / "nv.f32")
+    np.ascontiguousarray(na.transpose(1, 0, 2)).tofile(work / "na.f32")   # the host takes [2][32][A]
+    keyframe = {}
     if a.case == "fl2va":
         img = np.asarray(Image.open(a.first_frame).convert("RGB").resize((a.width, a.height), Image.BILINEAR), dtype=np.float32) / 255.0
-        z = pipe.encode_video(img); kfs.append({"frame_index": 0, "video": z, "pixels": img}); toks.append((a.height // 32) * (a.width // 32))
-    ids = np.asarray(encode_presentation(a.prompt, images=toks, audios=0), np.int32)
-    t0 = time.time(); v, au = pipe.denoise(ids, p, noise_video=nv, noise_audio=np.ascontiguousarray(na.transpose(1, 0, 2)), keyframes=kfs); emit(f"C denoised in {time.time() - t0:.1f} s ({Path(dit).stem}, {a.attn} attention)", flush=True)
+        img.tofile(work / "kf.f32")
+        host("encode", work, pixels=work / "kf.f32", height=a.height, width=a.width, dit=dit, attn=a.attn)
+        keyframe = {"keyframe": work / "kf.f32", "keyframe_latents": work / "latents.f32"}
+    env = {"H3_DUMP_DIR": str(dump)}   # the per-evaluation trajectory; the residual stream is H3_DUMP_BLOCKS
+    t0 = time.time()
+    host("denoise", work, dumps=dump if a.mode == "blocks" else None, env=env,
+         prompt=a.prompt, height=a.height, width=a.width, frames=a.frames, steps=steps,
+         seed=a.seed, sampler="res_multistep", dit=dit, attn=a.attn,
+         noise_video=work / "nv.f32", noise_audio=work / "na.f32", **keyframe)
+    emit(f"host denoised in {time.time() - t0:.1f} s ({Path(dit).stem}, {a.attn} attention)", flush=True)
+    ids = np.fromfile(work / "ids.i32", dtype=np.int32)
     cos = lambda x, y: float((x * y).sum() / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-30))
-    T, Hh, Ww = sh.latent_t, sh.lat_h, sh.lat_w
+    T, Hh, Ww = sh["latent_t"], sh["lat_h"], sh["lat_w"]
     if a.mode == "trajectory":
         for k in range(0, 20):
             c = np.fromfile(dump / f"x_{k:02d}.f32", dtype=np.float32).reshape(24, T, Hh, Ww).astype(np.float64); y = np.load(D / f"x_{k:02d}.npy").astype(np.float64)
@@ -745,8 +574,10 @@ def compare(a) -> list:
         c = np.fromfile(dump / "x_20.f32", dtype=np.float32).reshape(24, T, Hh, Ww).astype(np.float64); y = np.load(D / "video_latent.npy").astype(np.float64)
         emit(f"final: cosine {cos(c, y):.4f}  rel err {np.linalg.norm(c - y) / np.linalg.norm(y):.4f}", flush=True)
     else:
-        L = len(ids); Na = sh.audio_t * 2; Nv = sh.latent_t * (sh.lat_h // 2) * (sh.lat_w // 2)
-        txt = pipe.text_in(ids).astype(np.float64); ref = np.load(D / "blocks/refined_text.npy").astype(np.float64).reshape(-1, txt.shape[-1])
+        L = len(ids); Na = sh["audio_t"] * 2; Nv = sh["latent_t"] * (sh["lat_h"] // 2) * (sh["lat_w"] // 2)
+        host("text", work, prompt=a.prompt, dit=dit, attn=a.attn)
+        txt = read_f32(work / "text_in.f32", HIDDEN).astype(np.float64)
+        ref = np.load(D / "blocks/refined_text.npy").astype(np.float64).reshape(-1, txt.shape[-1])
         emit(f"refined text: cosine {cos(txt, ref):.5f} rel err {np.linalg.norm(txt - ref) / np.linalg.norm(ref):.4f}", flush=True)
         segs = {"text": (0, L), "audio": (L, L + Na), "video": (L + Na, L + Na + Nv)}
         for i in [int(x) for x in a.block_ids.split(",")]:
@@ -818,18 +649,22 @@ def dumped(dump, tag, name, width):
 def stack_dit(depths, tokens_hw):
     """The DiT stack: the host's packed rows through the PyTorch reference above (the same int8 checkpoint, dequantised)."""
     height, width, frames = tokens_hw
+    prompt = "A red fox trotting through a snowy forest at dawn, cinematic"
     with tempfile.TemporaryDirectory(prefix="h3-dit-parity-") as tmp:
-        os.environ["H3_DUMP_BLOCKS"] = tmp; os.environ["H3_DUMP_CALL"] = "0"
-        pipe = H3()
-        ids = np.asarray(encode_presentation("A red fox trotting through a snowy forest at dawn, cinematic"), np.int32)
-        p = H3.params(height=height, width=width, frames=frames, steps=2, seed=1); s = pipe.shape(p)
+        tmp = Path(tmp)
+        s = host_shape(height, width, frames)
         rng = np.random.default_rng(1)
-        nv = rng.standard_normal((24, s.latent_t, s.lat_h, s.lat_w)).astype(np.float32); na = rng.standard_normal((2, 32, s.audio_t)).astype(np.float32)
-        t0 = time.time(); pipe.denoise(ids, p, noise_video=nv, noise_audio=na); print(f"C evaluation in {time.time() - t0:.1f} s")
-        pipe.close()
-        x0 = dumped(Path(tmp), "dit", "h_in", R.HIDDEN)
-        want_last = {d: dumped(Path(tmp), "dit", f"blk_{d - 1:02d}", R.HIDDEN) for d in depths}
-    layout = R.Layout(ids.size, s.latent_t, s.lat_h, s.lat_w, s.audio_t)
+        nv = rng.standard_normal((24, s["latent_t"], s["lat_h"], s["lat_w"])).astype(np.float32)
+        na = rng.standard_normal((2, 32, s["audio_t"])).astype(np.float32)
+        nv.tofile(tmp / "nv.f32"); na.tofile(tmp / "na.f32")
+        t0 = time.time()
+        host("denoise", tmp, dumps=tmp, prompt=prompt, height=height, width=width, frames=frames,
+             steps=2, seed=1, noise_video=tmp / "nv.f32", noise_audio=tmp / "na.f32")
+        print(f"host evaluation in {time.time() - t0:.1f} s")
+        ids = np.fromfile(tmp / "ids.i32", dtype=np.int32)
+        x0 = dumped(tmp, "dit", "h_in", R.HIDDEN)
+        want_last = {d: dumped(tmp, "dit", f"blk_{d - 1:02d}", R.HIDDEN) for d in depths}
+    layout = R.Layout(ids.size, s["latent_t"], s["lat_h"], s["lat_w"], s["audio_t"])
     ckpt = R.Checkpoint(device="cuda", dtype=torch.bfloat16); ref = R.H3Ref(ckpt, quant="none")
     cos, sin = R.rope_tables(layout.position_ids, ref.inv_freq, "cuda"); rows = layout.adaln_rows.to("cuda")
     from diffusers import MiniMaxH3Scheduler
@@ -853,12 +688,13 @@ def stack_dit(depths, tokens_hw):
 def stack_te(depths):
     """The text encoder: the host's embedding rows through transformers' bf16 layers on the same checkpoint's weights."""
     cache = ROOT / "build/te_hidden.pt"
-    ids = np.asarray(encode_presentation("A red fox trotting through a snowy forest at dawn, cinematic"), np.int32)
     with tempfile.TemporaryDirectory(prefix="h3-te-parity-") as tmp:
-        os.environ["H3_DUMP_BLOCKS"] = tmp; os.environ["H3_DUMP_CALL"] = "0"
-        pipe = H3(); t0 = time.time(); pipe.text_in(ids); print(f"C text_in in {time.time() - t0:.1f} s"); pipe.close()
-        got = {d: dumped(Path(tmp), "te", f"blk_{d - 1:02d}", 5120) for d in depths}
-        x0 = dumped(Path(tmp), "te", "h_in", 5120)
+        tmp = Path(tmp)
+        t0 = time.time()
+        host("text", tmp, dumps=tmp, prompt="A red fox trotting through a snowy forest at dawn, cinematic")
+        print(f"host text_in in {time.time() - t0:.1f} s")
+        got = {d: dumped(tmp, "te", f"blk_{d - 1:02d}", TEXT_DIM) for d in depths}
+        x0 = dumped(tmp, "te", "h_in", TEXT_DIM)
     if not cache.exists():
         print(f"SKIP: no {cache} (the transformers reference: see docs/archive/notes.md, the text encoder)"); return True
     want = torch.load(cache)   # [layers + 1][tokens][5120] bf16 hidden states from transformers on the same ids
@@ -918,11 +754,13 @@ def vae_parity(a) -> int:
         return 1
     frames = (t - 2) // 5 * 17 + 5
 
-    pipe = H3(dit="/unused/dit.safetensors", te="/unused/te.safetensors")
-    try:
-        got = pipe.decode_video(pipe.params(height=h * 16, width=w * 16, frames=frames), z)
-    finally:
-        pipe.close()
+    with tempfile.TemporaryDirectory(prefix="h3-vae-parity-") as tmp:
+        tmp = Path(tmp)
+        z.tofile(tmp / "latents.f32")
+        # a decoder-only run: the DiT and text checkpoints are never opened
+        host("decode", tmp, latents=tmp / "latents.f32", height=h * 16, width=w * 16,
+             frames=frames, dit="/unused/dit.safetensors", te="/unused/te.safetensors")
+        got = np.fromfile(tmp / "frames.rgb", dtype=np.uint8).reshape(frames, h * 16, w * 16, 3)
 
     vae, config = official_vae(Path(a.official), a.device)
     with torch.no_grad():
@@ -1019,31 +857,27 @@ def dit_parity(a) -> int:
         directory = snapshots[-1]
 
     depths = [int(x) for x in a.depths.split(",") if x]
+    prompt = "A red fox trotting through a snowy forest at dawn, cinematic"
     with tempfile.TemporaryDirectory(prefix="h3-dit-official-") as tmp:
-        os.environ["H3_DUMP_BLOCKS"] = tmp
-        os.environ["H3_DUMP_CALL"] = "0"
-        pipe = H3()
-        ids = np.asarray(
-            encode_presentation("A red fox trotting through a snowy forest at dawn, cinematic"),
-            np.int32,
-        )
-        p = H3.params(height=a.height, width=a.width, frames=a.frames, steps=2, seed=1)
-        shape = pipe.shape(p)
+        tmp = Path(tmp)
+        shape = host_shape(a.height, a.width, a.frames)
         rng = np.random.default_rng(1)
         nv = rng.standard_normal(
-            (24, shape.latent_t, shape.lat_h, shape.lat_w)
+            (24, shape["latent_t"], shape["lat_h"], shape["lat_w"])
         ).astype(np.float32)
-        na = rng.standard_normal((2, 32, shape.audio_t)).astype(np.float32)
+        na = rng.standard_normal((2, 32, shape["audio_t"])).astype(np.float32)
+        nv.tofile(tmp / "nv.f32")
+        na.tofile(tmp / "na.f32")
         started = time.time()
-        pipe.denoise(ids, p, noise_video=nv, noise_audio=na)
+        host("denoise", tmp, dumps=tmp, prompt=prompt, height=a.height, width=a.width,
+             frames=a.frames, steps=2, seed=1,
+             noise_video=tmp / "nv.f32", noise_audio=tmp / "na.f32")
         print(f"host evaluation in {time.time() - started:.1f} s")
-        pipe.close()
-        x0 = dumped(Path(tmp), "dit", "h_in", HIDDEN)
-        want = dict(
-            (d, dumped(Path(tmp), "dit", f"blk_{d - 1:02d}", HIDDEN)) for d in depths
-        )
+        ids = np.fromfile(tmp / "ids.i32", dtype=np.int32)
+        x0 = dumped(tmp, "dit", "h_in", HIDDEN)
+        want = dict((d, dumped(tmp, "dit", f"blk_{d - 1:02d}", HIDDEN)) for d in depths)
 
-    layout = Layout(ids.size, shape.latent_t, shape.lat_h, shape.lat_w, shape.audio_t)
+    layout = Layout(ids.size, shape["latent_t"], shape["lat_h"], shape["lat_w"], shape["audio_t"])
     model, index, tensor = official_transformer(directory, a.device)
     from diffusers import MiniMaxH3Scheduler
 
@@ -1217,16 +1051,12 @@ def te_parity(a) -> int:
 
     depths = [int(x) for x in a.depths.split(",") if x]
     with tempfile.TemporaryDirectory(prefix="h3-te-official-") as tmp:
-        os.environ["H3_DUMP_BLOCKS"] = tmp
-        os.environ["H3_DUMP_CALL"] = "0"
-        ids = np.asarray(encode_presentation(a.prompt), np.int32)
-        pipe = H3()
+        tmp = Path(tmp)
         started = time.time()
-        pipe.text_in(ids)
+        host("text", tmp, dumps=tmp, prompt=a.prompt)
         print(f"host text_in in {time.time() - started:.1f} s")
-        pipe.close()
-        x0 = dumped(Path(tmp), "te", "h_in", TEXT_DIM)
-        want = dict((d, dumped(Path(tmp), "te", f"blk_{d - 1:02d}", TEXT_DIM)) for d in depths)
+        x0 = dumped(tmp, "te", "h_in", TEXT_DIM)
+        want = dict((d, dumped(tmp, "te", f"blk_{d - 1:02d}", TEXT_DIM)) for d in depths)
 
     config = AutoConfig.from_pretrained(str(directory))
     text = getattr(config, "text_config", config)

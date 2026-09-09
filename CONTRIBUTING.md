@@ -17,8 +17,8 @@ and caches the compiler and runtime. `HRX_OFFLINE=1` requires an existing bundle
 
 Use the shared HRX crate for native loading, allocation, scalar packing, dispatch,
 compilation, caching and FFI guards. Model code owns its source selection, shapes,
-weight layout and numerical semantics. Preserve the generated C ABI and keep
-Rustler adapters in the consuming application.
+weight layout and numerical semantics. `Session` is the interface; keep Rustler
+adapters in the consuming application.
 
 See [test coverage](docs/testing.md) for the numerical cases and remaining limits.
 Record dimensions, precision, toolchain and GPU when reporting performance.

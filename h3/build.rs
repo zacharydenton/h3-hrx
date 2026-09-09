@@ -1,18 +1,8 @@
-//! Headers and embedded model sources; no native linker paths or build downloads.
+//! The embedded Loom sources; no headers, no native linker paths, no build downloads.
 use std::{fs, path::PathBuf};
 fn main() {
     let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-    println!("cargo:rerun-if-changed=src/capi.rs");
-    println!("cargo:rerun-if-changed=cbindgen.toml");
-    let config = cbindgen::Config::from_file(root.join("cbindgen.toml"))
-        .expect("valid C header configuration");
-    let bindings = cbindgen::Builder::new()
-        .with_src(root.join("src/capi.rs"))
-        .with_config(config)
-        .generate()
-        .expect("generate H3 C ABI header");
-    bindings.write_to_file(out.join("h3.h"));
     let kernels = root.join("kernels");
     println!("cargo:rerun-if-changed={}", kernels.display());
     let mut entries: Vec<_> = fs::read_dir(&kernels)

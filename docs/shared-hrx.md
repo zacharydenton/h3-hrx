@@ -2,7 +2,7 @@
 
 H3 depends on the shared `hrx.rs` crate. Its former local `hrx` package and
 binary rpath build scripts are removed. The model still exposes `Session` as its
-Rust API, and `libh3.so` as its portable C ABI. Neither requires Python, Torch,
+Rust API. It does not require Python, Torch,
 ROCm development headers or an LLVM build.
 
 The workspace pins HRX to a Git revision with explicit features. A clean clone
@@ -29,13 +29,11 @@ the native directory; `HRX_BUNDLE_MANIFEST` selects a pinned mirror; `HRX_OFFLIN
 refuses network access. Explicit model compiler arguments or `HRX_LOOM_LIBRARY`
 select a developer compiler. See the shared crate README for the bundle contract.
 
-The C ABI is version 9: `loom_library` selects a shared compiler library.
-Rebuild clients against the generated header. Headers are generated
-by cbindgen as a Cargo build dependency into `OUT_DIR`, with failures treated as
-build errors. `scripts/build_host.sh` copies that header to `include/h3.h`;
-ordinary Cargo builds leave the checkout untouched, and the CPU tests check for
-header drift. Foreign slices check alignment and arithmetic before becoming Rust
-references. Session panics remain contained and poison the session.
+`Config::loom_library` selects a shared compiler library, or `HRX_LOOM_LIBRARY`
+does; either empty takes the pinned bundle's. There is no C ABI any more — the
+crate's `Session` is the interface, `examples/rustler` is the interop, and
+`scripts/parity.py` reaches the host through the `parity_dump` example rather
+than by linking it.
 
 `examples/rustler` is a minimal, working Rustler adapter owned by an Elixir app.
 Its worker owns an H3 Rust session; jobs contain owned data and a bounded queue.

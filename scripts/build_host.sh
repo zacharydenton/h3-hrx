@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the library and the CLI. All Rust, all on libhrx — no ROCm headers, no hipcc, and no
+# Builds the CLI. All Rust, all on libhrx — no ROCm headers, no hipcc, and no
 # device code outside h3/kernels/.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -11,12 +11,7 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 cargo build --workspace --release --quiet
-cp target/release/libh3.so build/libh3.so
-cp target/release/h3 build/h3
-printf 'built build/libh3.so, build/h3\n'
-
-# Export the header from this build, including when Cargo reused cached outputs.
-# Only this explicit build/install step updates the checkout's committed copy.
-cargo run --release --quiet -p h3 --example export_header > build/h3.h
-cp build/h3.h include/h3.h
-printf 'generated include/h3.h\n'
+# A link, not a copy: `build/` is the ignored working area, and a copy of the binary would go stale
+# exactly the way the library's did while nothing rebuilt it.
+ln -sf ../target/release/h3 build/h3
+printf 'built target/release/h3 (linked as build/h3)\n'

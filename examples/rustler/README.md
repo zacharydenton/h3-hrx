@@ -1,5 +1,5 @@
 This is an application-owned Rustler 0.38 adapter to the H3 Rust API. It does
-not call the C ABI. Each resource has a bounded job channel; a dedicated thread
+calls the crate directly. Each resource has a bounded job channel; a dedicated thread
 owns the model, runs inference and releases the GPU session after the resource
 is collected. NIF inputs are copied into owned job data before the NIF returns.
 Model files must remain immutable while the worker is alive.
@@ -19,6 +19,6 @@ The example returns latents as a list; an application handling large outputs
 should encode them as an owned binary. A full queue rejects the request.
 
 Rustler is optional and confined to this adapter; neither model nor HRX requires
-BEAM at build or run time. Portable consumers use the cbindgen C headers instead.
+BEAM at build or run time.
 The resource and scheduler choices follow the [Rustler resource documentation](https://docs.rs/rustler/0.38.0/rustler/struct.ResourceArc.html)
 and [NIF scheduling documentation](https://docs.rs/rustler/0.38.0/rustler/attr.nif.html).

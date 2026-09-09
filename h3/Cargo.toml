@@ -6,8 +6,7 @@ description = "MiniMax H3 inference: ComfyUI checkpoints in, video and audio out
 
 [lib]
 path = "src/lib.rs"
-# rlib for cli/ and the examples, cdylib for everyone reaching the C ABI
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [dependencies]
 hrx.workspace = true
@@ -30,5 +29,3 @@ rand_distr = "0.5"
 libm = "0.2"
 tempfile = "3"
 
-[build-dependencies]
-cbindgen = "0.29.4"
