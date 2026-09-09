@@ -25,8 +25,8 @@ It checks:
 - Unsupported register widths and epilogue selectors are rejected.
 
 The latter two probes originally exposed compiler bugs. Patches
-[0005](../../patches/loom/0005-materialize-encoding-config.patch) and
-[0006](../../patches/loom/0006-bind-dependent-inline-types.patch) fix them in the
+[0005](https://github.com/zacharydenton/hrx.rs/blob/main/patches/loom/0005-materialize-encoding-config.patch) and
+[0006](https://github.com/zacharydenton/hrx.rs/blob/main/patches/loom/0006-bind-dependent-inline-types.patch) fix them in the
 current bundle. Exact encoding reads become `encoding.define`; callable types
 are compared after SSA binding and exact-fact refinement. Unresolved configs and
 runtime dimensions retain their ordinary semantics.

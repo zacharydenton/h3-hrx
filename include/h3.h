@@ -2,7 +2,7 @@
 // prompt token ids in, latents / frames / samples out. Everything between the kernels runs on the
 // host in Rust — layout, AdaLN curves, scheduler, noise, patching, blending.
 //
-// Kernels are compiled on first use for a shape by spawning `loom-compile` into cache_dir; the
+// Kernels are compiled in process on first use for a shape through HRX and cached in cache_dir; the
 // runtime surface is libhrx, and there is no device code in this library.
 //
 // A call returns H3_OK or a status; h3_last_error() gives the reason for the last failure on the
@@ -33,7 +33,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#define H3_ABI_VERSION 8u
+
+#define H3_ABI_VERSION 9
 
 // What an entry point returns. The distinction is the caller's: `INVALID_ARGUMENT` means the request
 // was not one this library serves, `CANCELLED` that a progress callback stopped the run, and `ERROR`
@@ -69,8 +70,8 @@ typedef struct h3_config {
   const char *kernel_sources;
   // Optional cache directory; NULL or empty selects the shared per-user HRX cache
   const char *cache_dir;
-  // Optional compiler override; NULL or empty selects LOOM_COMPILE or the pinned bundle
-  const char *loom_compile;
+  // Optional compiler override; NULL or empty selects HRX_LOOM_LIBRARY or the pinned bundle
+  const char *loom_library;
   // the DiT attention's QK^T operands: 16 (f16), 8 (int8, the parity path) or 4 (int4); 0 means 8
   int attn_qk_bits;
 } h3_config;

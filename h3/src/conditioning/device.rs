@@ -137,7 +137,7 @@ mod tests {
     fn projections_match_cpu_tables_bit_for_bit() -> Result<()> {
         let gpu = hrx::Gpu::open()?;
         let cache = tempfile::tempdir().unwrap();
-        let compiler = Compiler::new("", "", cache.path());
+        let compiler = Compiler::new(None, "", cache.path());
         let ramp = |n: usize, layer: usize| {
             (0..n)
                 .map(|i| ((i + layer * 7) % 97) as f32 * 0.01 - 0.5)

@@ -108,7 +108,7 @@ mod tests {
     fn resident_euler_matches_cpu_across_steps_and_strided_heads() -> Result<()> {
         let gpu = hrx::Gpu::open()?;
         let cache = tempfile::tempdir().unwrap();
-        let compiler = Compiler::new("", "", cache.path());
+        let compiler = Compiler::new(None, "", cache.path());
         // Both launches include partial workgroups. Head channels belonging to
         // the other modality contain sentinels to detect incorrect gathering.
         let (na, nv) = (9, 7);

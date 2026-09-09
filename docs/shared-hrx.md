@@ -19,17 +19,18 @@ these paths directly.
 Compiled kernels go to an `hrx-v1` cache subdirectory.
 
 The pinned native release includes the VOPD register-bank fix and Loom's
-encoding-configuration and dependent-inline-type fixes. Because `hrx.rs` is
+fragment-repack and SMEM storage-reuse fixes on the public upstream compiler. Because `hrx.rs` is
 private, [download it with an authenticated GitHub CLI](setup.md#toolchain-and-build)
 and prepare the local cache before running the model. A sibling checkout is
 optional.
 
 Default first-use provisioning is implemented in HRX. `HRX_RUNTIME_DIR` overrides
 the native directory; `HRX_BUNDLE_MANIFEST` selects a pinned mirror; `HRX_OFFLINE`
-refuses network access. Explicit model compiler arguments or `LOOM_COMPILE`
+refuses network access. Explicit model compiler arguments or `HRX_LOOM_LIBRARY`
 select a developer compiler. See the shared crate README for the bundle contract.
 
-The C ABI keeps version 8 and exactly the symbols it had. Headers are generated
+The C ABI is version 9: `loom_library` selects a shared compiler library.
+Rebuild clients against the generated header. Headers are generated
 by cbindgen as a Cargo build dependency into `OUT_DIR`, with failures treated as
 build errors. `scripts/build_host.sh` copies that header to `include/h3.h`;
 ordinary Cargo builds leave the checkout untouched, and the CPU tests check for

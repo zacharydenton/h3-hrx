@@ -29,7 +29,7 @@ int main(int argc, char **argv) {
     if (n_ids < 0 || n_ids > 4096) { fprintf(stderr, "cannot tokenize the prompt\n"); return 1; }
 
     /* a session: weights resident, kernels compiled on first use into cache_dir */
-    const char *loom = getenv("LOOM_COMPILE") ? getenv("LOOM_COMPILE") : "loom-compile";
+    const char *loom = getenv("HRX_LOOM_LIBRARY");
     /* ComfyUI's models directory: the four checkpoints, read as they are */
     const char *models = getenv("H3_MODELS") ? getenv("H3_MODELS") : join(home, "comfy-models");
     h3_config cfg = {join(models, "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"), join(models, "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),

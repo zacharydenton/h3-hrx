@@ -20,22 +20,22 @@ Run commands from the repository root unless stated otherwise.
 
 ## Toolchain and build
 
-The pinned `native-9e4fff00d244` release contains the corrected compiler.
+The pinned `native-ecaaf7376f7d-loomc` release contains the corrected compiler.
 Download it with repository credentials and prepare the verified local cache:
 
 ```sh
 cargo install --locked --git https://github.com/zacharydenton/hrx.rs \
-  --rev b26b95349fbb03e748947da3cbb0e3ffe9899649 --features runner
+  --rev be89b44652af6adf17c5c950d0759f92c2e88582 --features runner
 mkdir -p build
-gh release download native-9e4fff00d244 --repo zacharydenton/hrx.rs \
+gh release download native-ecaaf7376f7d-loomc --repo zacharydenton/hrx.rs \
   --pattern hrx-linux-x86_64-gfx1151.tar.gz --dir build --clobber
 hrx prepare build/hrx-linux-x86_64-gfx1151.tar.gz
 bash scripts/build_host.sh
 ```
 
 `HRX_RUNTIME_DIR` points at a native directory of your own, `HRX_BUNDLE_MANIFEST`
-at a pinned mirror, and `HRX_OFFLINE` refuses the network outright. `LOOM_COMPILE`
-selects a developer compiler in place of the bundle's.
+at a pinned mirror, and `HRX_OFFLINE` refuses the network outright. `HRX_LOOM_LIBRARY`
+selects a developer `libloomc.so` in place of the bundle’s.
 
 The build produces `build/libh3.so`, `build/h3` and `include/h3.h`, the last copied from what the Cargo build generated — an ordinary
 `cargo build` leaves the checkout alone. An installed binary carries the Loom
@@ -49,13 +49,11 @@ Optional CLI installation:
 cargo install --locked --path cli   # or: ln -s "$PWD/build/h3" ~/.local/bin/h3
 ```
 
-Building Loom yourself, rather than taking the bundle's compiler, needs
-[the included compiler patches](../patches/loom/README.md) — among them
-`0003-amdgpu-pm4-emulation-query-optional.patch`, without which `hrx_gpu_initialize`
-returns `INVALID_ARGUMENT` from `hsa_agent_get_info` on a ROCr older than the
-`HSA_AMD_AGENT_INFO_PM4_EMULATION` attribute. Nothing here requires such a build
-any more — the bundle's compiler is what the tests and the model use, and
-`LOOM_COMPILE` is how you substitute your own.
+For a local compiler build, follow
+[HRX’s upstream pin and compiler patches](https://github.com/zacharydenton/hrx.rs/tree/main/patches/loom).
+HRX owns the required native fixes; H3 loads the resulting `libloomc.so` through
+`HRX_LOOM_LIBRARY`. The [historical H3 patch record](../patches/loom/README.md)
+documents the previous bundle.
 
 ## Checkpoints
 

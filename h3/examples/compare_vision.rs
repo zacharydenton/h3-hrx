@@ -68,20 +68,22 @@ fn main() {
         let symbol = format!("h3_{stem}");
         let original =
             std::fs::read_to_string(Path::new(&baseline).join(format!("{stem}.loom"))).unwrap();
-        let mut request = hrx::loom::Request::new(&original, &symbol);
+        let mut request = hrx::loom::Specialization::new(&symbol);
         request.config = [("k_size", k), ("n_size", n)]
             .into_iter()
             .map(|(key, value)| (format!("h3.{stem}.{key}"), value.to_string()))
             .collect();
-        let old = compiler.compile(&request, &cache).unwrap();
-        request.source = &source;
-        let new = compiler.compile(&request, &cache).unwrap();
-        let identical = std::fs::read(&old).unwrap() == std::fs::read(&new).unwrap();
+        let old = compiler
+            .module(&original)
+            .compile(&request, &cache)
+            .unwrap();
+        let new = compiler.module(&source).compile(&request, &cache).unwrap();
+        let identical = old.bytes() == new.bytes();
         // Safety: both artifacts were compiled from the trusted sources above.
         let kernels = unsafe {
             [
-                stream.load(&old, &symbol).unwrap(),
-                stream.load(&new, &symbol).unwrap(),
+                stream.load_artifact(&old).unwrap(),
+                stream.load_artifact(&new).unwrap(),
             ]
         };
         let weights: Vec<_> = values(k * n, 0.1).into_iter().map(bf16::from_f32).collect();

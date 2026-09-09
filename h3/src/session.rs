@@ -23,7 +23,7 @@ pub struct Config {
     pub kernel_sources: std::path::PathBuf,
     /// Empty selects the shared per-user HRX cache.
     pub cache_dir: std::path::PathBuf,
-    pub loom_compile: String,
+    pub loom_library: Option<std::path::PathBuf>,
     /// the DiT attention's QK operands
     pub attention: crate::dit::Attention,
 }
@@ -40,7 +40,7 @@ impl Default for Config {
             audio_vae: Some(models.join(crate::models::AUDIO_VAE)),
             kernel_sources: std::path::PathBuf::new(),
             cache_dir: std::path::PathBuf::new(),
-            loom_compile: "loom-compile".into(),
+            loom_library: None,
             attention: crate::dit::Attention::default(),
         }
     }
@@ -79,7 +79,7 @@ impl Session {
         // that every route to one — this, the C ABI, a direct `Compiler::new` — reaches the same
         // place rather than each defaulting on its own.
         let compiler = Compiler::new(
-            config.loom_compile.clone(),
+            config.loom_library.clone(),
             config.kernel_sources.clone(),
             config.cache_dir.clone(),
         );
@@ -384,7 +384,7 @@ mod tests {
             audio_vae: None,
             kernel_sources: "kernels".into(),
             cache_dir: "build/kernel_cache".into(),
-            loom_compile: "loom-compile".into(),
+            loom_library: None,
             attention,
         }
     }

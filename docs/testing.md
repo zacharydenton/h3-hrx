@@ -145,8 +145,8 @@ cargo run --release -p h3 --example compare_decode -- \
 Latents are little-endian f32 in `[24, 7, 30, 54]` order for that shape. The
 diagnostic loads both decoders once, warms each, alternates ten timed pairs and
 requires identical decoded RGB for every pair. By default it compares source
-changes with the same host and compiler. Set `H3_BASELINE_LOOM_COMPILE` to the
-previous compiler executable to include a compiler upgrade in the comparison.
+changes with the same host and compiler. Set `H3_BASELINE_LOOM_LIBRARY` to the
+previous compiler shared library to include a compiler upgrade in the comparison.
 Neither mode replaces whole-model parity testing.
 
 The first consolidation pass on gfx1151 passed all 15 kernel tests with bitwise
@@ -164,8 +164,9 @@ The second pass uses bundle
 All 15 GPU kernel tests pass again, including every float GEMM export and all
 three shared vision epilogues, with bitwise baseline and CPU-oracle checks.
 Workspace tests, formatting and Clippy pass. The compiler's available fixture
-corpus passes 550 suites; [the patch record](../patches/loom/README.md) documents
-the pre-existing failures and excluded optional executables.
+corpus passed 550 suites in that historical bundle; its validation record is
+preserved in Git history. Current compiler validation lives in
+[HRX](https://github.com/zacharydenton/hrx.rs/blob/main/patches/loom/README.md).
 
 Resource checks across 36 float export/shape combinations retain the same VGPR
 counts, 55,296 bytes of LDS, no scratch memory, and 64 static WMMA instructions.

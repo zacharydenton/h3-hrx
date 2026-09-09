@@ -15,4 +15,4 @@ edition = "2021"
 opt-level = 2
 
 [workspace.dependencies]
-hrx = { git = "https://github.com/zacharydenton/hrx.rs", rev = "b26b95349fbb03e748947da3cbb0e3ffe9899649", default-features = false, features = ["download", "ffi", "loom"] }
+hrx = { git = "https://github.com/zacharydenton/hrx.rs", rev = "be89b44652af6adf17c5c950d0759f92c2e88582", default-features = false, features = ["download", "ffi", "loom"] }

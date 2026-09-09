@@ -33,7 +33,7 @@ fn main() {
         audio_vae: file("vae/minimax_h3_audio_vae_fp32.safetensors"),
         kernel_sources: format!("{root}/h3/kernels").into(),
         cache_dir: format!("{root}/build/kernel_cache").into(),
-        loom_compile: std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into()),
+        loom_library: std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from),
         attention: h3::Attention::I8,
     })
     .expect("session") };

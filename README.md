@@ -42,9 +42,9 @@ With access to the private `hrx.rs` repository and an authenticated GitHub CLI:
 
 ```sh
 cargo install --locked --git https://github.com/zacharydenton/hrx.rs \
-  --rev b26b95349fbb03e748947da3cbb0e3ffe9899649 --features runner
+  --rev be89b44652af6adf17c5c950d0759f92c2e88582 --features runner
 mkdir -p build
-gh release download native-9e4fff00d244 --repo zacharydenton/hrx.rs \
+gh release download native-ecaaf7376f7d-loomc --repo zacharydenton/hrx.rs \
   --pattern hrx-linux-x86_64-gfx1151.tar.gz --dir build --clobber
 hrx prepare build/hrx-linux-x86_64-gfx1151.tar.gz
 cargo install --locked --path cli

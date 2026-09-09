@@ -10,7 +10,7 @@ not need the C ABI at all: the `h3` crate's `Session` is the same API with slice
 `Result`, which is what `cli/` and `examples/rust` use.
 
 ```
-h3_abi_version                                            -> 8
+h3_abi_version                                            -> 9
 h3_last_error                                             the last failure on this thread
 h3_tokenizer_create / _encode / _vocab_size / _destroy    text -> token ids
 h3_create / h3_destroy                                    a session: weights resident, kernels cached
@@ -26,7 +26,7 @@ failure on the calling thread, valid until the next one. Signatures carry no err
 
 ## Contract
 
-**Versioning.** `h3_abi_version()` returns `H3_ABI_VERSION` (8). Check it before using
+**Versioning.** `h3_abi_version()` returns `H3_ABI_VERSION` (9). Check it before using
 the structs; the structs' layouts are frozen per version and every field is a fixed-width C
 type or a pointer, so no language needs a bindings generator.
 
@@ -60,7 +60,7 @@ threads are safe and run one at a time. The progress callback runs on the callin
 denoising steps; returning nonzero from it cancels the run, which returns `H3_CANCELLED` with
 the output buffers unspecified. Reuse a session across requests to retain loaded weights and compiled kernels.
 
-**Kernels.** The first call at a new shape spawns `loom-compile` (path in the config) for the kernels
+**Kernels.** The first call at a new shape compiles the kernels in process through HRX’s `libloomc`
 that shape needs and caches the binaries in `cache_dir`; later runs at the same shape load from the
 cache. Expect tens of seconds the first time a size is used.
 
@@ -119,8 +119,8 @@ be NULL; the calls that need it then fail with a message naming it, and each fil
 first use. The three remaining strings are all optional, and NULL or `""` selects a default:
 `kernel_sources` the Loom sources built into the library (pass the repository's `h3/kernels/` to
 compile from a working tree instead), `cache_dir` the shared per-user HRX cache under
-`$XDG_CACHE_HOME/hrx` (pass any writable directory to keep a cache of your own), and `loom_compile`
-whatever `LOOM_COMPILE` names or, failing that, the compiler in the pinned native bundle.
+`$XDG_CACHE_HOME/hrx` (pass any writable directory to keep a cache of your own), and `loom_library`
+whatever `HRX_LOOM_LIBRARY` names or, failing that, the compiler in the pinned native bundle.
 `attn_qk_bits` chooses the DiT attention's QK^T operands: 8 (the default and the parity path), 16
 for f16, or 4 for int4.
 

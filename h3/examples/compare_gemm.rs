@@ -111,17 +111,15 @@ fn main() {
                     let old =
                         std::fs::read_to_string(baseline.join(format!("{stem}.loom"))).unwrap();
                     let new = std::fs::read_to_string(root.join(format!("{module}.loom"))).unwrap();
-                    let mut request = hrx::loom::Request::new(&old, &symbol);
+                    let mut request = hrx::loom::Specialization::new(&symbol);
                     request.config = cfg;
-                    let old_path = compiler.compile(&request, &cache).unwrap();
-                    request.source = &new;
-                    let new_path = compiler.compile(&request, &cache).unwrap();
-                    let identical =
-                        std::fs::read(&old_path).unwrap() == std::fs::read(&new_path).unwrap();
+                    let old_path = compiler.module(&old).compile(&request, &cache).unwrap();
+                    let new_path = compiler.module(&new).compile(&request, &cache).unwrap();
+                    let identical = old_path.bytes() == new_path.bytes();
                     // Safety: trusted baseline and candidate sources compiled through HRX.
                     let kernels = [
-                        unsafe { stream.load(&old_path, &symbol).unwrap() },
-                        unsafe { stream.load(&new_path, &symbol).unwrap() },
+                        unsafe { stream.load_artifact(&old_path).unwrap() },
+                        unsafe { stream.load_artifact(&new_path).unwrap() },
                     ];
                     let constants = kernels
                         .each_ref()

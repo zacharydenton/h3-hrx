@@ -46,13 +46,14 @@ impl Harness {
         };
         let source = std::fs::read_to_string(path).unwrap();
         let symbol = format!("h3_{stem}");
-        let mut request = hrx::loom::Request::new(&source, &symbol);
+        let mut request = hrx::loom::Specialization::new(&symbol);
         request.config = cfg
             .iter()
             .map(|(key, value)| (format!("h3.{stem}.{key}"), value.clone()))
             .collect();
         let path = self
             .compiler
+            .module(&source)
             .compile(
                 &request,
                 &hrx::bundle::cache_root().unwrap().join("kernels"),
@@ -63,15 +64,16 @@ impl Harness {
             .map(|dir| {
                 let source = std::fs::read_to_string(Path::new(&dir).join(format!("{stem}.loom")))
                     .expect("baseline kernel source");
-                let mut old = hrx::loom::Request::new(&source, &symbol);
+                let mut old = hrx::loom::Specialization::new(&symbol);
                 old.config = request.config.clone();
                 let old_path = self
                     .compiler
+                    .module(&source)
                     .compile(&old, &hrx::bundle::cache_root().unwrap().join("kernels"))
                     .unwrap();
                 eprintln!(
                     "artifact {stem}: {}",
-                    if std::fs::read(&old_path).unwrap() == std::fs::read(&path).unwrap() {
+                    if old_path.bytes() == path.bytes() {
                         "identical"
                     } else {
                         "changed"
@@ -81,7 +83,7 @@ impl Harness {
             });
         // Safety: trusted checked-in source compiled through HRX. Every test below
         // sizes the bindings from the same dimensions passed as kernel configuration.
-        let kernel = unsafe { self.stream.load(&path, &symbol).unwrap() };
+        let kernel = unsafe { self.stream.load_artifact(&path).unwrap() };
         let buffers: Vec<Buffer> = data
             .iter()
             .map(|bytes| self.stream.allocate(bytes.len()).unwrap())
@@ -106,7 +108,7 @@ impl Harness {
             .map(|r| r.wait(&mut self.stream).unwrap())
             .collect();
         if let Some(path) = baseline {
-            let old = unsafe { self.stream.load(&path, &symbol).unwrap() };
+            let old = unsafe { self.stream.load_artifact(&path).unwrap() };
             for (buffer, bytes) in buffers.iter().zip(data) {
                 self.stream.upload_queued(buffer, 0, bytes).unwrap();
             }
@@ -409,6 +411,7 @@ fn vision_bf16_matmuls_match_rounded_operands_and_epilogues() {
     let w: Vec<_> = values(n * k, 0.1).into_iter().map(bf16::from_f32).collect();
     let b = values(n, 0.1);
     for kind in ["bias", "gelu", "gelu_erf", "resid"] {
+        eprintln!("vision epilogue: {kind}");
         let a: Vec<_> = input
             .iter()
             .map(|&x| {

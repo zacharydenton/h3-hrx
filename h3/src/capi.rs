@@ -17,7 +17,7 @@ use crate::session::{Config, Session};
 use crate::vvae::Clip;
 use std::ffi::{c_char, c_int, c_void, CStr};
 
-pub const ABI_VERSION: u32 = 8;
+pub const ABI_VERSION: u32 = 9;
 
 /// What every entry point here requires of its caller, stated once.
 ///
@@ -75,8 +75,8 @@ pub struct h3_config {
     pub kernel_sources: *const c_char,
     /// Optional cache directory; NULL or empty selects the shared per-user HRX cache
     pub cache_dir: *const c_char,
-    /// Optional compiler override; NULL or empty selects LOOM_COMPILE or the pinned bundle
-    pub loom_compile: *const c_char,
+    /// Optional compiler override; NULL or empty selects HRX_LOOM_LIBRARY or the pinned bundle
+    pub loom_library: *const c_char,
     /// the DiT attention's QK^T operands: 16 (f16), 8 (int8, the parity path) or 4 (int4); 0 means 8
     pub attn_qk_bits: c_int,
 }
@@ -303,7 +303,7 @@ pub unsafe extern "C" fn h3_create(
         let c = &*config;
         let kernel_sources = path(c.kernel_sources).unwrap_or_default();
         let cache_dir = path(c.cache_dir).unwrap_or_default();
-        let loom_compile = path(c.loom_compile).unwrap_or_default();
+        let loom_library = path(c.loom_library);
         // Safety: stated in the header — a checkpoint must not be modified while the
         // session holds it. The C caller made that promise by calling h3_create.
         let session =
@@ -315,7 +315,7 @@ pub unsafe extern "C" fn h3_create(
                     audio_vae: path(c.audio_vae_file),
                     kernel_sources,
                     cache_dir,
-                    loom_compile: loom_compile.to_string_lossy().into_owned(),
+                    loom_library,
                     // 0 means the default, and anything that is not a width with kernels is refused
                     attention: match c.attn_qk_bits {
                         0 => crate::dit::Attention::default(),
@@ -1019,7 +1019,7 @@ mod tests {
         assert_eq!(h3_status::H3_ERROR as c_int, 1);
         assert_eq!(h3_status::H3_CANCELLED as c_int, 2);
         assert_eq!(h3_status::H3_INVALID_ARGUMENT as c_int, 64);
-        assert_eq!(ABI_VERSION, 8);
+        assert_eq!(ABI_VERSION, 9);
     }
 
     #[test]

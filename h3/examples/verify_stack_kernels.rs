@@ -25,7 +25,7 @@ fn main() {
         .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
         .collect();
 
-    let exe = std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into());
+    let exe = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
     let gpu = hrx::Gpu::open().expect("gpu");
     let compiler = Compiler::new(exe, root.join("h3/kernels"), &cache);
     // Safety: a diagnostic run over checkpoints the operator named and is not writing to.

@@ -12,9 +12,9 @@ for registers in 2 4; do
   for epilogue in 0 1; do
     stem="$out/i${bits}-epilogue${epilogue}"
     if ! "$compiler" experiments/loom_gemm_family/packed.loom \
-        --backend=amdgpu-hal --target=gfx1151 \
+        --product=kernel --format=amdgpu-hsaco --target=amdgpu:gfx1151 \
         --config="probe.registers=$registers" --config="probe.epilogue=$epilogue" \
-        --output="$stem.hal" --emit-target-artifact="$stem.hsaco" \
+        --output="$stem.hsaco" \
         --dump-ir-after-all --dump-ir-output="$stem-ir/" > "$stem.log" 2>&1; then
       cat "$stem.log" >&2
       exit 1
@@ -42,18 +42,18 @@ for registers in 2 4; do
   bits=$((registers * 2))
   stem="$out/config-i$bits"
   "$compiler" experiments/loom_gemm_family/encoding_config.loom \
-    --backend=amdgpu-hal --target=gfx1151 \
+    --product=kernel --format=amdgpu-hsaco --target=amdgpu:gfx1151 \
     --config="probe.registers=$registers" \
     --config="probe.schema=#encoding.operand<element_format=i$bits, payload_elements=16, payload_registers=$registers>" \
-    --output="$stem.hal" --emit-target-artifact="$stem.hsaco"
+    --output="$stem.hsaco"
   "$objdump" -d --mcpu=gfx1151 "$stem.hsaco" > "$stem.asm"
   awk -v opcode="v_wmma_i32_16x16x16_iu$bits" '
     $1 == opcode { mma++ }
     $1 ~ /^v_wmma/ && $1 != opcode { bad++ }
     END { exit mma != 1 || bad }' "$stem.asm"
   "$compiler" experiments/loom_gemm_family/dynamic_argument.loom \
-    --backend=amdgpu-hal --target=gfx1151 --config="probe.registers=$registers" \
-    --output="$out/argument-$registers.hal"
+    --product=kernel --format=amdgpu-hsaco --target=amdgpu:gfx1151 --config="probe.registers=$registers" \
+    --output="$out/argument-$registers.hsaco"
   printf 'PASS i%s encoding config and vector<%sxi32> template argument\n' "$bits" "$registers"
 done
 
@@ -64,8 +64,8 @@ for invalid in probe.registers=3 probe.epilogue=2; do
     *) config=(--config=probe.registers=2 --config="$invalid") ;;
   esac
   if "$compiler" experiments/loom_gemm_family/packed.loom \
-      --backend=amdgpu-hal --target=gfx1151 "${config[@]}" \
-      --output="$out/invalid.hal" > "$out/$invalid.log" 2>&1; then
+      --product=kernel --format=amdgpu-hsaco --target=amdgpu:gfx1151 "${config[@]}" \
+      --output="$out/invalid.hsaco" > "$out/$invalid.log" 2>&1; then
     printf 'Unexpected success: %s\n' "$invalid" >&2
     exit 1
   fi

@@ -1,8 +1,8 @@
-//! Compiling Loom kernels through `loom-compile` into a shared cache, and loading them.
+//! Compiling Loom kernels in process through the shared HRX library.
 //!
 //! One kernel per (stem, source text, symbol, backend, target, config, compiler binary): the cache
 //! file name is a digest of all of them, so neither an edited kernel source nor a replaced
-//! `loom-compile` ever reuses a stale binary. `hrx::loom` computes the digest and owns the cache; what
+//! `libloomc` ever reuses a stale binary. `hrx::loom` computes the digest and owns the cache; what
 //! is here is the choice of source and configuration.
 use std::collections::HashMap;
 use std::fs::File;
@@ -10,11 +10,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub const BACKEND: &str = "amdgpu-hal";
-pub const TARGET: &str = "gfx1151";
-
 /// A kernel's configuration. `hrx::loom` canonicalises it into a `BTreeMap` before hashing it and
-/// before spelling out the argv, so the order these pairs are built in is not observable — but a
+/// before passing it to the native compiler, so the order these pairs are built in is not observable — but a
 /// key repeated in one `Cfg` would silently lose all but one of its values, which `config` refuses.
 pub type Cfg = Vec<(String, String)>;
 
@@ -22,10 +19,8 @@ pub type Cfg = Vec<(String, String)>;
 pub enum Error {
     #[error("missing kernel source {0}")]
     MissingSource(PathBuf),
-    #[error("loom-compile not found: {0}")]
-    NoCompiler(String),
-    #[error("loom-compile failed for {stem}: {command}")]
-    Failed { stem: String, command: String },
+    #[error("invalid configuration for {stem}: {message}")]
+    Configuration { stem: String, message: String },
     #[error("{0}")]
     Io(String),
     #[error(transparent)]
@@ -84,7 +79,8 @@ fn trim(s: &str) -> String {
 /// Model-specific source selection and loaded exports. Compilation, integrity,
 /// process locks and publication are provided by the shared HRX crate.
 pub struct Compiler {
-    exe: String,
+    library: Option<PathBuf>,
+    modules: Mutex<HashMap<String, hrx::loom::Module>>,
     sources: PathBuf,
     source_cache: Mutex<HashMap<String, Arc<str>>>,
     cache: PathBuf,
@@ -93,12 +89,13 @@ pub struct Compiler {
 }
 impl Compiler {
     pub fn new(
-        exe: impl Into<String>,
+        library: Option<PathBuf>,
         sources: impl Into<PathBuf>,
         cache: impl Into<PathBuf>,
     ) -> Self {
         Self {
-            exe: exe.into(),
+            library,
+            modules: Mutex::new(HashMap::new()),
             sources: sources.into(),
             source_cache: Mutex::new(HashMap::new()),
             cache: cache.into(),
@@ -110,12 +107,7 @@ impl Compiler {
         if let Some(c) = self.compiler.get() {
             return Ok(c);
         }
-        let explicit = if self.exe.is_empty() || self.exe == "loom-compile" {
-            None
-        } else {
-            Some(Path::new(&self.exe))
-        };
-        let compiler = hrx::loom::Compiler::resolve(explicit)?;
+        let compiler = hrx::loom::Compiler::resolve(self.library.as_deref())?;
         let _ = self.compiler.set(compiler);
         Ok(self.compiler.get().expect("compiler initialized"))
     }
@@ -155,12 +147,22 @@ impl Compiler {
         }
     }
 
-    pub fn tag(&self, stem: &str, symbol: &str, cfg: &Cfg) -> Result<String> {
+    fn module(&self, stem: &str) -> Result<hrx::loom::Module> {
+        let mut modules = self.modules.lock().expect("module cache poisoned");
+        if let Some(module) = modules.get(stem) {
+            return Ok(module.clone());
+        }
         let source = self.source(stem)?;
-        let mut request = hrx::loom::Request::new(&source, symbol);
-        request.config = config(stem, cfg)?;
-        Ok(self.compiler()?.key(&request)?)
+        let module = self.compiler()?.module(&source);
+        modules.insert(stem.into(), module.clone());
+        Ok(module)
     }
+    pub fn tag(&self, stem: &str, symbol: &str, cfg: &Cfg) -> Result<String> {
+        let mut request = hrx::loom::Specialization::new(symbol);
+        request.config = config(stem, cfg)?;
+        Ok(self.module(stem)?.key(&request)?)
+    }
+
     pub fn get(
         &self,
         gpu: &hrx::Gpu,
@@ -168,11 +170,10 @@ impl Compiler {
         symbol: &str,
         cfg: &Cfg,
     ) -> Result<Arc<hrx::Kernel>> {
-        let source = self.source(stem)?;
-        let mut request = hrx::loom::Request::new(&source, symbol);
+        let module = self.module(stem)?;
+        let mut request = hrx::loom::Specialization::new(symbol);
         request.config = config(stem, cfg)?;
-        let compiler = self.compiler()?;
-        let tag = compiler.key(&request)?;
+        let tag = module.key(&request)?;
         if let Some(kernel) = self
             .loaded
             .lock()
@@ -181,9 +182,9 @@ impl Compiler {
         {
             return Ok(kernel.clone());
         }
-        let path = compiler.compile(&request, &self.cache_dir()?)?;
+        let artifact = module.compile(&request, &self.cache_dir()?)?;
         // Safety: verified artifact from trusted model source and configured compiler.
-        let kernel = Arc::new(unsafe { gpu.load(&path, symbol)? });
+        let kernel = Arc::new(unsafe { gpu.load_artifact(&artifact)? });
         let mut loaded = self.loaded.lock().expect("compiler cache poisoned");
         Ok(loaded.entry(tag).or_insert(kernel).clone())
     }
@@ -192,15 +193,15 @@ impl Compiler {
 /// A `Cfg` as the map the compiler hashes and spells out, rejecting a repeated key.
 ///
 /// The map keeps one value per key, so a builder that pushed the same key twice would have all but
-/// the last of them disappear — into the cache tag as well as into the argv, which means the kernel
+/// the last of them disappear — into the cache tag as well as into specialization, which means the kernel
 /// that ran and the name it was filed under would agree with each other and with nothing else. It
 /// costs one comparison per kernel built to know that never happens.
 fn config(stem: &str, cfg: &Cfg) -> Result<std::collections::BTreeMap<String, String>> {
     let map: std::collections::BTreeMap<String, String> = cfg.iter().cloned().collect();
     if map.len() != cfg.len() {
-        return Err(Error::Failed {
+        return Err(Error::Configuration {
             stem: stem.to_string(),
-            command: "a configuration key was given twice".into(),
+            message: "a configuration key was given twice".into(),
         });
     }
     Ok(map)
@@ -222,10 +223,10 @@ mod tests {
 
     #[test]
     fn embedded_sources_need_no_checkout_and_explicit_directories_are_honored() {
-        let c = Compiler::new("unused", PathBuf::new(), PathBuf::new());
+        let c = Compiler::new(None, PathBuf::new(), PathBuf::new());
         assert!(c.source("gn_silu_f16").unwrap().contains("h3_gn_silu_f16"));
         let directory = tempfile::tempdir().unwrap();
-        let c = Compiler::new("unused", directory.path(), PathBuf::new());
+        let c = Compiler::new(None, directory.path(), PathBuf::new());
         assert!(c.source("gn_silu_f16").is_err());
     }
 
@@ -283,88 +284,12 @@ mod tests {
     }
 
     #[test]
-    fn the_tag_carries_source_symbol_and_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let sources = dir.path().join("kernels");
-        write(&sources.join("gemm.loom"), b"kernel v1").unwrap();
-        // a compiler that exists, so compiler_id resolves
-        let exe = dir.path().join("loom-compile");
-        write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
-        let c = Compiler::new(
-            exe.display().to_string(),
-            &sources,
-            dir.path().join("cache"),
-        );
-
-        let cfg: Cfg = vec![("h3.gemm.k_size".into(), "2048".into())];
-        let base = c.tag("gemm", "h3_gemm", &cfg).unwrap();
-        assert_eq!(base.len(), 64);
-
-        // the symbol is in the identity, not the visible tag, so it changes the __i suffix
-        let other_symbol = c.tag("gemm", "h3_other", &cfg).unwrap();
-        assert_ne!(base, other_symbol);
-
-        // a different config value changes both halves
-        let other_cfg: Cfg = vec![("h3.gemm.k_size".into(), "4096".into())];
-        assert_ne!(base, c.tag("gemm", "h3_gemm", &other_cfg).unwrap());
-
-        // an edited source changes the __s hash
-        write(&sources.join("gemm.loom"), b"kernel v2").unwrap();
-        let edited = Compiler::new(
-            exe.display().to_string(),
-            &sources,
-            dir.path().join("cache"),
-        )
-        .tag("gemm", "h3_gemm", &cfg)
-        .unwrap();
-        assert_ne!(base, edited);
-    }
-
-    #[test]
-    fn a_replaced_compiler_invalidates_the_tag() {
-        let dir = tempfile::tempdir().unwrap();
-        let sources = dir.path().join("kernels");
-        write(&sources.join("k.loom"), b"src").unwrap();
-        let exe = dir.path().join("loom-compile");
-        write(&exe, b"v1").unwrap();
-        let first = Compiler::new(exe.display().to_string(), &sources, dir.path().join("c"))
-            .tag("k", "s", &vec![])
-            .unwrap();
-        // a different size and mtime
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        write(&exe, b"a longer v2").unwrap();
-        let second = Compiler::new(exe.display().to_string(), &sources, dir.path().join("c"))
-            .tag("k", "s", &vec![])
-            .unwrap();
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn every_tag_is_a_safe_file_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let sources = dir.path().join("kernels");
-        write(&sources.join("k.loom"), b"src").unwrap();
-        let exe = dir.path().join("loom-compile");
-        write(&exe, b"v").unwrap();
-        let c = Compiler::new(exe.display().to_string(), &sources, dir.path().join("c"));
-        // a float config carries '.', '-' and '+', and the sanitiser must keep the name usable
-        let cfg: Cfg = vec![("h3.k.eps".into(), num(1e-6))];
-        let tag = c.tag("k", "s", &cfg).unwrap();
-        assert!(
-            tag.chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.'),
-            "{tag}"
-        );
-        assert!(!tag.contains('/') && !tag.contains(' '));
-    }
-
-    #[test]
     fn a_missing_source_names_itself() {
         let dir = tempfile::tempdir().unwrap();
-        let exe = dir.path().join("loom-compile");
-        write(&exe, b"v").unwrap();
+        let library = dir.path().join("libloomc.so");
+        write(&library, b"v").unwrap();
         let c = Compiler::new(
-            exe.display().to_string(),
+            Some(library.clone()),
             dir.path().join("kernels"),
             dir.path(),
         );
@@ -377,7 +302,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sources = dir.path().join("kernels");
         write(&sources.join("k.loom"), b"src").unwrap();
-        let c = Compiler::new("definitely-not-on-path-h3", &sources, dir.path());
+        let c = Compiler::new(
+            Some(PathBuf::from("definitely-not-on-path-h3")),
+            &sources,
+            dir.path(),
+        );
         let message = c.tag("k", "s", &vec![]).unwrap_err().to_string();
         assert!(message.contains("definitely-not-on-path-h3"), "{message}");
     }

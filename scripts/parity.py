@@ -67,14 +67,14 @@ ROOT = Path(__file__).resolve().parent.parent
 # The C ABI: libh3.so through ctypes
 # --------------------------------------------------------------------------------------------------
 
-_ABI = 8
+_ABI = 9
 _F32P, _U8P, _I32P = ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_int32)
 PROGRESS = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_double)
 
 
 class Config(ctypes.Structure):
     _fields_ = [("dit_file", ctypes.c_char_p), ("te_file", ctypes.c_char_p), ("video_vae_file", ctypes.c_char_p), ("audio_vae_file", ctypes.c_char_p),
-                ("kernel_sources", ctypes.c_char_p), ("cache_dir", ctypes.c_char_p), ("loom_compile", ctypes.c_char_p), ("attn_qk_bits", ctypes.c_int)]
+                ("kernel_sources", ctypes.c_char_p), ("cache_dir", ctypes.c_char_p), ("loom_library", ctypes.c_char_p), ("attn_qk_bits", ctypes.c_int)]
 
 
 MODELS = Path(os.environ.get("H3_MODELS") or Path.home() / "comfy-models")   # ComfyUI's models directory: the four checkpoints, read as they are
@@ -123,11 +123,6 @@ def _canvas(name: str, height: int, width: int, limit: int = 2048):
         raise ValueError(f"{name} height and width must be multiples of 32 up to {limit}, got {height}x{width}")
 
 
-def default_loom_compile() -> str:
-    if os.environ.get("LOOM_COMPILE"): return os.environ["LOOM_COMPILE"]
-    return str(Path.home() / "code/hrx-system/build-cuda/loom/src/loom/tools/loom-compile/loom-compile")
-
-
 def _last_error(lib) -> str:
     """The library's message for the last failing call on this thread."""
     lib.h3_last_error.restype = ctypes.c_char_p
@@ -154,7 +149,7 @@ class H3:
         native.h3_encode_audio.argtypes = [ctypes.c_void_p, _F32P, ctypes.c_int, _F32P, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int)]
         self._native = native
         cfg = Config(os.fsencode(dit or DIT), os.fsencode(te or TE), os.fsencode(video_vae or VIDEO_VAE), os.fsencode(audio_vae or AUDIO_VAE),
-                     os.fsencode(ROOT / "h3/kernels"), os.fsencode(cache or ROOT / "build/kernel_cache"), os.fsencode(default_loom_compile()), {"i4": 4, "i8": 8, "f16": 16}[attn])
+                     os.fsencode(ROOT / "h3/kernels"), os.fsencode(cache or ROOT / "build/kernel_cache"), os.fsencode(os.environ.get("HRX_LOOM_LIBRARY", "")), {"i4": 4, "i8": 8, "f16": 16}[attn])
         handle = ctypes.c_void_p()
         if native.h3_create(ctypes.byref(cfg), ctypes.byref(handle)): raise H3Error(_last_error(native))
         self._handle = handle

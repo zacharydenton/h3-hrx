@@ -169,7 +169,7 @@ fn main() {
     }
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    let exe = std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into());
+    let exe = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
     let gpu = hrx::Gpu::open().expect("gpu");
     let compiler = Compiler::new(
         exe,

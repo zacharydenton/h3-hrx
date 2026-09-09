@@ -464,7 +464,7 @@ fn run(cli: Cli) -> Result<()> {
     } else {
         PathBuf::new()
     };
-    let loom_compile = std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into());
+    let loom_library = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
     let config = Config {
         dit: Some(dit.clone()),
         te: Some(te),
@@ -472,7 +472,7 @@ fn run(cli: Cli) -> Result<()> {
         audio_vae: Some(audio_vae),
         kernel_sources: sources,
         cache_dir: cache,
-        loom_compile,
+        loom_library,
         attention: match cli.attn {
             Attn::F16 => Attn16::F16,
             Attn::I8 => Attn16::I8,
