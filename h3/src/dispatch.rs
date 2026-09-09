@@ -63,7 +63,7 @@ impl Profile {
 ///
 /// # Safety
 ///
-/// Inherits [`hrx::Gpu::dispatch`]'s contract: `grid`, `block`, `scalars` and `bindings` must be what
+/// Inherits [`hrx::Gpu::dispatch_constants`]'s contract: `grid`, `block`, `scalars` and `bindings` must be what
 /// `kernel` was compiled for. Private to the crate, and every caller goes through [`checked`], which
 /// discharges the binding half of that contract against the extents the kernel was configured with.
 #[allow(clippy::too_many_arguments)]
@@ -77,16 +77,19 @@ pub(crate) unsafe fn launch(
     scalars: &[u32],
     bindings: &[View<'_>],
 ) -> Result<()> {
+    // Every H3 scalar is an unsigned Loom index. HRX handles the compiler's
+    // checked 32/64-bit index lowering; arbitrary mixed scalars are never inferred.
+    let constants = hrx::Constants::indices(kernel, scalars)?;
     match profile {
         Some(p) if p.on => {
             gpu.sync()?;
             let started = Instant::now();
-            unsafe { gpu.dispatch(kernel, grid, block, scalars, bindings)? };
+            unsafe { gpu.dispatch_constants(kernel, grid, block, &constants, bindings)? };
             gpu.sync()?;
             *p.micros.entry(stage.to_string()).or_insert(0.0) +=
                 started.elapsed().as_secs_f64() * 1e6;
         }
-        _ => unsafe { gpu.dispatch(kernel, grid, block, scalars, bindings)? },
+        _ => unsafe { gpu.dispatch_constants(kernel, grid, block, &constants, bindings)? },
     }
     Ok(())
 }

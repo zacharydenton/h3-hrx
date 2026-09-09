@@ -1,0 +1,81 @@
+// Ordered f32 AdaLN projection; row maps encode the checkpoint's semantic layout.
+amdgpu.target<gfx11-generic> @h3_modulation_target {subgroup_size = 32}
+config.decl @h3.modulation_f32.count : %value: index where [range(%value, 1, 1073741824)]
+config.decl @h3.modulation_f32.width : %value: index where [range(%value, 1, 1073741824)]
+config.decl @h3.modulation_f32.rows : %value: index where [range(%value, 1, 1073741824)]
+config.decl @h3.modulation_f32.out_count : %value: index where [range(%value, 1, 1073741824)]
+kernel.def target(@h3_modulation_target) export("h3_modulation_f32") @h3_modulation_f32() {
+  %count = config.get @h3.modulation_f32.count : index
+  %one = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %round = index.constant 255 : index
+  %rounded = index.add %count, %round : index
+  %groups = index.div %rounded, %threads : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%t0: f32, %t1: f32, %t2: f32, %t3: f32, %t4: f32, %t5: f32, %t6: f32, %t7: f32, %w: buffer, %b: buffer, %map: buffer, %out: buffer) {
+  %count = config.get @h3.modulation_f32.count : index
+  %width = config.get @h3.modulation_f32.width : index
+  %rows = config.get @h3.modulation_f32.rows : index
+  %out_count = config.get @h3.modulation_f32.out_count : index
+  %threads = index.constant 256 : index
+  %offset = index.constant 0 : offset
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %group, %threads : index
+  %i = index.add %base, %lane : index
+  %wg = buffer.assume.memory_space<global> %w : buffer
+  %bg = buffer.assume.memory_space<global> %b : buffer
+  %mg = buffer.assume.memory_space<global> %map : buffer
+  %og = buffer.assume.memory_space<global> %out : buffer
+  %wv = buffer.view %wg[%offset] : buffer -> view<[%count]x8xf32>
+  %bv = buffer.view %bg[%offset] : buffer -> view<[%count]xf32>
+  %mv = buffer.view %mg[%offset] : buffer -> view<[%rows]xi32>
+  %ov = buffer.view %og[%offset] : buffer -> view<[%out_count]xf32>
+  %active = index.cmp ult, %i, %count : index
+  scf.if %active {
+    %ii = index.assume %i [lt(%i, %count)] : index
+    %row0 = index.div %ii, %width : index
+    %row = index.assume %row0 [lt(%row0, %rows)] : index
+    %col = index.rem %ii, %width : index
+    %mapped_i32 = view.load %mv[%row] : view<[%rows]xi32> -> i32
+    %mapped = index.cast %mapped_i32 : i32 to index
+    %dest_base = index.mul %mapped, %width : index
+    %dest0 = index.add %dest_base, %col : index
+    %dest = index.assume %dest0 [range(%dest0, 0, 1073741823), lt(%dest0, %out_count)] : index
+    %a0 = view.load %bv[%ii] : view<[%count]xf32> -> f32
+    %j0 = index.constant 0 : index
+    %w0 = view.load %wv[%ii, %j0] : view<[%count]x8xf32> -> f32
+    %p0 = scalar.mulf %w0, %t0 : f32
+    %a1 = scalar.addf %a0, %p0 : f32
+    %j1 = index.constant 1 : index
+    %w1 = view.load %wv[%ii, %j1] : view<[%count]x8xf32> -> f32
+    %p1 = scalar.mulf %w1, %t1 : f32
+    %a2 = scalar.addf %a1, %p1 : f32
+    %j2 = index.constant 2 : index
+    %w2 = view.load %wv[%ii, %j2] : view<[%count]x8xf32> -> f32
+    %p2 = scalar.mulf %w2, %t2 : f32
+    %a3 = scalar.addf %a2, %p2 : f32
+    %j3 = index.constant 3 : index
+    %w3 = view.load %wv[%ii, %j3] : view<[%count]x8xf32> -> f32
+    %p3 = scalar.mulf %w3, %t3 : f32
+    %a4 = scalar.addf %a3, %p3 : f32
+    %j4 = index.constant 4 : index
+    %w4 = view.load %wv[%ii, %j4] : view<[%count]x8xf32> -> f32
+    %p4 = scalar.mulf %w4, %t4 : f32
+    %a5 = scalar.addf %a4, %p4 : f32
+    %j5 = index.constant 5 : index
+    %w5 = view.load %wv[%ii, %j5] : view<[%count]x8xf32> -> f32
+    %p5 = scalar.mulf %w5, %t5 : f32
+    %a6 = scalar.addf %a5, %p5 : f32
+    %j6 = index.constant 6 : index
+    %w6 = view.load %wv[%ii, %j6] : view<[%count]x8xf32> -> f32
+    %p6 = scalar.mulf %w6, %t6 : f32
+    %a7 = scalar.addf %a6, %p6 : f32
+    %j7 = index.constant 7 : index
+    %w7 = view.load %wv[%ii, %j7] : view<[%count]x8xf32> -> f32
+    %p7 = scalar.mulf %w7, %t7 : f32
+    %a8 = scalar.addf %a7, %p7 : f32
+    view.store %a8, %ov[%dest] : f32, view<[%out_count]xf32>
+  }
+  kernel.return
+}

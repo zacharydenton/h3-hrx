@@ -1230,6 +1230,7 @@ dependencies = [
 [[package]]
 name = "hrx"
 version = "0.1.0"
+source = "git+https://github.com/zacharydenton/hrx.rs?rev=a440e8b23586b1ae88e0f4cb616f8d6755d766dc#a440e8b23586b1ae88e0f4cb616f8d6755d766dc"
 dependencies = [
  "flate2",
  "libc",

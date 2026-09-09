@@ -45,20 +45,18 @@ python3 dev.py --cmake-build-dir "$PWD/build" cmake configure \
 python3 dev.py --cmake-build-dir "$PWD/build" cmake build \
   loom-compile loom-format loom-check iree-test-loom iree-benchmark-loom \
   libhrx_src_libhrx_hrx
-export HRX_BUILD="$PWD/build"
+export LOOM_COMPILE="$PWD/build/loom/src/loom/tools/loom-compile/loom-compile"
 cd "$H3_SOURCE"
-source scripts/env.sh
-bash scripts/test.sh --cpu
+bash scripts/test.sh
 ```
 
-`libhrx_src_libhrx_hrx` builds `libhrx.so`. Nothing links it any more — the
-library loads a digest-verified copy from the HRX bundle at run time — but the
-Python kernel tooling under `tools/` still finds this build's tools through
-`scripts/env.sh` and `$HRX_BUILD`, and `LOOM_COMPILE` points the Rust side at
-this `loom-compile` in place of the bundle's. There is no HIP path any more.
+`libhrx_src_libhrx_hrx` builds `libhrx.so`. Nothing here links it, and nothing
+here needs this build at all: the model and its tests take a digest-verified
+`libhrx` and `loom-compile` from the HRX bundle. What this checkout is for is
+rebuilding that compiler — these three patches are the only record of how it
+differs from upstream, and two of them are codegen changes the recorded kernel
+measurements depend on. `LOOM_COMPILE` substitutes the result for the bundle's.
 
 The three patches reproduce the committed compiler source used for the recorded
-measurements. The CPU suite checks this project's generated kernels with the
-selected compiler; it does not benchmark or initialize the GPU. A compiler
-rebuild from a fresh checkout has not been repeated as part of this documentation
-cleanup. The patches retain their upstream source license headers.
+measurements. A compiler rebuild from a fresh checkout has not been repeated
+recently. The patches retain their upstream source license headers.

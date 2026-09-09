@@ -14,7 +14,7 @@ five-second example at the normal evaluation count.
 | C | `(cd examples/c && gcc -O2 -I../../include minimal.c -L../../build -lh3 -Wl,-rpath,"$PWD/../../build" -o minimal)` | `examples/c/minimal "$(cat docs/prompts/cliff_rider_768p.txt)" 22 3 out` |
 | Rust (the `h3` crate directly, no C ABI and no bindgen) | `(cd examples/rust && cargo build --release)` | `examples/rust/target/release/minimal "$(cat docs/prompts/cliff_rider_768p.txt)" 22 3 out` |
 | Go (cgo) | `(cd examples/go && go build -o minimal .)` | `examples/go/minimal "$(cat docs/prompts/cliff_rider_768p.txt)" 22 3 out` |
-| Python (ctypes) | | `python3 tools/pipeline_c.py "$(cat docs/prompts/cliff_rider_768p.txt)" --frames 22 --steps 3` (`h3_loom.py` is the binding) |
+| Elixir (Rustler, the Rust API) | `cargo build --manifest-path examples/rustler/Cargo.toml` | `H3_NIF="$PWD/examples/rustler/target/debug/libh3_nif" elixir examples/rustler/smoke.exs` |
 
 The positional arguments are the prompt, the frame count, the sigma grid points (evaluations + 1)
 and the output prefix. `ffmpeg -f rawvideo -pix_fmt rgb24 -s 864x480 -r 24 -i out.rgb -i out.wav out.mp4`

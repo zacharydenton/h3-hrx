@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn encodes_the_prompts_the_c_implementation_was_checked_against() {
-        // The counts `tests/test_tokenizer.py` asserts against transformers.
+        // The counts the Python suite asserted against transformers, before it was removed.
         let t = tok();
         for (text, want) in [
             (

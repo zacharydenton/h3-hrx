@@ -1,0 +1,55 @@
+// Euler update in the CPU sampler's exact f32 operation order; no fused multiply-add.
+amdgpu.target<gfx11-generic> @h3_sampler_update_target {subgroup_size = 32}
+config.decl @h3.sampler_update_f32.count : %value: index where [range(%value, 1, 1073741824)]
+config.decl @h3.sampler_update_f32.channels : %value: index where [range(%value, 1, 128)]
+config.decl @h3.sampler_update_f32.row_offset : %value: index where [range(%value, 0, 1073741824)]
+config.decl @h3.sampler_update_f32.col_offset : %value: index where [range(%value, 0, 128)]
+config.decl @h3.sampler_update_f32.head_rows : %value: index where [range(%value, 1, 1073741824)]
+
+kernel.def target(@h3_sampler_update_target) export("h3_sampler_update_f32") @h3_sampler_update_f32() {
+  %count = config.get @h3.sampler_update_f32.count : index
+  %one = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %round = index.constant 255 : index
+  %rounded = index.add %count, %round : index
+  %groups = index.div %rounded, %threads : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%sigma: f32, %ratio: f32, %x: buffer, %head: buffer) {
+  %count = config.get @h3.sampler_update_f32.count : index
+  %channels = config.get @h3.sampler_update_f32.channels : index
+  %row_offset = config.get @h3.sampler_update_f32.row_offset : index
+  %col_offset = config.get @h3.sampler_update_f32.col_offset : index
+  %head_rows = config.get @h3.sampler_update_f32.head_rows : index
+  %threads = index.constant 256 : index
+  %offset = index.constant 0 : offset
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %group, %threads : index
+  %i = index.add %base, %lane : index
+  %xg = buffer.assume.memory_space<global> %x : buffer
+  %hg = buffer.assume.memory_space<global> %head : buffer
+  %xv = buffer.view %xg[%offset] : buffer -> view<[%count]xf32>
+  %hv = buffer.view %hg[%offset] : buffer -> view<[%head_rows]x128xf32>
+  %active = index.cmp ult, %i, %count : index
+  scf.if %active {
+    %ii = index.assume %i [lt(%i, %count)] : index
+    %row0 = index.div %ii, %channels : index
+    %col0 = index.rem %ii, %channels : index
+    %row1 = index.add %row0, %row_offset : index
+    %col1 = index.add %col0, %col_offset : index
+    %row = index.assume %row1 [lt(%row1, %head_rows)] : index
+    %cols = index.constant 128 : index
+    %col = index.assume %col1 [lt(%col1, %cols)] : index
+    %xi = view.load %xv[%ii] : view<[%count]xf32> -> f32
+    %vi = view.load %hv[%row, %col] : view<[%head_rows]x128xf32> -> f32
+    %one = scalar.constant 1.0 : f32
+    %sv = scalar.mulf %sigma, %vi : f32
+    %d = scalar.addf %xi, %sv : f32
+    %complement = scalar.subf %one, %ratio : f32
+    %rx = scalar.mulf %ratio, %xi : f32
+    %rd = scalar.mulf %complement, %d : f32
+    %next = scalar.addf %rx, %rd : f32
+    view.store %next, %xv[%ii] : f32, view<[%count]xf32>
+  }
+  kernel.return
+}

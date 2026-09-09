@@ -6,6 +6,8 @@
 //! the *video* sigma grid, so it advances with the video's ratio, not its own.
 use crate::model::*;
 
+pub(crate) mod device;
+
 /// `x' = r x + (1 - r) (x + sigma v)`, in f32, exactly as written.
 ///
 /// Algebraically this is `x + (1 - r) sigma v`, which is not the same in f32; the form here is the one
@@ -18,10 +20,15 @@ pub fn euler_update(x: &mut [f32], v: &[f32], sigma: f32, r: f32) {
 
 /// The video's denoised estimate: `D = x + sigma_v * out`, where the network's output is `-v`.
 pub fn denoised_video(x: &[f32], out: &[f32], sigma_v: f32) -> Vec<f32> {
-    x.iter()
-        .zip(out)
-        .map(|(xi, oi)| xi + sigma_v * oi)
-        .collect()
+    let mut result = vec![0.0; x.len().min(out.len())];
+    denoised_video_into(x, out, sigma_v, &mut result);
+    result
+}
+
+pub(crate) fn denoised_video_into(x: &[f32], out: &[f32], sigma_v: f32, result: &mut [f32]) {
+    for ((xi, oi), di) in x.iter().zip(out).zip(result) {
+        *di = xi + sigma_v * oi;
+    }
 }
 
 /// The audio's denoised estimate for the carried variable.
@@ -38,15 +45,25 @@ pub fn denoised_audio(
     sigma_a: f32,
     ascale: f64,
 ) -> Vec<f32> {
-    y.iter()
-        .zip(x_a)
-        .zip(v)
-        .map(|((yi, xi), vi)| {
-            let out = (1.0 - ascale) * f64::from(*xi)
-                - (1.0 + (ascale - 1.0) * f64::from(sigma_a)) * f64::from(*vi);
-            (f64::from(*yi) - f64::from(sigma_v) * out) as f32
-        })
-        .collect()
+    let mut result = vec![0.0; y.len().min(x_a.len()).min(v.len())];
+    denoised_audio_into(y, x_a, v, sigma_v, sigma_a, ascale, &mut result);
+    result
+}
+
+pub(crate) fn denoised_audio_into(
+    y: &[f32],
+    x_a: &[f32],
+    v: &[f32],
+    sigma_v: f32,
+    sigma_a: f32,
+    ascale: f64,
+    result: &mut [f32],
+) {
+    for (((yi, xi), vi), di) in y.iter().zip(x_a).zip(v).zip(result) {
+        let out = (1.0 - ascale) * f64::from(*xi)
+            - (1.0 + (ascale - 1.0) * f64::from(sigma_a)) * f64::from(*vi);
+        *di = (f64::from(*yi) - f64::from(sigma_v) * out) as f32;
+    }
 }
 
 /// One res_multistep advance, on the video sigma grid.

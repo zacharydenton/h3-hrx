@@ -1127,6 +1127,7 @@ dependencies = [
  "hf-hub",
  "hrx",
  "libc",
+ "libm",
  "memmap2",
  "rand 0.9.5",
  "rand_chacha",
@@ -1246,6 +1247,7 @@ dependencies = [
 [[package]]
 name = "hrx"
 version = "0.1.0"
+source = "git+https://github.com/zacharydenton/hrx.rs?rev=a440e8b23586b1ae88e0f4cb616f8d6755d766dc#a440e8b23586b1ae88e0f4cb616f8d6755d766dc"
 dependencies = [
  "flate2",
  "libc",
@@ -1698,13 +1700,6 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
-
-[[package]]
-name = "loomrun"
-version = "0.1.0"
-dependencies = [
- "hrx",
-]
 
 [[package]]
 name = "lru-slab"

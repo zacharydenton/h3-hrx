@@ -5,7 +5,7 @@
 committed copy no longer matches the code that implements it.
 
 Every language with a C foreign-function interface can drive it; `examples/c` and `examples/go` are
-working clients, and `h3_loom.py` is the ctypes binding the Python tools use. A **Rust** caller does
+working clients. A **Rust** caller does
 not need the C ABI at all: the `h3` crate's `Session` is the same API with slices, borrows and
 `Result`, which is what `cli/` and `examples/rust` use.
 
@@ -129,7 +129,7 @@ overrides it); passing a path reads that file instead.
 
 ## Clients
 
-[Complete examples](../examples/README.md) cover C, Rust, Go, and Python,
+[Complete examples](../examples/README.md) cover C, Rust, Go, and Elixir,
 including error handling and output. The `h3` command in
 [`cli/src/main.rs`](../cli/src/main.rs) is the fullest client: reference
 preparation, keyframes, decoding and muxing. Use [structured

@@ -36,7 +36,7 @@ measurements, and decoder timings.
 
 You need Linux, a `gfx1151` device with its kernel driver, Rust and ffmpeg.
 The shared `hrx.rs` crate provisions prebuilt Loom, HRX and compatible HSA.
-Python and NumPy are development/reference-test dependencies.
+Nothing here needs Python.
 
 With the sibling `hrx.rs` checkout:
 
@@ -76,9 +76,10 @@ hf download Comfy-Org/MiniMax-H3 \
             vae/minimax_h3_audio_vae_fp32.safetensors
 ```
 
-If you already have them in a ComfyUI models directory,
-`python3 tools/link_hf_cache.py --apply` registers them in the cache by symlink
-rather than downloading them again. Reference images and audio additionally need
+If you already have them in a ComfyUI models directory, point `H3_MODELS` at it
+or symlink them into the Hugging Face cache rather than downloading them again:
+the resolver checks the models directory, then that cache, then the hub.
+Reference images and audio additionally need
 the ref2va checkpoint. See [setup details](docs/setup.md) for that download and
 tool paths.
 Model weights have their own license; consult the
@@ -114,7 +115,7 @@ but not the CLI.
 
 - [Setup](docs/setup.md) — dependencies, checkpoints, and configuration.
 - [Prompting](docs/prompting.md) and [other modes](docs/tricks.md) — references, audio, and stills.
-- [C API](docs/abi.md) and [examples](examples/README.md) — C, Rust, Go, and Python clients.
+- [C API](docs/abi.md) and [examples](examples/README.md) — C, Rust, Go, and Elixir clients.
 - [Contributing](CONTRIBUTING.md) — repository layout, tests, and benchmarking.
 - [Performance](docs/performance.md) and [research archive](docs/archive/README.md).
 

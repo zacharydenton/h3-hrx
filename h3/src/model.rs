@@ -214,7 +214,7 @@ mod selection_tests {
 
     #[test]
     fn the_row_group_rule_pads_as_little_as_it_can() {
-        // The values tests/test_host_logic.cpp pins.
+        // The values the C implementation's own test pinned.
         assert_eq!(gemm_m_group_for(37723, FFN, HID, 8), 2);
         assert_eq!(gemm_m_group_for(32768, FFN, HID, 8), 2);
         // just below the threshold, and the wrong shape, both fall through to the general rule

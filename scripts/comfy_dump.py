@@ -1,9 +1,17 @@
 """A whole ComfyUI MiniMax H3 clip with the stock workflows' settings (res_multistep, 'simple', 20 evaluations,
 cfg 1, the model's shifts): t2va, or fl2va from --first-frame. Ground truth for what a conditioned clip should
-look like. Run inside the Strix Halo ComfyUI image with the local checkout on PYTHONPATH (docs/archive/notes.md):
-    tools/comfy_clip.py --first-frame build/refs/fox_clean.png --out build/comfy_fl2va
-Writes frames.npy [F,H,W,3] uint8, audio.wav, video_latent.npy, audio_latent.npy; tools/pipeline.py-style mp4 muxing is
-left to ffmpeg outside the container."""
+look like, and the fixtures `scripts/parity.py gate` compares against.
+
+This is the half of the parity check that cannot live in `scripts/parity.py`: it runs inside the
+Strix Halo ComfyUI image, against ComfyUI's own modules, where nothing else here runs.
+
+    podman run --rm -v "$HOME:$HOME" -w "$PWD" -e PYTHONPATH=/opt/ComfyUI \
+      --entrypoint /opt/venv/bin/python docker.io/kyuz0/amd-strix-halo-comfyui:latest \
+      scripts/comfy_dump.py --dump-steps --dump-blocks 0,1,2,5,10,20,30,40,49 \
+      --steps 2 --out build/comfy_t2va_blocks
+
+Writes frames.npy [F,H,W,3] uint8, audio.wav, video_latent.npy, audio_latent.npy; mp4 muxing is left
+to ffmpeg outside the container."""
 import argparse, logging, os, sys, time, wave
 from pathlib import Path
 import numpy as np

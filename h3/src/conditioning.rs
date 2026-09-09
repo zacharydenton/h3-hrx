@@ -1,10 +1,13 @@
-//! The AdaLN tables the blocks modulate with, built on the host once per denoising step.
+//! AdaLN timestep interpolation and CPU reference tables; prepared device projections
+//! build the runtime tables without transferring them from the host each step.
 //!
 //! A timestep becomes eight numbers by interpolating the checkpoint's curve, those eight drive each
 //! layer's projection, and the projection's chunks are permuted into the row order the kernels index
 //! by class. The accumulation is f32 in a fixed order and the permutation is semantic, so both are
 //! carried over exactly rather than tidied.
 use crate::model::*;
+
+pub(crate) mod device;
 
 /// A timestep's eight-vector, interpolated from the checkpoint's 1025-point curve.
 ///

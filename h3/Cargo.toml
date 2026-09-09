@@ -10,7 +10,7 @@ path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-hrx = { version = "0.1.0", path = "../../hrx.rs" }
+hrx.workspace = true
 memmap2 = "0.9"
 safetensors = "0.8"
 half = { version = "2", features = ["bytemuck"] }
@@ -27,6 +27,7 @@ rand_chacha = "0.9"
 rand_distr = "0.5"
 
 [dev-dependencies]
+libm = "0.2"
 tempfile = "3"
 
 [build-dependencies]

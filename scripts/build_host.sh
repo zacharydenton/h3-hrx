@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Builds everything: the library, the CLI and the kernel-test launcher. All Rust, all on libhrx —
-# no ROCm headers, no hipcc, no device code outside kernels/.
+# Builds the library and the CLI. All Rust, all on libhrx — no ROCm headers, no hipcc, and no
+# device code outside h3/kernels/.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mkdir -p build
@@ -13,8 +13,7 @@ fi
 cargo build --workspace --release --quiet
 cp target/release/libh3.so build/libh3.so
 cp target/release/h3 build/h3
-cp target/release/loomrun build/loomrun
-printf 'built build/libh3.so, build/h3, build/loomrun\n'
+printf 'built build/libh3.so, build/h3\n'
 
 # Export the header from this build, including when Cargo reused cached outputs.
 # Only this explicit build/install step updates the checkout's committed copy.

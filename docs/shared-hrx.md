@@ -5,11 +5,9 @@ binary rpath build scripts are removed. The model still exposes `Session` as its
 Rust API, and `libh3.so` as its portable C ABI. Neither requires Python, Torch,
 ROCm development headers or an LLVM build.
 
-The dependency is a path one — `hrx = { path = "../../hrx.rs" }` in `h3/Cargo.toml`
-and `loomrun/Cargo.toml` — so **this repository does not build from a clean clone
-on its own**. A checkout of `hrx.rs` has to sit beside the directory holding this
-one, and there is no revision to pin: nothing here records which `hrx.rs` a given
-commit was built against. Anyone building this needs that checkout first.
+The workspace pins HRX to a Git revision with explicit features. A clean clone
+needs access to the private `hrx.rs` repository, but no sibling checkout.
+A local development override can be supplied with Cargo's `[patch]` mechanism.
 
 The shared runtime supplies per-session streams, allocator-based allocation,
 checked buffer ranges, dynamic native loading, and prepared binding dispatch.
@@ -18,8 +16,7 @@ SHA-256 identity, integrity checks and atomic publication to `hrx::loom`.
 Sources are read once per compiler session. The source files and tokenizer are
 inside the `h3` package at `h3/kernels` and `h3/assets`. Generators, tests, and
 examples use these paths directly.
-Existing Python test tools retain their paths and their separate legacy cache;
-Rust uses the new `hrx-v1` cache subdirectory.
+Compiled kernels go to an `hrx-v1` cache subdirectory.
 
 The tested native bundle is currently local; its proposed public release has not
 been uploaded. To prepare it and build:
@@ -47,6 +44,6 @@ references. Session panics remain contained and poison the session.
 Its worker owns an H3 Rust session; jobs contain owned data and a bounded queue.
 It calls the Rust API directly. No Rustler dependency is added to H3 or HRX.
 
-`loomrun` now delegates to the shared generic runner, preserving its command-line
-interface. This runner also accepts HSACOs produced by the vision model repos;
-their full Rust ports remain separate work.
+`loomrun` is gone: it existed to launch one kernel for the Python test harness,
+and the kernel tests dispatch in process now. The equivalent runner lives in the
+shared crate for anyone who wants it.

@@ -8,16 +8,15 @@ Run commands from the repository root unless stated otherwise.
   128 GB Strix Halo system. Allow room for activations as well as weights;
   smaller memory configurations have not been validated.
 - ffmpeg for input decoding and MP4/WAV output.
-- `cargo` (Rust). Everything outside `h3/kernels/` is Rust: the library, the `h3`
-  command and the `loomrun` kernel launcher. No ROCm headers and no `hipcc` —
-  the runtime surface is `libhrx`.
+- `cargo` (Rust). Everything outside `h3/kernels/` is Rust: the library and the
+  `h3` command. No ROCm headers and no `hipcc` — the runtime surface is `libhrx`,
+  loaded on demand from the HRX bundle.
 - A checkout of the [`hrx.rs`](shared-hrx.md) crate beside the directory holding
   this one. It is a path dependency, so nothing here builds without it, and it
   supplies the Loom compiler, `libhrx` and a compatible HSA as a pinned,
   digest-verified native bundle. No ROCm headers, no `hipcc`, no LLVM build.
-- For downloads, the Hugging Face CLI (`python3 -m pip install huggingface_hub`
-  in a Python environment). For development, Python 3 with NumPy. Inference
-  itself runs without Python.
+
+`h3` fetches the checkpoints itself. Nothing in this repository needs Python.
 
 ## Toolchain and build
 
@@ -35,8 +34,7 @@ bash scripts/build_host.sh
 at a pinned mirror, and `HRX_OFFLINE` refuses the network outright. `LOOM_COMPILE`
 selects a developer compiler in place of the bundle's.
 
-The build produces `build/libh3.so`, `build/h3`, `build/loomrun` and
-`include/h3.h`, the last copied from what the Cargo build generated — an ordinary
+The build produces `build/libh3.so`, `build/h3` and `include/h3.h`, the last copied from what the Cargo build generated — an ordinary
 `cargo build` leaves the checkout alone. An installed binary carries the Loom
 sources and the tokenizer inside it and caches compiled kernels per user under
 `$XDG_CACHE_HOME/hrx`; `h3 --root DIR` opts back into a working tree's
@@ -52,17 +50,18 @@ Building Loom yourself, rather than taking the bundle's compiler, needs
 [the included compiler patches](../patches/loom/README.md) — among them
 `0003-amdgpu-pm4-emulation-query-optional.patch`, without which `hrx_gpu_initialize`
 returns `INVALID_ARGUMENT` from `hsa_agent_get_info` on a ROCr older than the
-`HSA_AMD_AGENT_INFO_PM4_EMULATION` attribute. The Python kernel tooling under
-`tools/` still drives such a build, through `scripts/env.sh` and `HRX_BUILD`.
+`HSA_AMD_AGENT_INFO_PM4_EMULATION` attribute. Nothing here requires such a build
+any more — the bundle's compiler is what the tests and the model use, and
+`LOOM_COMPILE` is how you substitute your own.
 
 ## Checkpoints
 
 Follow the [base checkpoint download](../README.md#weights); `h3` fetches them on
 first use if they are not already present. They are resolved from a models
 directory, then the shared Hugging Face cache, then the hub, so a copy that
-already exists anywhere is reused. `tools/link_hf_cache.py --apply` registers an
-existing ComfyUI models directory in the cache by symlink, which costs no disk
-and works when the two are on different filesystems. Approximate file sizes:
+already exists anywhere is reused. `H3_MODELS` names the models directory; a
+symlink from the Hugging Face cache to an existing ComfyUI one costs no disk and
+works when the two are on different filesystems. Approximate file sizes:
 
 | Checkpoint | Contents | Disk size |
 | --- | --- | ---: |
@@ -89,6 +88,3 @@ for references; use ref2va for normal reference-conditioned generation.
 The default model directory is `~/comfy-models`. Set `H3_MODELS` or pass
 `--models DIR`; `--dit`, `--te`, `--video-vae`, and `--audio-vae` override
 individual files. All flags are listed by `./build/h3 --help`.
-
-`scripts/download.sh` downloads the original MiniMax reference-model files
-for development tools. It is not needed to generate clips with this host.

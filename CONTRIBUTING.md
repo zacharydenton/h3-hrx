@@ -1,85 +1,24 @@
 # Contributing
 
-Use [setup](docs/setup.md) to build the library and the CLI; kernel work also
-wants the [pinned Loom toolchain](patches/loom/README.md), which the Python
-tooling under `tools/` drives directly. Include a description of the changed
-behavior and the checks you ran with a contribution.
-For performance changes, record the shape, precision, hardware, toolchain,
-timing boundary, and numerical comparison alongside the result.
-
-## Repository layout
-
-| Directory | Purpose |
-| --- | --- |
-| `h3/` | the library: pipeline, checkpoint loader, tokenizer, and the C ABI in `src/capi.rs` |
-| `hrx/` | the safe wrapper over libhrx: devices, buffers, kernels, dispatch |
-| `cli/` | the `h3` command, a client of the `h3` crate's own API |
-| `loomrun/` | the kernel-test launcher the Python harness dispatches through |
-| `include/` | `h3.h`, generated from `h3/src/capi.rs` by cbindgen and checked in |
-| `h3/kernels/` | Runtime Loom sources, mostly emitted by `tools/gen_*.py` |
-| `tools/` | Generators, Python client, benchmarks, and ComfyUI comparison tools |
-| `tests/` | kernel numerical checks and pipeline comparisons; the host's own tests are `cargo test` |
-| `reference/` | PyTorch/diffusers numerical oracles; unused during normal inference |
-| `experiments/` | Kernel alternatives, including templates and GPU regression inputs |
-| `examples/` | C, Rust, Go, and Python clients |
-| `h3/assets/` | Tokenizer data embedded into the library |
-| `docs/archive/` | Historical measurements and tuning logs |
-
-Edit a generated kernel's generator and regenerate the source together.
-The CPU suite checks the canonical generated sources it covers. Do not delete
-`experiments/` wholesale: production head-major attention generation reads
-`attention_i8qkt32_mha8_lds_f16_wmma.loom`, and the kernel regressions exercise
-several experimental 32-key attention variants.
-
-## Tests
+The model host, tests, and tooling are Rust. Checked-in `.loom` files are the
+source of truth: edit them directly and test the affected operation against an
+independent CPU reference. The old Python generators, wrappers, and one-off
+measurement scripts are retired; their history remains in Git.
 
 ```sh
-bash scripts/test.sh --cpu
-bash scripts/test.sh --quick
-bash scripts/test.sh
+scripts/test.sh --cpu
+scripts/test.sh --gpu
 ```
 
-- `--cpu`: Python syntax, host regressions (including ASan/UBSan), generated
-  source checks, and kernel compilation. No GPU, weights, or containers.
-  Loom-dependent checks are explicitly skipped when its tools are absent.
-- `--quick`: adds the host build, GPU kernel checks, tokenizer comparison,
-  and a toy ComfyUI comparison when its container runtime is available.
-- Full suite: adds model and pipeline comparisons; some checks require saved
-  reference data and report a skip if it is absent.
+The CPU suite runs formatting, Clippy and workspace tests. GPU tests are explicitly
+ignored by default and must be requested on gfx1151; once requested, missing
+hardware, compiler, or runtime is a failure, never a silent pass. HRX provisions
+and caches the compiler and runtime. `HRX_OFFLINE=1` requires an existing bundle.
 
-Set `H3_PYTHON` to a Python 3 interpreter with NumPy. Set
-`H3_REFERENCE_PYTHON` to an environment with ROCm PyTorch, diffusers, and
-transformers for GPU/reference checks; it defaults to `H3_PYTHON`.
-`bash scripts/test_host.sh` runs the CPU host checks alone.
+Use the shared HRX crate for native loading, allocation, scalar packing, dispatch,
+compilation, caching and FFI guards. Model code owns its source selection, shapes,
+weight layout and numerical semantics. Preserve the generated C ABI and keep
+Rustler adapters in the consuming application.
 
-The ComfyUI harness uses podman and
-`docker.io/kyuz0/amd-strix-halo-comfyui:latest`. `H3_REQUIRE_COMFY=1` makes
-the toy comparison mandatory. Reference tools run inside that image with the
-checkout and model directory mounted; their module docstrings describe their
-inputs. In particular:
-
-- [`comfy_clip.py`](tools/comfy_clip.py) produces block and trajectory dumps
-  for [`test_comfy_parity.py`](tests/test_comfy_parity.py).
-- [`ref_truth_comfy.py`](tools/ref_truth_comfy.py) produces encoder and
-  reference-conditioning fixtures under `build/ref_truth`.
-- `scripts/download.sh [DIR] [--all]` fetches original MiniMax files used by
-  reference tools; `--all` also downloads the large bf16 transformer and
-  text encoder. Production uses the separate ComfyUI-format checkpoints.
-
-For a release numerical check, require the dumps instead of accepting a skip:
-
-```sh
-python3 tests/test_comfy_parity.py --require
-```
-
-Use the reference interpreter for this command. Passing the CPU suite alone
-does not establish GPU correctness or model parity.
-
-## Benchmarks
-
-[`docs/performance.md`](docs/performance.md) summarizes recorded results.
-`tools/bench_attention_i8.py`, `tools/bench_gemm_i8_tuning.py`,
-`tools/bench_vae_gemm.py`, and `tools/bench_vae_decode.py` contain the focused
-drivers; consult their `--help` for inputs. Keep logs, binaries, checkpoints,
-and generated clips under ignored `build/`, and commit compact measurements
-only when they support a documented change.
+See [test coverage](docs/testing.md) for the numerical cases and remaining limits.
+Record dimensions, precision, toolchain and GPU when reporting performance.

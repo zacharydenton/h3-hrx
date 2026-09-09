@@ -65,7 +65,7 @@ func main() {
 	models := os.Getenv("H3_MODELS"); if models == "" { models = home + "/comfy-models" }
 	cfg := C.h3_config{dit_file: cs(models + "/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"), te_file: cs(models + "/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
 		video_vae_file: cs(models + "/vae/minimax_h3_video_vae_fp16.safetensors"), audio_vae_file: cs(models + "/vae/minimax_h3_audio_vae_fp32.safetensors"),
-		kernel_sources: cs(root + "/kernels"), cache_dir: cs(root + "/build/kernel_cache"), loom_compile: cs(loom), attn_qk_bits: 8}
+		kernel_sources: cs(root + "/h3/kernels"), cache_dir: cs(root + "/build/kernel_cache"), loom_compile: cs(loom), attn_qk_bits: 8}
 	var s *C.h3_session
 	if C.h3_create(&cfg, &s) != 0 { fail("create") }
 

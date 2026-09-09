@@ -1,10 +1,9 @@
 //! Compiling Loom kernels through `loom-compile` into a shared cache, and loading them.
 //!
-//! One kernel per (stem, source text, symbol, backend, target, config, compiler binary): the cache file
-//! name carries a hash of all of them, so neither an edited kernel source nor a replaced `loom-compile`
-//! ever reuses a stale binary. `tools/kernel_cache.py` keeps the same policy for the Python harnesses,
-//! and this must keep it too — the tag is the only thing that makes a cache entry reusable across
-//! implementations.
+//! One kernel per (stem, source text, symbol, backend, target, config, compiler binary): the cache
+//! file name is a digest of all of them, so neither an edited kernel source nor a replaced
+//! `loom-compile` ever reuses a stale binary. `hrx::loom` computes the digest and owns the cache; what
+//! is here is the choice of source and configuration.
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
