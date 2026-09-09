@@ -179,7 +179,12 @@ impl Weights {
     /// between rows stays zero. Either way the file's pages are released once their bytes are on the
     /// device: a tensor is read once, and tens of gigabytes of resident checkpoint would compete with
     /// the device allocations for the same memory on this part.
-    pub fn at(&self, gpu: &hrx::Gpu, name: &str, expect_bytes: usize) -> Result<Arc<hrx::Buffer>> {
+    pub fn at(
+        &self,
+        stream: &mut hrx::Stream,
+        name: &str,
+        expect_bytes: usize,
+    ) -> Result<Arc<hrx::Buffer>> {
         // The size is checked on both paths. Checking only the miss would mean the guard against a
         // wrongly-sized kernel operand held for the first caller and vanished for every one after,
         // which is the worst shape for a check to have.
@@ -194,10 +199,11 @@ impl Weights {
             return Ok(buffer.clone());
         }
         let buffer = Arc::new(
-            gpu.alloc(expect_bytes.max(1))
+            stream
+                .allocate(expect_bytes.max(1))
                 .map_err(|e| Error::Device(e.to_string()))?,
         );
-        self.fill(gpu, recipe, &buffer)?;
+        self.fill(stream, recipe, &buffer)?;
         self.uploaded
             .lock()
             .expect("not poisoned")
@@ -208,7 +214,7 @@ impl Weights {
     /// As [`Weights::at`], additionally checking the shape the kernel will read it with.
     pub fn rows(
         &self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         name: &str,
         rows: usize,
         row_bytes: usize,
@@ -227,15 +233,15 @@ impl Weights {
                 ))
             }
         }
-        self.at(gpu, name, rows * pitch_bytes)
+        self.at(stream, name, rows * pitch_bytes)
     }
 
-    fn fill(&self, gpu: &hrx::Gpu, recipe: &Recipe, buffer: &hrx::Buffer) -> Result<()> {
+    fn fill(&self, stream: &mut hrx::Stream, recipe: &Recipe, buffer: &hrx::Buffer) -> Result<()> {
         let device = |e: hrx::Error| Error::Device(e.to_string());
         match recipe {
             Recipe::Built { .. } => {
                 let bytes = recipe.assemble(&self.file)?;
-                gpu.h2d(buffer, &bytes).map_err(device)?;
+                stream.upload(buffer.binding(), &bytes).map_err(device)?;
             }
             Recipe::Rows {
                 rows,
@@ -252,7 +258,8 @@ impl Weights {
                     let span = &all[from..from + segment.rows * row_bytes];
                     self.file.will_need(span);
                     for (i, chunk) in span.chunks(CHUNK).enumerate() {
-                        gpu.h2d_at(buffer, i * CHUNK, chunk).map_err(device)?;
+                        crate::dispatch::upload_at(stream, buffer, i * CHUNK, chunk)
+                            .map_err(|e| Error::Device(e.to_string()))?;
                     }
                 } else {
                     // Gathered at the pitch, through a staging buffer zeroed once. Every row's first
@@ -274,24 +281,26 @@ impl Weights {
                             stage[dst..dst + row_bytes].copy_from_slice(&all[src..src + row_bytes]);
                             staged += 1;
                             if staged == per {
-                                gpu.h2d_at(
+                                crate::dispatch::upload_at(
+                                    stream,
                                     buffer,
                                     written * pitch_bytes,
                                     &stage[..staged * pitch_bytes],
                                 )
-                                .map_err(device)?;
+                                .map_err(|e| Error::Device(e.to_string()))?;
                                 written += staged;
                                 staged = 0;
                             }
                         }
                     }
                     if staged > 0 {
-                        gpu.h2d_at(
+                        crate::dispatch::upload_at(
+                            stream,
                             buffer,
                             written * pitch_bytes,
                             &stage[..staged * pitch_bytes],
                         )
-                        .map_err(device)?;
+                        .map_err(|e| Error::Device(e.to_string()))?;
                         written += staged;
                     }
                     if written != *rows {

@@ -16,7 +16,7 @@ fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let exe = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
-    let gpu = hrx::Gpu::open().expect("gpu");
+    let mut stream = hrx::Stream::open().expect("stream");
     let compiler = Compiler::new(
         exe,
         root.join("h3/kernels"),
@@ -25,8 +25,8 @@ fn main() {
 
     // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
 
-    let mut dit = unsafe { Dit::open(&gpu, &a[0]) }.expect("DiT checkpoint");
-    let mut te = unsafe { TextEncoder::open(&gpu, &a[1]) }.expect("text encoder checkpoint");
+    let mut dit = unsafe { Dit::open(&mut stream, &a[0]) }.expect("DiT checkpoint");
+    let mut te = unsafe { TextEncoder::open(&mut stream, &a[1]) }.expect("text encoder checkpoint");
     let mut prof = Profile::from_env();
 
     for pair in a[2..].chunks(2) {
@@ -36,10 +36,11 @@ fn main() {
             .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         let start = std::time::Instant::now();
-        dit.text_in(&gpu, &compiler, &mut prof, &mut te, &ids, &[])
+        dit.text_in(&mut stream, &compiler, &mut prof, &mut te, &ids, &[])
             .expect("text_in");
         let mut out = vec![0.0f32; ids.len() * HID];
-        dit.read_rows(&gpu, ids.len(), &mut out).expect("read");
+        dit.read_rows(&mut stream, ids.len(), &mut out)
+            .expect("read");
         eprintln!(
             "encoded {} tokens in {:.2}s",
             ids.len(),

@@ -89,7 +89,7 @@ impl Harness {
             .map(|bytes| self.stream.allocate(bytes.len()).unwrap())
             .collect();
         for (buffer, bytes) in buffers.iter().zip(data) {
-            self.stream.upload_queued(buffer, 0, bytes).unwrap();
+            self.stream.upload(buffer.binding(), bytes).unwrap();
         }
         let indices: Vec<_> = scalars.iter().map(|&v| u32::try_from(v).unwrap()).collect();
         let constants = Constants::indices(&kernel, &indices).unwrap();
@@ -110,7 +110,7 @@ impl Harness {
         if let Some(path) = baseline {
             let old = unsafe { self.stream.load_artifact(&path).unwrap() };
             for (buffer, bytes) in buffers.iter().zip(data) {
-                self.stream.upload_queued(buffer, 0, bytes).unwrap();
+                self.stream.upload(buffer.binding(), bytes).unwrap();
             }
             let old_constants = Constants::indices(&old, &indices).unwrap();
             unsafe {
@@ -153,7 +153,7 @@ impl Harness {
                     for order in 0..2 {
                         let version = (batch + order) % 2;
                         for (buffer, bytes) in buffers.iter().zip(data) {
-                            self.stream.upload_queued(buffer, 0, bytes).unwrap();
+                            self.stream.upload(buffer.binding(), bytes).unwrap();
                         }
                         self.stream.synchronize().unwrap();
                         let start = std::time::Instant::now();

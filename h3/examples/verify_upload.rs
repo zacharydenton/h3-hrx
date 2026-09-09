@@ -34,7 +34,7 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(usize::MAX);
 
-    let gpu = hrx::Gpu::open().expect("gpu");
+    let mut stream = hrx::Stream::open().expect("stream");
     // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
     let weights = unsafe { Weights::open(&path, plan_for(&which)) }.expect("plan");
 
@@ -62,9 +62,9 @@ fn main() {
         *kinds.entry(kind).or_insert(0usize) += 1;
 
         let want = recipe.assemble(weights.file()).expect("assemble");
-        let buffer = weights.at(&gpu, name, size).expect("upload");
+        let buffer = weights.at(&mut stream, name, size).expect("upload");
         let mut got = vec![0u8; size];
-        gpu.d2h(&buffer, &mut got).expect("read back");
+        stream.read(buffer.binding(), &mut got).expect("read back");
         if got != want {
             let at = got.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(0);
             println!("MISMATCH {name} ({kind}, {size} bytes) first differs at {at}");

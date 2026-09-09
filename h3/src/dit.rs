@@ -86,10 +86,13 @@ impl Dit {
     /// # Safety
     ///
     /// Maps the checkpoint; see [`crate::Session::new`].
-    pub unsafe fn open(gpu: &hrx::Gpu, path: impl AsRef<std::path::Path>) -> Result<Self> {
+    pub unsafe fn open(
+        stream: &mut hrx::Stream,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self> {
         Ok(Self {
             weights: unsafe { Weights::open(path, crate::plan::dit::plan) }?,
-            constants: Constants::new(gpu)?,
+            constants: Constants::new(stream)?,
             seq: None,
             refiner: None,
             cond: None,
@@ -105,39 +108,39 @@ impl Dit {
 
     /// Grows the sequence buffers if this length does not fit. The capacity is rounded to 256 rows
     /// plus 32, which is the slack the attention kernels read past the end of a sequence.
-    pub fn ensure_seq(&mut self, gpu: &hrx::Gpu, seq: usize) -> Result<()> {
+    pub fn ensure_seq(&mut self, stream: &mut hrx::Stream, seq: usize) -> Result<()> {
         if self.seq.as_ref().is_some_and(|s| seq <= s.capacity) {
             return Ok(());
         }
         self.seq = None;
         let t = seq_capacity(seq);
-        let zeroed = |bytes: usize| -> Result<hrx::Buffer> {
-            let b = gpu.alloc(bytes)?;
-            gpu.memset(&b, 0, bytes)?;
+        let mut zeroed = |bytes: usize| -> Result<hrx::Buffer> {
+            let b = stream.allocate(bytes)?;
+            stream.fill(b.slice(0, bytes), 0)?;
             Ok(b)
         };
         self.seq = Some(Seq {
             capacity: t,
             x: zeroed(t * HID * 4)?,
-            cls: Classes::zeroed(gpu, t)?,
-            cls0: Classes::zeroed(gpu, t)?,
-            tcls: Classes::zeroed(gpu, t)?,
-            cos: gpu.alloc(t * ROPE_HALF * 4)?,
-            sin: gpu.alloc(t * ROPE_HALF * 4)?,
-            in32: gpu.alloc(t * VIDEO_PATCH * 4)?,
-            out32: gpu.alloc(t * FINAL_N * 4)?,
+            cls: Classes::zeroed(stream, t)?,
+            cls0: Classes::zeroed(stream, t)?,
+            tcls: Classes::zeroed(stream, t)?,
+            cos: stream.allocate(t * ROPE_HALF * 4)?,
+            sin: stream.allocate(t * ROPE_HALF * 4)?,
+            in32: stream.allocate(t * VIDEO_PATCH * 4)?,
+            out32: stream.allocate(t * FINAL_N * 4)?,
         });
         Ok(())
     }
 
-    fn ensure_refiner(&mut self, gpu: &hrx::Gpu, c: &Compiler, n: usize) -> Result<()> {
+    fn ensure_refiner(&mut self, stream: &mut hrx::Stream, c: &Compiler, n: usize) -> Result<()> {
         if self.refiner.as_ref().is_some_and(|r| r.tokens == n) {
             return Ok(());
         }
         self.refiner = None;
         let stack = Stack::new(
             c,
-            gpu,
+            stream,
             refiner_dims(),
             n,
             REFINER_BLOCKS,
@@ -148,16 +151,19 @@ impl Dit {
             "refiner",
         )?;
         // no rope: the identity rotation at every row
-        let cos = gpu.alloc(n * ROPE_HALF * 4)?;
-        let sin = gpu.alloc(n * ROPE_HALF * 4)?;
-        gpu.h2d(&cos, crate::vvae::as_bytes(&vec![1.0f32; n * ROPE_HALF]))?;
-        gpu.memset(&sin, 0, n * ROPE_HALF * 4)?;
+        let cos = stream.allocate(n * ROPE_HALF * 4)?;
+        let sin = stream.allocate(n * ROPE_HALF * 4)?;
+        stream.upload(
+            cos.binding(),
+            crate::vvae::as_bytes(&vec![1.0f32; n * ROPE_HALF]),
+        )?;
+        stream.fill(sin.slice(0, n * ROPE_HALF * 4), 0)?;
         self.refiner = Some(Refiner {
             stack,
             tokens: n,
             cos,
             sin,
-            norm: NormMod::build(c, gpu, HID, 1e-5, 1)?,
+            norm: NormMod::build(c, stream, HID, 1e-5, 1)?,
         });
         Ok(())
     }
@@ -166,7 +172,7 @@ impl Dit {
     /// then the refiner and its final norm, all landing in `x` rows `[0, n)`.
     pub fn text_in(
         &mut self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         c: &Compiler,
         prof: &mut Profile,
         te: &mut TextEncoder,
@@ -174,31 +180,31 @@ impl Dit {
         spans: &[Span<'_>],
     ) -> Result<()> {
         let n = ids.len();
-        self.ensure_seq(gpu, n)?;
-        let hidden = te.encode(gpu, c, prof, ids, spans)?;
+        self.ensure_seq(stream, n)?;
+        let hidden = te.encode(stream, c, prof, ids, spans)?;
 
         let seq = self.seq.as_ref().expect("sized above");
-        Matmul16::build(c, gpu, "bias", TEXT_DIM, HID)?.run(
-            gpu,
+        let held_1 = self.weights.at(stream, "h3.cond.w", HID * TEXT_DIM * 2)?;
+        let held_2 = self.weights.at(stream, "h3.cond.b", HID * 4)?;
+        Matmul16::build(c, stream, "bias", TEXT_DIM, HID)?.run(
+            stream,
             Some(prof),
             "condition proj",
             n,
             hidden,
-            self.weights
-                .at(gpu, "h3.cond.w", HID * TEXT_DIM * 2)?
-                .binding(),
-            self.weights.at(gpu, "h3.cond.b", HID * 4)?.binding(),
+            held_1.binding(),
+            held_2.binding(),
             seq.x.binding(),
             None,
         )?;
 
-        self.ensure_refiner(gpu, c, n)?;
+        self.ensure_refiner(stream, c, n)?;
         let r = self.refiner.as_mut().expect("built above");
         let seq = self.seq.as_ref().expect("sized above");
         let cond = self.constants.identity();
         let cond_fn = |_: usize| crate::stack::LayerCond { ..cond };
         r.stack.forward(
-            gpu,
+            stream,
             prof,
             seq.x.binding(),
             seq.cls0.slice(0, n),
@@ -209,15 +215,14 @@ impl Dit {
             None,
         )?;
         // the refiner modulates with a single class, so its table is the two zero rows
+        let held_1 = self.weights.at(stream, "h3.refiner.final_norm", HID * 4)?;
         r.norm.run(
-            gpu,
+            stream,
             Some(prof),
             "refiner final norm",
             n,
             seq.x.binding(),
-            self.weights
-                .at(gpu, "h3.refiner.final_norm", HID * 4)?
-                .binding(),
+            held_1.binding(),
             self.constants.zeros.binding(),
             seq.cls0.slice(0, n),
         )?;
@@ -225,10 +230,10 @@ impl Dit {
     }
 
     /// The sequence's first `rows` rows, `[rows][5376]` f32 — what `h3_text_in` hands back.
-    pub fn read_rows(&self, gpu: &hrx::Gpu, rows: usize, out: &mut [f32]) -> Result<()> {
+    pub fn read_rows(&self, stream: &mut hrx::Stream, rows: usize, out: &mut [f32]) -> Result<()> {
         let seq = self.seq.as_ref().expect("a sequence has been sized");
-        gpu.sync()?;
-        gpu.d2h_ref(
+        stream.synchronize()?;
+        stream.read(
             seq.x.slice(0, rows * HID * 4),
             crate::vvae::as_bytes_mut(out),
         )?;
@@ -349,22 +354,22 @@ struct Projection {
 impl Projection {
     fn build(
         c: &Compiler,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         weights: &Weights,
         name: &str,
         k: usize,
         n: usize,
     ) -> Result<Self> {
         Ok(Self {
-            op: crate::dispatch::MatmulF32::build(c, gpu, k, n)?,
-            weight: weights.at(gpu, &format!("{name}.w"), n * k * 4)?,
-            bias: weights.at(gpu, &format!("{name}.b"), n * 4)?,
+            op: crate::dispatch::MatmulF32::build(c, stream, k, n)?,
+            weight: weights.at(stream, &format!("{name}.w"), n * k * 4)?,
+            bias: weights.at(stream, &format!("{name}.b"), n * 4)?,
         })
     }
 
     fn run(
         &self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         prof: &mut Profile,
         stage: &str,
         rows: usize,
@@ -372,7 +377,7 @@ impl Projection {
         output: hrx::View<'_>,
     ) -> Result<()> {
         Ok(self.op.run(
-            gpu,
+            stream,
             Some(prof),
             stage,
             rows,
@@ -608,7 +613,7 @@ pub struct Latents {
 
 impl Dit {
     /// Upload conditioning weights and prepare both table projections once.
-    fn ensure_conditioning(&mut self, gpu: &hrx::Gpu, c: &Compiler) -> Result<()> {
+    fn ensure_conditioning(&mut self, stream: &mut hrx::Stream, c: &Compiler) -> Result<()> {
         if self.cond.is_some() {
             return Ok(());
         }
@@ -622,15 +627,15 @@ impl Dit {
         self.cond = Some(Conditioning {
             curve: w.host_f32("h3.adaln_t_table", 1025 * 8)?,
             inv_freq: w.host_f32("h3.rope_inv_freq", 16)?,
-            adaln: crate::conditioning::device::Projection::blocks(gpu, c, &adaln_w, &adaln_b)?,
+            adaln: crate::conditioning::device::Projection::blocks(stream, c, &adaln_w, &adaln_b)?,
             final_adaln: crate::conditioning::device::Projection::final_layer(
-                gpu,
+                stream,
                 c,
                 w.host_f32("h3.final.adaln.w", 2 * HID * 8)?,
                 w.host_f32("h3.final.adaln.b", 2 * HID)?,
             )?,
-            mods: gpu.alloc(BLOCKS * MODS_ROWS * HID * 4)?,
-            final_table: gpu.alloc(4 * HID * 4)?,
+            mods: stream.allocate(BLOCKS * MODS_ROWS * HID * 4)?,
+            final_table: stream.allocate(4 * HID * 4)?,
         });
         Ok(())
     }
@@ -638,7 +643,7 @@ impl Dit {
     /// The 50 blocks and the final layer's norm, for one sequence length.
     fn ensure_blocks(
         &mut self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         c: &Compiler,
         tokens: usize,
         qk_bits: usize,
@@ -681,7 +686,7 @@ impl Dit {
         let qk = d.attn_qk_bits;
         let stack = Stack::new(
             c,
-            gpu,
+            stream,
             d,
             tokens,
             BLOCKS,
@@ -696,12 +701,12 @@ impl Dit {
             tokens,
             qk_bits: qk,
             // the final head has only the video and audio timestep classes
-            final_norm: NormMod::build(c, gpu, HID, 1e-5, 2)?,
-            final_norm_scale: self.weights.at(gpu, "h3.final.norm", HID * 4)?,
-            audio_in: Projection::build(c, gpu, &self.weights, "h3.audio_in", AUDIO_CH, HID)?,
-            video_in: Projection::build(c, gpu, &self.weights, "h3.video_in", VIDEO_PATCH, HID)?,
-            final_out: Projection::build(c, gpu, &self.weights, "h3.final.out", HID, FINAL_N)?,
-            text_copy: gpu.alloc(seq_capacity(tokens) * HID * 4)?,
+            final_norm: NormMod::build(c, stream, HID, 1e-5, 2)?,
+            final_norm_scale: self.weights.at(stream, "h3.final.norm", HID * 4)?,
+            audio_in: Projection::build(c, stream, &self.weights, "h3.audio_in", AUDIO_CH, HID)?,
+            video_in: Projection::build(c, stream, &self.weights, "h3.video_in", VIDEO_PATCH, HID)?,
+            final_out: Projection::build(c, stream, &self.weights, "h3.final.out", HID, FINAL_N)?,
+            text_copy: stream.allocate(seq_capacity(tokens) * HID * 4)?,
         });
         Ok(())
     }
@@ -709,13 +714,15 @@ impl Dit {
     /// The two modulation tables for one step's four timestep embeddings.
     fn build_mods(
         &self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         te: (&[f32; 8], &[f32; 8], &[f32; 8], &[f32; 8]),
     ) -> Result<()> {
         let cond = self.cond.as_ref().expect("conditioning is ready");
         let (tv, ta, tcv, tca) = te;
-        cond.adaln.run(gpu, &[*tv, *ta, *tcv, *tca], &cond.mods)?;
-        cond.final_adaln.run(gpu, &[*tv, *ta], &cond.final_table)?;
+        cond.adaln
+            .run(stream, &[*tv, *ta, *tcv, *tca], &cond.mods)?;
+        cond.final_adaln
+            .run(stream, &[*tv, *ta], &cond.final_table)?;
         Ok(())
     }
 
@@ -723,7 +730,7 @@ impl Dit {
     #[allow(clippy::too_many_arguments)]
     fn embed_f32(
         &self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         prof: &mut Profile,
         stage: &str,
         row0: usize,
@@ -739,7 +746,7 @@ impl Dit {
             &blocks.video_in
         };
         projection.run(
-            gpu,
+            stream,
             prof,
             stage,
             rows,
@@ -752,7 +759,7 @@ impl Dit {
     #[allow(clippy::too_many_arguments)]
     pub fn denoise(
         &mut self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         c: &Compiler,
         prof: &mut Profile,
         te: &mut TextEncoder,
@@ -770,7 +777,7 @@ impl Dit {
         if !(2..=1000).contains(&p.steps) {
             return invalid("steps must be 2..1000");
         }
-        self.ensure_conditioning(gpu, c)?;
+        self.ensure_conditioning(stream, c)?;
 
         let n = ids.len();
         let lay_refs: Vec<crate::layout::Ref> = refs
@@ -809,10 +816,10 @@ impl Dit {
         let (l, rr) = (n, lay.ref_rows);
         let lr = l + rr;
         let (na, nv, s) = (lay.audio_rows, lay.video_rows, lay.seq_len);
-        self.ensure_seq(gpu, s)?;
+        self.ensure_seq(stream, s)?;
 
         // the images this prompt presents, through the tower, in the order of the placeholder runs
-        let embeddings = self.vision_for(gpu, c, prof, te, ids, refs, kfs)?;
+        let embeddings = self.vision_for(stream, c, prof, te, ids, refs, kfs)?;
         let spans: Vec<crate::te::Span<'_>> = embeddings
             .iter()
             .map(|(at, e)| crate::te::Span {
@@ -825,7 +832,7 @@ impl Dit {
             lay.mark_vision(sp.at.start, sp.at.count)
                 .map_err(crate::error::Error::Invalid)?;
         }
-        self.text_in(gpu, c, prof, te, ids, &spans)?;
+        self.text_in(stream, c, prof, te, ids, &spans)?;
 
         // the packed layout's per-row tables
         {
@@ -833,16 +840,16 @@ impl Dit {
             let inv = &self.cond.as_ref().expect("ready").inv_freq;
             crate::rope::dit(&lay.pos, inv, &mut cos, &mut sin);
             let seq = self.seq.as_mut().expect("sized above");
-            seq.cls.write(gpu, &lay.adaln_rows, CLASSES)?;
+            seq.cls.write(stream, &lay.adaln_rows, CLASSES)?;
             // The final head runs on the generated rows alone, and has only the video and audio
             // timestep classes. The rows before them carry conditioning classes its two-row table
             // has no place for — 2 for a reference's video, 3 for its audio — so only the generated
             // span goes up, and the head binds it from row zero.
-            seq.tcls.write(gpu, &lay.tclass[lr..lr + na + nv], 2)?;
-            gpu.h2d_at(&seq.cos, 0, crate::vvae::as_bytes(&cos))?;
-            gpu.h2d_at(&seq.sin, 0, crate::vvae::as_bytes(&sin))?;
+            seq.tcls.write(stream, &lay.tclass[lr..lr + na + nv], 2)?;
+            crate::dispatch::upload_at(stream, &seq.cos, 0, crate::vvae::as_bytes(&cos))?;
+            crate::dispatch::upload_at(stream, &seq.sin, 0, crate::vvae::as_bytes(&sin))?;
         }
-        self.ensure_blocks(gpu, c, s, qk_bits)?;
+        self.ensure_blocks(stream, c, s, qk_bits)?;
 
         // the latents, as rows
         let generated = na + nv;
@@ -893,12 +900,12 @@ impl Dit {
         if !res {
             if !self.euler.as_ref().is_some_and(|e| e.matches(na, nv)) {
                 self.euler = None;
-                self.euler = Some(crate::sampler::device::Euler::new(gpu, c, na, nv)?);
+                self.euler = Some(crate::sampler::device::Euler::new(stream, c, na, nv)?);
             }
             self.euler
                 .as_ref()
                 .expect("Euler prepared")
-                .upload(gpu, &arows, &vrows)?;
+                .upload(stream, &arows, &vrows)?;
         }
 
         let sv = crate::layout::Schedule::new(p.steps, shift_v);
@@ -908,7 +915,7 @@ impl Dit {
         }
         let mut cache = crate::cache::StepCache::new(p.cache_threshold);
         if cache.is_some() {
-            self.ensure_cache(gpu, c, s * HID)?;
+            self.ensure_cache(stream, c, s * HID)?;
         }
 
         let mut in_rows = na.max(nv);
@@ -928,7 +935,7 @@ impl Dit {
             let ta = crate::conditioning::temb(&curve, sa.timesteps[step]);
             let tcv = crate::conditioning::temb(&curve, sv.timesteps[step].max(VISUAL_COND_AUG));
             let tca = crate::conditioning::temb(&curve, sa.timesteps[step].max(1.0));
-            self.build_mods(gpu, (&tv, &ta, &tcv, &tca))?;
+            self.build_mods(stream, (&tv, &ta, &tcv, &tca))?;
 
             // audio rows then video rows, each through its f32 patch projection
             if res {
@@ -939,38 +946,44 @@ impl Dit {
             }
             if res {
                 let seq = self.seq.as_ref().expect("sized above");
-                gpu.h2d_at(&seq.in32, 0, crate::vvae::as_bytes(&arows))?;
+                crate::dispatch::upload_at(stream, &seq.in32, 0, crate::vvae::as_bytes(&arows))?;
             }
             let input = self
                 .euler
                 .as_ref()
                 .filter(|_| !res)
                 .map(|e| e.audio.binding());
-            self.embed_f32(gpu, prof, "audio in", lr, na, true, input)?;
+            self.embed_f32(stream, prof, "audio in", lr, na, true, input)?;
             if res {
                 let seq = self.seq.as_ref().expect("sized above");
-                gpu.h2d_at(&seq.in32, 0, crate::vvae::as_bytes(&vrows))?;
+                crate::dispatch::upload_at(stream, &seq.in32, 0, crate::vvae::as_bytes(&vrows))?;
             }
             let input = self
                 .euler
                 .as_ref()
                 .filter(|_| !res)
                 .map(|e| e.video.binding());
-            self.embed_f32(gpu, prof, "video in", lr + na, nv, false, input)?;
+            self.embed_f32(stream, prof, "video in", lr + na, nv, false, input)?;
 
             if step == 0 {
-                self.inject_references(gpu, prof, &lay, refs, kfs, p.seed, &mut in32)?;
+                self.inject_references(stream, prof, &lay, refs, kfs, p.seed, &mut in32)?;
                 let seq = self.seq.as_ref().expect("sized above");
                 let b = self.blocks.as_ref().expect("built above");
-                gpu.d2d(&b.text_copy, &seq.x, lr * HID * 4)?;
+                stream.copy(
+                    b.text_copy.slice(0, lr * HID * 4),
+                    seq.x.slice(0, lr * HID * 4),
+                )?;
             } else {
                 let seq = self.seq.as_ref().expect("sized above");
                 let b = self.blocks.as_ref().expect("built above");
                 // the blocks update x in place, so the text and reference rows are restored each step
-                gpu.d2d_at(&seq.x, 0, &b.text_copy, 0, lr * HID * 4)?;
+                stream.copy(
+                    seq.x.slice(0, lr * HID * 4),
+                    b.text_copy.slice(0, lr * HID * 4),
+                )?;
             }
 
-            self.run_blocks(gpu, c, prof, s, step, cache.as_mut())?;
+            self.run_blocks(stream, c, prof, s, step, cache.as_mut())?;
 
             // the final layer: the modulated norm on the generated rows, then the two f32 heads
             {
@@ -979,7 +992,7 @@ impl Dit {
                 let cond = self.cond.as_ref().expect("ready");
                 // two classes here, the video and audio timesteps, so four table rows
                 b.final_norm.run(
-                    gpu,
+                    stream,
                     Some(prof),
                     "final norm",
                     generated,
@@ -993,7 +1006,7 @@ impl Dit {
                 let seq = self.seq.as_ref().expect("sized above");
                 let b = self.blocks.as_ref().expect("built above");
                 b.final_out.run(
-                    gpu,
+                    stream,
                     prof,
                     "final out",
                     generated,
@@ -1001,13 +1014,13 @@ impl Dit {
                     seq.out32.binding(),
                 )?;
                 if res {
-                    gpu.d2h_ref(
+                    stream.read(
                         seq.out32.slice(0, generated * FINAL_N * 4),
                         crate::vvae::as_bytes_mut(&mut out32),
                     )?;
                 } else {
                     self.euler.as_ref().expect("Euler prepared").step(
-                        gpu,
+                        stream,
                         seq.out32.binding(),
                         (sa.sigmas[step], sa.sigmas[step + 1] / sa.sigmas[step]),
                         (sv.sigmas[step], sv.sigmas[step + 1] / sv.sigmas[step]),
@@ -1037,7 +1050,7 @@ impl Dit {
             if let Some(cb) = progress.as_deref_mut() {
                 // Progress reports completed steps, even when Euler stays on the GPU.
                 if !res {
-                    gpu.sync()?;
+                    stream.synchronize()?;
                 }
                 if cb(
                     step + 1,
@@ -1063,7 +1076,7 @@ impl Dit {
             self.euler
                 .as_ref()
                 .expect("Euler prepared")
-                .download(gpu, &mut arows, &mut vrows)?;
+                .download(stream, &mut arows, &mut vrows)?;
         }
         let mut video = vec![0.0f32; LATENT_CH * t_len * h * w];
         let mut audio = vec![0.0f32; 2 * AUDIO_CH * a];
@@ -1087,7 +1100,7 @@ impl Dit {
     #[allow(clippy::too_many_arguments)]
     fn vision_for(
         &self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         c: &Compiler,
         prof: &mut Profile,
         te: &TextEncoder,
@@ -1132,7 +1145,7 @@ impl Dit {
                     mh * mw
                 ));
             }
-            let e = crate::vision::embed(gpu, c, prof, te.weights(), px, ph, pw)?;
+            let e = crate::vision::embed(stream, c, prof, te.weights(), px, ph, pw)?;
             out.push((
                 VisionSpan {
                     start: runs[ri].0,
@@ -1154,7 +1167,7 @@ impl Dit {
     #[allow(clippy::too_many_arguments)]
     fn inject_references(
         &self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         prof: &mut Profile,
         lay: &crate::layout::Layout,
         refs: &[Reference<'_>],
@@ -1184,12 +1197,13 @@ impl Dit {
                     }
                 }
                 let seq = self.seq.as_ref().expect("sized above");
-                gpu.h2d_at(
+                crate::dispatch::upload_at(
+                    stream,
                     &seq.in32,
                     0,
                     crate::vvae::as_bytes(&in32[..sg.rows * AUDIO_CH]),
                 )?;
-                self.embed_f32(gpu, prof, "ref audio in", sg.row0, sg.rows, true, None)?;
+                self.embed_f32(stream, prof, "ref audio in", sg.row0, sg.rows, true, None)?;
             } else {
                 let Some(vl) = video_latent else {
                     return invalid("a visual reference segment without video latents");
@@ -1203,29 +1217,30 @@ impl Dit {
                     seed,
                 );
                 let seq = self.seq.as_ref().expect("sized above");
-                gpu.h2d_at(
+                crate::dispatch::upload_at(
+                    stream,
                     &seq.in32,
                     0,
                     crate::vvae::as_bytes(&in32[..sg.rows * VIDEO_PATCH]),
                 )?;
-                self.embed_f32(gpu, prof, "ref video in", sg.row0, sg.rows, false, None)?;
+                self.embed_f32(stream, prof, "ref video in", sg.row0, sg.rows, false, None)?;
             }
         }
         Ok(())
     }
 
-    fn ensure_cache(&mut self, gpu: &hrx::Gpu, c: &Compiler, n: usize) -> Result<()> {
+    fn ensure_cache(&mut self, stream: &mut hrx::Stream, c: &Compiler, n: usize) -> Result<()> {
         if self.cache.as_ref().is_some_and(|b| b.n >= n) {
             return Ok(());
         }
         self.cache = None;
         self.cache = Some(CacheBuffers {
             n,
-            xb0: gpu.alloc(n * 4)?,
-            prev: gpu.alloc(n * 4)?,
-            resid: gpu.alloc(n * 4)?,
-            partials: gpu.alloc(crate::cache::groups(n) * 8)?,
-            metric: c.get(gpu, "absdiff_sum_f32", "h3_absdiff_sum_f32", &Cfg::new())?,
+            xb0: stream.allocate(n * 4)?,
+            prev: stream.allocate(n * 4)?,
+            resid: stream.allocate(n * 4)?,
+            partials: stream.allocate(crate::cache::groups(n) * 8)?,
+            metric: c.get(stream, "absdiff_sum_f32", "h3_absdiff_sum_f32", &Cfg::new())?,
         });
         Ok(())
     }
@@ -1233,7 +1248,7 @@ impl Dit {
     /// The 50 blocks, either straight through or with the first-block cache deciding.
     fn run_blocks(
         &mut self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         c: &Compiler,
         prof: &mut Profile,
         s: usize,
@@ -1264,19 +1279,19 @@ impl Dit {
         );
         let Some(cache) = cache else {
             b.stack
-                .forward(gpu, prof, x, cls, cos, sin, &cond_fn, 0, None)?;
+                .forward(stream, prof, x, cls, cos, sin, &cond_fn, 0, None)?;
             return Ok(());
         };
 
         let cb = cbuf.as_ref().expect("cache buffers");
         let n = s * HID;
         b.stack
-            .forward(gpu, prof, x, cls, cos, sin, &cond_fn, 0, Some(1))?;
+            .forward(stream, prof, x, cls, cos, sin, &cond_fn, 0, Some(1))?;
         let (mut d, mut m) = (0.0f64, 0.0f64);
         if step > 0 {
             let groups = crate::cache::groups(n);
             checked(
-                gpu,
+                stream,
                 &cb.metric,
                 Some(prof),
                 "cache metric",
@@ -1287,8 +1302,8 @@ impl Dit {
                 &[n * 4, n * 4, groups * 8],
             )?;
             let mut ps = vec![0.0f32; groups * 2];
-            gpu.sync()?;
-            gpu.d2h_ref(
+            stream.synchronize()?;
+            stream.read(
                 cb.partials.slice(0, groups * 8),
                 crate::vvae::as_bytes_mut(&mut ps),
             )?;
@@ -1309,11 +1324,11 @@ impl Dit {
                 if change.skip { "cached" } else { "full" }
             );
         }
-        gpu.d2d(&cb.prev, &seq.x, n * 4)?;
+        stream.copy(cb.prev.slice(0, n * 4), seq.x.slice(0, n * 4))?;
         if change.skip {
             axpy(
                 c,
-                gpu,
+                stream,
                 Some(prof),
                 "cache add",
                 1.0,
@@ -1323,14 +1338,14 @@ impl Dit {
                 x,
             )?;
         } else {
-            gpu.d2d(&cb.xb0, &seq.x, n * 4)?;
+            stream.copy(cb.xb0.slice(0, n * 4), seq.x.slice(0, n * 4))?;
             b.stack
-                .forward(gpu, prof, x, cls, cos, sin, &cond_fn, 1, None)?;
+                .forward(stream, prof, x, cls, cos, sin, &cond_fn, 1, None)?;
             // the residual of blocks 1..49, which a skipped step adds instead of running them
-            gpu.d2d(&cb.resid, &seq.x, n * 4)?;
+            stream.copy(cb.resid.slice(0, n * 4), seq.x.slice(0, n * 4))?;
             axpy(
                 c,
-                gpu,
+                stream,
                 Some(prof),
                 "cache resid",
                 -1.0,

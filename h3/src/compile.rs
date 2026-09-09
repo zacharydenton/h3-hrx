@@ -165,7 +165,7 @@ impl Compiler {
 
     pub fn get(
         &self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         stem: &str,
         symbol: &str,
         cfg: &Cfg,
@@ -184,7 +184,7 @@ impl Compiler {
         }
         let artifact = module.compile(&request, &self.cache_dir()?)?;
         // Safety: verified artifact from trusted model source and configured compiler.
-        let kernel = Arc::new(unsafe { gpu.load_artifact(&artifact)? });
+        let kernel = Arc::new(unsafe { stream.load_artifact(&artifact)? });
         let mut loaded = self.loaded.lock().expect("compiler cache poisoned");
         Ok(loaded.entry(tag).or_insert(kernel).clone())
     }

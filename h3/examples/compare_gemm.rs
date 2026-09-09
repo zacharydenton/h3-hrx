@@ -28,7 +28,7 @@ fn operand(count: usize, dtype: &str, seed: usize) -> Vec<u8> {
 }
 fn uploaded(stream: &mut Stream, bytes: &[u8]) -> Buffer {
     let b = stream.allocate(bytes.len()).unwrap();
-    stream.upload(&b, bytes).unwrap();
+    stream.upload(b.binding(), bytes).unwrap();
     b
 }
 fn launch(
@@ -162,7 +162,9 @@ fn main() {
                     ];
                     let mut results = Vec::new();
                     for version in 0..2 {
-                        stream.upload(&buffers[output], &data[output]).unwrap();
+                        stream
+                            .upload(buffers[output].binding(), &data[output])
+                            .unwrap();
                         launch(
                             &mut stream,
                             &kernels[version],
@@ -202,7 +204,9 @@ fn main() {
                         for batch in 0..batches {
                             for order in 0..2 {
                                 let version = (batch + order) % 2;
-                                stream.upload(&buffers[output], &data[output]).unwrap();
+                                stream
+                                    .upload(buffers[output].binding(), &data[output])
+                                    .unwrap();
                                 stream.synchronize().unwrap();
                                 let start = Instant::now();
                                 for j in 0..launches {

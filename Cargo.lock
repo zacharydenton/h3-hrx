@@ -1105,7 +1105,7 @@ dependencies = [
  "bytemuck",
  "half",
  "hf-hub",
- "hrx",
+ "hrx-rs",
  "libc",
  "libm",
  "memmap2",
@@ -1225,9 +1225,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "hrx"
+name = "hrx-rs"
 version = "0.1.0"
-source = "git+https://github.com/zacharydenton/hrx.rs?rev=be89b44652af6adf17c5c950d0759f92c2e88582#be89b44652af6adf17c5c950d0759f92c2e88582"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46f435fb6db94df0b7ab9af8755f6216fdc9798faf3bad7ed76f4f25f5d4a4df"
 dependencies = [
  "flate2",
  "libc",

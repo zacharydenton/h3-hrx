@@ -19,14 +19,14 @@ fn main() {
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let exe = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
-    let gpu = hrx::Gpu::open().expect("gpu");
+    let mut stream = hrx::Stream::open().expect("stream");
     let compiler = Compiler::new(
         exe,
         root.join("h3/kernels"),
         root.join("build/kernel_cache"),
     );
     // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
-    let mut vae = unsafe { VideoVae::open(&gpu, &a[0]) }.expect("video VAE checkpoint");
+    let mut vae = unsafe { VideoVae::open(&mut stream, &a[0]) }.expect("video VAE checkpoint");
 
     let bytes = std::fs::read(&a[1]).expect("pixels");
     let pixels: Vec<f32> = bytes
@@ -43,7 +43,7 @@ fn main() {
     let start = std::time::Instant::now();
     let (z, t) = vae
         .encode_video(
-            &gpu,
+            &mut stream,
             &compiler,
             &mut prof,
             Clip {

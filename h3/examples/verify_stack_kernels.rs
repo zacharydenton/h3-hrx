@@ -26,7 +26,7 @@ fn main() {
         .collect();
 
     let exe = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
-    let gpu = hrx::Gpu::open().expect("gpu");
+    let mut stream = hrx::Stream::open().expect("stream");
     let compiler = Compiler::new(exe, root.join("h3/kernels"), &cache);
     // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
     let weights = unsafe { Weights::open(&path, h3::plan::vvae::plan) }.expect("plan");
@@ -50,13 +50,15 @@ fn main() {
         bf16: false,
     };
     // qnorm and knorm are ones for this stack: it has no per-head norm weights.
-    let ones = std::sync::Arc::new(gpu.alloc(VAE_D * 4).expect("ones"));
+    let ones = std::sync::Arc::new(stream.allocate(VAE_D * 4).expect("ones"));
     let one_bytes: Vec<u8> = (0..VAE_D).flat_map(|_| 1.0f32.to_le_bytes()).collect();
-    gpu.h2d(&ones, &one_bytes).expect("upload ones");
+    stream
+        .upload(ones.binding(), &one_bytes)
+        .expect("upload ones");
 
     let stack = Stack::new(
         &compiler,
-        &gpu,
+        &mut stream,
         dims,
         tokens,
         VAE_BLOCKS,

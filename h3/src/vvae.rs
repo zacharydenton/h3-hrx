@@ -101,7 +101,10 @@ impl VideoVae {
     /// # Safety
     ///
     /// Maps the checkpoint; see [`crate::Session::new`].
-    pub unsafe fn open(gpu: &hrx::Gpu, path: impl AsRef<std::path::Path>) -> Result<Self> {
+    pub unsafe fn open(
+        stream: &mut hrx::Stream,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self> {
         let weights = unsafe { Weights::open(path, crate::plan::vvae::plan) }?;
         // the attention's per-head norms are ones for this stack, and its AdaLN tables are zero: it
         // modulates with a learned per-block scale alone
@@ -113,14 +116,14 @@ impl VideoVae {
             enc_mean: weights.host_f32("venc.latents_mean", LATENT_CH)?,
             enc_std: weights.host_f32("venc.latents_std", LATENT_CH)?,
             weights,
-            constants: Constants::new(gpu)?,
+            constants: Constants::new(stream)?,
             built: None,
         })
     }
 
     /// Builds the stack, the two projections and the buffers for one latent grid, if the last call was
     /// for a different one.
-    fn ensure(&mut self, gpu: &hrx::Gpu, c: &Compiler, grid: Grid) -> Result<()> {
+    fn ensure(&mut self, stream: &mut hrx::Stream, c: &Compiler, grid: Grid) -> Result<()> {
         if self.built.as_ref().is_some_and(|b| b.grid == grid) {
             return Ok(());
         }
@@ -129,7 +132,7 @@ impl VideoVae {
         let (n, nt) = (grid.voxels(), grid.tokens());
         let stack = Stack::new(
             c,
-            gpu,
+            stream,
             dims(),
             nt,
             VAE_BLOCKS,
@@ -141,11 +144,11 @@ impl VideoVae {
         )?;
         let t = stack.capacity();
 
-        let x = gpu.alloc(t * VAE_HID * 4)?;
-        gpu.memset(&x, 0, t * VAE_HID * 4)?;
-        let in16 = gpu.alloc(t * VAE_KIN * 2)?;
-        gpu.memset(&in16, 0, t * VAE_KIN * 2)?;
-        let cls = crate::dispatch::Classes::zeroed(gpu, t)?;
+        let x = stream.allocate(t * VAE_HID * 4)?;
+        stream.fill(x.slice(0, t * VAE_HID * 4), 0)?;
+        let in16 = stream.allocate(t * VAE_KIN * 2)?;
+        stream.fill(in16.slice(0, t * VAE_KIN * 2), 0)?;
+        let cls = crate::dispatch::Classes::zeroed(stream, t)?;
 
         // the rotary table over this grid; the register and cls rows keep the identity rotation
         let (mut cos_h, mut sin_h) = (
@@ -153,21 +156,24 @@ impl VideoVae {
             vec![0.0f32; t * VAE_ROPE_HALF],
         );
         crate::rope::vae(grid.ft, grid.h, grid.w, &mut cos_h, &mut sin_h);
-        let cos = gpu.alloc(t * VAE_ROPE_HALF * 4)?;
-        let sin = gpu.alloc(t * VAE_ROPE_HALF * 4)?;
-        gpu.h2d(&cos, as_bytes(&cos_h))?;
-        gpu.h2d(&sin, as_bytes(&sin_h))?;
+        let cos = stream.allocate(t * VAE_ROPE_HALF * 4)?;
+        let sin = stream.allocate(t * VAE_ROPE_HALF * 4)?;
+        stream.upload(cos.binding(), as_bytes(&cos_h))?;
+        stream.upload(sin.binding(), as_bytes(&sin_h))?;
 
         // the output norm's (scale, shift) table: no scale, the checkpoint's bias as the shift
-        let norm_table = gpu.alloc(2 * VAE_HID * 4)?;
-        gpu.memset(&norm_table, 0, VAE_HID * 4)?;
-        let bias = self.weights.at(gpu, "vae.norm_out.b", VAE_HID * 4)?;
-        gpu.d2d_at(&norm_table, VAE_HID * 4, &bias, 0, VAE_HID * 4)?;
+        let norm_table = stream.allocate(2 * VAE_HID * 4)?;
+        stream.fill(norm_table.slice(0, VAE_HID * 4), 0)?;
+        let bias = self.weights.at(stream, "vae.norm_out.b", VAE_HID * 4)?;
+        stream.copy(
+            norm_table.slice(VAE_HID * 4, VAE_HID * 4),
+            bias.slice(0, VAE_HID * 4),
+        )?;
 
         self.built = Some(Built {
             proj_in: Gemm::build(
                 c,
-                gpu,
+                stream,
                 "resid",
                 "f16",
                 true,
@@ -180,10 +186,10 @@ impl VideoVae {
                 Tile::Plain,
                 0,
             )?,
-            norm_out: Prepare::build(c, gpu, "lnorm", "f16", VAE_HID, 1e-5, 1, 0)?,
+            norm_out: Prepare::build(c, stream, "lnorm", "f16", VAE_HID, 1e-5, 1, 0)?,
             proj_out: Gemm::build(
                 c,
-                gpu,
+                stream,
                 "plain",
                 "f16",
                 true,
@@ -196,9 +202,9 @@ impl VideoVae {
                 Tile::Plain,
                 0,
             )?,
-            a_q: gpu.alloc(t * VAE_HID * 2)?,
-            a_s: gpu.alloc(t * 4)?,
-            out16: gpu.alloc(t * VAE_OUT * 2)?,
+            a_q: stream.allocate(t * VAE_HID * 2)?,
+            a_s: stream.allocate(t * 4)?,
+            out16: stream.allocate(t * VAE_OUT * 2)?,
             stack,
             grid,
             x,
@@ -219,14 +225,14 @@ impl VideoVae {
     /// tiled decode can hand back the same allocation for every tile.
     pub fn decode_clip(
         &mut self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         c: &Compiler,
         prof: &mut Profile,
         z: &[f32],
         grid: Grid,
         frames: &mut Vec<f32>,
     ) -> Result<()> {
-        self.ensure(gpu, c, grid)?;
+        self.ensure(stream, c, grid)?;
         let (n, nt) = (grid.voxels(), grid.tokens());
 
         // post_quant_conv is a 24x24 matrix per voxel, small enough to stay on the host; the result
@@ -251,13 +257,13 @@ impl VideoVae {
             }
         }
 
-        gpu.h2d(&b.in16, as_bytes_f16(&b.stage_in))?;
-        gpu.memset(&b.x, 0, nt * VAE_HID * 4)?;
+        stream.upload(b.in16.binding(), as_bytes_f16(&b.stage_in))?;
+        stream.fill(b.x.slice(0, nt * VAE_HID * 4), 0)?;
 
-        let w_in = weights.at(gpu, "vae.proj_in.w", VAE_HID * VAE_KIN * 2)?;
-        let b_in = weights.at(gpu, "vae.proj_in.b", VAE_HID * 4)?;
+        let w_in = weights.at(stream, "vae.proj_in.w", VAE_HID * VAE_KIN * 2)?;
+        let b_in = weights.at(stream, "vae.proj_in.b", VAE_HID * 4)?;
         b.proj_in.run(
-            gpu,
+            stream,
             Some(prof),
             "vae proj_in",
             n as u32,
@@ -269,8 +275,11 @@ impl VideoVae {
             Some(b_in.binding()),
         )?;
         // the four register tokens follow the voxels, then a zero cls row
-        let reg = weights.at(gpu, "vae.register_tokens", VAE_REG * VAE_HID * 4)?;
-        gpu.d2d_at(&b.x, n * VAE_HID * 4, &reg, 0, VAE_REG * VAE_HID * 4)?;
+        let reg = weights.at(stream, "vae.register_tokens", VAE_REG * VAE_HID * 4)?;
+        stream.copy(
+            b.x.slice(n * VAE_HID * 4, VAE_REG * VAE_HID * 4),
+            reg.slice(0, VAE_REG * VAE_HID * 4),
+        )?;
 
         // every block modulates with its own learned scale and no shift
         let zeros = constants.zeros.binding();
@@ -304,11 +313,11 @@ impl VideoVae {
         };
         let (x, cls, cos, sin) = (b.x.binding(), b.cls.all(), b.cos.binding(), b.sin.binding());
         b.stack
-            .forward(gpu, prof, x, cls, cos, sin, &cond, 0, None)?;
+            .forward(stream, prof, x, cls, cos, sin, &cond, 0, None)?;
 
-        let w_norm = weights.at(gpu, "vae.norm_out.w", VAE_HID * 4)?;
+        let w_norm = weights.at(stream, "vae.norm_out.w", VAE_HID * 4)?;
         b.norm_out.run(
-            gpu,
+            stream,
             Some(prof),
             "vae norm_out",
             nt as u32,
@@ -317,10 +326,10 @@ impl VideoVae {
             b.a_q.binding(),
             Some(b.a_s.binding()),
         )?;
-        let w_out = weights.at(gpu, "vae.proj_out.w", VAE_OUT * VAE_HID * 2)?;
-        let b_out = weights.at(gpu, "vae.proj_out.b", VAE_OUT * 4)?;
+        let w_out = weights.at(stream, "vae.proj_out.w", VAE_OUT * VAE_HID * 2)?;
+        let b_out = weights.at(stream, "vae.proj_out.b", VAE_OUT * 4)?;
         b.proj_out.run(
-            gpu,
+            stream,
             Some(prof),
             "vae proj_out",
             nt as u32,
@@ -335,8 +344,8 @@ impl VideoVae {
         // read straight into the f16 buffer the unpatchify converts from, rather than into bytes and
         // then through a second allocation
         let out16 = &mut b.stage_out;
-        gpu.sync()?;
-        gpu.d2h_ref(
+        stream.synchronize()?;
+        stream.read(
             b.out16.slice(0, n * VAE_OUT * 2),
             bytes_mut(&mut out16[..n * VAE_OUT]),
         )?;
@@ -370,7 +379,7 @@ impl VideoVae {
     /// One clip in spatial tiles, blended in pixel space — the released VAE's `tiled_decode`.
     pub fn decode_spatial(
         &mut self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         c: &Compiler,
         prof: &mut Profile,
         z: &[f32],
@@ -382,7 +391,7 @@ impl VideoVae {
         let (ys, yo) = tiles::split_tiles(height);
         let (xs, xo) = tiles::split_tiles(width);
         if ys.len() == 1 && xs.len() == 1 {
-            return self.decode_clip(gpu, c, prof, z, grid, frames);
+            return self.decode_clip(stream, c, prof, z, grid, frames);
         }
         frames.clear();
         frames.resize(3 * frames_n * height * width, 0.0);
@@ -406,7 +415,7 @@ impl VideoVae {
                     }
                 }
                 self.decode_clip(
-                    gpu,
+                    stream,
                     c,
                     prof,
                     &latent,
@@ -451,7 +460,7 @@ impl VideoVae {
     /// The whole clip: latents `[24][T][H][W]` in, RGB bytes `[frames][H*16][W*16][3]` out.
     pub fn decode_video(
         &mut self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         c: &Compiler,
         prof: &mut Profile,
         shape: &crate::layout::Shape,
@@ -516,7 +525,7 @@ impl VideoVae {
                 let dst = ch * ft * h * w;
                 z[dst..dst + ft * h * w].copy_from_slice(&zp[src..src + ft * h * w]);
             }
-            self.decode_spatial(gpu, c, prof, &z, Grid { ft, h, w }, &mut clip)?;
+            self.decode_spatial(stream, c, prof, &z, Grid { ft, h, w }, &mut clip)?;
             let clip_frames = ft * VAE_TRATIO;
             for j in 0..2 {
                 let f0 = j * plan.chunk_frames + plan.pre;
@@ -634,7 +643,7 @@ impl VideoVae {
     #[allow(clippy::too_many_arguments)]
     fn encode_tile(
         &mut self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         c: &Compiler,
         prof: &mut Profile,
         pixels: &[f32],
@@ -673,25 +682,25 @@ impl VideoVae {
             }
         }
 
-        let x = gpu.alloc(rows0 * 8 * 2)?;
-        gpu.h2d(&x, as_bytes_f16(&inrows))?;
+        let x = stream.allocate(rows0 * 8 * 2)?;
+        stream.upload(x.binding(), as_bytes_f16(&inrows))?;
         // the widest [rows][channels] plane of the stack: rows fall as fast as channels rise
         let plane_bytes = rows0 * 128 * 2;
-        let mut h = gpu.alloc(plane_bytes)?;
-        let y = gpu.alloc(plane_bytes)?;
-        let mut tmp = gpu.alloc(plane_bytes)?;
-        let sc = gpu.alloc(plane_bytes)?;
-        let stats = gpu.alloc(frames * 32 * 2 * 4)?;
+        let mut h = stream.allocate(plane_bytes)?;
+        let y = stream.allocate(plane_bytes)?;
+        let mut tmp = stream.allocate(plane_bytes)?;
+        let sc = stream.allocate(plane_bytes)?;
+        let stats = stream.allocate(frames * 32 * 2 * 4)?;
 
-        let w3 = |gpu: &hrx::Gpu, nm: &str, cout_pad: usize, k: usize| {
+        let w3 = |stream: &mut hrx::Stream, nm: &str, cout_pad: usize, k: usize| {
             self.weights
-                .at(gpu, &format!("{nm}{suffix}"), cout_pad * k * 2)
+                .at(stream, &format!("{nm}{suffix}"), cout_pad * k * 2)
         };
 
         let (mut t_len, mut hh, mut ww, mut chan) = (frames, th, tw, 128usize);
         let conv = Conv3d::build(
             c,
-            gpu,
+            stream,
             false,
             t_len,
             hh,
@@ -704,13 +713,15 @@ impl VideoVae {
             ksz(8),
             128,
         )?;
+        let hoisted_1 = w3(stream, "venc.conv_in", 128, ksz(8))?;
+        let held_1 = self.weights.at(stream, "venc.conv_in.b", 128 * 4)?;
         conv.run(
-            gpu,
+            stream,
             Some(prof),
             "venc conv_in",
             x.binding(),
-            w3(gpu, "venc.conv_in", 128, ksz(8))?.binding(),
-            self.weights.at(gpu, "venc.conv_in.b", 128 * 4)?.binding(),
+            hoisted_1.binding(),
+            held_1.binding(),
             h.binding(),
             None,
         )?;
@@ -719,23 +730,23 @@ impl VideoVae {
             for r in 0..2 {
                 let b = format!("venc.l{l}.r{r}.");
                 let (cin, cout) = (chan, ENC_MID[l]);
-                GroupNormSilu::build(c, gpu, t_len, hh, ww, cin)?.run(
-                    gpu,
+                let held_1 = self.weights.at(stream, &format!("{b}norm1.g"), cin * 4)?;
+                let held_2 = self.weights.at(stream, &format!("{b}norm1.b"), cin * 4)?;
+                GroupNormSilu::build(c, stream, t_len, hh, ww, cin)?.run(
+                    stream,
                     Some(prof),
                     "venc groupnorm",
                     h.binding(),
-                    self.weights
-                        .at(gpu, &format!("{b}norm1.g"), cin * 4)?
-                        .binding(),
-                    self.weights
-                        .at(gpu, &format!("{b}norm1.b"), cin * 4)?
-                        .binding(),
+                    held_1.binding(),
+                    held_2.binding(),
                     stats.binding(),
                     y.binding(),
                 )?;
+                let hoisted_1 = w3(stream, &format!("{b}conv1"), cout, ksz(cin))?;
+                let held_1 = self.weights.at(stream, &format!("{b}conv1.b"), cout * 4)?;
                 Conv3d::build(
                     c,
-                    gpu,
+                    stream,
                     false,
                     t_len,
                     hh,
@@ -749,55 +760,53 @@ impl VideoVae {
                     cout,
                 )?
                 .run(
-                    gpu,
+                    stream,
                     Some(prof),
                     "venc conv",
                     y.binding(),
-                    w3(gpu, &format!("{b}conv1"), cout, ksz(cin))?.binding(),
-                    self.weights
-                        .at(gpu, &format!("{b}conv1.b"), cout * 4)?
-                        .binding(),
+                    hoisted_1.binding(),
+                    held_1.binding(),
                     tmp.binding(),
                     None,
                 )?;
-                GroupNormSilu::build(c, gpu, t_len, hh, ww, cout)?.run(
-                    gpu,
+                let held_1 = self.weights.at(stream, &format!("{b}norm2.g"), cout * 4)?;
+                let held_2 = self.weights.at(stream, &format!("{b}norm2.b"), cout * 4)?;
+                GroupNormSilu::build(c, stream, t_len, hh, ww, cout)?.run(
+                    stream,
                     Some(prof),
                     "venc groupnorm",
                     tmp.binding(),
-                    self.weights
-                        .at(gpu, &format!("{b}norm2.g"), cout * 4)?
-                        .binding(),
-                    self.weights
-                        .at(gpu, &format!("{b}norm2.b"), cout * 4)?
-                        .binding(),
+                    held_1.binding(),
+                    held_2.binding(),
                     stats.binding(),
                     y.binding(),
                 )?;
                 // a change of width needs the skip projected: a 1x1 convolution, which is a matmul
                 let resid = if cin != cout {
                     let k = cin.div_ceil(32) * 32;
-                    Matmul::build(c, gpu, k, cout)?.run(
-                        gpu,
+                    let held_1 = self
+                        .weights
+                        .at(stream, &format!("{b}nin.wm"), cout * k * 2)?;
+                    let held_2 = self.weights.at(stream, &format!("{b}nin.b"), cout * 4)?;
+                    Matmul::build(c, stream, k, cout)?.run(
+                        stream,
                         Some(prof),
                         "venc shortcut",
                         t_len * hh * ww,
                         h.binding(),
-                        self.weights
-                            .at(gpu, &format!("{b}nin.wm"), cout * k * 2)?
-                            .binding(),
-                        self.weights
-                            .at(gpu, &format!("{b}nin.b"), cout * 4)?
-                            .binding(),
+                        held_1.binding(),
+                        held_2.binding(),
                         sc.binding(),
                     )?;
                     sc.binding()
                 } else {
                     h.binding()
                 };
+                let hoisted_1 = w3(stream, &format!("{b}conv2"), cout, ksz(cout))?;
+                let held_1 = self.weights.at(stream, &format!("{b}conv2.b"), cout * 4)?;
                 Conv3d::build(
                     c,
-                    gpu,
+                    stream,
                     true,
                     t_len,
                     hh,
@@ -811,14 +820,12 @@ impl VideoVae {
                     cout,
                 )?
                 .run(
-                    gpu,
+                    stream,
                     Some(prof),
                     "venc conv",
                     y.binding(),
-                    w3(gpu, &format!("{b}conv2"), cout, ksz(cout))?.binding(),
-                    self.weights
-                        .at(gpu, &format!("{b}conv2.b"), cout * 4)?
-                        .binding(),
+                    hoisted_1.binding(),
+                    held_1.binding(),
                     tmp.binding(),
                     Some(resid),
                 )?;
@@ -829,7 +836,7 @@ impl VideoVae {
                 let b = format!("venc.l{l}.down");
                 let down = Conv3d::build(
                     c,
-                    gpu,
+                    stream,
                     false,
                     t_len,
                     hh,
@@ -842,13 +849,15 @@ impl VideoVae {
                     ksz(chan),
                     chan,
                 )?;
+                let hoisted_1 = w3(stream, &b, chan, ksz(chan))?;
+                let held_1 = self.weights.at(stream, &format!("{b}.b"), chan * 4)?;
                 down.run(
-                    gpu,
+                    stream,
                     Some(prof),
                     "venc down",
                     h.binding(),
-                    w3(gpu, &b, chan, ksz(chan))?.binding(),
-                    self.weights.at(gpu, &format!("{b}.b"), chan * 4)?.binding(),
+                    hoisted_1.binding(),
+                    held_1.binding(),
                     tmp.binding(),
                     None,
                 )?;
@@ -859,19 +868,23 @@ impl VideoVae {
             }
         }
 
-        GroupNormSilu::build(c, gpu, t_len, hh, ww, chan)?.run(
-            gpu,
+        let held_1 = self.weights.at(stream, "venc.norm_out.g", chan * 4)?;
+        let held_2 = self.weights.at(stream, "venc.norm_out.b", chan * 4)?;
+        GroupNormSilu::build(c, stream, t_len, hh, ww, chan)?.run(
+            stream,
             Some(prof),
             "venc groupnorm",
             h.binding(),
-            self.weights.at(gpu, "venc.norm_out.g", chan * 4)?.binding(),
-            self.weights.at(gpu, "venc.norm_out.b", chan * 4)?.binding(),
+            held_1.binding(),
+            held_2.binding(),
             stats.binding(),
             y.binding(),
         )?;
+        let hoisted_1 = w3(stream, "venc.conv_out", 64, ksz(chan))?;
+        let held_1 = self.weights.at(stream, "venc.conv_out.b", 64 * 4)?;
         Conv3d::build(
             c,
-            gpu,
+            stream,
             false,
             t_len,
             hh,
@@ -885,34 +898,34 @@ impl VideoVae {
             64,
         )?
         .run(
-            gpu,
+            stream,
             Some(prof),
             "venc conv_out",
             y.binding(),
-            w3(gpu, "venc.conv_out", 64, ksz(chan))?.binding(),
-            self.weights.at(gpu, "venc.conv_out.b", 64 * 4)?.binding(),
+            hoisted_1.binding(),
+            held_1.binding(),
             tmp.binding(),
             None,
         )?;
         let m = t_len * hh * ww;
-        Matmul::build(c, gpu, 64, 64)?.run(
-            gpu,
+        let held_1 = self.weights.at(stream, "venc.quant.wm", 64 * 64 * 2)?;
+        let held_2 = self.weights.at(stream, "venc.quant.b", 64 * 4)?;
+        Matmul::build(c, stream, 64, 64)?.run(
+            stream,
             Some(prof),
             "venc quant",
             m,
             tmp.binding(),
-            self.weights
-                .at(gpu, "venc.quant.wm", 64 * 64 * 2)?
-                .binding(),
-            self.weights.at(gpu, "venc.quant.b", 64 * 4)?.binding(),
+            held_1.binding(),
+            held_2.binding(),
             y.binding(),
         )?;
 
         // the head emits 64 channels: the first 24 are the posterior's mean, the rest its log variance,
         // which sampling would use and this does not
         let mut mom = vec![half::f16::ZERO; m * 64];
-        gpu.sync()?;
-        gpu.d2h_ref(y.slice(0, mom.len() * 2), bytes_mut(&mut mom))?;
+        stream.synchronize()?;
+        stream.read(y.slice(0, mom.len() * 2), bytes_mut(&mut mom))?;
         let mut latent = vec![0.0f32; LATENT_CH * m];
         for t in 0..t_len {
             for yy in 0..hh {
@@ -933,7 +946,7 @@ impl VideoVae {
     /// result, then crop the trailing overlaps and concatenate.
     pub fn encode_clip(
         &mut self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         c: &Compiler,
         prof: &mut Profile,
         clip: Clip<'_>,
@@ -952,7 +965,7 @@ impl VideoVae {
                 th_lat[i] = tile_h / VAE_PS;
                 tw_lat[j] = tile_w / VAE_PS;
                 let (z, t) = self.encode_tile(
-                    gpu,
+                    stream,
                     c,
                     prof,
                     clip.pixels,
@@ -1028,7 +1041,7 @@ impl VideoVae {
     /// of the concatenation are dropped — the decoder's token drop, undone.
     pub fn encode_video(
         &mut self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         c: &Compiler,
         prof: &mut Profile,
         clip: Clip<'_>,
@@ -1037,7 +1050,7 @@ impl VideoVae {
         let (lh, lw) = clip.latent();
         let frames = clip.frames;
         if frames == 1 {
-            let (z, t) = self.encode_clip(gpu, c, prof, clip)?;
+            let (z, t) = self.encode_clip(stream, c, prof, clip)?;
             if t != 1 {
                 return other("image encode produced more than one latent frame");
             }
@@ -1055,7 +1068,7 @@ impl VideoVae {
                 chunk[f * plane..(f + 1) * plane].copy_from_slice(&clip.pixels[src..src + plane]);
             }
             let (z, t) = self.encode_clip(
-                gpu,
+                stream,
                 c,
                 prof,
                 Clip {

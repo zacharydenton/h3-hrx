@@ -13,14 +13,14 @@ fn assert_send<T: Send>() {}
 
 fn main() {
     // A compile-time statement of the claim, before any of it runs.
-    assert_send::<hrx::Gpu>();
+    assert_send::<hrx::Stream>();
     assert_send::<hrx::Buffer>();
     assert_send::<hrx::Kernel>();
     assert_send::<Gemm>();
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let exe = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
-    let gpu = hrx::Gpu::open().expect("gpu");
+    let mut stream = hrx::Stream::open().expect("stream");
     let compiler = Compiler::new(
         exe,
         root.join("h3/kernels"),
@@ -52,25 +52,30 @@ fn main() {
     let bias: Vec<f32> = vec![0.0; n];
 
     let bytes = |v: &[f16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
-    let a_buf = gpu.alloc(m * k_stride * 2).expect("a");
-    let w_buf = gpu.alloc(n * k_stride * 2).expect("w");
-    let b_buf = gpu.alloc(n * 4).expect("b");
-    let out_buf = gpu.alloc(m * n * 2).expect("out");
-    gpu.h2d(&a_buf, &bytes(&a)).expect("upload a");
-    gpu.h2d(&w_buf, &bytes(&w)).expect("upload w");
-    gpu.h2d(
-        &b_buf,
-        &bias
-            .iter()
-            .flat_map(|x| x.to_le_bytes())
-            .collect::<Vec<u8>>(),
-    )
-    .expect("upload b");
-    gpu.memset(&out_buf, 0, m * n * 2).expect("clear");
+    let a_buf = stream.allocate(m * k_stride * 2).expect("a");
+    let w_buf = stream.allocate(n * k_stride * 2).expect("w");
+    let b_buf = stream.allocate(n * 4).expect("b");
+    let out_buf = stream.allocate(m * n * 2).expect("out");
+    stream
+        .upload(a_buf.binding(), &bytes(&a))
+        .expect("upload a");
+    stream
+        .upload(w_buf.binding(), &bytes(&w))
+        .expect("upload w");
+    stream
+        .upload(
+            b_buf.binding(),
+            &bias
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )
+        .expect("upload b");
+    stream.fill(out_buf.slice(0, m * n * 2), 0).expect("clear");
 
     let gemm = Gemm::build(
         &compiler,
-        &gpu,
+        &mut stream,
         "plain",
         "f16",
         true,
@@ -87,9 +92,9 @@ fn main() {
     drop(compiler); // the compiler stays behind; only the runtime handles travel
 
     // Everything the dispatch needs moves to a second thread.
-    let (gpu, out_buf) = std::thread::spawn(move || {
+    let (stream, out_buf) = std::thread::spawn(move || {
         gemm.run(
-            &gpu,
+            &mut stream,
             None,
             "gemm",
             m as u32,
@@ -101,10 +106,10 @@ fn main() {
             Some(b_buf.binding()),
         )
         .expect("run on another thread");
-        gpu.sync().expect("sync");
+        stream.synchronize().expect("sync");
 
         let mut raw = vec![0u8; m * n * 2];
-        gpu.d2h(&out_buf, &mut raw).expect("read back");
+        stream.read(out_buf.binding(), &mut raw).expect("read back");
         let got: Vec<f32> = raw
             .chunks_exact(2)
             .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
@@ -121,7 +126,7 @@ fn main() {
             "dispatch from another thread gave wrong values: rel {worst}"
         );
         println!("dispatched and read back on a second thread: worst relative error {worst:.2e}");
-        (gpu, out_buf)
+        (stream, out_buf)
     })
     .join()
     .expect("second thread");
@@ -130,7 +135,7 @@ fn main() {
     // were made. The device outlives the buffer because the buffer holds a reference to it.
     std::thread::spawn(move || {
         drop(out_buf);
-        drop(gpu);
+        drop(stream);
         println!("buffer and device released on a third thread");
     })
     .join()

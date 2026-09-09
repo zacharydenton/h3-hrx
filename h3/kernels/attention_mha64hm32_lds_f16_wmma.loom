@@ -3,7 +3,9 @@
 // All 128 lanes stage distinct K/V packets and prefetch the next tile.
 // Online softmax, f32 accumulators, f16 output.
 // ATTN_STEM=attention_mha64hm32_lds_f16_wmma.
-amdgpu.target<gfx11-generic> @h3_attention_mha64hm32_lds_f16_wmma_gfx11 {subgroup_size = 32}
+// Named for the chip rather than gfx11-generic: the hand-written low asm below is spelled in
+// the amdgpu.rdna3_5.core descriptor set, and only a bare architecture selects that profile.
+amdgpu.target<gfx1151> @h3_attention_mha64hm32_lds_f16_wmma_gfx11 {subgroup_size = 32}
 
 config.decl @h3.attention_mha64hm32_lds_f16_wmma.q_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
 
@@ -17,7 +19,7 @@ config.decl @h3.attention_mha64hm32_lds_f16_wmma.token_capacity : %value: index 
 
 config.decl @h3.attention_mha64hm32_lds_f16_wmma.scale : f32
 
-low.func.def target<amdgpu.gfx11.generic.core>(@h3_attention_mha64hm32_lds_f16_wmma_gfx11) @h3_vae_pack(%even: reg<amdgpu.vgpr x4>, %odd: reg<amdgpu.vgpr x4>) -> (reg<amdgpu.vgpr x8>) asm {
+low.func.def target<amdgpu.rdna3_5.core>(@h3_attention_mha64hm32_lds_f16_wmma_gfx11) @h3_vae_pack(%even: reg<amdgpu.vgpr x4>, %odd: reg<amdgpu.vgpr x4>) -> (reg<amdgpu.vgpr x8>) asm {
   %lo = s_mov_b32 84148480
   %hi = s_mov_b32 117834498
   %e0 = slice %even[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>

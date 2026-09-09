@@ -24,7 +24,7 @@ fn main() {
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let exe = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
-    let gpu = hrx::Gpu::open().expect("gpu");
+    let mut stream = hrx::Stream::open().expect("stream");
     let compiler = Compiler::new(
         exe,
         root.join("h3/kernels"),
@@ -43,8 +43,16 @@ fn main() {
 
     let mut prof = Profile::from_env();
     let start = std::time::Instant::now();
-    let e = h3::vision::embed(&gpu, &compiler, &mut prof, &weights, &pixels, height, width)
-        .expect("embed");
+    let e = h3::vision::embed(
+        &mut stream,
+        &compiler,
+        &mut prof,
+        &weights,
+        &pixels,
+        height,
+        width,
+    )
+    .expect("embed");
     eprintln!(
         "embedded {height}x{width} to {} tokens in {:.2}s",
         e.tokens,

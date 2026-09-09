@@ -16,20 +16,30 @@ pub(crate) struct Projection {
 }
 
 impl Projection {
-    pub fn blocks(gpu: &hrx::Gpu, c: &Compiler, w: &[Vec<f32>], b: &[Vec<f32>]) -> Result<Self> {
+    pub fn blocks(
+        stream: &mut hrx::Stream,
+        c: &Compiler,
+        w: &[Vec<f32>],
+        b: &[Vec<f32>],
+    ) -> Result<Self> {
         if w.len() != BLOCKS || b.len() != BLOCKS {
             return invalid("AdaLN layer count mismatch");
         }
-        Self::new(gpu, c, w, b, MODALITIES, 6, 4)
+        Self::new(stream, c, w, b, MODALITIES, 6, 4)
     }
 
-    pub fn final_layer(gpu: &hrx::Gpu, c: &Compiler, w: Vec<f32>, b: Vec<f32>) -> Result<Self> {
-        Self::new(gpu, c, &[w], &[b], 1, 2, 2)
+    pub fn final_layer(
+        stream: &mut hrx::Stream,
+        c: &Compiler,
+        w: Vec<f32>,
+        b: Vec<f32>,
+    ) -> Result<Self> {
+        Self::new(stream, c, &[w], &[b], 1, 2, 2)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn new(
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         c: &Compiler,
         w: &[Vec<f32>],
         b: &[Vec<f32>],
@@ -43,15 +53,21 @@ impl Projection {
         {
             return invalid("AdaLN projection shape mismatch");
         }
-        let weights = gpu.alloc(count * 8 * 4)?;
-        let bias = gpu.alloc(count * 4)?;
+        let weights = stream.allocate(count * 8 * 4)?;
+        let bias = stream.allocate(count * 4)?;
         for (layer, (w, b)) in w.iter().zip(b).enumerate() {
-            gpu.h2d_at(
+            crate::dispatch::upload_at(
+                stream,
                 &weights,
                 layer * layer_count * 8 * 4,
                 crate::vvae::as_bytes(w),
             )?;
-            gpu.h2d_at(&bias, layer * layer_count * 4, crate::vvae::as_bytes(b))?;
+            crate::dispatch::upload_at(
+                stream,
+                &bias,
+                layer * layer_count * 4,
+                crate::vvae::as_bytes(b),
+            )?;
         }
         let classes = timesteps * modalities;
         let rows = count / HID;
@@ -74,9 +90,9 @@ impl Projection {
                     }
                 }
             }
-            let buffer = gpu.alloc(map.len() * 4)?;
+            let buffer = stream.allocate(map.len() * 4)?;
             let bytes: Vec<u8> = map.iter().flat_map(|row| row.to_ne_bytes()).collect();
-            gpu.h2d(&buffer, &bytes)?;
+            stream.upload(buffer.binding(), &bytes)?;
             maps.push(buffer);
         }
         let cfg = [
@@ -88,7 +104,7 @@ impl Projection {
         .map(|(k, v)| (format!("h3.modulation_f32.{k}"), v.to_string()))
         .to_vec();
         Ok(Self {
-            kernel: c.get(gpu, "modulation_f32", "h3_modulation_f32", &cfg)?,
+            kernel: c.get(stream, "modulation_f32", "h3_modulation_f32", &cfg)?,
             weights,
             bias,
             maps,
@@ -97,7 +113,12 @@ impl Projection {
         })
     }
 
-    pub fn run(&self, gpu: &hrx::Gpu, timesteps: &[[f32; 8]], output: &hrx::Buffer) -> Result<()> {
+    pub fn run(
+        &self,
+        stream: &mut hrx::Stream,
+        timesteps: &[[f32; 8]],
+        output: &hrx::Buffer,
+    ) -> Result<()> {
         if timesteps.len() != self.maps.len() || output.bytes() < self.output_bytes {
             return invalid("AdaLN output or timestep shape mismatch");
         }
@@ -110,7 +131,7 @@ impl Projection {
             // match specialization extents. Construction maps every lane to a
             // unique output within the checked allocation, across all launches.
             unsafe {
-                gpu.dispatch_constants(
+                stream.dispatch(
                     &self.kernel,
                     [self.count.div_ceil(256) as u32, 1, 1],
                     [256, 1, 1],
@@ -135,7 +156,7 @@ mod tests {
     #[test]
     #[ignore = "requires gfx1151 and the packaged Loom compiler"]
     fn projections_match_cpu_tables_bit_for_bit() -> Result<()> {
-        let gpu = hrx::Gpu::open()?;
+        let mut stream = hrx::Stream::open()?;
         let cache = tempfile::tempdir().unwrap();
         let compiler = Compiler::new(None, "", cache.path());
         let ramp = |n: usize, layer: usize| {
@@ -153,12 +174,12 @@ mod tests {
             [0.0; 8],
             [1.0; 8],
         ];
-        let blocks = Projection::blocks(&gpu, &compiler, &w, &b)?;
+        let blocks = Projection::blocks(&mut stream, &compiler, &w, &b)?;
         let expected = crate::conditioning::mods_table(&w, &b, &te[0], &te[1], &te[2], &te[3]);
-        let output = gpu.alloc(expected.len() * 4)?;
-        blocks.run(&gpu, &te, &output)?;
+        let output = stream.allocate(expected.len() * 4)?;
+        blocks.run(&mut stream, &te, &output)?;
         let mut got = vec![0.0f32; expected.len()];
-        gpu.d2h(&output, crate::vvae::as_bytes_mut(&mut got))?;
+        stream.read(output.binding(), crate::vvae::as_bytes_mut(&mut got))?;
         for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
             assert_eq!(
                 a.to_bits(),
@@ -168,11 +189,11 @@ mod tests {
         }
         let (w, b) = (ramp(2 * HID * 8, 3), ramp(2 * HID, 3));
         let expected = crate::conditioning::final_table(&w, &b, &te[0], &te[1]);
-        let final_layer = Projection::final_layer(&gpu, &compiler, w, b)?;
-        let output = gpu.alloc(expected.len() * 4)?;
-        final_layer.run(&gpu, &te[..2], &output)?;
+        let final_layer = Projection::final_layer(&mut stream, &compiler, w, b)?;
+        let output = stream.allocate(expected.len() * 4)?;
+        final_layer.run(&mut stream, &te[..2], &output)?;
         let mut got = vec![0.0f32; expected.len()];
-        gpu.d2h(&output, crate::vvae::as_bytes_mut(&mut got))?;
+        stream.read(output.binding(), crate::vvae::as_bytes_mut(&mut got))?;
         for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
             assert_eq!(
                 a.to_bits(),
@@ -180,8 +201,10 @@ mod tests {
                 "final element {i}: GPU {a}, CPU {b}"
             );
         }
-        assert!(final_layer.run(&gpu, &te, &output).is_err());
-        assert!(final_layer.run(&gpu, &te[..2], &gpu.alloc(4)?).is_err());
+        assert!(final_layer.run(&mut stream, &te, &output).is_err());
+        // allocate before the call: the run borrows the stream mutably for its duration
+        let short = stream.allocate(4)?;
+        assert!(final_layer.run(&mut stream, &te[..2], &short).is_err());
         Ok(())
     }
 }

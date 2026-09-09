@@ -53,7 +53,7 @@ impl Default for Config {
 /// Every method takes `&mut self`, so the borrow checker serialises the calls; nothing here needs a
 /// lock of its own.
 pub struct Session {
-    gpu: hrx::Gpu,
+    stream: hrx::Stream,
     compiler: Compiler,
     config: Config,
     prof: Profile,
@@ -90,7 +90,7 @@ impl Session {
             config.cache_dir.clone(),
         );
         Ok(Self {
-            gpu: hrx::Gpu::open()?,
+            stream: hrx::Stream::open()?,
             compiler,
             config,
             prof: Profile::from_env(),
@@ -131,7 +131,7 @@ impl Session {
                 return invalid("no DiT checkpoint was configured");
             };
             // Safety: the caller's, taken at Session::new.
-            self.dit = Some(unsafe { Dit::open(&self.gpu, path) }?);
+            self.dit = Some(unsafe { Dit::open(&mut self.stream, path) }?);
         }
         Ok(self.dit.as_mut().expect("opened above"))
     }
@@ -142,7 +142,7 @@ impl Session {
                 return invalid("no text encoder checkpoint was configured");
             };
             // Safety: the caller's, taken at Session::new.
-            self.te = Some(unsafe { TextEncoder::open(&self.gpu, path) }?);
+            self.te = Some(unsafe { TextEncoder::open(&mut self.stream, path) }?);
         }
         Ok(self.te.as_mut().expect("opened above"))
     }
@@ -153,7 +153,7 @@ impl Session {
                 return invalid("no video VAE checkpoint was configured");
             };
             // Safety: the caller's, taken at Session::new.
-            self.vvae = Some(unsafe { VideoVae::open(&self.gpu, path) }?);
+            self.vvae = Some(unsafe { VideoVae::open(&mut self.stream, path) }?);
         }
         Ok(self.vvae.as_mut().expect("opened above"))
     }
@@ -164,7 +164,7 @@ impl Session {
                 return invalid("no audio VAE checkpoint was configured");
             };
             // Safety: the caller's, taken at Session::new.
-            self.avae = Some(unsafe { AudioVae::open(&self.gpu, path) }?);
+            self.avae = Some(unsafe { AudioVae::open(&mut self.stream, path) }?);
         }
         Ok(self.avae.as_mut().expect("opened above"))
     }
@@ -173,7 +173,7 @@ impl Session {
     fn prompt_pair(
         &mut self,
     ) -> Result<(
-        &hrx::Gpu,
+        &mut hrx::Stream,
         &Compiler,
         &mut Profile,
         &mut Dit,
@@ -182,7 +182,7 @@ impl Session {
         self.dit()?;
         self.te()?;
         let Self {
-            gpu,
+            stream,
             compiler,
             prof,
             dit,
@@ -190,7 +190,7 @@ impl Session {
             ..
         } = self;
         Ok((
-            gpu,
+            stream,
             compiler,
             prof,
             dit.as_mut().expect("opened"),
@@ -216,9 +216,9 @@ impl Session {
                 out.len()
             ));
         }
-        let (gpu, c, prof, dit, te) = self.prompt_pair()?;
-        dit.text_in(gpu, c, prof, te, ids, &[])?;
-        dit.read_rows(gpu, ids.len(), out)
+        let (stream, c, prof, dit, te) = self.prompt_pair()?;
+        dit.text_in(stream, c, prof, te, ids, &[])?;
+        dit.read_rows(stream, ids.len(), out)
     }
 
     /// The whole denoising run.
@@ -239,9 +239,9 @@ impl Session {
         let _ = sh;
         // the attention width is the session's, set once at creation: the stack is built for it
         let qk_bits = self.config.attention.bits();
-        let (gpu, c, prof, dit, te) = self.prompt_pair()?;
+        let (stream, c, prof, dit, te) = self.prompt_pair()?;
         dit.denoise(
-            gpu, c, prof, te, ids, p, qk_bits, noise, refs, kfs, progress,
+            stream, c, prof, te, ids, p, qk_bits, noise, refs, kfs, progress,
         )
     }
 
@@ -308,14 +308,14 @@ impl Session {
     ) -> Result<crate::vision::Embedding> {
         self.te()?;
         let Self {
-            gpu,
+            stream,
             compiler,
             prof,
             te,
             ..
         } = self;
         let te = te.as_ref().expect("opened");
-        crate::vision::embed(gpu, compiler, prof, te.weights(), pixels, height, width)
+        crate::vision::embed(stream, compiler, prof, te.weights(), pixels, height, width)
     }
 
     /// Model-space latents to `[frames][height][width][3]` RGB8.
@@ -329,7 +329,7 @@ impl Session {
     pub fn decode_video(&mut self, shape: &Shape, latents: &[f32], out: &mut [u8]) -> Result<()> {
         self.vvae()?;
         let Self {
-            gpu,
+            stream,
             compiler,
             prof,
             vvae,
@@ -337,13 +337,13 @@ impl Session {
         } = self;
         vvae.as_mut()
             .expect("opened")
-            .decode_video(gpu, compiler, prof, shape, latents, out)
+            .decode_video(stream, compiler, prof, shape, latents, out)
     }
 
     pub fn encode_video(&mut self, clip: Clip<'_>) -> Result<(Vec<f32>, usize)> {
         self.vvae()?;
         let Self {
-            gpu,
+            stream,
             compiler,
             prof,
             vvae,
@@ -351,7 +351,7 @@ impl Session {
         } = self;
         vvae.as_mut()
             .expect("opened")
-            .encode_video(gpu, compiler, prof, clip)
+            .encode_video(stream, compiler, prof, clip)
     }
 
     pub fn decode_audio(
@@ -362,7 +362,7 @@ impl Session {
     ) -> Result<()> {
         self.avae()?;
         let Self {
-            gpu,
+            stream,
             compiler,
             prof,
             avae,
@@ -370,13 +370,13 @@ impl Session {
         } = self;
         avae.as_mut()
             .expect("opened")
-            .decode(gpu, compiler, prof, latents, audio_t, samples)
+            .decode(stream, compiler, prof, latents, audio_t, samples)
     }
 
     pub fn encode_audio(&mut self, samples: &[f32], n: usize) -> Result<(Vec<f32>, usize)> {
         self.avae()?;
         let Self {
-            gpu,
+            stream,
             compiler,
             prof,
             avae,
@@ -384,7 +384,7 @@ impl Session {
         } = self;
         avae.as_mut()
             .expect("opened")
-            .encode(gpu, compiler, prof, samples, n)
+            .encode(stream, compiler, prof, samples, n)
     }
 }
 

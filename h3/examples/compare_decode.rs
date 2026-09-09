@@ -38,18 +38,19 @@ fn main() {
         Compiler::new(baseline_exe, &a[1], &cache),
         Compiler::new(exe, root, &cache),
     ];
-    let gpu = hrx::Gpu::open().unwrap();
+    let mut stream = hrx::Stream::open().unwrap();
     // Safety: caller-owned checkpoint, which is not modified during this comparison.
-    let mut vaes = [unsafe { VideoVae::open(&gpu, &a[2]).unwrap() }, unsafe {
-        VideoVae::open(&gpu, &a[2]).unwrap()
-    }];
+    let mut vaes = [
+        unsafe { VideoVae::open(&mut stream, &a[2]).unwrap() },
+        unsafe { VideoVae::open(&mut stream, &a[2]).unwrap() },
+    ];
     let mut profile = Profile::default();
     let bytes = shape.frames as usize * shape.lat_h as usize * 16 * shape.lat_w as usize * 16 * 3;
     let mut outputs = [vec![0; bytes], vec![0; bytes]];
     for version in 0..2 {
         vaes[version]
             .decode_video(
-                &gpu,
+                &mut stream,
                 &compilers[version],
                 &mut profile,
                 &shape,
@@ -64,11 +65,11 @@ fn main() {
         let mut times = [0.; 2];
         for order in 0..2 {
             let version = (batch + order) % 2;
-            gpu.sync().unwrap();
+            stream.synchronize().unwrap();
             let start = Instant::now();
             vaes[version]
                 .decode_video(
-                    &gpu,
+                    &mut stream,
                     &compilers[version],
                     &mut profile,
                     &shape,
@@ -76,7 +77,7 @@ fn main() {
                     &mut outputs[version],
                 )
                 .unwrap();
-            gpu.sync().unwrap();
+            stream.synchronize().unwrap();
             times[version] = start.elapsed().as_secs_f64();
         }
         assert!(

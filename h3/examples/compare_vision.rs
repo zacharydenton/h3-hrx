@@ -12,7 +12,7 @@ fn values(count: usize, scale: f32) -> Vec<f32> {
 
 fn upload(stream: &mut Stream, bytes: &[u8]) -> Buffer {
     let buffer = stream.allocate(bytes.len()).unwrap();
-    stream.upload(&buffer, bytes).unwrap();
+    stream.upload(buffer.binding(), bytes).unwrap();
     buffer
 }
 

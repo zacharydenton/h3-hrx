@@ -63,12 +63,12 @@ impl Profile {
 ///
 /// # Safety
 ///
-/// Inherits [`hrx::Gpu::dispatch_constants`]'s contract: `grid`, `block`, `scalars` and `bindings` must be what
+/// Inherits [`hrx::Stream::dispatch_constants`]'s contract: `grid`, `block`, `scalars` and `bindings` must be what
 /// `kernel` was compiled for. Private to the crate, and every caller goes through [`checked`], which
 /// discharges the binding half of that contract against the extents the kernel was configured with.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn launch(
-    gpu: &hrx::Gpu,
+    stream: &mut hrx::Stream,
     kernel: &hrx::Kernel,
     profile: Option<&mut Profile>,
     stage: &str,
@@ -82,16 +82,29 @@ pub(crate) unsafe fn launch(
     let constants = hrx::Constants::indices(kernel, scalars)?;
     match profile {
         Some(p) if p.on => {
-            gpu.sync()?;
+            stream.synchronize()?;
             let started = Instant::now();
-            unsafe { gpu.dispatch_constants(kernel, grid, block, &constants, bindings)? };
-            gpu.sync()?;
+            unsafe { stream.dispatch(kernel, grid, block, &constants, bindings)? };
+            stream.synchronize()?;
             *p.micros.entry(stage.to_string()).or_insert(0.0) +=
                 started.elapsed().as_secs_f64() * 1e6;
         }
-        _ => unsafe { gpu.dispatch_constants(kernel, grid, block, &constants, bindings)? },
+        _ => unsafe { stream.dispatch(kernel, grid, block, &constants, bindings)? },
     }
     Ok(())
+}
+
+/// Upload into `dst` at a byte offset.
+///
+/// `Stream::upload` takes the view it writes, so an offset upload is an upload into a slice — this
+/// just names the length, which is the source's, rather than repeating it at every call.
+pub fn upload_at(
+    stream: &mut hrx::Stream,
+    dst: &hrx::Buffer,
+    offset: usize,
+    bytes: &[u8],
+) -> Result<()> {
+    Ok(stream.upload(dst.slice(offset, bytes.len()), bytes)?)
 }
 
 /// A launch whose bindings have been checked against the extents its kernel addresses.
@@ -108,7 +121,7 @@ pub(crate) unsafe fn launch(
 /// is the one that belongs here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn checked(
-    gpu: &hrx::Gpu,
+    stream: &mut hrx::Stream,
     kernel: &hrx::Kernel,
     profile: Option<&mut Profile>,
     stage: &str,
@@ -134,7 +147,11 @@ pub(crate) fn checked(
     // Safety: every binding is at least as long as the extent this kernel was compiled to address,
     // checked immediately above, and the grid, block and scalars come from the same builder that
     // compiled it.
-    unsafe { launch(gpu, kernel, profile, stage, grid, block, scalars, bindings) }
+    unsafe {
+        launch(
+            stream, kernel, profile, stage, grid, block, scalars, bindings,
+        )
+    }
 }
 
 /// The most buffers any of these kernels binds.
@@ -200,10 +217,10 @@ pub struct Classes {
 
 impl Classes {
     /// `rows` of class zero, which is a row of every table.
-    pub fn zeroed(gpu: &hrx::Gpu, rows: usize) -> Result<Self> {
+    pub fn zeroed(stream: &mut hrx::Stream, rows: usize) -> Result<Self> {
         let bytes = rows.max(1) * 4;
-        let buf = gpu.alloc(bytes)?;
-        gpu.memset(&buf, 0, bytes)?;
+        let buf = stream.allocate(bytes)?;
+        stream.fill(buf.slice(0, bytes), 0)?;
         Ok(Self {
             buf,
             capacity: rows,
@@ -216,10 +233,15 @@ impl Classes {
     ///
     /// A refusal leaves nothing offered: the rows are marked unwritten first, so a caller that
     /// ignores the error cannot bind the stale ones.
-    pub fn write(&mut self, gpu: &hrx::Gpu, values: &[i32], classes: usize) -> Result<()> {
+    pub fn write(
+        &mut self,
+        stream: &mut hrx::Stream,
+        values: &[i32],
+        classes: usize,
+    ) -> Result<()> {
         self.written = 0;
         checkable(values, classes, self.capacity)?;
-        gpu.h2d_at(&self.buf, 0, bytemuck::cast_slice(values))?;
+        crate::dispatch::upload_at(stream, &self.buf, 0, bytemuck::cast_slice(values))?;
         self.written = values.len();
         self.bound = classes;
         Ok(())
@@ -312,7 +334,7 @@ impl Prepare {
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         c: &Compiler,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         form: &str,
         elem: &str,
         width: usize,
@@ -348,7 +370,7 @@ impl Prepare {
         } else {
             format!("prepare_{elem}_family")
         };
-        let kernel = c.get(gpu, &module, &format!("h3_{stem}"), &cfg)?;
+        let kernel = c.get(stream, &module, &format!("h3_{stem}"), &cfg)?;
         Ok(Self {
             kernel,
             lanes,
@@ -365,7 +387,7 @@ impl Prepare {
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         profile: Option<&mut Profile>,
         stage: &str,
         tokens: u32,
@@ -392,7 +414,7 @@ impl Prepare {
             args.push(a_s.expect("an int8 prepare writes a token scale"), t * 4);
         }
         checked(
-            gpu,
+            stream,
             &self.kernel,
             profile,
             stage,
@@ -438,7 +460,7 @@ impl Gemm {
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         c: &Compiler,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         mode: &str,
         elem: &str,
         bias: bool,
@@ -528,7 +550,7 @@ impl Gemm {
         } else {
             stem.clone()
         };
-        let kernel = c.get(gpu, &module, &format!("h3_{stem}"), &cfg)?;
+        let kernel = c.get(stream, &module, &format!("h3_{stem}"), &cfg)?;
         Ok(Self {
             kernel,
             n: n_size,
@@ -550,7 +572,7 @@ impl Gemm {
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         profile: Option<&mut Profile>,
         stage: &str,
         tokens: u32,
@@ -583,7 +605,7 @@ impl Gemm {
             args.push(bias.expect("a biased GEMM needs its bias"), self.n * 4);
         }
         checked(
-            gpu,
+            stream,
             &self.kernel,
             profile,
             stage,
@@ -627,7 +649,7 @@ impl Conv3d {
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         c: &Compiler,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         add: bool,
         frames: usize,
         h: usize,
@@ -661,7 +683,7 @@ impl Conv3d {
             (format!("{ns}n_size"), cout_pad.to_string()),
         ];
         Ok(Self {
-            kernel: c.get(gpu, "conv3d_f16_family", &format!("h3_{stem}"), &cfg)?,
+            kernel: c.get(stream, "conv3d_f16_family", &format!("h3_{stem}"), &cfg)?,
             cout_pad,
             in_rows: frames * h * w,
             cin_stride,
@@ -680,7 +702,7 @@ impl Conv3d {
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         profile: Option<&mut Profile>,
         stage: &str,
         a: View<'_>,
@@ -701,7 +723,7 @@ impl Conv3d {
             args.push(r, plane);
         }
         checked(
-            gpu,
+            stream,
             &self.kernel,
             profile,
             stage,
@@ -729,7 +751,7 @@ pub struct GroupNormSilu {
 impl GroupNormSilu {
     pub fn build(
         c: &Compiler,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         frames: usize,
         h: usize,
         w: usize,
@@ -753,8 +775,8 @@ impl GroupNormSilu {
             (format!("{na}eps"), num(1e-6)),
         ];
         Ok(Self {
-            stats: c.get(gpu, "gn_stats_f16", "h3_gn_stats_f16", &stats_cfg)?,
-            silu: c.get(gpu, "gn_silu_f16", "h3_gn_silu_f16", &silu_cfg)?,
+            stats: c.get(stream, "gn_stats_f16", "h3_gn_stats_f16", &stats_cfg)?,
+            silu: c.get(stream, "gn_silu_f16", "h3_gn_silu_f16", &silu_cfg)?,
             frames,
             rows,
             channels,
@@ -765,7 +787,7 @@ impl GroupNormSilu {
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         mut profile: Option<&mut Profile>,
         stage: &str,
         x: View<'_>,
@@ -778,7 +800,7 @@ impl GroupNormSilu {
         let plane = self.rows * self.channels * 2;
         let stats_bytes = self.frames * 32 * 2 * 4;
         checked(
-            gpu,
+            stream,
             &self.stats,
             profile.as_deref_mut(),
             stage,
@@ -789,7 +811,7 @@ impl GroupNormSilu {
             &[plane, stats_bytes],
         )?;
         checked(
-            gpu,
+            stream,
             &self.silu,
             profile,
             stage,
@@ -816,7 +838,12 @@ pub struct Matmul {
 }
 
 impl Matmul {
-    pub fn build(c: &Compiler, gpu: &hrx::Gpu, k_size: usize, n_size: usize) -> Result<Self> {
+    pub fn build(
+        c: &Compiler,
+        stream: &mut hrx::Stream,
+        k_size: usize,
+        n_size: usize,
+    ) -> Result<Self> {
         let stem = "matmul_bias_f16_wmma_af16_cf16";
         let ns = format!("h3.{stem}.");
         let cfg: Cfg = vec![
@@ -824,7 +851,7 @@ impl Matmul {
             (format!("{ns}n_size"), n_size.to_string()),
         ];
         Ok(Self {
-            kernel: c.get(gpu, stem, &format!("h3_{stem}"), &cfg)?,
+            kernel: c.get(stream, stem, &format!("h3_{stem}"), &cfg)?,
             k_size,
             n_size,
         })
@@ -833,7 +860,7 @@ impl Matmul {
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         profile: Option<&mut Profile>,
         stage: &str,
         rows: usize,
@@ -843,7 +870,7 @@ impl Matmul {
         out: View<'_>,
     ) -> Result<()> {
         checked(
-            gpu,
+            stream,
             &self.kernel,
             profile,
             stage,
@@ -872,14 +899,14 @@ pub struct MatmulF32 {
 }
 
 impl MatmulF32 {
-    pub fn build(c: &Compiler, gpu: &hrx::Gpu, k: usize, n: usize) -> Result<Self> {
+    pub fn build(c: &Compiler, stream: &mut hrx::Stream, k: usize, n: usize) -> Result<Self> {
         let ns = "h3.matmul_f32.";
         let cfg: Cfg = vec![
             (format!("{ns}k"), k.to_string()),
             (format!("{ns}n"), n.to_string()),
         ];
         Ok(Self {
-            kernel: c.get(gpu, "matmul_f32", "h3_matmul_f32", &cfg)?,
+            kernel: c.get(stream, "matmul_f32", "h3_matmul_f32", &cfg)?,
             k,
             n,
         })
@@ -888,7 +915,7 @@ impl MatmulF32 {
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         profile: Option<&mut Profile>,
         stage: &str,
         m: usize,
@@ -898,7 +925,7 @@ impl MatmulF32 {
         out: View<'_>,
     ) -> Result<()> {
         checked(
-            gpu,
+            stream,
             &self.kernel,
             profile,
             stage,
@@ -921,7 +948,7 @@ impl MatmulF32 {
 #[allow(clippy::too_many_arguments)]
 pub fn axpy(
     c: &Compiler,
-    gpu: &hrx::Gpu,
+    stream: &mut hrx::Stream,
     profile: Option<&mut Profile>,
     stage: &str,
     a: f32,
@@ -935,9 +962,9 @@ pub fn axpy(
         (format!("{ns}a"), num(f64::from(a))),
         (format!("{ns}b"), num(f64::from(b))),
     ];
-    let kernel = c.get(gpu, "axpy_f32", "h3_axpy_f32", &cfg)?;
+    let kernel = c.get(stream, "axpy_f32", "h3_axpy_f32", &cfg)?;
     checked(
-        gpu,
+        stream,
         &kernel,
         profile,
         stage,
@@ -963,7 +990,13 @@ pub struct Matmul16 {
 }
 
 impl Matmul16 {
-    pub fn build(c: &Compiler, gpu: &hrx::Gpu, kind: &str, k: usize, n: usize) -> Result<Self> {
+    pub fn build(
+        c: &Compiler,
+        stream: &mut hrx::Stream,
+        kind: &str,
+        k: usize,
+        n: usize,
+    ) -> Result<Self> {
         let stem = format!("matmul_{kind}_bf16_wmma");
         let ns = format!("h3.{stem}.");
         let cfg: Cfg = vec![
@@ -972,7 +1005,7 @@ impl Matmul16 {
         ];
         Ok(Self {
             kernel: c.get(
-                gpu,
+                stream,
                 if kind == "resid" {
                     &stem
                 } else {
@@ -991,7 +1024,7 @@ impl Matmul16 {
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         profile: Option<&mut Profile>,
         stage: &str,
         m: usize,
@@ -1007,18 +1040,18 @@ impl Matmul16 {
             "only the resid form takes a lambda"
         );
         // the weight rows are bf16 as stored, and the bias and the residual form's lambda are one
-        // f32 per output column. The stream the other operands carry is the kind's: `resid` reads
-        // and writes the f16 stream, and the three that end a chain take f32 in and out.
-        let stream = if self.resid { 2 } else { 4 };
-        let mut args = Args::new(a, m * self.k * stream);
+        // f32 per output column. The element width the other operands carry is the kind's: `resid`
+        // reads and writes the f16 stream, and the three that end a chain take f32 in and out.
+        let elem = if self.resid { 2 } else { 4 };
+        let mut args = Args::new(a, m * self.k * elem);
         args.push(w, self.n * self.k * 2);
         args.push(bias, self.n * 4);
-        args.push(out, m * self.n * stream);
+        args.push(out, m * self.n * elem);
         if let Some(l) = lambda {
             args.push(l, self.n * 4);
         }
         checked(
-            gpu,
+            stream,
             &self.kernel,
             profile,
             stage,
@@ -1045,7 +1078,7 @@ pub struct NormMod {
 impl NormMod {
     pub fn build(
         c: &Compiler,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         width: usize,
         eps: f64,
         classes: usize,
@@ -1061,7 +1094,7 @@ impl NormMod {
             (format!("{ns}classes"), classes.to_string()),
         ];
         Ok(Self {
-            kernel: c.get(gpu, "norm_mod_f32", "h3_norm_mod_f32", &cfg)?,
+            kernel: c.get(stream, "norm_mod_f32", "h3_norm_mod_f32", &cfg)?,
             width,
             lanes,
             classes,
@@ -1071,7 +1104,7 @@ impl NormMod {
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         profile: Option<&mut Profile>,
         stage: &str,
         rows: usize,
@@ -1081,7 +1114,7 @@ impl NormMod {
         cls: ClassRows<'_>,
     ) -> Result<()> {
         checked(
-            gpu,
+            stream,
             &self.kernel,
             profile,
             stage,
@@ -1106,14 +1139,14 @@ pub struct LayerNorm16 {
 }
 
 impl LayerNorm16 {
-    pub fn build(c: &Compiler, gpu: &hrx::Gpu, width: usize, eps: f64) -> Result<Self> {
+    pub fn build(c: &Compiler, stream: &mut hrx::Stream, width: usize, eps: f64) -> Result<Self> {
         let ns = "h3.layernorm_f16_f32.";
         let cfg: Cfg = vec![
             (format!("{ns}width"), width.to_string()),
             (format!("{ns}eps"), num(eps)),
         ];
         Ok(Self {
-            kernel: c.get(gpu, "layernorm_f16_f32", "h3_layernorm_f16_f32", &cfg)?,
+            kernel: c.get(stream, "layernorm_f16_f32", "h3_layernorm_f16_f32", &cfg)?,
             width,
         })
     }
@@ -1121,7 +1154,7 @@ impl LayerNorm16 {
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         profile: Option<&mut Profile>,
         rows: usize,
         x16: View<'_>,
@@ -1130,7 +1163,7 @@ impl LayerNorm16 {
         out32: View<'_>,
     ) -> Result<()> {
         checked(
-            gpu,
+            stream,
             &self.kernel,
             profile,
             "vision layernorm",

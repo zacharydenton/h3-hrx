@@ -91,12 +91,12 @@ pub struct Constants {
 }
 
 impl Constants {
-    pub fn new(gpu: &hrx::Gpu) -> Result<Self> {
-        let ones = gpu.alloc(HID * 4)?;
+    pub fn new(stream: &mut hrx::Stream) -> Result<Self> {
+        let ones = stream.allocate(HID * 4)?;
         let row: Vec<u8> = (0..HID).flat_map(|_| 1.0f32.to_le_bytes()).collect();
-        gpu.h2d(&ones, &row)?;
-        let zeros = gpu.alloc(2 * TE_FFN * 4)?;
-        gpu.memset(&zeros, 0, 2 * TE_FFN * 4)?;
+        stream.upload(ones.binding(), &row)?;
+        let zeros = stream.allocate(2 * TE_FFN * 4)?;
+        stream.fill(zeros.slice(0, 2 * TE_FFN * 4), 0)?;
         Ok(Self {
             ones: Arc::new(ones),
             zeros: Arc::new(zeros),
@@ -210,7 +210,7 @@ impl Stack {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         c: &Compiler,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         d: StackDims,
         tokens: usize,
         layers: usize,
@@ -247,70 +247,78 @@ impl Stack {
         let mut blocks = Vec::with_capacity(layers);
         for i in 0..layers {
             let p = prefix(i);
-            let wpad = |name: &str, n: usize, k: usize| -> Result<Arc<hrx::Buffer>> {
-                w.rows(gpu, name, n, wbytes(1, k), wbytes(1, pitch(k)))
+            let wpad = |stream: &mut hrx::Stream,
+                        name: &str,
+                        n: usize,
+                        k: usize|
+             -> Result<Arc<hrx::Buffer>> {
+                w.rows(stream, name, n, wbytes(1, k), wbytes(1, pitch(k)))
                     .map_err(|e| crate::compile::Error::Io(e.to_string()))
             };
-            let scale = |name: &str, n: usize| -> Result<Option<Arc<hrx::Buffer>>> {
+            let scale = |stream: &mut hrx::Stream,
+                         name: &str,
+                         n: usize|
+             -> Result<Option<Arc<hrx::Buffer>>> {
                 if !quant {
                     return Ok(None);
                 }
-                w.at(gpu, name, n * 4)
+                w.at(stream, name, n * 4)
                     .map(Some)
                     .map_err(|e| crate::compile::Error::Io(e.to_string()))
             };
-            let vec_at = |name: &str, n: usize| -> Result<Arc<hrx::Buffer>> {
-                w.at(gpu, name, n * 4)
-                    .map_err(|e| crate::compile::Error::Io(e.to_string()))
-            };
+            let vec_at =
+                |stream: &mut hrx::Stream, name: &str, n: usize| -> Result<Arc<hrx::Buffer>> {
+                    w.at(stream, name, n * 4)
+                        .map_err(|e| crate::compile::Error::Io(e.to_string()))
+                };
 
             let (qnorm, knorm) = if qk_weights {
                 (
-                    vec_at(&format!("{p}qnorm"), d.head_dim)?,
-                    vec_at(&format!("{p}knorm"), d.head_dim)?,
+                    vec_at(stream, &format!("{p}qnorm"), d.head_dim)?,
+                    vec_at(stream, &format!("{p}knorm"), d.head_dim)?,
                 )
             } else {
                 (ones_head.clone(), ones_head.clone())
             };
             let (scale1, scale2) = if w.has(&format!("{p}scale1")) {
                 (
-                    Some(vec_at(&format!("{p}scale1"), d.hidden)?),
-                    Some(vec_at(&format!("{p}scale2"), d.hidden)?),
+                    Some(vec_at(stream, &format!("{p}scale1"), d.hidden)?),
+                    Some(vec_at(stream, &format!("{p}scale2"), d.hidden)?),
                 )
             } else {
                 (None, None)
             };
             blocks.push(Block {
-                qkv_q: wpad(&format!("{p}qkv.q"), d.qkv(), d.hidden)?,
-                qkv_s: scale(&format!("{p}qkv.s"), d.qkv())?,
-                out_q: wpad(&format!("{p}out.q"), d.hidden, d.inner())?,
-                out_s: scale(&format!("{p}out.s"), d.hidden)?,
-                gu_q: wpad(&format!("{p}gu.q"), 2 * d.ffn, d.hidden)?,
-                gu_s: scale(&format!("{p}gu.s"), 2 * d.ffn)?,
-                down_q: wpad(&format!("{p}down.q"), d.hidden, d.ffn)?,
-                down_s: scale(&format!("{p}down.s"), d.hidden)?,
+                qkv_q: wpad(stream, &format!("{p}qkv.q"), d.qkv(), d.hidden)?,
+                qkv_s: scale(stream, &format!("{p}qkv.s"), d.qkv())?,
+                out_q: wpad(stream, &format!("{p}out.q"), d.hidden, d.inner())?,
+                out_s: scale(stream, &format!("{p}out.s"), d.hidden)?,
+                gu_q: wpad(stream, &format!("{p}gu.q"), 2 * d.ffn, d.hidden)?,
+                gu_s: scale(stream, &format!("{p}gu.s"), 2 * d.ffn)?,
+                down_q: wpad(stream, &format!("{p}down.q"), d.hidden, d.ffn)?,
+                down_s: scale(stream, &format!("{p}down.s"), d.hidden)?,
                 qkv_b: if d.bias {
-                    Some(vec_at(&format!("{p}qkv.b"), d.qkv())?)
+                    Some(vec_at(stream, &format!("{p}qkv.b"), d.qkv())?)
                 } else {
                     None
                 },
                 out_b: if d.bias {
-                    Some(vec_at(&format!("{p}out.b"), d.hidden)?)
+                    Some(vec_at(stream, &format!("{p}out.b"), d.hidden)?)
                 } else {
                     None
                 },
                 gu_b: if d.bias {
-                    Some(vec_at(&format!("{p}gu.b"), 2 * d.ffn)?)
+                    Some(vec_at(stream, &format!("{p}gu.b"), 2 * d.ffn)?)
                 } else {
                     None
                 },
                 down_b: if d.bias {
-                    Some(vec_at(&format!("{p}down.b"), d.hidden)?)
+                    Some(vec_at(stream, &format!("{p}down.b"), d.hidden)?)
                 } else {
                     None
                 },
-                norm1: vec_at(&format!("{p}norm1"), d.hidden)?,
-                norm2: vec_at(&format!("{p}norm2"), d.hidden)?,
+                norm1: vec_at(stream, &format!("{p}norm1"), d.hidden)?,
+                norm2: vec_at(stream, &format!("{p}norm2"), d.hidden)?,
                 qnorm,
                 knorm,
                 scale1,
@@ -320,7 +328,7 @@ impl Stack {
 
         let prep_norm = Prepare::build(
             c,
-            gpu,
+            stream,
             "norm",
             elem,
             d.hidden,
@@ -339,7 +347,7 @@ impl Stack {
         } else {
             Some(Prepare::build(
                 c,
-                gpu,
+                stream,
                 "plain",
                 elem,
                 d.inner(),
@@ -353,7 +361,7 @@ impl Stack {
         } else {
             Some(Prepare::build(
                 c,
-                gpu,
+                stream,
                 "plain",
                 elem,
                 d.ffn,
@@ -377,7 +385,7 @@ impl Stack {
             let stem = "gemm_f16_qkvropehm_256b";
             let ns = format!("h3.{stem}.");
             qkv_rope = Some(c.get(
-                gpu,
+                stream,
                 stem,
                 &format!("h3_{stem}"),
                 &vec![
@@ -392,7 +400,7 @@ impl Stack {
         } else {
             gemm_qkv = Some(Gemm::build(
                 c,
-                gpu,
+                stream,
                 "plain",
                 elem,
                 d.bias,
@@ -408,7 +416,7 @@ impl Stack {
         }
         let gemm_gu = Gemm::build(
             c,
-            gpu,
+            stream,
             "swiglu",
             elem,
             d.bias,
@@ -423,7 +431,7 @@ impl Stack {
         )?;
         let gemm_out = Gemm::build(
             c,
-            gpu,
+            stream,
             "resid",
             elem,
             d.bias,
@@ -438,7 +446,7 @@ impl Stack {
         )?;
         let gemm_down = Gemm::build(
             c,
-            gpu,
+            stream,
             "resid",
             elem,
             d.bias,
@@ -464,7 +472,7 @@ impl Stack {
             };
             let ns = format!("h3.{stem}.");
             Some(c.get(
-                gpu,
+                stream,
                 if d.head_dim == 64 || d.rope_dim == 128 {
                     "rope_head_family"
                 } else {
@@ -497,7 +505,7 @@ impl Stack {
             }
             let pq = format!("h3.{pqk}.");
             colmean = Some(c.get(
-                gpu,
+                stream,
                 "colmean_f32",
                 "h3_colmean_f32",
                 &vec![("h3.colmean_f32.width".into(), d.inner().to_string())],
@@ -514,13 +522,13 @@ impl Stack {
                 format!("{pq}extra_scale"),
                 num(1.0 / (d.head_dim as f64).sqrt() / 128.0),
             ));
-            prep_q = Some(c.get(gpu, pqk, &format!("h3_{pqk}"), &cfg)?);
+            prep_q = Some(c.get(stream, pqk, &format!("h3_{pqk}"), &cfg)?);
             // the K operand differs only in its head offset
             let last = cfg.len() - 1;
             cfg[last].1 = "1".into();
-            prep_k = Some(c.get(gpu, pqk, &format!("h3_{pqk}"), &cfg)?);
+            prep_k = Some(c.get(stream, pqk, &format!("h3_{pqk}"), &cfg)?);
             transpose = Some(c.get(
-                gpu,
+                stream,
                 "transpose_f16",
                 "h3_transpose_f16",
                 &vec![
@@ -614,21 +622,21 @@ impl Stack {
             if skip {
                 acfg.push((format!("{ns}skip_tau"), num(tau)));
             }
-            c.get(gpu, &module, &format!("h3_{stem}"), &acfg)?
+            c.get(stream, &module, &format!("h3_{stem}"), &acfg)?
         };
 
         let t = capacity;
         let widest = pitch(d.ffn).max(pitch(d.hidden)).max(pitch(d.inner()));
-        let a_q = gpu.alloc(t * widest * if quant { 1 } else { 2 })?;
-        let a_s = gpu.alloc(t * 4)?;
-        let fused = gpu.alloc(t * d.qkv() * 2)?;
+        let a_q = stream.allocate(t * widest * if quant { 1 } else { 2 })?;
+        let a_s = stream.allocate(t * 4)?;
+        let fused = stream.allocate(t * d.qkv() * 2)?;
         let qkv_split = if fused_qkv {
             None // q, k and v are views into `fused`
         } else {
             Some((
-                gpu.alloc(t * d.inner() * 2)?,
-                gpu.alloc(t * d.kv_inner() * 2)?,
-                gpu.alloc(t * d.kv_inner() * 2)?,
+                stream.allocate(t * d.inner() * 2)?,
+                stream.allocate(t * d.kv_inner() * 2)?,
+                stream.allocate(t * d.kv_inner() * 2)?,
             ))
         };
         let attn_width = if direct_attn {
@@ -636,31 +644,31 @@ impl Stack {
         } else {
             d.inner()
         };
-        let attn = gpu.alloc(t * attn_width * 2)?;
-        let gu = gpu.alloc(t * if direct_down { pitch(d.ffn) } else { d.ffn } * 2)?;
-        gpu.memset(&fused, 0, t * d.qkv() * 2)?;
-        gpu.memset(&attn, 0, t * attn_width * 2)?;
+        let attn = stream.allocate(t * attn_width * 2)?;
+        let gu = stream.allocate(t * if direct_down { pitch(d.ffn) } else { d.ffn } * 2)?;
+        stream.fill(fused.slice(0, t * d.qkv() * 2), 0)?;
+        stream.fill(attn.slice(0, t * attn_width * 2), 0)?;
         if let Some((q, k, v)) = &qkv_split {
-            gpu.memset(q, 0, t * d.inner() * 2)?;
-            gpu.memset(k, 0, t * d.kv_inner() * 2)?;
-            gpu.memset(v, 0, t * d.kv_inner() * 2)?;
+            stream.fill(q.slice(0, t * d.inner() * 2), 0)?;
+            stream.fill(k.slice(0, t * d.kv_inner() * 2), 0)?;
+            stream.fill(v.slice(0, t * d.kv_inner() * 2), 0)?;
         }
 
         let int_qk = if qk_int {
             let code_bytes = if d.attn_i4 { 64 } else { 128 };
-            let qi = gpu.alloc(t * d.heads * code_bytes)?;
-            let ki = gpu.alloc(t * d.heads * code_bytes)?;
-            let qs = gpu.alloc(t * d.heads * 4)?;
-            let ks = gpu.alloc(t * d.heads * 4)?;
-            let kmean = gpu.alloc(d.inner() * 4)?;
-            let zmean = gpu.alloc(d.inner() * 4)?;
-            let vt = gpu.alloc(d.inner() * t * 2)?;
-            gpu.memset(&zmean, 0, d.inner() * 4)?;
-            gpu.memset(&vt, 0, d.inner() * t * 2)?;
-            gpu.memset(&qi, 0, t * d.heads * code_bytes)?;
-            gpu.memset(&ki, 0, t * d.heads * code_bytes)?;
-            gpu.memset(&qs, 0, t * d.heads * 4)?;
-            gpu.memset(&ks, 0, t * d.heads * 4)?;
+            let qi = stream.allocate(t * d.heads * code_bytes)?;
+            let ki = stream.allocate(t * d.heads * code_bytes)?;
+            let qs = stream.allocate(t * d.heads * 4)?;
+            let ks = stream.allocate(t * d.heads * 4)?;
+            let kmean = stream.allocate(d.inner() * 4)?;
+            let zmean = stream.allocate(d.inner() * 4)?;
+            let vt = stream.allocate(d.inner() * t * 2)?;
+            stream.fill(zmean.slice(0, d.inner() * 4), 0)?;
+            stream.fill(vt.slice(0, d.inner() * t * 2), 0)?;
+            stream.fill(qi.slice(0, t * d.heads * code_bytes), 0)?;
+            stream.fill(ki.slice(0, t * d.heads * code_bytes), 0)?;
+            stream.fill(qs.slice(0, t * d.heads * 4), 0)?;
+            stream.fill(ks.slice(0, t * d.heads * 4), 0)?;
             Some(IntQk {
                 qi,
                 ki,
@@ -746,7 +754,7 @@ impl Stack {
     #[allow(clippy::too_many_arguments)]
     pub fn forward<'a>(
         &mut self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         prof: &mut Profile,
         x: View<'_>,
         cls: ClassRows<'_>,
@@ -774,7 +782,7 @@ impl Stack {
         let (cap, rows) = (self.capacity, self.tokens);
         let (q, k, v) = self.qkv_views();
         if dumping {
-            self.dump(gpu, dump_dir.unwrap(), "h_in", x)?;
+            self.dump(stream, dump_dir.unwrap(), "h_in", x)?;
         }
 
         for i in first..last {
@@ -789,7 +797,7 @@ impl Stack {
                 )
             };
             self.prep_norm.run(
-                gpu,
+                stream,
                 Some(prof),
                 "prepare norm",
                 t,
@@ -809,7 +817,7 @@ impl Stack {
                 // the fused path is the 2048-wide, 32-head, 64-deep VAE stack alone, so its
                 // operands are that shape exactly
                 checked(
-                    gpu,
+                    stream,
                     kernel,
                     Some(prof),
                     "gemm qkv + rope",
@@ -847,7 +855,7 @@ impl Stack {
                 let b = &self.blocks[i];
                 let scales = b.qkv_s.as_ref().map(|s| (s.binding(), self.a_s.binding()));
                 self.gemm_qkv.as_ref().expect("built when not fused").run(
-                    gpu,
+                    stream,
                     Some(prof),
                     "gemm qkv",
                     t,
@@ -859,7 +867,7 @@ impl Stack {
                     b.qkv_b.as_ref().map(|x| x.binding()),
                 )?;
                 checked(
-                    gpu,
+                    stream,
                     self.rope.as_ref().expect("built when not fused"),
                     Some(prof),
                     "qk norm + rope",
@@ -880,7 +888,7 @@ impl Stack {
                 )?;
             }
 
-            self.attend(gpu, prof, t, q, k, v)?;
+            self.attend(stream, prof, t, q, k, v)?;
 
             let attn_operand = if self.direct_attn {
                 self.attn.binding()
@@ -889,7 +897,7 @@ impl Stack {
                     .as_ref()
                     .expect("built when not direct")
                     .run(
-                        gpu,
+                        stream,
                         Some(prof),
                         "prepare out input",
                         t,
@@ -904,7 +912,7 @@ impl Stack {
                 let b = &self.blocks[i];
                 let scales = b.out_s.as_ref().map(|s| (s.binding(), self.a_s.binding()));
                 self.gemm_out.run(
-                    gpu,
+                    stream,
                     Some(prof),
                     "gemm out + residual",
                     t,
@@ -918,7 +926,7 @@ impl Stack {
             }
 
             self.prep_norm.run(
-                gpu,
+                stream,
                 Some(prof),
                 "prepare norm",
                 t,
@@ -931,7 +939,7 @@ impl Stack {
                 let b = &self.blocks[i];
                 let scales = b.gu_s.as_ref().map(|s| (s.binding(), self.a_s.binding()));
                 self.gemm_gu.run(
-                    gpu,
+                    stream,
                     Some(prof),
                     "gemm ff + swiglu",
                     t,
@@ -950,7 +958,7 @@ impl Stack {
                     .as_ref()
                     .expect("built when not direct")
                     .run(
-                        gpu,
+                        stream,
                         Some(prof),
                         "prepare down input",
                         t,
@@ -965,7 +973,7 @@ impl Stack {
                 let b = &self.blocks[i];
                 let scales = b.down_s.as_ref().map(|s| (s.binding(), self.a_s.binding()));
                 self.gemm_down.run(
-                    gpu,
+                    stream,
                     Some(prof),
                     "gemm down + residual",
                     t,
@@ -978,7 +986,7 @@ impl Stack {
                 )?;
             }
             if dumping {
-                self.dump(gpu, dump_dir.unwrap(), &format!("blk_{i:02}"), x)?;
+                self.dump(stream, dump_dir.unwrap(), &format!("blk_{i:02}"), x)?;
             }
         }
         Ok(())
@@ -987,7 +995,7 @@ impl Stack {
     /// Attention, on f16 Q/K/V or on the narrowed integer operands.
     fn attend(
         &self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         prof: &mut Profile,
         t: u32,
         q: View<'_>,
@@ -1012,7 +1020,7 @@ impl Stack {
                 [32 * self.waves as u32, 1, 1]
             };
             return checked(
-                gpu,
+                stream,
                 &self.attention,
                 Some(prof),
                 "attention",
@@ -1033,7 +1041,7 @@ impl Stack {
         let smooth = env_once("H3_KSMOOTH") == Some("1");
         if smooth {
             checked(
-                gpu,
+                stream,
                 self.colmean.as_ref().expect("built with integer QK"),
                 Some(prof),
                 "attention operands",
@@ -1056,7 +1064,7 @@ impl Stack {
             rows * self.d.heads * 4,
         ];
         checked(
-            gpu,
+            stream,
             self.prep_q.as_ref().expect("built with integer QK"),
             Some(prof),
             "attention operands",
@@ -1072,7 +1080,7 @@ impl Stack {
             &operand,
         )?;
         checked(
-            gpu,
+            stream,
             self.prep_k.as_ref().expect("built with integer QK"),
             Some(prof),
             "attention operands",
@@ -1092,7 +1100,7 @@ impl Stack {
             &operand,
         )?;
         checked(
-            gpu,
+            stream,
             self.transpose.as_ref().expect("built with integer QK"),
             Some(prof),
             "attention operands",
@@ -1103,7 +1111,7 @@ impl Stack {
             &[rows * self.d.inner() * 2, self.d.inner() * cap * 2],
         )?;
         checked(
-            gpu,
+            stream,
             &self.attention,
             Some(prof),
             "attention",
@@ -1129,10 +1137,10 @@ impl Stack {
         )
     }
 
-    fn dump(&self, gpu: &hrx::Gpu, dir: &str, name: &str, x: View<'_>) -> Result<()> {
+    fn dump(&self, stream: &mut hrx::Stream, dir: &str, name: &str, x: View<'_>) -> Result<()> {
         let bytes = self.tokens * self.d.hidden * 4;
         let mut host = vec![0u8; bytes];
-        gpu.d2h_ref(x, &mut host)?;
+        stream.read(x, &mut host)?;
         let path = std::path::Path::new(dir).join(format!("{}_{name}.f32", self.tag));
         let _ = std::fs::write(path, &host);
         Ok(())

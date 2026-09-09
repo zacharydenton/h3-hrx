@@ -66,7 +66,7 @@ pub fn add_positions(x: &mut [f32], pos: &[f32], gh: usize, gw: usize) {
 /// `pixels` is `[height][width][3]` in `[0, 1]`. Both extents must be multiples of 32: 16 for the patch
 /// and another factor of two because the merger consumes 2x2 blocks.
 pub fn embed(
-    gpu: &hrx::Gpu,
+    stream: &mut hrx::Stream,
     c: &Compiler,
     prof: &mut Profile,
     weights: &Weights,
@@ -82,21 +82,22 @@ pub fn embed(
     let m = n / 4;
     // the attention's token capacity: sixteen rows of slack, rounded to 32
     let cap = (n + 16).div_ceil(32) * 32;
-    let v = |nm: &str, bytes: usize| weights.at(gpu, nm, bytes);
 
     // patches in merge order, CLIP-normalised, straight into the patch projection
     let patches = crate::pixels::vision_patches(pixels, gh, gw, width);
-    let pa = gpu.alloc(patches.len() * 4)?;
-    gpu.h2d(&pa, crate::vvae::as_bytes(&patches))?;
-    let x32 = gpu.alloc(n * VHID * 4)?;
-    Matmul16::build(c, gpu, "bias", VISION_PATCH, VHID)?.run(
-        gpu,
+    let pa = stream.allocate(patches.len() * 4)?;
+    stream.upload(pa.binding(), crate::vvae::as_bytes(&patches))?;
+    let x32 = stream.allocate(n * VHID * 4)?;
+    let held_1 = weights.at(stream, "vis.patch.w", VHID * VISION_PATCH * 2)?;
+    let held_2 = weights.at(stream, "vis.patch.b", VHID * 4)?;
+    Matmul16::build(c, stream, "bias", VISION_PATCH, VHID)?.run(
+        stream,
         Some(prof),
         "vision patch",
         n,
         pa.binding(),
-        v("vis.patch.w", VHID * VISION_PATCH * 2)?.binding(),
-        v("vis.patch.b", VHID * 4)?.binding(),
+        held_1.binding(),
+        held_2.binding(),
         x32.binding(),
         None,
     )?;
@@ -104,38 +105,38 @@ pub fn embed(
     // the position table is resampled on the host, then the stream narrows to f16 for the blocks
     let pos = weights.host_f32("vis.pos", VPOS_GRID * VPOS_GRID * VHID)?;
     let mut x0 = vec![0.0f32; n * VHID];
-    gpu.d2h_ref(x32.binding(), crate::vvae::as_bytes_mut(&mut x0))?;
+    stream.read(x32.binding(), crate::vvae::as_bytes_mut(&mut x0))?;
     add_positions(&mut x0, &pos, gh, gw);
     let x16h: Vec<half::f16> = x0.iter().map(|v| half::f16::from_f32(*v)).collect();
-    let x16 = gpu.alloc(x16h.len() * 2)?;
-    gpu.h2d(&x16, crate::vvae::as_bytes_f16(&x16h))?;
+    let x16 = stream.allocate(x16h.len() * 2)?;
+    stream.upload(x16.binding(), crate::vvae::as_bytes_f16(&x16h))?;
 
     let (mut cosv, mut sinv) = (vec![0.0f32; n * 36], vec![0.0f32; n * 36]);
     crate::rope::vision(gh, gw, &mut cosv, &mut sinv);
-    let cosb = gpu.alloc(cosv.len() * 4)?;
-    let sinb = gpu.alloc(sinv.len() * 4)?;
-    gpu.h2d(&cosb, crate::vvae::as_bytes(&cosv))?;
-    gpu.h2d(&sinb, crate::vvae::as_bytes(&sinv))?;
+    let cosb = stream.allocate(cosv.len() * 4)?;
+    let sinb = stream.allocate(sinv.len() * 4)?;
+    stream.upload(cosb.binding(), crate::vvae::as_bytes(&cosv))?;
+    stream.upload(sinb.binding(), crate::vvae::as_bytes(&sinv))?;
 
     let qkv_width = 3 * VHEADS * VHD;
-    let ln = gpu.alloc(n * VHID * 4)?;
-    let qkv = gpu.alloc(n * qkv_width * 4)?;
-    let q16 = gpu.alloc(cap * VHEADS * VHDP * 2)?;
-    let k16 = gpu.alloc(cap * VHEADS * VHDP * 2)?;
-    let v16 = gpu.alloc(cap * VHEADS * VHDP * 2)?;
-    let att16 = gpu.alloc(cap * VHEADS * VHDP * 2)?;
-    let hid = gpu.alloc(n * VMLP * 4)?;
-    let hid16 = gpu.alloc(n * VMLP * 2)?;
-    let ln4 = gpu.alloc(m * VMERGE * 4)?;
-    let mid = gpu.alloc(m * VMERGE * 4)?;
-    let out5 = gpu.alloc(m * VOUT * 4)?;
+    let ln = stream.allocate(n * VHID * 4)?;
+    let qkv = stream.allocate(n * qkv_width * 4)?;
+    let q16 = stream.allocate(cap * VHEADS * VHDP * 2)?;
+    let k16 = stream.allocate(cap * VHEADS * VHDP * 2)?;
+    let v16 = stream.allocate(cap * VHEADS * VHDP * 2)?;
+    let att16 = stream.allocate(cap * VHEADS * VHDP * 2)?;
+    let hid = stream.allocate(n * VMLP * 4)?;
+    let hid16 = stream.allocate(n * VMLP * 2)?;
+    let ln4 = stream.allocate(m * VMERGE * 4)?;
+    let mid = stream.allocate(m * VMERGE * 4)?;
+    let out5 = stream.allocate(m * VOUT * 4)?;
     // the residual GEMM's per-column scale, which this tower does not use: all ones
-    let lam = gpu.alloc(VMERGE * 4)?;
+    let lam = stream.allocate(VMERGE * 4)?;
     let ones: Vec<f32> = vec![1.0; VMERGE];
-    gpu.h2d(&lam, crate::vvae::as_bytes(&ones))?;
+    stream.upload(lam.binding(), crate::vvae::as_bytes(&ones))?;
     // the rows past `n` are read by the attention and never written, so they start at zero
     for b in [&q16, &k16, &v16] {
-        gpu.memset(b, 0, cap * VHEADS * VHDP * 2)?;
+        stream.fill(b.slice(0, cap * VHEADS * VHDP * 2), 0)?;
     }
 
     let ans = "h3.attention_mha_lds_f16_wmma.";
@@ -151,7 +152,7 @@ pub fn embed(
         (format!("{ans}out_stride"), (VHEADS * VHDP).to_string()),
     ];
     let attn = c.get(
-        gpu,
+        stream,
         "attention_mha_family",
         "h3_attention_mha_lds_f16_wmma",
         &attn_cfg,
@@ -162,44 +163,48 @@ pub fn embed(
         (format!("{rns}hd"), VHD.to_string()),
         (format!("{rns}hd_pad"), VHDP.to_string()),
     ];
-    let rope = c.get(gpu, "rope2d_qkv_f16", "h3_rope2d_qkv_f16", &rope_cfg)?;
-    let cast = c.get(gpu, "cast_f32_f16", "h3_cast_f32_f16", &Cfg::new())?;
+    let rope = c.get(stream, "rope2d_qkv_f16", "h3_rope2d_qkv_f16", &rope_cfg)?;
+    let cast = c.get(stream, "cast_f32_f16", "h3_cast_f32_f16", &Cfg::new())?;
 
-    let norm = LayerNorm16::build(c, gpu, VHID, 1e-6)?;
-    let norm4 = LayerNorm16::build(c, gpu, VMERGE, 1e-6)?;
-    let g_qkv = Matmul16::build(c, gpu, "bias", VHID, qkv_width)?;
-    let g_proj = Matmul16::build(c, gpu, "resid", VHEADS * VHDP, VHID)?;
-    let g_fc1 = Matmul16::build(c, gpu, "gelu", VHID, VMLP)?;
-    let g_fc2 = Matmul16::build(c, gpu, "resid", VMLP, VHID)?;
-    let g_merge1 = Matmul16::build(c, gpu, "gelu_erf", VMERGE, VMERGE)?;
-    let g_merge2 = Matmul16::build(c, gpu, "bias", VMERGE, VOUT)?;
+    let norm = LayerNorm16::build(c, stream, VHID, 1e-6)?;
+    let norm4 = LayerNorm16::build(c, stream, VMERGE, 1e-6)?;
+    let g_qkv = Matmul16::build(c, stream, "bias", VHID, qkv_width)?;
+    let g_proj = Matmul16::build(c, stream, "resid", VHEADS * VHDP, VHID)?;
+    let g_fc1 = Matmul16::build(c, stream, "gelu", VHID, VMLP)?;
+    let g_fc2 = Matmul16::build(c, stream, "resid", VMLP, VHID)?;
+    let g_merge1 = Matmul16::build(c, stream, "gelu_erf", VMERGE, VMERGE)?;
+    let g_merge2 = Matmul16::build(c, stream, "bias", VMERGE, VOUT)?;
 
     let mut deepstack = vec![0.0f32; 3 * m * VOUT];
     for i in 0..VBLOCKS {
         let b = format!("vis.b{i}.");
+        let held_1 = weights.at(stream, &format!("{b}norm1.w"), VHID * 4)?;
+        let held_2 = weights.at(stream, &format!("{b}norm1.b"), VHID * 4)?;
         norm.run(
-            gpu,
+            stream,
             Some(prof),
             n,
             x16.binding(),
-            v(&format!("{b}norm1.w"), VHID * 4)?.binding(),
-            v(&format!("{b}norm1.b"), VHID * 4)?.binding(),
+            held_1.binding(),
+            held_2.binding(),
             ln.binding(),
         )?;
+        let held_1 = weights.at(stream, &format!("{b}qkv.w"), qkv_width * VHID * 2)?;
+        let held_2 = weights.at(stream, &format!("{b}qkv.b"), qkv_width * 4)?;
         g_qkv.run(
-            gpu,
+            stream,
             Some(prof),
             "vision qkv",
             n,
             ln.binding(),
-            v(&format!("{b}qkv.w"), qkv_width * VHID * 2)?.binding(),
-            v(&format!("{b}qkv.b"), qkv_width * 4)?.binding(),
+            held_1.binding(),
+            held_2.binding(),
             qkv.binding(),
             None,
         )?;
         // rope reads the packed f32 q|k|v at its 72-deep heads and writes them out padded to 128
         checked(
-            gpu,
+            stream,
             &rope,
             Some(prof),
             "vision rope",
@@ -226,7 +231,7 @@ pub fn embed(
         // the attention kernel was compiled to `cap` rows, which is what these hold
         let pad = cap * VHEADS * VHDP * 2;
         checked(
-            gpu,
+            stream,
             &attn,
             Some(prof),
             "vision attention",
@@ -237,39 +242,45 @@ pub fn embed(
             &[pad, pad, pad, pad],
         )?;
         // the residual GEMM takes its A operand as f16, which is what the attention already wrote
+        let held_1 = weights.at(stream, &format!("{b}proj.w"), VHID * VHEADS * VHDP * 2)?;
+        let held_2 = weights.at(stream, &format!("{b}proj.b"), VHID * 4)?;
         g_proj.run(
-            gpu,
+            stream,
             Some(prof),
             "vision proj",
             n,
             att16.binding(),
-            v(&format!("{b}proj.w"), VHID * VHEADS * VHDP * 2)?.binding(),
-            v(&format!("{b}proj.b"), VHID * 4)?.binding(),
+            held_1.binding(),
+            held_2.binding(),
             x16.binding(),
             Some(lam.binding()),
         )?;
+        let held_1 = weights.at(stream, &format!("{b}norm2.w"), VHID * 4)?;
+        let held_2 = weights.at(stream, &format!("{b}norm2.b"), VHID * 4)?;
         norm.run(
-            gpu,
+            stream,
             Some(prof),
             n,
             x16.binding(),
-            v(&format!("{b}norm2.w"), VHID * 4)?.binding(),
-            v(&format!("{b}norm2.b"), VHID * 4)?.binding(),
+            held_1.binding(),
+            held_2.binding(),
             ln.binding(),
         )?;
+        let held_1 = weights.at(stream, &format!("{b}fc1.w"), VMLP * VHID * 2)?;
+        let held_2 = weights.at(stream, &format!("{b}fc1.b"), VMLP * 4)?;
         g_fc1.run(
-            gpu,
+            stream,
             Some(prof),
             "vision fc1",
             n,
             ln.binding(),
-            v(&format!("{b}fc1.w"), VMLP * VHID * 2)?.binding(),
-            v(&format!("{b}fc1.b"), VMLP * 4)?.binding(),
+            held_1.binding(),
+            held_2.binding(),
             hid.binding(),
             None,
         )?;
         checked(
-            gpu,
+            stream,
             &cast,
             Some(prof),
             "vision cast",
@@ -279,14 +290,16 @@ pub fn embed(
             &[hid.binding(), hid16.binding()],
             &[n * VMLP * 4, n * VMLP * 2],
         )?;
+        let held_1 = weights.at(stream, &format!("{b}fc2.w"), VHID * VMLP * 2)?;
+        let held_2 = weights.at(stream, &format!("{b}fc2.b"), VHID * 4)?;
         g_fc2.run(
-            gpu,
+            stream,
             Some(prof),
             "vision fc2",
             n,
             hid16.binding(),
-            v(&format!("{b}fc2.w"), VHID * VMLP * 2)?.binding(),
-            v(&format!("{b}fc2.b"), VHID * 4)?.binding(),
+            held_1.binding(),
+            held_2.binding(),
             x16.binding(),
             Some(lam.binding()),
         )?;
@@ -297,38 +310,44 @@ pub fn embed(
                 continue;
             }
             let d = format!("vis.ds{j}.");
+            let held_1 = weights.at(stream, &format!("{d}norm.w"), VMERGE * 4)?;
+            let held_2 = weights.at(stream, &format!("{d}norm.b"), VMERGE * 4)?;
             norm4.run(
-                gpu,
+                stream,
                 Some(prof),
                 m,
                 x16.binding(),
-                v(&format!("{d}norm.w"), VMERGE * 4)?.binding(),
-                v(&format!("{d}norm.b"), VMERGE * 4)?.binding(),
+                held_1.binding(),
+                held_2.binding(),
                 ln4.binding(),
             )?;
+            let held_1 = weights.at(stream, &format!("{d}fc1.w"), VMERGE * VMERGE * 2)?;
+            let held_2 = weights.at(stream, &format!("{d}fc1.b"), VMERGE * 4)?;
             g_merge1.run(
-                gpu,
+                stream,
                 Some(prof),
                 "vision deepstack",
                 m,
                 ln4.binding(),
-                v(&format!("{d}fc1.w"), VMERGE * VMERGE * 2)?.binding(),
-                v(&format!("{d}fc1.b"), VMERGE * 4)?.binding(),
+                held_1.binding(),
+                held_2.binding(),
                 mid.binding(),
                 None,
             )?;
+            let held_1 = weights.at(stream, &format!("{d}fc2.w"), VOUT * VMERGE * 2)?;
+            let held_2 = weights.at(stream, &format!("{d}fc2.b"), VOUT * 4)?;
             g_merge2.run(
-                gpu,
+                stream,
                 Some(prof),
                 "vision deepstack",
                 m,
                 mid.binding(),
-                v(&format!("{d}fc2.w"), VOUT * VMERGE * 2)?.binding(),
-                v(&format!("{d}fc2.b"), VOUT * 4)?.binding(),
+                held_1.binding(),
+                held_2.binding(),
                 out5.binding(),
                 None,
             )?;
-            gpu.d2h_ref(
+            stream.read(
                 out5.slice(0, m * VOUT * 4),
                 crate::vvae::as_bytes_mut(&mut deepstack[j * m * VOUT..(j + 1) * m * VOUT]),
             )?;
@@ -338,43 +357,49 @@ pub fn embed(
     // The final merger normalises each 1152-wide patch row and only then lets the GEMM read the
     // result as [m][4608]. The DeepStack mergers above normalise the merged row itself. They look
     // interchangeable and are not — the statistics are over different sets of numbers.
+    let held_1 = weights.at(stream, "vis.merger.norm.w", VHID * 4)?;
+    let held_2 = weights.at(stream, "vis.merger.norm.b", VHID * 4)?;
     norm.run(
-        gpu,
+        stream,
         Some(prof),
         n,
         x16.binding(),
-        v("vis.merger.norm.w", VHID * 4)?.binding(),
-        v("vis.merger.norm.b", VHID * 4)?.binding(),
+        held_1.binding(),
+        held_2.binding(),
         ln.binding(),
     )?;
+    let held_1 = weights.at(stream, "vis.merger.fc1.w", VMERGE * VMERGE * 2)?;
+    let held_2 = weights.at(stream, "vis.merger.fc1.b", VMERGE * 4)?;
     g_merge1.run(
-        gpu,
+        stream,
         Some(prof),
         "vision merger",
         m,
         ln.binding(),
-        v("vis.merger.fc1.w", VMERGE * VMERGE * 2)?.binding(),
-        v("vis.merger.fc1.b", VMERGE * 4)?.binding(),
+        held_1.binding(),
+        held_2.binding(),
         mid.binding(),
         None,
     )?;
+    let held_1 = weights.at(stream, "vis.merger.fc2.w", VOUT * VMERGE * 2)?;
+    let held_2 = weights.at(stream, "vis.merger.fc2.b", VOUT * 4)?;
     g_merge2.run(
-        gpu,
+        stream,
         Some(prof),
         "vision merger",
         m,
         mid.binding(),
-        v("vis.merger.fc2.w", VOUT * VMERGE * 2)?.binding(),
-        v("vis.merger.fc2.b", VOUT * 4)?.binding(),
+        held_1.binding(),
+        held_2.binding(),
         out5.binding(),
         None,
     )?;
     let mut merged = vec![0.0f32; m * VOUT];
-    gpu.d2h_ref(
+    stream.read(
         out5.slice(0, m * VOUT * 4),
         crate::vvae::as_bytes_mut(&mut merged),
     )?;
-    gpu.sync()?;
+    stream.synchronize()?;
     Ok(Embedding {
         merged,
         deepstack,

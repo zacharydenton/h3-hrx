@@ -67,10 +67,13 @@ impl TextEncoder {
     /// # Safety
     ///
     /// Maps the checkpoint; see [`crate::Session::new`].
-    pub unsafe fn open(gpu: &hrx::Gpu, path: impl AsRef<std::path::Path>) -> Result<Self> {
+    pub unsafe fn open(
+        stream: &mut hrx::Stream,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self> {
         Ok(Self {
             weights: unsafe { Weights::open(path, crate::plan::te::plan) }?,
-            constants: Constants::new(gpu)?,
+            constants: Constants::new(stream)?,
             built: None,
         })
     }
@@ -119,7 +122,13 @@ impl TextEncoder {
         Ok(emb)
     }
 
-    fn ensure(&mut self, gpu: &hrx::Gpu, c: &Compiler, n: usize, spans: &[Span<'_>]) -> Result<()> {
+    fn ensure(
+        &mut self,
+        stream: &mut hrx::Stream,
+        c: &Compiler,
+        n: usize,
+        spans: &[Span<'_>],
+    ) -> Result<()> {
         let signature: Vec<(usize, usize, usize, usize)> = spans
             .iter()
             .map(|s| (s.at.start, s.at.count, s.at.merged_h, s.at.merged_w))
@@ -134,7 +143,7 @@ impl TextEncoder {
         self.built = None;
         let stack = Stack::new(
             c,
-            gpu,
+            stream,
             dims(),
             n,
             TE_LAYERS,
@@ -145,9 +154,9 @@ impl TextEncoder {
             "te",
         )?;
         let t = stack.capacity();
-        let x = gpu.alloc(t * TE_HID * 4)?;
-        gpu.memset(&x, 0, t * TE_HID * 4)?;
-        let cls = crate::dispatch::Classes::zeroed(gpu, t)?;
+        let x = stream.allocate(t * TE_HID * 4)?;
+        stream.fill(x.slice(0, t * TE_HID * 4), 0)?;
+        let cls = crate::dispatch::Classes::zeroed(stream, t)?;
 
         let positions = rope::mrope_positions(n, &signature_spans(spans));
         let (mut cos_h, mut sin_h) = (
@@ -155,10 +164,10 @@ impl TextEncoder {
             vec![0.0f32; n * TE_ROPE_HALF],
         );
         rope::te(&positions, &mut cos_h, &mut sin_h);
-        let cos = gpu.alloc(t * TE_ROPE_HALF * 4)?;
-        let sin = gpu.alloc(t * TE_ROPE_HALF * 4)?;
-        gpu.h2d_at(&cos, 0, crate::vvae::as_bytes(&cos_h))?;
-        gpu.h2d_at(&sin, 0, crate::vvae::as_bytes(&sin_h))?;
+        let cos = stream.allocate(t * TE_ROPE_HALF * 4)?;
+        let sin = stream.allocate(t * TE_ROPE_HALF * 4)?;
+        crate::dispatch::upload_at(stream, &cos, 0, crate::vvae::as_bytes(&cos_h))?;
+        crate::dispatch::upload_at(stream, &sin, 0, crate::vvae::as_bytes(&sin_h))?;
 
         self.built = Some(Built {
             stack,
@@ -167,7 +176,7 @@ impl TextEncoder {
             cos,
             sin,
             cls,
-            ds: gpu.alloc(MAX_SPAN * TEXT_DIM * 4)?,
+            ds: stream.allocate(MAX_SPAN * TEXT_DIM * 4)?,
         });
         Ok(())
     }
@@ -175,7 +184,7 @@ impl TextEncoder {
     /// Runs the encoder, leaving `[n][5120]` f32 on the device.
     pub fn encode(
         &mut self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         c: &Compiler,
         prof: &mut Profile,
         ids: &[i32],
@@ -188,23 +197,23 @@ impl TextEncoder {
         }
         let n = ids.len();
         let emb = self.embed(ids, spans)?;
-        self.ensure(gpu, c, n, spans)?;
+        self.ensure(stream, c, n, spans)?;
         let b = self.built.as_mut().expect("built above");
-        gpu.h2d_at(&b.x, 0, crate::vvae::as_bytes(&emb))?;
+        crate::dispatch::upload_at(stream, &b.x, 0, crate::vvae::as_bytes(&emb))?;
 
         let cond = self.constants.identity();
         let cond_fn = |_: usize| crate::stack::LayerCond { ..cond };
         let (x, cls, cos, sin) = (b.x.binding(), b.cls.all(), b.cos.binding(), b.sin.binding());
         if spans.is_empty() {
             b.stack
-                .forward(gpu, prof, x, cls, cos, sin, &cond_fn, 0, None)?;
+                .forward(stream, prof, x, cls, cos, sin, &cond_fn, 0, None)?;
             return Ok(x);
         }
         // DeepStack: the tower's features from blocks 8, 16 and 24 land at the image rows after each of
         // the first three layers, so the pass is run one layer at a time until they are in.
         for layer in 0..3 {
             b.stack.forward(
-                gpu,
+                stream,
                 prof,
                 x,
                 cls,
@@ -217,14 +226,15 @@ impl TextEncoder {
             for sp in spans {
                 let take = sp.at.count * TEXT_DIM;
                 let from = layer * take;
-                gpu.h2d_at(
+                crate::dispatch::upload_at(
+                    stream,
                     &b.ds,
                     0,
                     crate::vvae::as_bytes(&sp.deepstack[from..from + take]),
                 )?;
                 axpy(
                     c,
-                    gpu,
+                    stream,
                     Some(prof),
                     "deepstack",
                     1.0,
@@ -236,7 +246,7 @@ impl TextEncoder {
             }
         }
         b.stack
-            .forward(gpu, prof, x, cls, cos, sin, &cond_fn, 3, None)?;
+            .forward(stream, prof, x, cls, cos, sin, &cond_fn, 3, None)?;
         Ok(x)
     }
 }

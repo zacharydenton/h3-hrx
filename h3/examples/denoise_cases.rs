@@ -170,15 +170,15 @@ fn main() {
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let exe = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
-    let gpu = hrx::Gpu::open().expect("gpu");
+    let mut stream = hrx::Stream::open().expect("stream");
     let compiler = Compiler::new(
         exe,
         root.join("h3/kernels"),
         root.join("build/kernel_cache"),
     );
     // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
-    let mut dit = unsafe { Dit::open(&gpu, &a[0]) }.expect("DiT checkpoint");
-    let mut te = unsafe { TextEncoder::open(&gpu, &a[1]) }.expect("text encoder checkpoint");
+    let mut dit = unsafe { Dit::open(&mut stream, &a[0]) }.expect("DiT checkpoint");
+    let mut te = unsafe { TextEncoder::open(&mut stream, &a[1]) }.expect("text encoder checkpoint");
     let mut prof = Profile::from_env();
 
     for case in &cases {
@@ -239,7 +239,7 @@ fn main() {
         let start = std::time::Instant::now();
         let out = dit
             .denoise(
-                &gpu,
+                &mut stream,
                 &compiler,
                 &mut prof,
                 &mut te,

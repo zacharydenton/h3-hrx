@@ -20,11 +20,16 @@ impl Euler {
         self.audio_rows == audio_rows && self.video_rows == video_rows
     }
 
-    pub fn new(gpu: &hrx::Gpu, c: &Compiler, audio_rows: usize, video_rows: usize) -> Result<Self> {
+    pub fn new(
+        stream: &mut hrx::Stream,
+        c: &Compiler,
+        audio_rows: usize,
+        video_rows: usize,
+    ) -> Result<Self> {
         if audio_rows == 0 || video_rows == 0 {
             return invalid("Euler requires audio and video rows");
         }
-        let kernel = |rows: usize, channels: usize, row_offset: usize, col_offset: usize| {
+        let mut kernel = |rows: usize, channels: usize, row_offset: usize, col_offset: usize| {
             let cfg = [
                 ("count", rows * channels),
                 ("channels", channels),
@@ -34,31 +39,31 @@ impl Euler {
             ]
             .map(|(key, value)| (format!("h3.sampler_update_f32.{key}"), value.to_string()))
             .to_vec();
-            c.get(gpu, "sampler_update_f32", "h3_sampler_update_f32", &cfg)
+            c.get(stream, "sampler_update_f32", "h3_sampler_update_f32", &cfg)
         };
         Ok(Self {
             audio_kernel: kernel(audio_rows, AUDIO_CH, 0, VIDEO_PATCH)?,
             video_kernel: kernel(video_rows, VIDEO_PATCH, audio_rows, 0)?,
-            audio: gpu.alloc(audio_rows * AUDIO_CH * 4)?,
-            video: gpu.alloc(video_rows * VIDEO_PATCH * 4)?,
+            audio: stream.allocate(audio_rows * AUDIO_CH * 4)?,
+            video: stream.allocate(video_rows * VIDEO_PATCH * 4)?,
             audio_rows,
             video_rows,
         })
     }
 
-    pub fn upload(&self, gpu: &hrx::Gpu, audio: &[f32], video: &[f32]) -> Result<()> {
+    pub fn upload(&self, stream: &mut hrx::Stream, audio: &[f32], video: &[f32]) -> Result<()> {
         if audio.len() != self.audio_rows * AUDIO_CH || video.len() != self.video_rows * VIDEO_PATCH
         {
             return invalid("Euler latent shape mismatch");
         }
-        gpu.h2d(&self.audio, crate::vvae::as_bytes(audio))?;
-        gpu.h2d(&self.video, crate::vvae::as_bytes(video))?;
+        stream.upload(self.audio.binding(), crate::vvae::as_bytes(audio))?;
+        stream.upload(self.video.binding(), crate::vvae::as_bytes(video))?;
         Ok(())
     }
 
     pub fn step(
         &self,
-        gpu: &hrx::Gpu,
+        stream: &mut hrx::Stream,
         head: hrx::View<'_>,
         audio: (f32, f32),
         video: (f32, f32),
@@ -71,12 +76,13 @@ impl Euler {
             (&self.video_kernel, &self.video, video),
         ] {
             let mut constants = hrx::Constants::new();
-            constants.push(sigma)?.push(ratio)?;
+            constants.push(sigma)?;
+            constants.push(ratio)?;
             // Safety: these kernels specialize on the owned latent extents and
             // the checked head extent. Each lane updates one unique latent;
             // both scalar arguments are f32, in declaration order.
             unsafe {
-                gpu.dispatch_constants(
+                stream.dispatch(
                     kernel,
                     [(buffer.bytes() / 4).div_ceil(256) as u32, 1, 1],
                     [256, 1, 1],
@@ -88,13 +94,18 @@ impl Euler {
         Ok(())
     }
 
-    pub fn download(&self, gpu: &hrx::Gpu, audio: &mut [f32], video: &mut [f32]) -> Result<()> {
+    pub fn download(
+        &self,
+        stream: &mut hrx::Stream,
+        audio: &mut [f32],
+        video: &mut [f32],
+    ) -> Result<()> {
         if audio.len() != self.audio_rows * AUDIO_CH || video.len() != self.video_rows * VIDEO_PATCH
         {
             return invalid("Euler latent shape mismatch");
         }
-        gpu.d2h(&self.audio, crate::vvae::as_bytes_mut(audio))?;
-        gpu.d2h(&self.video, crate::vvae::as_bytes_mut(video))?;
+        stream.read(self.audio.binding(), crate::vvae::as_bytes_mut(audio))?;
+        stream.read(self.video.binding(), crate::vvae::as_bytes_mut(video))?;
         Ok(())
     }
 }
@@ -106,18 +117,18 @@ mod tests {
     #[test]
     #[ignore = "requires gfx1151 and the packaged Loom compiler"]
     fn resident_euler_matches_cpu_across_steps_and_strided_heads() -> Result<()> {
-        let gpu = hrx::Gpu::open()?;
+        let mut stream = hrx::Stream::open()?;
         let cache = tempfile::tempdir().unwrap();
         let compiler = Compiler::new(None, "", cache.path());
         // Both launches include partial workgroups. Head channels belonging to
         // the other modality contain sentinels to detect incorrect gathering.
         let (na, nv) = (9, 7);
-        let sampler = Euler::new(&gpu, &compiler, na, nv)?;
+        let sampler = Euler::new(&mut stream, &compiler, na, nv)?;
         let mut audio: Vec<f32> = (0..na * AUDIO_CH).map(|i| i as f32 / 37.0 - 3.0).collect();
         let mut video: Vec<f32> = (0..nv * VIDEO_PATCH)
             .map(|i| i as f32 / 91.0 - 4.0)
             .collect();
-        sampler.upload(&gpu, &audio, &video)?;
+        sampler.upload(&mut stream, &audio, &video)?;
         let mut head = vec![f32::NAN; (na + nv) * FINAL_N];
         let av: Vec<f32> = (0..audio.len()).map(|i| (i as f32 * 0.17).sin()).collect();
         let vv: Vec<f32> = (0..video.len()).map(|i| (i as f32 * 0.23).cos()).collect();
@@ -127,21 +138,26 @@ mod tests {
         for (i, value) in vv.iter().enumerate() {
             head[(na + i / VIDEO_PATCH) * FINAL_N + i % VIDEO_PATCH] = *value;
         }
-        let output = gpu.alloc(head.len() * 4)?;
-        gpu.h2d(&output, crate::vvae::as_bytes(&head))?;
+        let output = stream.allocate(head.len() * 4)?;
+        stream.upload(output.binding(), crate::vvae::as_bytes(&head))?;
         for (sigma, ratio) in [(2.0, 0.1), (1.0, 1.0), (0.75, 0.3), (0.2, 0.0)] {
-            sampler.step(&gpu, output.binding(), (sigma, ratio), (sigma * 0.7, ratio))?;
+            sampler.step(
+                &mut stream,
+                output.binding(),
+                (sigma, ratio),
+                (sigma * 0.7, ratio),
+            )?;
             crate::sampler::euler_update(&mut audio, &av, sigma, ratio);
             crate::sampler::euler_update(&mut video, &vv, sigma * 0.7, ratio);
         }
         let mut got_a = vec![0.0; audio.len()];
         let mut got_v = vec![0.0; video.len()];
-        sampler.download(&gpu, &mut got_a, &mut got_v)?;
+        sampler.download(&mut stream, &mut got_a, &mut got_v)?;
         for (got, want) in got_a.iter().zip(&audio).chain(got_v.iter().zip(&video)) {
             assert_eq!(got.to_bits(), want.to_bits(), "GPU {got}, CPU {want}");
         }
         assert!(sampler
-            .step(&gpu, output.slice(0, 4), (1.0, 0.0), (1.0, 0.0))
+            .step(&mut stream, output.slice(0, 4), (1.0, 0.0), (1.0, 0.0))
             .is_err());
         Ok(())
     }
