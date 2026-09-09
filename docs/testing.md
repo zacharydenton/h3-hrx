@@ -40,8 +40,18 @@ application adapter under `examples/rustler`.
 Loom sources are maintained directly. Python generators, reference model
 implementations, wrappers and one-off studies are retired. Historical reports
 remain historical; they are not automatically revalidated by this suite.
-`python3 scripts/parity.py vae` is the one check anchored genuinely upstream: the
-host's tiled f16 decoder against diffusers' `AutoencoderKLMiniMaxH3` reading the
+Two checks are anchored genuinely upstream, against the weights MiniMax released
+and the implementation diffusers ships, rather than against ComfyUI's conversion
+or a reimplementation of either.
+
+`python3 scripts/parity.py dit` runs the host's packed rows through the released
+**unquantized bf16** blocks, one block resident at a time so it costs about a
+gigabyte rather than sixty-two. The host runs ComfyUI's int8 ConvRot conversion of
+those same weights, so the agreement is the quantisation and this implementation
+together: 0.99999 after one block and 0.99865 after all fifty (text 0.9992, audio
+0.9996, video 0.9971). It needs the released `transformer/`, a 62 GB download.
+
+`python3 scripts/parity.py vae` is the other: the host's tiled f16 decoder against diffusers' `AutoencoderKLMiniMaxH3` reading the
 weights MiniMax released, rather than against ComfyUI's conversion or a
 reimplementation. It measures the f16 narrowing plus whatever the Loom decoder
 does differently, and clears 62.5 dB PSNR at 384x320x22. It needs `diffusers`,

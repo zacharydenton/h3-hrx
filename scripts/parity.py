@@ -10,6 +10,7 @@ Run it before a release, not on every change.
     python3 scripts/parity.py compare --truth DIR --mode blocks|trajectory     one comparison, verbose
     python3 scripts/parity.py stack --stack dit|te      locate a regression to a block
     python3 scripts/parity.py vae                      the decoder vs diffusers on MiniMax's weights
+    python3 scripts/parity.py dit                      the blocks vs diffusers on MiniMax's weights
 
 `gate` needs no torch. `stack` needs torch, and `--stack dit` also needs diffusers.
 
@@ -961,6 +962,143 @@ def vae_parity(a) -> int:
 
 
 # --------------------------------------------------------------------------------------------------
+# The DiT blocks against diffusers on MiniMax's unquantized weights
+# --------------------------------------------------------------------------------------------------
+
+OFFICIAL = Path.home() / ".cache/huggingface/hub/models--MiniMaxAI--MiniMax-H3"
+
+
+def official_transformer(directory: Path, device: str):
+    """diffusers' `MiniMaxH3Transformer3DModel` pieces, with one block resident at a time.
+
+    Returns the model shell, its weight map and a loader. The shell is built on the meta device, so
+    `rope` and `time_proj` — whose tables are computed in `__init__` rather than stored — are
+    reconstructed rather than moved: `to_empty` would hand them uninitialised memory, which shows up
+    as plausible text and audio rows and nonsense video ones.
+    """
+    import json
+
+    import diffusers.models.transformers.transformer_minimax_h3 as impl
+    from diffusers import MiniMaxH3Transformer3DModel
+    from safetensors import safe_open
+
+    config = json.loads((directory / "config.json").read_text())
+    index = json.loads(
+        (directory / "diffusion_pytorch_model.safetensors.index.json").read_text()
+    )["weight_map"]
+
+    def tensor(name):
+        with safe_open(str(directory / index[name]), framework="pt", device="cpu") as f:
+            return f.get_tensor(name).to(device)
+
+    with torch.device("meta"):
+        model = MiniMaxH3Transformer3DModel.from_config(config)
+    embed = dict(
+        (name[len("time_embedder."):], tensor(name))
+        for name in index
+        if name.startswith("time_embedder.")
+    )
+    model.time_embedder.load_state_dict(embed, strict=True, assign=True)
+    model.rope = impl.MiniMaxH3RotaryPosEmbed(config["rope_freq_dim"], config["rope_theta"]).to(device)
+    model.time_proj = type(model.time_proj)(
+        config["freq_dim"], flip_sin_to_cos=True, downscale_freq_shift=0
+    ).to(device)
+    return model, index, tensor
+
+
+def dit_parity(a) -> int:
+    """The host's packed rows through the released bf16 blocks, block by block.
+
+    The host runs the int8 ConvRot conversion of these weights, so the agreement below is the
+    quantisation and this implementation together, measured against the reference rather than against
+    ComfyUI's independent reimplementation of it.
+    """
+    directory = Path(a.official)
+    if not (directory / "config.json").is_file():
+        snapshots = sorted((OFFICIAL / "snapshots").glob("*/transformer"))
+        if not snapshots:
+            print(f"no released transformer under {directory}", file=sys.stderr)
+            return 1
+        directory = snapshots[-1]
+
+    depths = [int(x) for x in a.depths.split(",") if x]
+    with tempfile.TemporaryDirectory(prefix="h3-dit-official-") as tmp:
+        os.environ["H3_DUMP_BLOCKS"] = tmp
+        os.environ["H3_DUMP_CALL"] = "0"
+        pipe = H3()
+        ids = np.asarray(
+            encode_presentation("A red fox trotting through a snowy forest at dawn, cinematic"),
+            np.int32,
+        )
+        p = H3.params(height=a.height, width=a.width, frames=a.frames, steps=2, seed=1)
+        shape = pipe.shape(p)
+        rng = np.random.default_rng(1)
+        nv = rng.standard_normal(
+            (24, shape.latent_t, shape.lat_h, shape.lat_w)
+        ).astype(np.float32)
+        na = rng.standard_normal((2, 32, shape.audio_t)).astype(np.float32)
+        started = time.time()
+        pipe.denoise(ids, p, noise_video=nv, noise_audio=na)
+        print(f"host evaluation in {time.time() - started:.1f} s")
+        pipe.close()
+        x0 = dumped(Path(tmp), "dit", "h_in", HIDDEN)
+        want = dict(
+            (d, dumped(Path(tmp), "dit", f"blk_{d - 1:02d}", HIDDEN)) for d in depths
+        )
+
+    layout = Layout(ids.size, shape.latent_t, shape.lat_h, shape.lat_w, shape.audio_t)
+    model, index, tensor = official_transformer(directory, a.device)
+    from diffusers import MiniMaxH3Scheduler
+
+    sv = MiniMaxH3Scheduler(shift=12.0)
+    sa = MiniMaxH3Scheduler(shift=3.0)
+    sv.set_timesteps(2, device=a.device)
+    sa.set_timesteps(2, device=a.device)
+    ok = True
+    with torch.no_grad():
+        steps = torch.tensor(
+            [sv.timesteps[0].item(), sa.timesteps[0].item()], device=a.device
+        )
+        embed_dtype = next(model.time_embedder.parameters()).dtype
+        temb = model.time_embedder(model.time_proj(steps).to(embed_dtype))
+        rope = model.rope(layout.position_ids.to(a.device))
+        rows = layout.adaln_rows.to(a.device)
+        x = torch.from_numpy(x0).to(a.device).to(torch.bfloat16)[None]
+        block = model.transformer_blocks[0]
+        for i in range(max(depths)):
+            prefix = f"transformer_blocks.{i}."
+            state = dict(
+                (name[len(prefix):], tensor(name))
+                for name in index
+                if name.startswith(prefix)
+            )
+            block.load_state_dict(state, strict=True, assign=True)
+            del state
+            x = block(x, temb, rows, rope)
+            if i + 1 in depths:
+                y = x[0].float().cpu().numpy()
+                got = want[i + 1]
+                text, audio = layout.text_len, layout.audio_rows
+                segments = {
+                    "text": (0, text),
+                    "audio": (text, text + audio),
+                    "video": (text + audio, got.shape[0]),
+                }
+                parts = "  ".join(
+                    f"{k} {cosine(got[lo:hi], y[lo:hi]):.4f}"
+                    for k, (lo, hi) in segments.items()
+                )
+                c = cosine(got, y)
+                good = c > a.floor
+                ok &= good
+                verdict = "PASS" if good else "FAIL"
+                print(f"  {verdict} after {i + 1:2d} blocks: cosine {c:.5f}  [{parts}]")
+            if a.device == "cuda":
+                torch.cuda.empty_cache()
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------------------------------
 
@@ -975,6 +1113,14 @@ def main() -> int:
     v.add_argument("--latents", type=Path, help="a .npy of [24][t][h][w]; a fixed random draw by default")
     v.add_argument("--device", default="cuda")
     v.add_argument("--floor", type=float, default=40.0, help="PSNR the decoder must clear")
+    d = sub.add_parser("dit", help="the blocks against diffusers on MiniMax's unquantized weights")
+    d.add_argument("--official", default=str(OFFICIAL), help="the released transformer, diffusers layout")
+    d.add_argument("--depths", default="1,10,25,50", help="block counts to compare")
+    d.add_argument("--height", type=int, default=64)
+    d.add_argument("--width", type=int, default=96)
+    d.add_argument("--frames", type=int, default=22)
+    d.add_argument("--device", default="cuda")
+    d.add_argument("--floor", type=float, default=0.99, help="cosine every depth must clear")
     s = sub.add_parser("stack", help="locate a regression to a block")
     s.add_argument("--stack", choices=["dit", "te"], required=True)
     s.add_argument("--depths", default="1,10,25,50", help="block counts to compare")
@@ -992,6 +1138,11 @@ def main() -> int:
             print("the VAE check needs torch and diffusers", file=sys.stderr)
             return 1
         return vae_parity(a)
+    if a.command == "dit":
+        if not require_torch():
+            print("the DiT check needs torch and diffusers", file=sys.stderr)
+            return 1
+        return dit_parity(a)
     if not require_torch():
         print("stack parity needs torch (and diffusers for --stack dit)", file=sys.stderr)
         return 1
