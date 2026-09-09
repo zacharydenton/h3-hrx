@@ -2,8 +2,8 @@
 
 MiniMax H3 (Hailuo 3.0) video and audio generation on AMD Strix Halo
 (Radeon 8060S, `gfx1151`). Every GPU kernel is written in
-[Loom](https://github.com/ROCm/hrx-system); everything else is Rust, behind both a
-Rust API and a generated C one. Inference dispatches through `libhrx` and needs no
+[Loom](https://github.com/ROCm/hrx-system); everything else is Rust, behind a Rust
+API. Inference dispatches through `libhrx` and needs no
 Python, PyTorch, Triton, or vendor math libraries — and no ROCm headers or `hipcc`
 to build. The host reads ComfyUI-format checkpoints directly.
 
@@ -35,25 +35,15 @@ measurements, and decoder timings.
 ## Setup
 
 You need Linux, a `gfx1151` device with its kernel driver, Rust and ffmpeg.
-The shared `hrx.rs` crate provisions prebuilt Loom, HRX and compatible HSA.
+The `hrx-rs` crate provisions prebuilt Loom, HRX and compatible HSA.
 Nothing here needs Python.
 
-With access to the private `hrx.rs` repository and an authenticated GitHub CLI:
-
 ```sh
-cargo install --locked --git https://github.com/zacharydenton/hrx.rs \
-  --rev be89b44652af6adf17c5c950d0759f92c2e88582 --features runner
-mkdir -p build
-gh release download native-ecaaf7376f7d-loomc --repo zacharydenton/hrx.rs \
-  --pattern hrx-linux-x86_64-gfx1151.tar.gz --dir build --clobber
-hrx prepare build/hrx-linux-x86_64-gfx1151.tar.gz
 cargo install --locked --path cli
-# Build the C library and headers too:
-bash scripts/build_host.sh
 ```
 
-The pinned native release includes the Loom consolidation fixes. It is hosted
-in the private HRX repository; the commands above prepare it locally. See
+The first run that opens the GPU downloads the native release the crate pins and
+verifies it against the manifest built into the crate. See
 [shared HRX integration](docs/shared-hrx.md) for overrides, offline use and
 Rustler. Kernel sources and the tokenizer are embedded in installed binaries;
 the default compiler cache is in the writable per-user HRX cache. `--root`

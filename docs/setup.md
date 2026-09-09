@@ -11,26 +11,30 @@ Run commands from the repository root unless stated otherwise.
 - `cargo` (Rust). Everything outside `h3/kernels/` is Rust: the library and the
   `h3` command. No ROCm headers and no `hipcc` — the runtime surface is `libhrx`,
   loaded on demand from the HRX bundle.
-- Access to the private [`hrx.rs`](shared-hrx.md) Git repository and an
-  authenticated GitHub CLI (`gh`) to download its native release. Cargo pins
-  the crate revision; no sibling checkout is required. The bundle supplies
-  Loom, `libhrx`, and compatible HSA without a local LLVM or ROCm build.
+- Nothing else. [`hrx-rs`](shared-hrx.md) comes from crates.io like any other
+  dependency, and provisions its own native bundle — Loom, `libhrx` and a
+  compatible HSA — on first use, without a local LLVM or ROCm build.
 
 `h3` fetches the checkpoints itself. Nothing in this repository needs Python.
 
 ## Toolchain and build
 
-The pinned `native-ecaaf7376f7d-loomc` release contains the corrected compiler.
-Download it with repository credentials and prepare the verified local cache:
+```sh
+bash scripts/build_host.sh
+```
+
+That is the whole of it. The first run that needs the GPU downloads the native
+bundle the crate pins, verifies it file by file against the manifest compiled
+into the crate, and caches it under `$XDG_CACHE_HOME/hrx`.
+
+To provision it ahead of time, or on a machine that will not have the network
+later, install the crate's runner and unpack the release yourself:
 
 ```sh
-cargo install --locked --git https://github.com/zacharydenton/hrx.rs \
-  --rev be89b44652af6adf17c5c950d0759f92c2e88582 --features runner
-mkdir -p build
-gh release download native-ecaaf7376f7d-loomc --repo zacharydenton/hrx.rs \
+cargo install --locked hrx-rs --features runner
+gh release download native-20260909-reviewed --repo zacharydenton/hrx-rs \
   --pattern hrx-linux-x86_64-gfx1151.tar.gz --dir build --clobber
 hrx prepare build/hrx-linux-x86_64-gfx1151.tar.gz
-bash scripts/build_host.sh
 ```
 
 `HRX_RUNTIME_DIR` points at a native directory of your own, `HRX_BUNDLE_MANIFEST`
@@ -49,7 +53,7 @@ cargo install --locked --path cli   # or: ln -s "$PWD/build/h3" ~/.local/bin/h3
 ```
 
 For a local compiler build, follow
-[HRX’s upstream pin and compiler patches](https://github.com/zacharydenton/hrx.rs/tree/main/patches/loom).
+[HRX’s upstream pin and compiler patches](https://github.com/zacharydenton/hrx-rs/tree/main/patches/loom).
 HRX owns the required native fixes; H3 loads the resulting `libloomc.so` through
 `HRX_LOOM_LIBRARY`. The [historical H3 patch record](../patches/loom/README.md)
 documents the previous bundle.

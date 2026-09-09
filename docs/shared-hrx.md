@@ -1,28 +1,42 @@
 # Shared HRX integration
 
-H3 depends on the shared `hrx.rs` crate. Its former local `hrx` package and
+H3 depends on the shared `hrx-rs` crate. Its former local `hrx` package and
 binary rpath build scripts are removed. The model still exposes `Session` as its
 Rust API. It does not require Python, Torch,
 ROCm development headers or an LLVM build.
 
-The workspace pins HRX to a Git revision with explicit features. A clean clone
-needs access to the private `hrx.rs` repository, but no sibling checkout.
-A local development override can be supplied with Cargo's `[patch]` mechanism.
+The workspace takes it from crates.io by version, under the name `hrx`:
+
+```toml
+hrx = { package = "hrx-rs", version = "0.1.0", default-features = false, features = ["download", "loom"] }
+```
+
+So a clean clone builds with `cargo build` and nothing else — no credentials, no
+sibling checkout, no `[patch]` table. A local development override is still
+Cargo's `[patch]` mechanism when you want one.
 
 The shared runtime supplies per-session streams, allocator-based allocation,
 checked buffer ranges, dynamic native loading, and prepared binding dispatch.
 `h3::compile` now selects model sources/exports and delegates compilation,
-SHA-256 identity, integrity checks and atomic publication to `hrx::loom`.
-Sources are read once per compiler session. The source files and tokenizer are
+SHA-256 identity, integrity checks and atomic publication to `hrx::loom`. It
+compiles for the architecture the stream's device reports, and asking for a kernel
+does not build it: requests accumulate and the whole outstanding set is compiled
+at once, across threads. Sources are read once per compiler session. The source files and tokenizer are
 inside the `h3` package at `h3/kernels` and `h3/assets`. Tests and examples use
 these paths directly.
 Compiled kernels go to an `hrx-v1` cache subdirectory.
 
 The pinned native release includes the VOPD register-bank fix and Loom's
-fragment-repack and SMEM storage-reuse fixes on the public upstream compiler. Because `hrx.rs` is
-private, [download it with an authenticated GitHub CLI](setup.md#toolchain-and-build)
-and prepare the local cache before running the model. A sibling checkout is
-optional.
+fragment-repack and SMEM storage-reuse fixes on the public upstream compiler. The
+release is public and the crate carries its manifest, so the first run that opens
+the GPU downloads and verifies it; [preparing the cache by hand](setup.md#toolchain-and-build)
+is for provisioning ahead of time or for a machine that will be offline later.
+
+That compiler is also the reason the four kernels with hand-written low asm —
+`attention_mha64t32`, `attention_mha64hm32` and the two `attention_i8qkhm` — name
+`gfx1151` where the other hundred name `gfx11-generic`. A Loom target is a bare
+architecture, and the profile it selects is what registers the descriptor set the
+asm is spelled in: `amdgpu.rdna3_5.core`, which no generic profile provides.
 
 Default first-use provisioning is implemented in HRX. `HRX_RUNTIME_DIR` overrides
 the native directory; `HRX_BUNDLE_MANIFEST` selects a pinned mirror; `HRX_OFFLINE`
