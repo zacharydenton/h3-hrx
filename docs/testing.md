@@ -51,7 +51,17 @@ those same weights, so the agreement is the quantisation and this implementation
 together: 0.99999 after one block and 0.99865 after all fifty (text 0.9992, audio
 0.9996, video 0.9971). It needs the released `transformer/`, a 62 GB download.
 
-`python3 scripts/parity.py vae` is the other: the host's tiled f16 decoder against diffusers' `AutoencoderKLMiniMaxH3` reading the
+`python3 scripts/parity.py convert` answers the tensor-level question the other
+two cannot: whether ComfyUI's int8 ConvRot conversion carries the weights MiniMax
+released. The conversion rotates within 256-channel groups, quantises, and
+reorders rows for the kernels, so the stored numbers are deliberately not the
+released ones — but a rotation is orthogonal, so row norms survive it, and
+compared as a multiset they survive the reordering too. All 200 quantised tensors
+agree to 1.1e-4; the 150 attention projections keep their rows in place, so their
+group norms match as well, while the SwiGLU projections are the same weights
+permuted. It needs no GPU.
+
+`python3 scripts/parity.py vae` is the other end: the host's tiled f16 decoder against diffusers' `AutoencoderKLMiniMaxH3` reading the
 weights MiniMax released, rather than against ComfyUI's conversion or a
 reimplementation. It measures the f16 narrowing plus whatever the Loom decoder
 does differently, and clears 62.5 dB PSNR at 384x320x22. It needs `diffusers`,

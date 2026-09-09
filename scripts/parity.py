@@ -11,6 +11,7 @@ Run it before a release, not on every change.
     python3 scripts/parity.py stack --stack dit|te      locate a regression to a block
     python3 scripts/parity.py vae                      the decoder vs diffusers on MiniMax's weights
     python3 scripts/parity.py dit                      the blocks vs diffusers on MiniMax's weights
+    python3 scripts/parity.py convert                  ComfyUI's conversion vs the released weights
 
 `gate` needs no torch. `stack` needs torch, and `--stack dit` also needs diffusers.
 
@@ -1099,6 +1100,101 @@ def dit_parity(a) -> int:
 
 
 # --------------------------------------------------------------------------------------------------
+# ComfyUI's conversion against the weights it was converted from
+# --------------------------------------------------------------------------------------------------
+
+# What ComfyUI's `comfy_quant` descriptor says each quantised tensor is, and where the same weights
+# live in the released checkpoint. `qkv_proj` fuses the three projections the reference keeps apart.
+CONVERTED = {
+    "attn.qkv_proj": ["attn.to_q", "attn.to_k", "attn.to_v"],
+    "attn.out_proj": ["attn.to_out.0"],
+    "mlp.fc1": ["ff.net.0.proj"],
+    "mlp.fc2": ["ff.net.2"],
+}
+
+
+def conversion_parity(a) -> int:
+    """Is ComfyUI's int8 ConvRot conversion faithful to the weights MiniMax released?
+
+    The conversion rotates each row within groups of `convrot_groupsize` channels, quantises to int8
+    and reorders rows to suit the kernels, so the stored numbers are deliberately not the released
+    ones. Two invariants survive all of that. A rotation is orthogonal, so the norm of every row is
+    unchanged — compared as a multiset, that holds whatever order the rows end up in and whatever
+    Hadamard convention was used. Where the rows also stay in place, every 256-channel group norm
+    holds too, which is the stricter statement and the one the attention projections satisfy.
+
+    Between them these catch a tensor mapped to the wrong place, a mis-scaled row, a dropped shard
+    and a truncated conversion. Neither can catch a rotation applied with the wrong sign convention;
+    that is what `parity.py dit` measures end to end.
+    """
+    import json
+
+    from safetensors import safe_open
+
+    directory = Path(a.official)
+    if not (directory / "config.json").is_file():
+        found = sorted((OFFICIAL / "snapshots").glob("*/transformer"))
+        if not found:
+            print(f"no released transformer under {directory}", file=sys.stderr)
+            return 1
+        directory = found[-1]
+    index = json.loads(
+        (directory / "diffusion_pytorch_model.safetensors.index.json").read_text()
+    )["weight_map"]
+
+    def official(name):
+        with safe_open(str(directory / index[name]), framework="pt", device="cpu") as f:
+            return f.get_tensor(name).float()
+
+    worst, aligned, checked, unmapped = 0.0, 0, 0, []
+    with safe_open(str(a.converted), framework="pt", device="cpu") as f:
+        for name in sorted(f.keys()):
+            if not name.endswith(".weight_scale"):
+                continue
+            stem = name[: -len(".weight_scale")]
+            _, _, rest = stem.partition(".")
+            depth, _, kind = rest.partition(".")
+            if kind not in CONVERTED:
+                unmapped.append(stem)
+                continue
+            size = json.loads(
+                bytes(f.get_tensor(stem + ".comfy_quant").numpy().tobytes())
+            ).get("convrot_groupsize", 256)
+            got = f.get_tensor(stem + ".weight").float() * f.get_tensor(name).float()
+            want = torch.cat(
+                [official(f"transformer_blocks.{depth}.{part}.weight") for part in CONVERTED[kind]],
+                0,
+            )
+            if got.shape != want.shape:
+                print(f"  FAIL {stem}: {tuple(got.shape)} against {tuple(want.shape)}")
+                return 1
+            rows = got.norm(dim=1).sort().values, want.norm(dim=1).sort().values
+            error = float((rows[0] - rows[1]).abs().mean() / rows[1].mean())
+            if error > a.floor:
+                print(f"  FAIL {stem}: row norms differ by {error:.5f} even as a multiset")
+                return 1
+            worst = max(worst, error)
+            checked += 1
+            groups = (
+                got.reshape(got.shape[0], -1, size).norm(dim=2),
+                want.reshape(want.shape[0], -1, size).norm(dim=2),
+            )
+            if float((groups[0] - groups[1]).abs().mean() / groups[1].mean()) <= a.floor:
+                aligned += 1
+            del got, want, groups
+
+    if unmapped:
+        print(f"  FAIL {len(unmapped)} quantised tensors have no mapping, e.g. {unmapped[:3]}")
+        return 1
+    print(
+        f"  PASS {checked} converted tensors carry the released weights: worst row-norm error "
+        f"{worst:.5f} (floor {a.floor}); {aligned} of them also keep their rows in place, so their "
+        f"256-channel group norms match too"
+    )
+    return 0
+
+
+# --------------------------------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------------------------------
 
@@ -1121,6 +1217,10 @@ def main() -> int:
     d.add_argument("--frames", type=int, default=22)
     d.add_argument("--device", default="cuda")
     d.add_argument("--floor", type=float, default=0.99, help="cosine every depth must clear")
+    c = sub.add_parser("convert", help="ComfyUI's int8 conversion against the released weights")
+    c.add_argument("--official", default=str(OFFICIAL), help="the released transformer, diffusers layout")
+    c.add_argument("--converted", default=str(DIT), help="the ComfyUI checkpoint the host runs")
+    c.add_argument("--floor", type=float, default=0.005, help="relative group-norm error allowed")
     s = sub.add_parser("stack", help="locate a regression to a block")
     s.add_argument("--stack", choices=["dit", "te"], required=True)
     s.add_argument("--depths", default="1,10,25,50", help="block counts to compare")
@@ -1143,6 +1243,11 @@ def main() -> int:
             print("the DiT check needs torch and diffusers", file=sys.stderr)
             return 1
         return dit_parity(a)
+    if a.command == "convert":
+        if not require_torch():
+            print("the conversion check needs torch", file=sys.stderr)
+            return 1
+        return conversion_parity(a)
     if not require_torch():
         print("stack parity needs torch (and diffusers for --stack dit)", file=sys.stderr)
         return 1
