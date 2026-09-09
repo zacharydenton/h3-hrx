@@ -658,3 +658,441 @@ fn quantized_gemms_match_integer_dot_products_bias_and_residual_classes() {
         }
     }
 }
+
+/// The attention stems `Stack::build` actually selects, against scaled dot-product attention in f64.
+///
+/// The four `t32` variants above are experimental; these are the ones that run. Each is one
+/// workgroup of `16 * waves` query rows per head, `q`/`k`/`v` contiguous `[capacity][stride]` f16
+/// with zero headroom past `tokens`, and `gqa8c` is the text encoder's causal 8-query-per-kv layout.
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn attention_matches_scaled_dot_product_for_the_shipped_layouts() {
+    let mut h = Harness::new();
+    for (stem, d, waves, heads, gqa, causal) in [
+        (
+            "attention_mha_lds_f16_wmma",
+            128usize,
+            4usize,
+            4usize,
+            1usize,
+            false,
+        ),
+        ("attention_mha8_lds_f16_wmma", 128, 8, 4, 1, false),
+        ("attention_mha64_lds_f16_wmma", 64, 4, 4, 1, false),
+        ("attention_mha648_lds_f16_wmma", 64, 8, 4, 1, false),
+        ("attention_mha64t32_lds_f16_wmma", 64, 4, 4, 1, false),
+        ("attention_gqa8c_lds_f16_wmma", 128, 8, 8, 8, true),
+    ] {
+        let kv_heads = heads / gqa;
+        for tokens in [17usize, 40, 96] {
+            // Zero headroom past `tokens`, and enough rows for whole query blocks.
+            let block = 16 * waves;
+            let capacity = (tokens + 16).div_ceil(32) * 32;
+            let capacity = capacity.max(tokens.div_ceil(block) * block);
+            let (qs, kvs) = (heads * d, kv_heads * d);
+            let pad = |rows: &[f32], stride: usize| {
+                let mut out = vec![f16::ZERO; capacity * stride];
+                for (i, v) in rows.iter().enumerate() {
+                    out[i] = f16::from_f32(*v);
+                }
+                out
+            };
+            let q = pad(&values(tokens * qs, 0.5), qs);
+            let k = pad(&values(tokens * kvs, 0.45), kvs);
+            let v = pad(&values(tokens * kvs, 0.6), kvs);
+
+            let scale = 1.0 / (d as f64).sqrt();
+            let mut want = vec![0f64; tokens * qs];
+            for row in 0..tokens {
+                for head in 0..heads {
+                    let kv = head / gqa;
+                    let last = if causal { row } else { tokens - 1 };
+                    let score = |key: usize| {
+                        scale
+                            * (0..d)
+                                .map(|c| {
+                                    q[row * qs + head * d + c].to_f64()
+                                        * k[key * kvs + kv * d + c].to_f64()
+                                })
+                                .sum::<f64>()
+                    };
+                    let top = (0..=last).map(score).fold(f64::MIN, f64::max);
+                    let weights: Vec<f64> = (0..=last).map(|j| (score(j) - top).exp()).collect();
+                    let total: f64 = weights.iter().sum();
+                    for (key, w) in weights.iter().enumerate() {
+                        for c in 0..d {
+                            want[row * qs + head * d + c] +=
+                                w / total * v[key * kvs + kv * d + c].to_f64();
+                        }
+                    }
+                }
+            }
+
+            let config = cfg(&[
+                ("q_stride", qs),
+                ("kv_stride", kvs),
+                ("tokens", tokens),
+                ("token_capacity", capacity),
+                ("out_stride", qs),
+            ]);
+            let mut config = config;
+            config.push(("scale", format!("{scale:.17}")));
+            // gqa8c walks 16 query rows per group over the kv heads; the rest take a whole block.
+            let grid = if causal {
+                [tokens.div_ceil(16) as u32, kv_heads as u32, 1]
+            } else {
+                [tokens.div_ceil(block) as u32, heads as u32, 1]
+            };
+            let out = h.run(
+                stem,
+                &config,
+                grid,
+                32 * waves as u32,
+                &[tokens as u64, kv_heads as u64],
+                &[bytes(&q), bytes(&k), bytes(&v), vec![0; tokens * qs * 2]],
+            );
+            let got = halves(&out[3], false);
+            assert_eq!(got.len(), want.len(), "{stem} tokens={tokens}");
+            for (i, (&a, &b)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    a.is_finite() && (a - b).abs() <= 2e-2 + 2e-2 * b.abs(),
+                    "{stem} tokens={tokens} element {i}: {a} vs {b}"
+                );
+            }
+        }
+    }
+}
+
+/// The unnormalised Sylvester Hadamard of order 128: `H[i][j] = (-1)^popcount(i & j)`.
+fn hadamard(i: usize, j: usize) -> f64 {
+    if (i & j).count_ones().is_multiple_of(2) {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+/// What `prepare_qk_i8` is defined to produce: per (token, head) mean-subtract, rotate by the
+/// Hadamard, quantise to int8 against the row maximum, pack four codes per word, and report the
+/// scale the attention kernel multiplies back in. Returns (packed words, scales, integer codes).
+fn prepared_qk(
+    x: &[f16],
+    mean: &[f32],
+    tokens: usize,
+    heads: usize,
+    d: usize,
+    extra: f64,
+) -> (Vec<i32>, Vec<f32>, Vec<f64>) {
+    let stride = heads * d;
+    let (mut words, mut scales, mut codes) = (
+        vec![0i32; tokens * heads * 32],
+        vec![0f32; tokens * heads],
+        vec![0f64; tokens * stride],
+    );
+    for t in 0..tokens {
+        for head in 0..heads {
+            let centred: Vec<f64> = (0..d)
+                .map(|c| x[t * stride + head * d + c].to_f64() - f64::from(mean[head * d + c]))
+                .collect();
+            let rotated: Vec<f64> = (0..d)
+                .map(|e| (0..d).map(|c| centred[c] * hadamard(c, e)).sum())
+                .collect();
+            let amax = rotated.iter().fold(0f64, |m, v| m.max(v.abs())).max(1e-30);
+            let step = amax / 127.0;
+            for e in 0..d {
+                let code = (rotated[e] / step).round().clamp(-127.0, 127.0);
+                codes[t * stride + head * d + e] = code;
+                // four codes per word, element 4*lane + j in byte j
+                let word = &mut words[(t * heads + head) * 32 + e / 4];
+                *word |= ((code as i32) & 0xff) << (8 * (e % 4));
+            }
+            scales[t * heads + head] = (step * extra) as f32;
+        }
+    }
+    (words, scales, codes)
+}
+
+/// `prepare_qk_i8` against that definition: the codes the attention kernels consume, and the scales
+/// they multiply back in. Ties may round either way, so a handful of differing words is expected;
+/// a wrong rotation, packing or scale is not.
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn prepare_qk_int8_rotates_quantises_and_packs_the_attention_operands() {
+    let mut h = Harness::new();
+    let (tokens, heads, d) = (37usize, 4usize, 128usize);
+    let stride = heads * d;
+    let extra = 1.0 / (d as f64).sqrt() / 128.0;
+    let x: Vec<f16> = values(tokens * stride, 0.7)
+        .into_iter()
+        .map(f16::from_f32)
+        .collect();
+    let mean = values(stride, 0.1);
+    let (want_words, want_scales, _) = prepared_qk(&x, &mean, tokens, heads, d, extra);
+
+    let mut config = cfg(&[("row_stride", stride), ("head_offset", 0), ("heads", heads)]);
+    config.push(("extra_scale", format!("{extra:.17e}")));
+    let out = h.run(
+        "prepare_qk_i8",
+        &config,
+        [tokens as u32, 1, 1],
+        256,
+        &[tokens as u64],
+        &[
+            bytes(&x),
+            bytes(&mean),
+            vec![0; tokens * heads * 32 * 4],
+            vec![0; tokens * heads * 4],
+        ],
+    );
+    let words: Vec<i32> = out[2]
+        .chunks_exact(4)
+        .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    let differing = words
+        .iter()
+        .zip(&want_words)
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(
+        differing * 500 < words.len(),
+        "{differing} of {} packed words differ, beyond rounding ties",
+        words.len()
+    );
+    close(
+        &floats(&out[3]),
+        &want_scales
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect::<Vec<_>>(),
+        1e-7,
+        1e-4,
+    );
+}
+
+/// `attention_i8qk_mha_lds_f16_wmma`, the int8 QK^T path `attn_qk_bits = 8` selects, against the
+/// attention its own operands define: the integer dot product scaled by both rows' scales, softmax,
+/// then V in f16. Comparing against exact attention would measure the quantisation, not the kernel.
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn int8_qk_attention_matches_the_attention_its_operands_define() {
+    let mut h = Harness::new();
+    let (heads, d, waves) = (4usize, 128usize, 4usize);
+    let stride = heads * d;
+    for tokens in [23usize, 64] {
+        let block = 16 * waves;
+        let capacity = ((tokens + 16).div_ceil(32) * 32).max(tokens.div_ceil(block) * block);
+        let q: Vec<f16> = values(tokens * stride, 0.7)
+            .into_iter()
+            .map(f16::from_f32)
+            .collect();
+        let k: Vec<f16> = values(tokens * stride, 0.65)
+            .into_iter()
+            .map(f16::from_f32)
+            .collect();
+        let v: Vec<f16> = values(tokens * stride, 0.5)
+            .into_iter()
+            .map(f16::from_f32)
+            .collect();
+        // Q folds the softmax scale into its own; K is centred on its column mean, as the host does.
+        let extra = 1.0 / (d as f64).sqrt() / 128.0;
+        let mut kmean = vec![0f32; stride];
+        for (c, m) in kmean.iter_mut().enumerate() {
+            *m = (0..tokens).map(|t| k[t * stride + c].to_f32()).sum::<f32>() / tokens as f32;
+        }
+        let (qw, qs, qc) = prepared_qk(&q, &vec![0f32; stride], tokens, heads, d, extra);
+        let (kw, ks, kc) = prepared_qk(&k, &kmean, tokens, heads, d, 1.0);
+
+        let mut want = vec![0f64; tokens * stride];
+        for row in 0..tokens {
+            for head in 0..heads {
+                let score = |key: usize| {
+                    (0..d)
+                        .map(|e| qc[row * stride + head * d + e] * kc[key * stride + head * d + e])
+                        .sum::<f64>()
+                        * f64::from(qs[row * heads + head])
+                        * f64::from(ks[key * heads + head])
+                };
+                let top = (0..tokens).map(score).fold(f64::MIN, f64::max);
+                let weights: Vec<f64> = (0..tokens).map(|j| (score(j) - top).exp()).collect();
+                let total: f64 = weights.iter().sum();
+                for (key, w) in weights.iter().enumerate() {
+                    for c in 0..d {
+                        want[row * stride + head * d + c] +=
+                            w / total * v[key * stride + head * d + c].to_f64();
+                    }
+                }
+            }
+        }
+
+        // The operands arrive padded to the capacity, and V transposed: [channels][capacity].
+        let pad_words = |w: &[i32]| {
+            let mut out = vec![0i32; capacity * heads * 32];
+            out[..w.len()].copy_from_slice(w);
+            out
+        };
+        let pad_scales = |s: &[f32]| {
+            let mut out = vec![0f32; capacity * heads];
+            out[..s.len()].copy_from_slice(s);
+            out
+        };
+        let mut vt = vec![f16::ZERO; stride * capacity];
+        for t in 0..tokens {
+            for c in 0..stride {
+                vt[c * capacity + t] = v[t * stride + c];
+            }
+        }
+        let mut config = cfg(&[
+            ("q_stride", stride),
+            ("kv_stride", stride),
+            ("tokens", tokens),
+            ("token_capacity", capacity),
+            ("out_stride", stride),
+        ]);
+        config.push(("scale", "1.0".into()));
+        let out = h.run(
+            "attention_i8qk_mha_lds_f16_wmma",
+            &config,
+            [tokens.div_ceil(block) as u32, heads as u32, 1],
+            32 * waves as u32,
+            &[tokens as u64, heads as u64],
+            &[
+                bytes(&pad_words(&qw)),
+                bytes(&pad_scales(&qs)),
+                bytes(&pad_words(&kw)),
+                bytes(&pad_scales(&ks)),
+                bytes(&vt),
+                vec![0; tokens * stride * 2],
+            ],
+        );
+        close(&halves(&out[5], false), &want, 2e-2, 2e-2);
+    }
+}
+
+/// The f16 and bf16 GEMM families: the video VAE decoder's operands and the refiner's, which the
+/// int4/int8 test above does not reach. Same three modes and the same epilogues, but the operands
+/// arrive as stored floats with no per-row scale, so the reference rounds through the stored width
+/// and accumulates in f64.
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn float_gemms_match_rounded_operands_across_modes_and_epilogues() {
+    let mut h = Harness::new();
+    for bf in [false, true] {
+        for mode in ["plain", "resid", "swiglu"] {
+            for biased in [false, true] {
+                let (m, k, n) = (17usize, 128usize, 128usize);
+                let stride = k + 64;
+                let narrow = |v: f32| {
+                    if bf {
+                        bf16::from_f32(v).to_f64()
+                    } else {
+                        f16::from_f32(v).to_f64()
+                    }
+                };
+                let raw_a = values(m * stride, 0.5);
+                let raw_w = values(n * stride, 0.3);
+                let store = |v: &[f32]| -> Vec<u8> {
+                    if bf {
+                        bytes(&v.iter().map(|&x| bf16::from_f32(x)).collect::<Vec<_>>())
+                    } else {
+                        bytes(&v.iter().map(|&x| f16::from_f32(x)).collect::<Vec<_>>())
+                    }
+                };
+                let bias = values(n, 0.1);
+                let residual = values(m * n, 0.5);
+                let gates = values(2 * n, 0.3);
+                let classes: Vec<i32> = (0..m).map(|i| (i % 2) as i32).collect();
+                let full: Vec<f64> = (0..m * n)
+                    .map(|i| {
+                        let (r, c) = (i / n, i % n);
+                        (0..k)
+                            .map(|j| narrow(raw_a[r * stride + j]) * narrow(raw_w[c * stride + j]))
+                            .sum::<f64>()
+                            + if biased { f64::from(bias[c]) } else { 0.0 }
+                    })
+                    .collect();
+
+                let stem = format!(
+                    "gemm_{}{}_256{}{}",
+                    if bf { "bf16" } else { "f16" },
+                    match mode {
+                        "plain" => "",
+                        "resid" => "_resid",
+                        _ => "_swiglu",
+                    },
+                    if biased { "b" } else { "" },
+                    if biased && mode == "swiglu" {
+                        "_gs"
+                    } else {
+                        ""
+                    }
+                );
+                let mut config = cfg(&[
+                    ("k_size", k),
+                    ("n_size", n),
+                    ("k_stride", stride),
+                    ("m_group", 1),
+                ]);
+                let mut data = vec![store(&raw_a), store(&raw_w)];
+                let want = match mode {
+                    "resid" => {
+                        config.push(("classes", "2".into()));
+                        data.push(bytes(&residual));
+                        data.push(bytes(&gates));
+                        data.push(bytes(&classes));
+                        if biased {
+                            data.push(bytes(&bias));
+                        }
+                        full.iter()
+                            .enumerate()
+                            .map(|(i, &x)| {
+                                f64::from(residual[i])
+                                    + f64::from(gates[classes[i / n] as usize * n + i % n]) * x
+                            })
+                            .collect()
+                    }
+                    "swiglu" => {
+                        data.push(vec![0; m * n]);
+                        if biased {
+                            data.push(bytes(&bias));
+                        }
+                        // gate and up interleave in 16-column groups; `_gs` swaps which one gates
+                        (0..m * n / 2)
+                            .map(|i| {
+                                let (r, c) = (i / (n / 2), i % (n / 2));
+                                let a = full[r * n + (c / 16) * 32 + c % 16];
+                                let b = full[r * n + (c / 16) * 32 + c % 16 + 16];
+                                if biased {
+                                    b / (1.0 + (-b).exp()) * a
+                                } else {
+                                    a / (1.0 + (-a).exp()) * b
+                                }
+                            })
+                            .collect()
+                    }
+                    _ => {
+                        data.push(vec![0; m * n * 2]);
+                        if biased {
+                            data.push(bytes(&bias));
+                        }
+                        full
+                    }
+                };
+                let out = h.run(
+                    &stem,
+                    &config,
+                    [1, m.div_ceil(256) as u32, 1],
+                    256,
+                    &[m as u64],
+                    &data,
+                );
+                let got = if mode == "resid" {
+                    floats(&out[2])
+                } else {
+                    halves(&out[2], false)
+                };
+                eprintln!("checking {stem}");
+                close(&got, &want, 3e-3, 3e-3);
+            }
+        }
+    }
+}

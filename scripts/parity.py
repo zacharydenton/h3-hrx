@@ -15,6 +15,12 @@ Run it before a release, not on every change.
 Everything else in this repository checks that the model agrees with its own earlier output. This is
 the only check against something outside itself, which is why it is worth keeping even though it
 cannot run unattended.
+
+Assembled mechanically from the six modules this replaced, at commit 2ce3d0b: h3_loom.py,
+tools/h3tok_ids.py, reference/h3_ref.py, tools/compare_comfy.py, tests/test_comfy_parity.py and
+tests/test_stack_parity.py, in that order. That is why the sections below keep their original
+terse style, and why `R` is bound to this module: the stack checks call the reference section
+`R.Checkpoint`, `R.Layout` and so on, as they did when it was a separate import.
 """
 from __future__ import annotations
 
