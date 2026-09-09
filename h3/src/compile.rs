@@ -91,7 +91,7 @@ fn trim(s: &str) -> String {
 /// pointers: copy it into as many structures as the kernel is used from.
 #[derive(Clone)]
 pub struct Kernel {
-    cell: Arc<OnceLock<Arc<hrx::Kernel>>>,
+    cell: Arc<OnceLock<hrx::Kernel>>,
     queue: Arc<Queue>,
 }
 
@@ -119,7 +119,7 @@ struct Request {
     tag: String,
     module: hrx::loom::Module,
     spec: hrx::loom::Specialization,
-    cells: Vec<Arc<OnceLock<Arc<hrx::Kernel>>>>,
+    cells: Vec<Arc<OnceLock<hrx::Kernel>>>,
 }
 
 /// The requests not yet built, and the kernels already loaded.
@@ -128,8 +128,10 @@ struct Request {
 /// without holding a borrow of the compiler and without a lifetime of its own.
 struct Queue {
     cache: PathBuf,
+    /// Built on the first request, for the target that request's stream reported.
+    compiler: OnceLock<hrx::loom::Compiler>,
     pending: Mutex<Vec<Request>>,
-    loaded: Mutex<HashMap<String, Arc<hrx::Kernel>>>,
+    loaded: Mutex<HashMap<String, hrx::Kernel>>,
 }
 
 impl Queue {
@@ -142,7 +144,13 @@ impl Queue {
         if requests.is_empty() {
             return Ok(());
         }
-        let artifacts = compile_all(&requests, &Compiler::cache_dir(&self.cache)?);
+        let batch: Vec<(&hrx::loom::Module, &hrx::loom::Specialization)> =
+            requests.iter().map(|r| (&r.module, &r.spec)).collect();
+        let artifacts = self
+            .compiler
+            .get()
+            .expect("a request was recorded, so its compiler exists")
+            .compile_all(&batch, &Compiler::cache_dir(&self.cache)?);
         let mut outcome = Ok(());
         let mut unbuilt = Vec::new();
         {
@@ -153,7 +161,7 @@ impl Queue {
                     .map_err(Error::from)
                     .and_then(|a| Ok(unsafe { stream.load_artifact(&a) }?));
                 let kernel = match built {
-                    Ok(kernel) => Arc::new(kernel),
+                    Ok(kernel) => kernel,
                     Err(error) => {
                         // A kernel that will not build is that kernel's failure and no one else's, so
                         // the batch carries on and the rest of it is loaded. This one goes back on the
@@ -182,43 +190,7 @@ impl Queue {
     }
 }
 
-/// Compiles every request, in request order, on `workers()` threads.
-///
-/// Each result is that request's own, so one kernel that will not build is reported as itself rather
-/// than cancelling the batch — the caller sees the same error it would have seen building alone.
-fn compile_all(
-    requests: &[Request],
-    cache: &Path,
-) -> Vec<std::result::Result<hrx::loom::Artifact, hrx::Error>> {
-    let mut results: Vec<Option<_>> = (0..requests.len()).map(|_| None).collect();
-    let threads = workers().min(requests.len());
-    if threads < 2 {
-        return requests
-            .iter()
-            .map(|r| r.module.compile(&r.spec, cache))
-            .collect();
-    }
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let slots: Vec<Mutex<&mut Option<_>>> = results.iter_mut().map(Mutex::new).collect();
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(request) = requests.get(i) else {
-                    break;
-                };
-                **slots[i].lock().expect("compile slot poisoned") =
-                    Some(request.module.compile(&request.spec, cache));
-            });
-        }
-    });
-    results
-        .into_iter()
-        .map(|slot| slot.expect("every request was compiled"))
-        .collect()
-}
-
-/// How many kernels to build at once.
+/// How many kernels `hrx::loom::Compiler::compile_all` may build at once.
 ///
 /// Each worker holds its own compiler workspace, so this trades memory for latency at a point where
 /// the process is otherwise about to sit on the checkpoint's page faults anyway. Bounded rather than
@@ -236,7 +208,6 @@ pub struct Compiler {
     modules: Mutex<HashMap<String, hrx::loom::Module>>,
     sources: PathBuf,
     source_cache: Mutex<HashMap<String, Arc<str>>>,
-    compiler: OnceLock<hrx::loom::Compiler>,
     queue: Arc<Queue>,
 }
 impl Compiler {
@@ -250,9 +221,9 @@ impl Compiler {
             modules: Mutex::new(HashMap::new()),
             sources: sources.into(),
             source_cache: Mutex::new(HashMap::new()),
-            compiler: OnceLock::new(),
             queue: Arc::new(Queue {
                 cache: cache.into(),
+                compiler: OnceLock::new(),
                 pending: Mutex::new(Vec::new()),
                 loaded: Mutex::new(HashMap::new()),
             }),
@@ -266,7 +237,7 @@ impl Compiler {
     /// device reports; only [`Compiler::tag`], which has no device to ask, leaves it unset and takes
     /// the crate's default. Whichever comes first fixes it for this `Compiler`.
     fn compiler(&self, target: Option<&hrx::Target>) -> Result<&hrx::loom::Compiler> {
-        if let Some(c) = self.compiler.get() {
+        if let Some(c) = self.queue.compiler.get() {
             if target.is_some_and(|target| target != c.target()) {
                 return Err(Error::Io(format!(
                     "compiler target {} differs from stream target {}",
@@ -282,7 +253,7 @@ impl Compiler {
             ..Default::default()
         };
         let compiler = hrx::loom::Compiler::with_options(self.library.as_deref(), options)?;
-        let _ = self.compiler.set(compiler);
+        let _ = self.queue.compiler.set(compiler);
         self.compiler(target)
     }
     fn source(&self, stem: &str) -> Result<Arc<str>> {

@@ -114,7 +114,7 @@ impl Dit {
         }
         self.seq = None;
         let t = seq_capacity(seq);
-        let mut zeroed = |bytes: usize| -> Result<hrx::Buffer> {
+        let zeroed = |bytes: usize| -> Result<hrx::Buffer> {
             let b = stream.allocate(bytes)?;
             stream.fill(b.slice(0, bytes), 0)?;
             Ok(b)
@@ -232,7 +232,7 @@ impl Dit {
     /// The sequence's first `rows` rows, `[rows][5376]` f32 — what `h3_text_in` hands back.
     pub fn read_rows(&self, stream: &mut hrx::Stream, rows: usize, out: &mut [f32]) -> Result<()> {
         let seq = self.seq.as_ref().expect("a sequence has been sized");
-        stream.read(
+        stream.read_blocking(
             seq.x.slice(0, rows * HID * 4),
             crate::vvae::as_bytes_mut(out),
         )?;
@@ -1013,7 +1013,7 @@ impl Dit {
                     seq.out32.binding(),
                 )?;
                 if res {
-                    stream.read(
+                    stream.read_blocking(
                         seq.out32.slice(0, generated * FINAL_N * 4),
                         crate::vvae::as_bytes_mut(&mut out32),
                     )?;
@@ -1301,7 +1301,7 @@ impl Dit {
                 &[n * 4, n * 4, groups * 8],
             )?;
             let mut ps = vec![0.0f32; groups * 2];
-            stream.read(
+            stream.read_blocking(
                 cb.partials.slice(0, groups * 8),
                 crate::vvae::as_bytes_mut(&mut ps),
             )?;

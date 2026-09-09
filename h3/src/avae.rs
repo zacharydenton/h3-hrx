@@ -640,7 +640,7 @@ impl AudioVae {
             if len != l_out {
                 return other(format!("audio length {len} != {l_out}"));
             }
-            stream.read(
+            stream.read_blocking(
                 r2b,
                 crate::vvae::as_bytes_mut(&mut staged[ch * l_out..(ch + 1) * l_out]),
             )?;
@@ -1062,7 +1062,7 @@ impl AudioVae {
             )?;
 
             let mut zrow = vec![0.0f32; t * AUDIO_CH];
-            stream.read(xc.binding(), crate::vvae::as_bytes_mut(&mut zrow))?;
+            stream.read_blocking(xc.binding(), crate::vvae::as_bytes_mut(&mut zrow))?;
             for i in 0..t {
                 for k in 0..AUDIO_CH {
                     out[(ch * AUDIO_CH + k) * t + i] =

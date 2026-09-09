@@ -64,7 +64,9 @@ fn main() {
         let want = recipe.assemble(weights.file()).expect("assemble");
         let buffer = weights.at(&mut stream, name, size).expect("upload");
         let mut got = vec![0u8; size];
-        stream.read(buffer.binding(), &mut got).expect("read back");
+        stream
+            .read_blocking(buffer.binding(), &mut got)
+            .expect("read back");
         if got != want {
             let at = got.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(0);
             println!("MISMATCH {name} ({kind}, {size} bytes) first differs at {at}");

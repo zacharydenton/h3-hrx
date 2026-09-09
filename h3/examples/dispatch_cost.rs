@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     host.sort_by(f64::total_cmp);
     complete.sort_by(f64::total_cmp);
     let mut bytes = [0; 512];
-    stream.read(output.binding(), &mut bytes)?;
+    stream.read_blocking(output.binding(), &mut bytes)?;
     assert_eq!(bytes, [0; 512]);
     println!(
         "H3 Prepare::run: {:.0} ns host/dispatch, {:.0} ns completed/dispatch",

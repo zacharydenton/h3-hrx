@@ -179,7 +179,7 @@ mod tests {
         let output = stream.allocate(expected.len() * 4)?;
         blocks.run(&mut stream, &te, &output)?;
         let mut got = vec![0.0f32; expected.len()];
-        stream.read(output.binding(), crate::vvae::as_bytes_mut(&mut got))?;
+        stream.read_blocking(output.binding(), crate::vvae::as_bytes_mut(&mut got))?;
         for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
             assert_eq!(
                 a.to_bits(),
@@ -193,7 +193,7 @@ mod tests {
         let output = stream.allocate(expected.len() * 4)?;
         final_layer.run(&mut stream, &te[..2], &output)?;
         let mut got = vec![0.0f32; expected.len()];
-        stream.read(output.binding(), crate::vvae::as_bytes_mut(&mut got))?;
+        stream.read_blocking(output.binding(), crate::vvae::as_bytes_mut(&mut got))?;
         for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
             assert_eq!(
                 a.to_bits(),

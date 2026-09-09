@@ -175,7 +175,7 @@ fn main() {
                         );
                         results.push(
                             stream
-                                .read_queued(buffers[output].binding())
+                                .read(buffers[output].binding())
                                 .unwrap()
                                 .wait(&mut stream)
                                 .unwrap(),

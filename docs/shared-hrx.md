@@ -8,20 +8,34 @@ ROCm development headers or an LLVM build.
 The workspace takes it from crates.io by version, under the name `hrx`:
 
 ```toml
-hrx = { package = "hrx-rs", version = "0.1.0", default-features = false, features = ["download", "loom"] }
+hrx = { package = "hrx-rs", version = "0.2.0", default-features = false, features = ["download", "loom"] }
 ```
 
 So a clean clone builds with `cargo build` and nothing else — no credentials, no
-sibling checkout, no `[patch]` table. A local development override is still
-Cargo's `[patch]` mechanism when you want one.
+sibling checkout, no `[patch]` table.
+
+**0.2.0 is not yet on crates.io.** Until it is, point Cargo at a local checkout
+from an uncommitted `.cargo/config.toml`, which keeps the override off the
+dependency itself:
+
+```toml
+[patch.crates-io]
+hrx-rs = { path = "../hrx.rs" }
+```
+
+`hrx gc [DAYS]` collects what provisioning leaves behind: runtime bundles the
+crate's manifest no longer pins, and kernel artifacts unused for longer than
+DAYS, 30 by default. Cache hits refresh an artifact's timestamp, so the sweep
+tracks last use rather than creation. Nothing is evicted implicitly.
 
 The shared runtime supplies per-session streams, allocator-based allocation,
 checked buffer ranges, dynamic native loading, and prepared binding dispatch.
 `h3::compile` now selects model sources/exports and delegates compilation,
 SHA-256 identity, integrity checks and atomic publication to `hrx::loom`. It
 compiles for the architecture the stream's device reports, and asking for a kernel
-does not build it: requests accumulate and the whole outstanding set is compiled
-at once, across threads. Sources are read once per compiler session. The source files and tokenizer are
+does not build it: requests accumulate, and `Compiler::flush` hands the whole
+outstanding set to `hrx::loom::Compiler::compile_all`, which owns the thread
+budget. Sources are read once per compiler session. The source files and tokenizer are
 inside the `h3` package at `h3/kernels` and `h3/assets`. Tests and examples use
 these paths directly.
 Compiled kernels go to an `hrx-v1` cache subdirectory.

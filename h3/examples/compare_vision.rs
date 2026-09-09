@@ -113,7 +113,7 @@ fn main() {
                         grid,
                     );
                     stream
-                        .read_queued(data[2].binding())
+                        .read(data[2].binding())
                         .unwrap()
                         .wait(&mut stream)
                         .unwrap()

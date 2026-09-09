@@ -70,14 +70,11 @@ impl Euler {
         if head.len() < (self.audio_rows + self.video_rows) * FINAL_N * 4 {
             return invalid("Euler head output is too short");
         }
-        let kernels = (
-            self.audio_kernel.resolve(stream)?,
-            self.video_kernel.resolve(stream)?,
-        );
-        for (kernel, buffer, (sigma, ratio)) in [
-            (kernels.0, &self.audio, audio),
-            (kernels.1, &self.video, video),
+        for (handle, buffer, (sigma, ratio)) in [
+            (&self.audio_kernel, &self.audio, audio),
+            (&self.video_kernel, &self.video, video),
         ] {
+            let kernel = handle.resolve(stream)?;
             let mut constants = hrx::Constants::new();
             constants.push(sigma)?;
             constants.push(ratio)?;
@@ -107,8 +104,8 @@ impl Euler {
         {
             return invalid("Euler latent shape mismatch");
         }
-        stream.read(self.audio.binding(), crate::vvae::as_bytes_mut(audio))?;
-        stream.read(self.video.binding(), crate::vvae::as_bytes_mut(video))?;
+        stream.read_blocking(self.audio.binding(), crate::vvae::as_bytes_mut(audio))?;
+        stream.read_blocking(self.video.binding(), crate::vvae::as_bytes_mut(video))?;
         Ok(())
     }
 }

@@ -1145,7 +1145,7 @@ impl Stack {
     fn dump(&self, stream: &mut hrx::Stream, dir: &str, name: &str, x: View<'_>) -> Result<()> {
         let bytes = self.tokens * self.d.hidden * 4;
         let mut host = vec![0u8; bytes];
-        stream.read(x, &mut host)?;
+        stream.read_blocking(x, &mut host)?;
         let path = std::path::Path::new(dir).join(format!("{}_{name}.f32", self.tag));
         let _ = std::fs::write(path, &host);
         Ok(())

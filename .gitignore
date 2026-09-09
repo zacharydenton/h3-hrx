@@ -11,3 +11,4 @@ __pycache__/
 /examples/rust/target/
 
 /examples/rustler/target/
+.cargo/

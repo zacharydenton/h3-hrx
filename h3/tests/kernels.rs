@@ -101,7 +101,7 @@ impl Harness {
         }
         let reads: Vec<_> = bindings
             .iter()
-            .map(|&v| self.stream.read_queued(v).unwrap())
+            .map(|&v| self.stream.read(v).unwrap())
             .collect();
         let result: Vec<Vec<u8>> = reads
             .into_iter()
@@ -121,7 +121,7 @@ impl Harness {
             for (i, binding) in bindings.iter().enumerate() {
                 let actual = self
                     .stream
-                    .read_queued(*binding)
+                    .read(*binding)
                     .unwrap()
                     .wait(&mut self.stream)
                     .unwrap();
@@ -131,21 +131,25 @@ impl Harness {
                 );
             }
             if std::env::var_os("H3_KERNEL_TIMING").is_some() {
-                let mut sequences = Vec::new();
+                let mut graphs = Vec::new();
                 for (k, c) in [(&old, &old_constants), (&kernel, &constants)] {
-                    let mut sequence = self.stream.sequence().unwrap();
+                    let mut graph = self.stream.graph().unwrap();
+                    // Every repetition writes the same bindings, so they are chained: this times
+                    // the kernel back to back, not a hundred and twenty-eight copies at once.
+                    let mut previous = None;
                     for _ in 0..128 {
+                        let after = previous.as_slice();
                         // Safety: the same validated bindings as the numerical comparison.
-                        unsafe {
-                            sequence
-                                .dispatch(k, grid, [threads, 1, 1], c, &bindings)
-                                .unwrap();
-                        }
+                        previous = Some(unsafe {
+                            graph
+                                .dispatch(after, k, grid, [threads, 1, 1], c, &bindings)
+                                .unwrap()
+                        });
                     }
-                    sequences.push(sequence.finish().unwrap());
+                    graphs.push(graph.finish().unwrap());
                 }
-                for sequence in &mut sequences {
-                    self.stream.launch_sequence(sequence).unwrap();
+                for graph in &mut graphs {
+                    self.stream.launch(graph).unwrap();
                 }
                 self.stream.synchronize().unwrap();
                 let mut times = [Vec::new(), Vec::new()];
@@ -158,9 +162,7 @@ impl Harness {
                         self.stream.synchronize().unwrap();
                         let start = std::time::Instant::now();
                         for _ in 0..8 {
-                            self.stream
-                                .launch_sequence(&mut sequences[version])
-                                .unwrap();
+                            self.stream.launch(&mut graphs[version]).unwrap();
                         }
                         self.stream.synchronize().unwrap();
                         times[version].push(start.elapsed().as_secs_f64());

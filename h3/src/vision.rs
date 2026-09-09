@@ -105,7 +105,7 @@ pub fn embed(
     // the position table is resampled on the host, then the stream narrows to f16 for the blocks
     let pos = weights.host_f32("vis.pos", VPOS_GRID * VPOS_GRID * VHID)?;
     let mut x0 = vec![0.0f32; n * VHID];
-    stream.read(x32.binding(), crate::vvae::as_bytes_mut(&mut x0))?;
+    stream.read_blocking(x32.binding(), crate::vvae::as_bytes_mut(&mut x0))?;
     add_positions(&mut x0, &pos, gh, gw);
     let x16h: Vec<half::f16> = x0.iter().map(|v| half::f16::from_f32(*v)).collect();
     let x16 = stream.allocate(x16h.len() * 2)?;
@@ -347,7 +347,7 @@ pub fn embed(
                 out5.binding(),
                 None,
             )?;
-            stream.read(
+            stream.read_blocking(
                 out5.slice(0, m * VOUT * 4),
                 crate::vvae::as_bytes_mut(&mut deepstack[j * m * VOUT..(j + 1) * m * VOUT]),
             )?;
@@ -395,7 +395,7 @@ pub fn embed(
         None,
     )?;
     let mut merged = vec![0.0f32; m * VOUT];
-    stream.read(
+    stream.read_blocking(
         out5.slice(0, m * VOUT * 4),
         crate::vvae::as_bytes_mut(&mut merged),
     )?;

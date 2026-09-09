@@ -126,10 +126,11 @@ fn main() {
             Some(b_buf.binding()),
         )
         .expect("run");
-        stream.synchronize().expect("sync");
 
         let mut raw = vec![0u8; m * n * 2];
-        stream.read(out_buf.binding(), &mut raw).expect("read back");
+        stream
+            .read_blocking(out_buf.binding(), &mut raw)
+            .expect("read back");
         let got: Vec<f64> = raw
             .chunks_exact(2)
             .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f64())
