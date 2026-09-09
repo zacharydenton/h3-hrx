@@ -9,6 +9,7 @@ Run it before a release, not on every change.
     python3 scripts/parity.py gate [--require]   the release gate: this host vs ComfyUI's own run
     python3 scripts/parity.py compare --truth DIR --mode blocks|trajectory     one comparison, verbose
     python3 scripts/parity.py stack --stack dit|te      locate a regression to a block
+    python3 scripts/parity.py vae                      the decoder vs diffusers on MiniMax's weights
 
 `gate` needs no torch. `stack` needs torch, and `--stack dit` also needs diffusers.
 
@@ -872,6 +873,94 @@ def stack_te(depths):
 
 
 # --------------------------------------------------------------------------------------------------
+# The video VAE against diffusers on MiniMax's own weights
+# --------------------------------------------------------------------------------------------------
+
+def official_vae(directory: Path, device: str):
+    """diffusers' `AutoencoderKLMiniMaxH3` decoder in f32, on the weights MiniMax released.
+
+    This is the one oracle here that is genuinely upstream: not ComfyUI's conversion of the model and
+    not a reimplementation of it, but the reference implementation reading the reference weights. The
+    host decodes ComfyUI's f16 conversion of the same VAE, so the gap this measures is that narrowing
+    plus whatever the Loom decoder does differently.
+    """
+    import json
+
+    from diffusers import AutoencoderKLMiniMaxH3
+    from safetensors import safe_open
+
+    config = json.loads((directory / "config.json").read_text())
+    index = json.loads(
+        (directory / "diffusion_pytorch_model.safetensors.index.json").read_text()
+    )["weight_map"]
+
+    def tensor(name):
+        with safe_open(str(directory / index[name]), framework="pt", device="cpu") as f:
+            return f.get_tensor(name).to(device)
+
+    vae = AutoencoderKLMiniMaxH3.from_config(config)
+    wanted = [name for name in index if name.startswith(("post_quant_conv.", "decoder."))]
+    del vae.encoder, vae.quant_conv
+    vae.load_state_dict(dict((name, tensor(name)) for name in wanted), strict=True, assign=True)
+    return vae.to(device).eval(), config
+
+
+def vae_parity(a) -> int:
+    """The host's tiled f16 decoder against that reference, on latents both are given."""
+    import torch
+
+    z = (
+        np.load(a.latents).astype(np.float32)
+        if a.latents
+        else np.random.default_rng(0).normal(size=(24, 7, 20, 24)).astype(np.float32)
+    )
+    _, t, h, w = z.shape
+    if t < 7 or (t - 2) % 5 or h <= 16 or w <= 16:
+        print("latents must cross a tile and a temporal boundary", file=sys.stderr)
+        return 1
+    frames = (t - 2) // 5 * 17 + 5
+
+    pipe = H3(dit="/unused/dit.safetensors", te="/unused/te.safetensors")
+    try:
+        got = pipe.decode_video(pipe.params(height=h * 16, width=w * 16, frames=frames), z)
+    finally:
+        pipe.close()
+
+    vae, config = official_vae(Path(a.official), a.device)
+    with torch.no_grad():
+        zt = torch.from_numpy(z)[None].to(a.device)
+        mean = zt.new_tensor(config["latents_mean"])[None, :, None, None, None]
+        std = zt.new_tensor(config["latents_std"])[None, :, None, None, None]
+        video = vae._decode(zt * std + mean)
+        # the decoder emits ImageNet-normalised pixels; the host writes RGB8
+        vmean = video.new_tensor((0.485, 0.456, 0.406))[None, :, None, None, None]
+        vstd = video.new_tensor((0.229, 0.224, 0.225))[None, :, None, None, None]
+        want = (
+            ((video * vstd + vmean).clamp(0, 1) * 255)
+            .round()
+            .to(torch.uint8)[0]
+            .permute(1, 2, 3, 0)
+            .cpu()
+            .numpy()
+        )
+    del vae
+    torch.cuda.empty_cache()
+
+    if got.shape != want.shape:
+        print("shape %s against %s" % (got.shape, want.shape), file=sys.stderr)
+        return 1
+    mse = float(np.mean((got.astype(np.float64) - want.astype(np.float64)) ** 2))
+    psnr = 10 * math.log10(255**2 / max(mse, 1e-12))
+    good = psnr > a.floor
+    verdict = "PASS" if good else "FAIL"
+    print(
+        "  %s video decoder vs diffusers on MiniMax's weights: %.2f dB over %d frames at %dx%d (floor %s)"
+        % (verdict, psnr, got.shape[0], w * 16, h * 16, a.floor)
+    )
+    return 0 if good else 1
+
+
+# --------------------------------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------------------------------
 
@@ -881,6 +970,11 @@ def main() -> int:
     g = sub.add_parser("gate", help="the release gate: this host vs ComfyUI's own run")
     g.add_argument("--require", action="store_true", help="a missing dump or checkpoint is a failure, not a skip")
     sub.add_parser("compare", parents=[comparison_options()], add_help=False, help="one comparison, verbose")
+    v = sub.add_parser("vae", help="the video decoder against diffusers on MiniMax's own weights")
+    v.add_argument("--official", default=str(Path.home() / "h3-models/vae"), help="the released VAE, diffusers layout")
+    v.add_argument("--latents", type=Path, help="a .npy of [24][t][h][w]; a fixed random draw by default")
+    v.add_argument("--device", default="cuda")
+    v.add_argument("--floor", type=float, default=40.0, help="PSNR the decoder must clear")
     s = sub.add_parser("stack", help="locate a regression to a block")
     s.add_argument("--stack", choices=["dit", "te"], required=True)
     s.add_argument("--depths", default="1,10,25,50", help="block counts to compare")
@@ -893,6 +987,11 @@ def main() -> int:
     if a.command == "compare":
         compare(a)
         return 0
+    if a.command == "vae":
+        if not require_torch():
+            print("the VAE check needs torch and diffusers", file=sys.stderr)
+            return 1
+        return vae_parity(a)
     if not require_torch():
         print("stack parity needs torch (and diffusers for --stack dit)", file=sys.stderr)
         return 1

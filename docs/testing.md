@@ -40,6 +40,14 @@ application adapter under `examples/rustler`.
 Loom sources are maintained directly. Python generators, reference model
 implementations, wrappers and one-off studies are retired. Historical reports
 remain historical; they are not automatically revalidated by this suite.
+`python3 scripts/parity.py vae` is the one check anchored genuinely upstream: the
+host's tiled f16 decoder against diffusers' `AutoencoderKLMiniMaxH3` reading the
+weights MiniMax released, rather than against ComfyUI's conversion or a
+reimplementation. It measures the f16 narrowing plus whatever the Loom decoder
+does differently, and clears 62.5 dB PSNR at 384x320x22. It needs `diffusers`,
+`torch` and the released VAE in diffusers layout (`~/h3-models/vae`); no
+transformer, so it costs 10 GB rather than 62.
+
 Whole-model parity lives in `scripts/parity.py`, outside this suite and outside
 `scripts/test.sh`: it needs the checkpoints, a device and dumps produced inside the
 ComfyUI container by `scripts/comfy_dump.py`, and it takes about eleven minutes.
@@ -71,7 +79,9 @@ This replaces 45 sources with 14 modules, removing about 8,100 Loom lines.
 Tile geometry, LDS staging, prefetch and exported binding/configuration contracts
 remain the same. Separate families retain different native element types,
 specialized wide/fast/fused schedules and floating SwiGLU epilogues. A shared
-vision GELU candidate failed bitwise comparison and was excluded.
+vision GELU candidate failed bitwise comparison and was excluded. The cause is
+an [illegal dual-FMA register pairing in Loom](../experiments/vision_gelu_vopd/README.md),
+reproduced independently of the GELU formula.
 
 To reproduce the comparison, extract the pre-consolidation sources:
 
