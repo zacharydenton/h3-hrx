@@ -97,16 +97,20 @@ pub struct Kernel {
 
 impl Kernel {
     /// The loaded kernel, building the outstanding batch if this is the first call that needs it.
-    pub(crate) fn resolve(&self, stream: &mut hrx::Stream) -> Result<Arc<hrx::Kernel>> {
+    pub(crate) fn resolve(&self, stream: &mut hrx::Stream) -> Result<&hrx::Kernel> {
         if let Some(kernel) = self.cell.get() {
-            return Ok(kernel.clone());
+            return Ok(kernel);
         }
-        self.queue.flush(stream)?;
-        // Every queued request fills its own cell, so a batch that reported success built this one.
-        self.cell
-            .get()
-            .cloned()
-            .ok_or_else(|| Error::Io("a kernel outlived the compiler that queued it".into()))
+        // A batch reports the first kernel in it that would not build, which is not necessarily this
+        // one — so ask for the cell again before passing that failure on as though it were ours.
+        let outcome = self.queue.flush(stream);
+        if let Some(kernel) = self.cell.get() {
+            return Ok(kernel);
+        }
+        outcome?;
+        Err(Error::Io(
+            "a kernel outlived the compiler that queued it".into(),
+        ))
     }
 }
 
@@ -139,16 +143,42 @@ impl Queue {
             return Ok(());
         }
         let artifacts = compile_all(&requests, &Compiler::cache_dir(&self.cache)?);
-        let mut loaded = self.loaded.lock().expect("compiler cache poisoned");
-        for (request, artifact) in requests.into_iter().zip(artifacts) {
-            // Safety: verified artifact from trusted model source and configured compiler.
-            let kernel = Arc::new(unsafe { stream.load_artifact(&artifact?)? });
-            let kernel = loaded.entry(request.tag).or_insert(kernel).clone();
-            for cell in request.cells {
-                let _ = cell.set(kernel.clone());
+        let mut outcome = Ok(());
+        let mut unbuilt = Vec::new();
+        {
+            let mut loaded = self.loaded.lock().expect("compiler cache poisoned");
+            for (request, artifact) in requests.into_iter().zip(artifacts) {
+                // Safety: verified artifact from trusted model source and configured compiler.
+                let built = artifact
+                    .map_err(Error::from)
+                    .and_then(|a| Ok(unsafe { stream.load_artifact(&a) }?));
+                let kernel = match built {
+                    Ok(kernel) => Arc::new(kernel),
+                    Err(error) => {
+                        // A kernel that will not build is that kernel's failure and no one else's, so
+                        // the batch carries on and the rest of it is loaded. This one goes back on the
+                        // queue still wanted: dropping it would leave the handles that asked for it
+                        // holding an empty cell with nothing to say about why, where returning it
+                        // means the next attempt reports the same failure again.
+                        unbuilt.push(request);
+                        if outcome.is_ok() {
+                            outcome = Err(error);
+                        }
+                        continue;
+                    }
+                };
+                let kernel = loaded.entry(request.tag).or_insert(kernel).clone();
+                for cell in request.cells {
+                    let _ = cell.set(kernel.clone());
+                }
             }
         }
-        Ok(())
+        if !unbuilt.is_empty() {
+            let mut pending = self.pending.lock().expect("kernel queue poisoned");
+            unbuilt.append(&mut pending);
+            *pending = unbuilt;
+        }
+        outcome
     }
 }
 
@@ -237,6 +267,13 @@ impl Compiler {
     /// the crate's default. Whichever comes first fixes it for this `Compiler`.
     fn compiler(&self, target: Option<&hrx::Target>) -> Result<&hrx::loom::Compiler> {
         if let Some(c) = self.compiler.get() {
+            if target.is_some_and(|target| target != c.target()) {
+                return Err(Error::Io(format!(
+                    "compiler target {} differs from stream target {}",
+                    c.target().as_str(),
+                    target.unwrap().as_str()
+                )));
+            }
             return Ok(c);
         }
         let options = hrx::loom::CompilerOptions {
@@ -246,7 +283,7 @@ impl Compiler {
         };
         let compiler = hrx::loom::Compiler::with_options(self.library.as_deref(), options)?;
         let _ = self.compiler.set(compiler);
-        Ok(self.compiler.get().expect("compiler initialized"))
+        self.compiler(target)
     }
     fn source(&self, stem: &str) -> Result<Arc<str>> {
         if let Some(source) = self
@@ -287,6 +324,7 @@ impl Compiler {
     fn module(&self, target: Option<&hrx::Target>, stem: &str) -> Result<hrx::loom::Module> {
         let mut modules = self.modules.lock().expect("module cache poisoned");
         if let Some(module) = modules.get(stem) {
+            self.compiler(target)?;
             return Ok(module.clone());
         }
         let source = self.source(stem)?;
@@ -446,6 +484,53 @@ mod tests {
         }
         assert_eq!(num(f64::INFINITY), "inf");
         assert_eq!(num(f64::NEG_INFINITY), "-inf");
+    }
+
+    /// A batch is not all-or-nothing for the requests behind the one that failed.
+    ///
+    /// The failing kernel is asked for first here, so everything after it is still queued when the
+    /// batch gives up. Those handles are held by their callers and are still wanted: losing them
+    /// would turn a kernel that builds perfectly well into a handle that can never be resolved and
+    /// cannot say why.
+    #[test]
+    #[ignore = "requires gfx1151 and provisioned HRX"]
+    fn a_failed_batch_still_builds_the_requests_behind_it() {
+        let mut stream = hrx::Stream::open().expect("stream");
+        let compiler = Compiler::new(None, "", "");
+        let cfg: Cfg = vec![
+            ("h3.gn_silu_f16.channels".into(), "128".into()),
+            ("h3.gn_silu_f16.groups".into(), "32".into()),
+            ("h3.gn_silu_f16.plane".into(), "64".into()),
+            ("h3.gn_silu_f16.rows_bound".into(), "64".into()),
+            ("h3.gn_silu_f16.eps".into(), num(1e-5)),
+        ];
+        let doomed = compiler
+            .get(&mut stream, "gn_silu_f16", "h3_no_such_export", &cfg)
+            .expect("a request is recorded without being built");
+        let wanted = compiler
+            .get(&mut stream, "gn_silu_f16", "h3_gn_silu_f16", &cfg)
+            .expect("a request is recorded without being built");
+
+        let message = compiler.flush(&mut stream).unwrap_err().to_string();
+        assert!(message.contains("h3_no_such_export"), "{message}");
+        // the one behind it builds, and the failure is still the failure it was
+        assert!(wanted.resolve(&mut stream).is_ok(), "{message}");
+        let again = doomed.resolve(&mut stream).unwrap_err().to_string();
+        assert!(again.contains("h3_no_such_export"), "{again}");
+    }
+
+    #[test]
+    #[ignore = "requires the provisioned Loom compiler"]
+    fn cached_modules_reject_a_different_stream_target() {
+        let compiler = Compiler::new(None, "", "");
+        let first = hrx::Target::new("gfx1151").unwrap();
+        let other = hrx::Target::new("gfx1100").unwrap();
+        compiler.module(Some(&first), "prepare_i8_family").unwrap();
+        let error = match compiler.module(Some(&other), "prepare_i8_family") {
+            Err(error) => error,
+            Ok(_) => panic!("a cached module concealed a target mismatch"),
+        };
+        assert!(error.to_string().contains("differs from stream target"));
     }
 
     #[test]

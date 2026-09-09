@@ -320,7 +320,7 @@ impl Session {
 
     /// Model-space latents to `[frames][height][width][3]` RGB8.
     ///
-    /// Arguments are checked before anything is written, so an [`Error::Invalid`] leaves `out` as it
+    /// Arguments are checked before anything is written, so an [`crate::Error::Invalid`] leaves `out` as it
     /// was. A failure raised once the decode is under way — a device error, or a cancelled run —
     /// can leave it *partly* written, because the decoder commits each temporal chunk as it
     /// finishes rather than staging a whole clip. Read `out` only after this returns `Ok`.

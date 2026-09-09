@@ -16,7 +16,7 @@ hardware, compiler, or runtime is a failure, never a silent pass. HRX provisions
 and caches the compiler and runtime. `HRX_OFFLINE=1` requires an existing bundle.
 
 Use the shared HRX crate for native loading, allocation, scalar packing, dispatch,
-compilation, caching and FFI guards. Model code owns its source selection, shapes,
+compilation and caching. Model code owns its source selection, shapes,
 weight layout and numerical semantics. `Session` is the interface; keep Rustler
 adapters in the consuming application.
 

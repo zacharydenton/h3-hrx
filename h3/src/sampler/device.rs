@@ -75,8 +75,8 @@ impl Euler {
             self.video_kernel.resolve(stream)?,
         );
         for (kernel, buffer, (sigma, ratio)) in [
-            (&kernels.0, &self.audio, audio),
-            (&kernels.1, &self.video, video),
+            (kernels.0, &self.audio, audio),
+            (kernels.1, &self.video, video),
         ] {
             let mut constants = hrx::Constants::new();
             constants.push(sigma)?;

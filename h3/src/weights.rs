@@ -175,7 +175,7 @@ impl Weights {
     /// match is a wiring error and fails here rather than reading past an allocation later.
     ///
     /// Rows that are one straight run of the mapping at their own pitch go up chunk by chunk with no
-    /// host copy at all. Anything gathered at a wider pitch is staged a chunk at a time, so the pad
+    /// model-owned staging copy. HRX still copies each chunk into its upload staging. Anything gathered at a wider pitch is staged a chunk at a time, so the pad
     /// between rows stays zero. Either way the file's pages are released once their bytes are on the
     /// device: a tensor is read once, and tens of gigabytes of resident checkpoint would compete with
     /// the device allocations for the same memory on this part.
@@ -250,7 +250,7 @@ impl Weights {
                 segments,
             } => {
                 if segments.len() == 1 && pitch_bytes == row_bytes {
-                    // one straight run: the mapping is the staging buffer
+                    // one straight run: borrow the mapping directly for HRX to stage
                     let segment = &segments[0];
                     let entry = self.file.at(&segment.tensor)?;
                     let all = self.file.bytes(entry);
@@ -309,7 +309,7 @@ impl Weights {
                         ));
                     }
                 }
-                // the bytes are on the device; the file's pages are not needed again
+                // HRX owns a staging copy; the file's pages are not needed by queued work
                 for segment in segments {
                     let entry = self.file.at(&segment.tensor)?;
                     let all = self.file.bytes(entry);

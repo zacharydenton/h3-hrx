@@ -62,7 +62,7 @@ impl Profile {
 ///
 /// # Safety
 ///
-/// Inherits [`hrx::Stream::dispatch_constants`]'s contract: `grid`, `block`, `scalars` and `bindings` must be what
+/// Inherits [`hrx::Stream::dispatch`]'s contract: `grid`, `block`, `scalars` and `bindings` must be what
 /// `kernel` was compiled for. Private to the crate, and every caller goes through [`checked`], which
 /// discharges the binding half of that contract against the extents the kernel was configured with.
 #[allow(clippy::too_many_arguments)]
@@ -103,7 +103,7 @@ pub fn upload_at(
     offset: usize,
     bytes: &[u8],
 ) -> Result<()> {
-    Ok(stream.upload(dst.slice(offset, bytes.len()), bytes)?)
+    Ok(stream.upload(dst.binding().slice(offset, bytes.len())?, bytes)?)
 }
 
 /// A launch whose bindings have been checked against the extents its kernel addresses.
@@ -151,7 +151,7 @@ pub(crate) fn checked(
     // compiled it.
     unsafe {
         launch(
-            stream, &kernel, profile, stage, grid, block, scalars, bindings,
+            stream, kernel, profile, stage, grid, block, scalars, bindings,
         )
     }
 }
@@ -206,7 +206,7 @@ impl<'v> Args<'v> {
 ///
 /// So the check happens where the values are written, and the bound they were checked against
 /// travels with them in this type. A kernel takes these rows only when its own table is at least
-/// that wide, which is what [`ClassRows::against`] decides. The buffer is only ever written here,
+/// that wide, which is what `ClassRows::against` decides. The buffer is only ever written here,
 /// so a `Classes` that exists has been checked.
 pub struct Classes {
     buf: hrx::Buffer,

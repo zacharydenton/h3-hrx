@@ -640,7 +640,6 @@ impl AudioVae {
             if len != l_out {
                 return other(format!("audio length {len} != {l_out}"));
             }
-            stream.synchronize()?;
             stream.read(
                 r2b,
                 crate::vvae::as_bytes_mut(&mut staged[ch * l_out..(ch + 1) * l_out]),

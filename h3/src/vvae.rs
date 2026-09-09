@@ -344,7 +344,6 @@ impl VideoVae {
         // read straight into the f16 buffer the unpatchify converts from, rather than into bytes and
         // then through a second allocation
         let out16 = &mut b.stage_out;
-        stream.synchronize()?;
         stream.read(
             b.out16.slice(0, n * VAE_OUT * 2),
             bytes_mut(&mut out16[..n * VAE_OUT]),
@@ -924,7 +923,6 @@ impl VideoVae {
         // the head emits 64 channels: the first 24 are the posterior's mean, the rest its log variance,
         // which sampling would use and this does not
         let mut mom = vec![half::f16::ZERO; m * 64];
-        stream.synchronize()?;
         stream.read(y.slice(0, mom.len() * 2), bytes_mut(&mut mom))?;
         let mut latent = vec![0.0f32; LATENT_CH * m];
         for t in 0..t_len {

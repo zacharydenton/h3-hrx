@@ -132,7 +132,7 @@ impl Projection {
             // unique output within the checked allocation, across all launches.
             unsafe {
                 stream.dispatch(
-                    &kernel,
+                    kernel,
                     [self.count.div_ceil(256) as u32, 1, 1],
                     [256, 1, 1],
                     &constants,

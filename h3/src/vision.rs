@@ -399,7 +399,6 @@ pub fn embed(
         out5.slice(0, m * VOUT * 4),
         crate::vvae::as_bytes_mut(&mut merged),
     )?;
-    stream.synchronize()?;
     Ok(Embedding {
         merged,
         deepstack,

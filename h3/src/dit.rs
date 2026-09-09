@@ -232,7 +232,6 @@ impl Dit {
     /// The sequence's first `rows` rows, `[rows][5376]` f32 — what `h3_text_in` hands back.
     pub fn read_rows(&self, stream: &mut hrx::Stream, rows: usize, out: &mut [f32]) -> Result<()> {
         let seq = self.seq.as_ref().expect("a sequence has been sized");
-        stream.synchronize()?;
         stream.read(
             seq.x.slice(0, rows * HID * 4),
             crate::vvae::as_bytes_mut(out),
@@ -1302,7 +1301,6 @@ impl Dit {
                 &[n * 4, n * 4, groups * 8],
             )?;
             let mut ps = vec![0.0f32; groups * 2];
-            stream.synchronize()?;
             stream.read(
                 cb.partials.slice(0, groups * 8),
                 crate::vvae::as_bytes_mut(&mut ps),

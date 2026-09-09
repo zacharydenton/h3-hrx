@@ -56,3 +56,39 @@ It calls the Rust API directly. No Rustler dependency is added to H3 or HRX.
 `loomrun` is gone: it existed to launch one kernel for the Python test harness,
 and the kernel tests dispatch in process now. The equivalent runner lives in the
 shared crate for anyone who wants it.
+
+## Execution costs
+
+Weight uploads borrow checkpoint chunks or reuse a host buffer for padded rows.
+HRX copies them into owned staging before returning, so file pages can be released
+without waiting for GPU completion. These are staged transfers, not zero-copy DMA.
+
+Prepared kernel handles borrow their loaded export during each dispatch; they do
+not clone an `Arc` or take the compiler queue lock after the first resolution.
+A compiler is fixed to one target and rejects a different stream target even on
+a module-cache hit. `Stream::read` supplies the completion wait for host readback;
+normal inference does not enable per-kernel profiling.
+
+Fixed sequences and a separate copy stream are not used. Weights become resident
+on first use, and later steps reuse them. Adding overlapping first-use uploads or
+graph recording needs model-level measurements, including peak memory and changing
+bindings, rather than a claim based on the raw dispatch cost alone.
+
+## Integration checks, 2026-09-09
+
+Workspace CPU tests, clippy with warnings denied, library rustdoc, and all 19
+native tests passed. The native suite covers compiler target checks, recovery from
+a batch holding a kernel that will not build, conditioning, resident sampling,
+GEMMs, attention and convolutions. Repeat it with:
+
+```sh
+HRX_OFFLINE=1 cargo test -p h3 -- --ignored --test-threads=1
+HRX_OFFLINE=1 cargo run --release -p h3 --example dispatch_cost
+```
+
+Three release runs on Ryzen AI MAX+ 395 / gfx1151 with Rust 1.95 nightly and
+hrx-rs 0.1.0 measured 159–176 ns of host time per `Prepare::run`, including binding
+checks, kernel resolution and scalar packing. Each run takes the median of nine
+2,048-launch batches after three warmups and checks the output. Completed batches
+averaged 2.15–2.21 µs per kernel. This is a small prepared-kernel benchmark; full
+video/audio latency, checkpoint-scale load time and peak memory were not remeasured.
