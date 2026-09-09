@@ -450,7 +450,12 @@ fn vision_bf16_matmuls_match_rounded_operands_and_epilogues() {
             vec![bytes(&input), bytes(&w), bytes(&b), vec![0; m * n * 4]]
         };
         let stem = format!("matmul_{kind}_bf16_wmma");
-        let out = h.run(
+        let out = h.run_module(
+            if kind == "resid" {
+                &stem
+            } else {
+                "matmul_bf16_family"
+            },
             &stem,
             &cfg(&[("k_size", k), ("n_size", n)]),
             [1, m.div_ceil(64) as u32, 1],
@@ -1208,7 +1213,7 @@ fn float_gemms_match_rounded_operands_across_modes_and_epilogues() {
                 };
                 let module = format!("gemm_{}_family", if bf { "bf16" } else { "f16" });
                 let out = h.run_module(
-                    if mode == "swiglu" { &stem } else { &module },
+                    &module,
                     &stem,
                     &config,
                     [1, m.div_ceil(256) as u32, 1],

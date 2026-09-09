@@ -70,9 +70,6 @@ fn main() {
     println!("stem,M,K,N,weights,artifact_identical,baseline_ms,candidate_ms,ratio");
     for dtype in ["i4", "i8", "f16", "bf16"] {
         for mode in ["plain", "resid", "swiglu"] {
-            if mode == "swiglu" && !dtype.starts_with('i') {
-                continue;
-            }
             for biased in [false, true] {
                 let stem = format!(
                     "gemm_{dtype}{}_256{}{}",

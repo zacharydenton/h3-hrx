@@ -1,6 +1,7 @@
 //! Compare resident decoders using two explicit source directories and identical latents.
 //! compare_decode BASELINE_DIR CHECKPOINT LATENTS HEIGHT WIDTH FRAMES
 //! Baseline modules contain the original exports, grouped into the current module files.
+//! H3_BASELINE_LOOM_COMPILE optionally compares a compiler upgrade as well.
 use h3::{compile::Compiler, dispatch::Profile, layout::shape_for, vvae::VideoVae};
 use std::{path::Path, time::Instant};
 
@@ -30,8 +31,9 @@ fn main() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
     let cache = hrx::bundle::cache_root().unwrap().join("kernels");
     let exe = std::env::var("LOOM_COMPILE").unwrap_or_else(|_| "loom-compile".into());
+    let baseline_exe = std::env::var("H3_BASELINE_LOOM_COMPILE").unwrap_or_else(|_| exe.clone());
     let compilers = [
-        Compiler::new(&exe, &a[1], &cache),
+        Compiler::new(&baseline_exe, &a[1], &cache),
         Compiler::new(&exe, root, &cache),
     ];
     let gpu = hrx::Gpu::open().unwrap();

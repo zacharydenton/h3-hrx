@@ -38,18 +38,22 @@ You need Linux, a `gfx1151` device with its kernel driver, Rust and ffmpeg.
 The shared `hrx.rs` crate provisions prebuilt Loom, HRX and compatible HSA.
 Nothing here needs Python.
 
-With the sibling `hrx.rs` checkout:
+With access to the private `hrx.rs` repository and an authenticated GitHub CLI:
 
 ```sh
-cargo install --locked --path ../hrx.rs --features runner
-hrx prepare ../hrx.rs/artifacts/hrx-linux-x86_64-gfx1151.tar.gz
+cargo install --locked --git https://github.com/zacharydenton/hrx.rs \
+  --rev b26b95349fbb03e748947da3cbb0e3ffe9899649 --features runner
+mkdir -p build
+gh release download native-9e4fff00d244 --repo zacharydenton/hrx.rs \
+  --pattern hrx-linux-x86_64-gfx1151.tar.gz --dir build --clobber
+hrx prepare build/hrx-linux-x86_64-gfx1151.tar.gz
 cargo install --locked --path cli
 # Build the C library and headers too:
 bash scripts/build_host.sh
 ```
 
-The native bundle is currently a tested local candidate. The automatic download
-path is implemented, but its public release has not been uploaded. See
+The pinned native release includes the Loom consolidation fixes. It is hosted
+in the private HRX repository; the commands above prepare it locally. See
 [shared HRX integration](docs/shared-hrx.md) for overrides, offline use, C ABI and
 Rustler. Kernel sources and the tokenizer are embedded in installed binaries;
 the default compiler cache is in the writable per-user HRX cache. `--root`

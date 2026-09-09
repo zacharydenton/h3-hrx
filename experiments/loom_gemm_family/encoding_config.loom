@@ -1,4 +1,4 @@
-// Reproducer: an exact encoding config survives into source-to-low.
+// Regression: exact encoding configuration feeds native fragments.
 amdgpu.target<gfx11-generic> @probe_gfx11 {subgroup_size = 32}
 
 config.decl @probe.schema : encoding<schema>

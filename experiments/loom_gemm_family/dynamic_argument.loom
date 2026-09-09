@@ -1,5 +1,4 @@
-// Reproducer: specialization fixes the caller's vector width, but the template
-// argument still has a dynamic width when inline-callables compares the types.
+// Regression: dependent vector arguments specialize at template boundaries.
 amdgpu.target<gfx11-generic> @probe_gfx11 {subgroup_size = 32}
 
 config.decl @probe.registers : %value: index where [range(%value, 2, 4), mul(%value, 2)]

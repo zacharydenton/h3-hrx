@@ -1,6 +1,6 @@
 # Loom compiler used by this project
 
-These four patches apply on top of `ROCm/hrx-system` commit
+These six patches apply on top of `ROCm/hrx-system` commit
 `c9855b47e96e7eb1cbb5b81b1de973762982ae95`. They preserve the compiler and runtime
 changes needed by this project without requiring access to a local branch.
 
@@ -31,6 +31,15 @@ changes needed by this project without requiring access to a local branch.
    [`675cc43bc`](https://github.com/zacharydenton/hrx-system/commit/675cc43bc).
    See the [reproducer and GPU evidence](../../experiments/vision_gelu_vopd/README.md).
 
+5. `0005-materialize-encoding-config.patch` — materialize exact encoding
+   configuration as `encoding.define` before native lowering. Includes i4/i8
+   fragment consumers, returned schemas/layouts, and unresolved declarations.
+   Fork commit [`2fb396c2f`](https://github.com/zacharydenton/hrx-system/commit/2fb396c2f).
+6. `0006-bind-dependent-inline-types.patch` — bind callee dimensions and encoding
+   references to call-site values before checking inline argument and return
+   types. Exact facts resolve static dimensions without weakening type checks.
+   Fork commit [`9e4fff00d`](https://github.com/zacharydenton/hrx-system/commit/9e4fff00d).
+
 From this project's root, create a separate compiler checkout:
 
 ```sh
@@ -57,17 +66,21 @@ cd "$H3_SOURCE"
 bash scripts/test.sh
 ```
 
-`libhrx_src_libhrx_hrx` builds `libhrx.so`. Nothing here links it, and nothing
-here needs this build at all: the model and its tests take a digest-verified
-`libhrx` and `loom-compile` from the HRX bundle. What this checkout is for is
-rebuilding that compiler. Patches 0001–0003 reproduce the source changes used
-for the recorded measurements; patch 0004 adds the VOPD correctness fix.
-`LOOM_COMPILE` substitutes the result for the bundle's compiler. The currently
-pinned bundle does not contain patch 0004; merely applying these patches does
-not change the compiler selected by the model.
+`libhrx_src_libhrx_hrx` builds `libhrx.so`. The model normally loads the
+pinned HRX bundle, so a local native build is only needed for compiler development.
+`LOOM_COMPILE` selects a rebuilt compiler explicitly.
 
-Validated on 2026-09-09: all four patches apply in order to the pinned revision.
-The compiler fix was built in an isolated checkout and passed 17 generator tests,
-16 native AMDGPU/schedule fixture suites, and all 15 H3 GPU kernel tests. The
-previously failing shared vision GELU kernel matched all 4,160 baseline outputs
-bitwise. The patches retain their upstream source license headers.
+The current bundle contains the compiler built from fork commit
+`9e4fff00d244a8b5300d03569addd019ec8e262f` (patches 0001, 0002, 0004–0006).
+Compiler SHA-256:
+`74a0c9dc5f387e89b85a3cd9d2000644dc0e20a0657d9fe79dfcd627ff5ecdb6`.
+Runtime libraries retain their previous bundle bytes; patch 0003 records the
+runtime source fix, while the original runtime build provenance remains
+unverified. See [bundle setup](../../docs/setup.md).
+
+Validated on 2026-09-09: all six patches apply in order to the pinned revision,
+and the resulting compiler sources match the tested fork commits. 550 available
+Loom fixture suites pass. Four other source-low suites also fail on a rebuilt
+unchanged parent; optional unbuilt test executables were excluded. All 15 H3
+GPU kernel tests pass with bitwise source-baseline comparisons and independent
+CPU oracles. The patches retain their upstream source license headers.

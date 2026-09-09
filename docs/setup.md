@@ -11,22 +11,25 @@ Run commands from the repository root unless stated otherwise.
 - `cargo` (Rust). Everything outside `h3/kernels/` is Rust: the library and the
   `h3` command. No ROCm headers and no `hipcc` — the runtime surface is `libhrx`,
   loaded on demand from the HRX bundle.
-- A checkout of the [`hrx.rs`](shared-hrx.md) crate beside the directory holding
-  this one. It is a path dependency, so nothing here builds without it, and it
-  supplies the Loom compiler, `libhrx` and a compatible HSA as a pinned,
-  digest-verified native bundle. No ROCm headers, no `hipcc`, no LLVM build.
+- Access to the private [`hrx.rs`](shared-hrx.md) Git repository and an
+  authenticated GitHub CLI (`gh`) to download its native release. Cargo pins
+  the crate revision; no sibling checkout is required. The bundle supplies
+  Loom, `libhrx`, and compatible HSA without a local LLVM or ROCm build.
 
 `h3` fetches the checkpoints itself. Nothing in this repository needs Python.
 
 ## Toolchain and build
 
-The native bundle is a tested local candidate; its public release has not been
-uploaded yet, so prepare it from the sibling checkout rather than letting HRX
-fetch it:
+The pinned `native-9e4fff00d244` release contains the corrected compiler.
+Download it with repository credentials and prepare the verified local cache:
 
 ```sh
-cargo install --locked --path ../hrx.rs --features runner
-hrx prepare ../hrx.rs/artifacts/hrx-linux-x86_64-gfx1151.tar.gz
+cargo install --locked --git https://github.com/zacharydenton/hrx.rs \
+  --rev b26b95349fbb03e748947da3cbb0e3ffe9899649 --features runner
+mkdir -p build
+gh release download native-9e4fff00d244 --repo zacharydenton/hrx.rs \
+  --pattern hrx-linux-x86_64-gfx1151.tar.gz --dir build --clobber
+hrx prepare build/hrx-linux-x86_64-gfx1151.tar.gz
 bash scripts/build_host.sh
 ```
 

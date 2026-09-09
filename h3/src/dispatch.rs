@@ -523,7 +523,7 @@ impl Gemm {
         }
         let module = if tile == Tile::Plain && quantised(elem) {
             "gemm_packed_256".into()
-        } else if tile == Tile::Plain && mode != "swiglu" {
+        } else if tile == Tile::Plain {
             format!("gemm_{elem}_family")
         } else {
             stem.clone()
@@ -971,7 +971,16 @@ impl Matmul16 {
             (format!("{ns}n_size"), n.to_string()),
         ];
         Ok(Self {
-            kernel: c.get(gpu, &stem, &format!("h3_{stem}"), &cfg)?,
+            kernel: c.get(
+                gpu,
+                if kind == "resid" {
+                    &stem
+                } else {
+                    "matmul_bf16_family"
+                },
+                &format!("h3_{stem}"),
+                &cfg,
+            )?,
             k,
             n,
             resid: kind == "resid",
@@ -1202,7 +1211,7 @@ mod tests {
             let stem = gemm_stem(elem, mode, bias, gate_first, tile);
             let module = if tile == Tile::Plain && quantised(elem) {
                 "gemm_packed_256".into()
-            } else if tile == Tile::Plain && mode != "swiglu" {
+            } else if tile == Tile::Plain {
                 format!("gemm_{elem}_family")
             } else {
                 stem.clone()

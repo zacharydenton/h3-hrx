@@ -94,19 +94,20 @@ harness, so re-run the comparison by hand when that path changes.
 
 Production sources use native Loom templates and specialization. The packed
 256×128 GEMMs share INT4/INT8 bodies through schema providers and required
-unrolling. Float GEMMs share bias epilogues within each element type; preparation
-shares its narrowing or Hadamard/packing finish. Four/eight-wave attention,
+unrolling. Float GEMMs share their multiply loop across plain, residual, and
+both SwiGLU orderings within each native element type; preparation shares its
+narrowing or Hadamard/packing finish. Four/eight-wave attention,
 head-64/head-128 rotary normalization and residual video convolution also share
 bodies. The host selects a module and export explicitly; removed filenames have
 no aliases or fallback lookup.
 
-This replaces 45 sources with 14 modules, removing about 8,100 Loom lines.
+Across both passes, 52 sources become 15 modules, removing 10,086 Loom lines.
 Tile geometry, LDS staging, prefetch and exported binding/configuration contracts
-remain the same. Separate families retain different native element types,
-specialized wide/fast/fused schedules and floating SwiGLU epilogues. A shared
-vision GELU candidate failed bitwise comparison and was excluded. The cause is
-an [illegal dual-FMA register pairing in Loom](../experiments/vision_gelu_vopd/README.md),
-reproduced independently of the GELU formula.
+remain the same. Separate families retain different native element types and
+specialized wide/fast/fused schedules. Vision bias, tanh GELU, and erf GELU
+now share a BF16 module. That step required the
+[VOPD compiler fix](../experiments/vision_gelu_vopd/README.md), which is included
+in the pinned native bundle.
 
 To reproduce the comparison, extract the pre-consolidation sources:
 
@@ -117,6 +118,7 @@ export H3_KERNEL_BASELINE="$PWD/build/kernel-baseline/h3/kernels"
 cargo test -p h3 --test kernels -- --ignored --test-threads=1 --nocapture
 H3_KERNEL_TIMING=1 cargo test -p h3 --test kernels preparation -- --ignored --test-threads=1 --nocapture
 cargo run --release -p h3 --example compare_gemm -- "$H3_KERNEL_BASELINE"
+cargo run --release -p h3 --example compare_vision -- "$H3_KERNEL_BASELINE"
 ```
 
 The test harness compares every binding bit-for-bit before the independent CPU
@@ -142,14 +144,51 @@ cargo run --release -p h3 --example compare_decode -- \
 
 Latents are little-endian f32 in `[24, 7, 30, 54]` order for that shape. The
 diagnostic loads both decoders once, warms each, alternates ten timed pairs and
-requires identical decoded RGB for every pair. It isolates source changes with
-the same host and compiler; it does not replace whole-model parity testing.
+requires identical decoded RGB for every pair. By default it compares source
+changes with the same host and compiler. Set `H3_BASELINE_LOOM_COMPILE` to the
+previous compiler executable to include a compiler upgrade in the comparison.
+Neither mode replaces whole-model parity testing.
 
-On gfx1151, the consolidation passed all 15 kernel tests with bitwise baseline
-comparison, plus the two resident conditioning/sampler tests. The 480×864,
+The first consolidation pass on gfx1151 passed all 15 kernel tests with bitwise
+baseline comparison, plus the two resident conditioning/sampler tests. The 480×864,
 22-frame decoder comparison produced identical RGB in all ten pairs: median
 4.542 s before and 4.544 s after (+0.05%). Decoder-sized GEMM comparisons covered
 120 export/shape/cache cases; extending the noisy INT4 SwiGLU cases to 40 pairs
 left no repeatable slowdown above 2%. These measurements used native bundle
 `750f265ce4fd6a194fbac12a795c96cb19cc9ed3696fd5123c5edd5589a4cd05`, compiler SHA-256
 `a2902bba66bec779d95d15f6bac573072c1940dccd34215663c9a59842941dfa`, on 2026-09-09.
+
+The second pass uses bundle
+`34591d78d625f9c696657820d04615f3f55a134010a9354c0e455a4c2e60caa0`, compiler SHA-256
+`74a0c9dc5f387e89b85a3cd9d2000644dc0e20a0657d9fe79dfcd627ff5ecdb6`.
+All 15 GPU kernel tests pass again, including every float GEMM export and all
+three shared vision epilogues, with bitwise baseline and CPU-oracle checks.
+Workspace tests, formatting and Clippy pass. The compiler's available fixture
+corpus passes 550 suites; [the patch record](../patches/loom/README.md) documents
+the pre-existing failures and excluded optional executables.
+
+Resource checks across 36 float export/shape combinations retain the same VGPR
+counts, 55,296 bytes of LDS, no scratch memory, and 64 static WMMA instructions.
+SGPR counts are unchanged except unbiased SwiGLU, which drops from 24 to 22.
+
+Second-pass resident timings on 2026-09-09 compare original sources with shared
+modules using the same corrected compiler. Every case checks bitwise output:
+
+| Family | Shape/cache cases | Candidate time change |
+| --- | ---: | ---: |
+| Vision bias / GELU / erf GELU | 30 | −2.56% to +1.20% |
+| FP16 GEMM | 36 | −1.08% to +0.43% |
+| BF16 GEMM | 36 | −0.39% to +1.54% |
+
+Vision and FP16 use ten paired batches; BF16 uses forty. Competing memory-heavy
+jobs caused larger BF16 outliers in earlier runs. The table uses the final full
+BF16 run with its plain exports rechecked as a group after competing GPU work
+ended. No slowdown above 2% repeated. These are source-consolidation comparisons,
+not peak-throughput measurements.
+
+The resident 480×864, 22-frame decoder also produces identical RGB in all ten
+pairs when comparing the original sources and previous bundle's compiler with
+the new sources and compiler. Median times were 4.884 s before and 4.862 s after
+(−0.44%). One baseline execution took 31.533 s on the shared machine, so this
+run establishes output equivalence and gives only a coarse timing check; it
+does not establish an end-to-end speedup.

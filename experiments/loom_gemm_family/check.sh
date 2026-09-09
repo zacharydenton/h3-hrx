@@ -37,6 +37,26 @@ for registers in 2 4; do
   done
 done
 
+# Exact encoding configs and dependent vector arguments compile end to end.
+for registers in 2 4; do
+  bits=$((registers * 2))
+  stem="$out/config-i$bits"
+  "$compiler" experiments/loom_gemm_family/encoding_config.loom \
+    --backend=amdgpu-hal --target=gfx1151 \
+    --config="probe.registers=$registers" \
+    --config="probe.schema=#encoding.operand<element_format=i$bits, payload_elements=16, payload_registers=$registers>" \
+    --output="$stem.hal" --emit-target-artifact="$stem.hsaco"
+  "$objdump" -d --mcpu=gfx1151 "$stem.hsaco" > "$stem.asm"
+  awk -v opcode="v_wmma_i32_16x16x16_iu$bits" '
+    $1 == opcode { mma++ }
+    $1 ~ /^v_wmma/ && $1 != opcode { bad++ }
+    END { exit mma != 1 || bad }' "$stem.asm"
+  "$compiler" experiments/loom_gemm_family/dynamic_argument.loom \
+    --backend=amdgpu-hal --target=gfx1151 --config="probe.registers=$registers" \
+    --output="$out/argument-$registers.hal"
+  printf 'PASS i%s encoding config and vector<%sxi32> template argument\n' "$bits" "$registers"
+done
+
 # The public config contracts must reject unsupported family members.
 for invalid in probe.registers=3 probe.epilogue=2; do
   case "$invalid" in

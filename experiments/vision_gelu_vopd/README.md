@@ -1,6 +1,6 @@
 # Vision GELU: illegal dual-FMA register pairing
 
-The rejected vision family exposes a bug in Loom's native AMDGPU VOPD planner.
+The shared vision family exposed a bug in Loom's native AMDGPU VOPD planner.
 The template preserves the GELU arithmetic. Its different register allocation
 causes the planner to combine two FMAs whose addends use the same SRC2 bank.
 
@@ -10,9 +10,9 @@ and fork commit
 [`675cc43bc`](https://github.com/zacharydenton/hrx-system/commit/675cc43bc).
 The rebuilt compiler passes both cases below. On gfx1151, all three shared
 vision epilogues match the original baseline bitwise (4,160 outputs each), and
-all 15 H3 GPU kernel tests pass. The pinned native bundle still contains the
-original compiler; use the [patched compiler build](../../patches/loom/README.md)
-through `LOOM_COMPILE` to select the fix.
+all 15 H3 GPU kernel tests pass. The production `matmul_bf16_family.loom` now uses the shared body. The pinned
+native bundle contains the fix; a developer compiler can still be selected
+through `LOOM_COMPILE`. See the [compiler patch record](../../patches/loom/README.md).
 
 ## Minimal CPU reproducer
 
@@ -74,7 +74,8 @@ offending pair used addends `v30` and `v28`, both even. Replacing that pair and
 its preceding four-byte delay with two ordinary FMAs preserved code size and
 branch targets and restored bitwise agreement. Replacing all 121 `s_delay_alu`
 instructions with long `s_nop` delays did **not** correct the mismatch. These
-were diagnostic artifact edits; production kernels and compiler are unchanged.
+were diagnostic artifact edits. The production consolidation now uses the
+compiler fix instead.
 
 Tested 2026-09-09 with native bundle
 `750f265ce4fd6a194fbac12a795c96cb19cc9ed3696fd5123c5edd5589a4cd05`, compiler SHA-256
