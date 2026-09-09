@@ -51,6 +51,11 @@ those same weights, so the agreement is the quantisation and this implementation
 together: 0.99999 after one block and 0.99865 after all fifty (text 0.9992, audio
 0.9996, video 0.9971). It needs the released `transformer/`, a 62 GB download.
 
+`python3 scripts/parity.py te` walks the host's embedding rows through the
+released bf16 Qwen3-VL, the 50 of 64 decoder layers MiniMax-H3 reads before taking
+the unnormalised hidden state: 0.99995 after fifty. One layer resident at a time.
+It needs the released `text_encoder/`, a 62 GB download.
+
 `python3 scripts/parity.py convert` answers the tensor-level question the other
 two cannot: whether ComfyUI's int8 ConvRot conversion carries the weights MiniMax
 released. The conversion rotates within 256-channel groups, quantises, and

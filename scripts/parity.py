@@ -12,6 +12,7 @@ Run it before a release, not on every change.
     python3 scripts/parity.py vae                      the decoder vs diffusers on MiniMax's weights
     python3 scripts/parity.py dit                      the blocks vs diffusers on MiniMax's weights
     python3 scripts/parity.py convert                  ComfyUI's conversion vs the released weights
+    python3 scripts/parity.py te                       the text encoder vs the released Qwen3-VL
 
 `gate` needs no torch. `stack` needs torch, and `--stack dit` also needs diffusers.
 
@@ -1195,6 +1196,89 @@ def conversion_parity(a) -> int:
 
 
 # --------------------------------------------------------------------------------------------------
+# The text encoder against the released Qwen3-VL
+# --------------------------------------------------------------------------------------------------
+
+def te_parity(a) -> int:
+    """The host's embedding rows through the released bf16 Qwen3-VL layers, one layer resident.
+
+    MiniMax-H3 reads the unnormalised hidden state after the 50th of 64 decoder layers, so this walks
+    the same 50 and compares where the host dumped. The host runs ComfyUI's int8 conversion of these
+    weights; the agreement is that quantisation and this implementation together against the release.
+    """
+    import json
+
+    from safetensors import safe_open
+    from transformers import AutoConfig
+    from transformers.models.qwen3_vl import modeling_qwen3_vl as impl
+
+    directory = Path(a.official)
+    if not (directory / "config.json").is_file():
+        found = sorted((OFFICIAL / "snapshots").glob("*/text_encoder"))
+        if not found:
+            print(f"no released text encoder under {directory}", file=sys.stderr)
+            return 1
+        directory = found[-1]
+
+    depths = [int(x) for x in a.depths.split(",") if x]
+    with tempfile.TemporaryDirectory(prefix="h3-te-official-") as tmp:
+        os.environ["H3_DUMP_BLOCKS"] = tmp
+        os.environ["H3_DUMP_CALL"] = "0"
+        ids = np.asarray(encode_presentation(a.prompt), np.int32)
+        pipe = H3()
+        started = time.time()
+        pipe.text_in(ids)
+        print(f"host text_in in {time.time() - started:.1f} s")
+        pipe.close()
+        x0 = dumped(Path(tmp), "te", "h_in", TEXT_DIM)
+        want = dict((d, dumped(Path(tmp), "te", f"blk_{d - 1:02d}", TEXT_DIM)) for d in depths)
+
+    config = AutoConfig.from_pretrained(str(directory))
+    text = getattr(config, "text_config", config)
+    index = json.loads((directory / "model.safetensors.index.json").read_text())["weight_map"]
+    prefix = "model.language_model.layers."
+    if not any(name.startswith(prefix) for name in index):
+        prefix = "model.layers."
+
+    def tensor(name):
+        with safe_open(str(directory / index[name]), framework="pt", device="cpu") as f:
+            return f.get_tensor(name).to(a.device)
+
+    with torch.device("meta"):
+        layer = impl.Qwen3VLTextDecoderLayer(text, 0)
+    rotary = impl.Qwen3VLTextRotaryEmbedding(text).to(a.device)
+
+    rows = x0.shape[0]
+    ok = True
+    with torch.no_grad():
+        x = torch.from_numpy(x0).to(a.device).to(torch.bfloat16)[None]
+        # mrope carries three axes; a text-only presentation puts them all on one line
+        position = torch.arange(rows, device=a.device)[None].expand(3, 1, rows)
+        rope = rotary(x, position)
+        mask = torch.full(
+            (rows, rows), float("-inf"), device=a.device, dtype=x.dtype
+        ).triu(1)[None, None]
+        for i in range(max(depths)):
+            at = f"{prefix}{i}."
+            state = dict(
+                (name[len(at):], tensor(name)) for name in index if name.startswith(at)
+            )
+            layer.load_state_dict(state, strict=True, assign=True)
+            del state
+            x = layer(x, rope, attention_mask=mask, position_ids=position)
+            if isinstance(x, tuple):
+                x = x[0]
+            if i + 1 in depths:
+                c = cosine(want[i + 1], x[0].float().cpu().numpy())
+                good = c > a.floor
+                ok &= good
+                print(f"  {'PASS' if good else 'FAIL'} after {i + 1:2d} layers: cosine {c:.5f}")
+            if a.device == "cuda":
+                torch.cuda.empty_cache()
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------------------------------
 
@@ -1221,6 +1305,12 @@ def main() -> int:
     c.add_argument("--official", default=str(OFFICIAL), help="the released transformer, diffusers layout")
     c.add_argument("--converted", default=str(DIT), help="the ComfyUI checkpoint the host runs")
     c.add_argument("--floor", type=float, default=0.005, help="relative group-norm error allowed")
+    e = sub.add_parser("te", help="the text encoder against the released Qwen3-VL")
+    e.add_argument("--official", default=str(OFFICIAL), help="the released text encoder")
+    e.add_argument("--depths", default="1,10,25,50", help="layer counts to compare")
+    e.add_argument("--prompt", default="A red fox trotting through a snowy forest at dawn, cinematic")
+    e.add_argument("--device", default="cuda")
+    e.add_argument("--floor", type=float, default=0.99, help="cosine every depth must clear")
     s = sub.add_parser("stack", help="locate a regression to a block")
     s.add_argument("--stack", choices=["dit", "te"], required=True)
     s.add_argument("--depths", default="1,10,25,50", help="block counts to compare")
@@ -1248,6 +1338,11 @@ def main() -> int:
             print("the conversion check needs torch", file=sys.stderr)
             return 1
         return conversion_parity(a)
+    if a.command == "te":
+        if not require_torch():
+            print("the text encoder check needs torch and transformers", file=sys.stderr)
+            return 1
+        return te_parity(a)
     if not require_torch():
         print("stack parity needs torch (and diffusers for --stack dit)", file=sys.stderr)
         return 1
