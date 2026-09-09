@@ -83,10 +83,42 @@ A compiler is fixed to one target and rejects a different stream target even on
 a module-cache hit. `Stream::read` supplies the completion wait for host readback;
 normal inference does not enable per-kernel profiling.
 
-Fixed sequences and a separate copy stream are not used. Weights become resident
-on first use, and later steps reuse them. Adding overlapping first-use uploads or
-graph recording needs model-level measurements, including peak memory and changing
-bindings, rather than a claim based on the raw dispatch cost alone.
+## Video decode is compute-bound, measured 2026-09-09
+
+A 480x864x22 decode runs as fifteen 256x256 spatial tiles. Timed per phase, a warm tile costs about
+20 ms of host enqueue, 271 ms blocked in `read_blocking` -- which drains the queue before it
+transfers 10 MiB -- and 3 ms of unpatchify. Across the decode, every host phase together (latent
+gather, unpatchify, pixel blend) is **106 ms of 25.2 s, 0.4%**. The first tile carries about 21 s of
+one-time weight upload and kernel setup, which amortises over a real clip's 105 tiles.
+
+That is roughly 1.08 ms of GPU time per dispatch against 175 ns to enqueue one, so the decoder is
+bound by its kernels and not by the host. Queuing the readback to hide the host phase is worth about
+1%, and recording the fifteen independent tiles as concurrent workstreams competes for the same
+margin, since the device is already busy for 92% of a tile's wall time.
+
+Larger tiles are not the answer either: one 480x864 tile takes 26.2 s where fifteen 256x256 tiles
+take 25.2 s, despite covering 2.4x less total tile area, because the decoder's attention is quadratic
+in a tile's token count. The 256-pixel tiling is the efficient configuration.
+
+## The audio VAE is compute-bound too, measured 2026-09-09
+
+`docs/archive/notes.md` calls BigVGAN launch-bound, which was true of the torch implementation this
+one replaced. It is not true here. A warm stereo decode of 500 latents takes 1.49 s in process, and
+one latent -- where the ~836 dispatches are the same but the work is not -- takes 121 ms. Under
+`H3_PROFILE=1` that short case reports 126 ms of kernel time against 128 ms of wall, so 145 us per
+dispatch is the kernel running, not the host enqueuing it, and one enqueue costs 175 ns.
+
+The kernels are inefficient at short lengths -- `audio res conv2` averages 635 us over a 1024x5
+tensor -- which is a kernel problem worth its own look, and not one a recording addresses.
+
+Graphs are therefore not used anywhere in this model. All three recordable paths were measured
+first: a denoise step averages tens of milliseconds of GPU work per dispatch, a video decode tile
+about 1.08 ms, and an audio decode 145 us. Against 175 ns to enqueue, none of them is bound by the
+host, and no arrangement of dependencies changes the arithmetic they are actually waiting on.
+
+A separate copy stream is not used either. Weights become resident on first use, and later steps
+reuse them; overlapping those first-use uploads would need its own measurement, including peak
+memory, rather than a claim from the dispatch cost alone.
 
 ## Integration checks, 2026-09-09
 
