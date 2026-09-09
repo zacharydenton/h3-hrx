@@ -1608,3 +1608,95 @@ fn quantized_preparation_matches_group_rotation_and_packing() {
         }
     }
 }
+
+/// A recorded chain replays to the bytes dispatching it produces.
+///
+/// The launches alternate between two buffers, so each one reads what the one before it wrote: a
+/// recording that dropped an edge would let them run together and the last write would not be the
+/// last one to land. Both arms start from the same input and are compared byte for byte.
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn a_recorded_chain_replays_to_what_dispatching_it_produces() {
+    use h3::compile::Compiler;
+    use h3::dispatch::{Prepare, Sink};
+
+    const WIDTH: usize = 256;
+    const TOKENS: u32 = 64;
+    const BYTES: usize = WIDTH * TOKENS as usize * 2;
+
+    let mut stream = Stream::open().expect("gfx1151 device");
+    let compiler = Compiler::new(None, "", "");
+    let prepare = Prepare::build(&compiler, &mut stream, "plain", "f16", WIDTH, 0.0, 1, WIDTH)
+        .expect("prepare");
+    compiler.flush(&mut stream).expect("build the kernel");
+
+    let source: Vec<u8> = (0..BYTES).map(|i| (i % 251) as u8).collect();
+    let buffers: Vec<Buffer> = (0..3)
+        .map(|_| stream.allocate(BYTES).expect("allocate"))
+        .collect();
+    // ping-pong through the middle buffer so every launch depends on the one before it
+    let chain = [(0usize, 1usize), (1, 2), (2, 1), (1, 2), (2, 1)];
+
+    let mut outcome = Vec::new();
+    for recorded in [false, true] {
+        stream
+            .upload_blocking(buffers[0].binding(), &source)
+            .expect("seed the input");
+        for b in &buffers[1..] {
+            stream.fill(b.binding(), 0x7f).expect("poison the outputs");
+        }
+        if recorded {
+            // the recording borrows the stream until `finish`, so it is scoped tightly
+            let mut replay = {
+                let mut graph = stream.graph().expect("graph");
+                {
+                    let mut sink = Sink::Graph {
+                        graph: &mut graph,
+                        after: None,
+                    };
+                    for (from, to) in chain {
+                        prepare
+                            .emit(
+                                &mut sink,
+                                None,
+                                "prepare",
+                                TOKENS,
+                                buffers[from].binding(),
+                                None,
+                                buffers[to].binding(),
+                                None,
+                            )
+                            .expect("record");
+                    }
+                }
+                graph.finish().expect("instantiate")
+            };
+            stream.launch(&mut replay).expect("replay");
+        } else {
+            for (from, to) in chain {
+                prepare
+                    .run(
+                        &mut stream,
+                        None,
+                        "prepare",
+                        TOKENS,
+                        buffers[from].binding(),
+                        None,
+                        buffers[to].binding(),
+                        None,
+                    )
+                    .expect("dispatch");
+            }
+        }
+        let mut got = vec![0u8; BYTES];
+        stream
+            .read_blocking(buffers[1].binding(), &mut got)
+            .expect("read back");
+        outcome.push(got);
+    }
+    assert_ne!(outcome[0], vec![0x7f; BYTES], "the chain wrote nothing");
+    assert_eq!(
+        outcome[0], outcome[1],
+        "the replay differs from the launches"
+    );
+}

@@ -341,6 +341,10 @@ struct Blocks {
     final_out: Projection,
     /// the text rows, kept so they can be restored each step
     text_copy: hrx::Buffer,
+    /// `H3_GRAPH=1`: the fifty blocks recorded once and replayed per step. Every binding, grid and
+    /// constant in them is the same at every step; only the modulation table's contents and the
+    /// residual stream change, and both are buffers the recording already points at.
+    graph: Option<hrx::GraphExec>,
 }
 
 /// A projection and its resident operands, prepared outside the denoise loop.
@@ -702,6 +706,7 @@ impl Dit {
             // the final head has only the video and audio timestep classes
             final_norm: NormMod::build(c, stream, HID, 1e-5, 2)?,
             final_norm_scale: self.weights.at(stream, "h3.final.norm", HID * 4)?,
+            graph: None,
             audio_in: Projection::build(c, stream, &self.weights, "h3.audio_in", AUDIO_CH, HID)?,
             video_in: Projection::build(c, stream, &self.weights, "h3.video_in", VIDEO_PATCH, HID)?,
             final_out: Projection::build(c, stream, &self.weights, "h3.final.out", HID, FINAL_N)?,
@@ -1277,6 +1282,32 @@ impl Dit {
             seq.sin.binding(),
         );
         let Some(cache) = cache else {
+            // The step cache is off, so every step runs all fifty blocks over the same allocations:
+            // record once and replay. With the cache on the host decides after block 0 whether the
+            // rest runs at all, which a recording cannot express, so that path stays eager.
+            if crate::stack::env_once("H3_GRAPH").is_some_and(|v| v != "0") {
+                if b.graph.is_none() {
+                    let mut graph = stream.graph()?;
+                    b.stack.emit(
+                        &mut crate::dispatch::Sink::Graph {
+                            graph: &mut graph,
+                            after: None,
+                        },
+                        prof,
+                        x,
+                        cls,
+                        cos,
+                        sin,
+                        &cond_fn,
+                        0,
+                        None,
+                        false,
+                    )?;
+                    b.graph = Some(graph.finish()?);
+                }
+                stream.launch(b.graph.as_mut().expect("recorded above"))?;
+                return Ok(());
+            }
             b.stack
                 .forward(stream, prof, x, cls, cos, sin, &cond_fn, 0, None)?;
             return Ok(());

@@ -130,6 +130,83 @@ pub(crate) fn checked(
     bindings: &[View<'_>],
     required: &[usize],
 ) -> Result<()> {
+    emit(
+        &mut Sink::Stream(stream),
+        kernel,
+        profile,
+        stage,
+        grid,
+        block,
+        scalars,
+        bindings,
+        required,
+    )
+}
+
+/// Where a launch goes: onto a stream now, or into a graph to be replayed later.
+///
+/// A recording fixes addresses, constants and geometry, so it is worth only what a path repeats
+/// unchanged — and the graph orders nothing it is not told to order. `Graph` therefore chains each
+/// launch behind the one before it, which is what every builder here assumes: the stacks reuse one
+/// scratch pair between stages, so consecutive launches conflict on it even where their operands say
+/// otherwise. Independence has to be declared deliberately, against buffers shown to be disjoint,
+/// and [`Sink::fork`] is how a caller says so.
+pub enum Sink<'s, 'g> {
+    Stream(&'s mut hrx::Stream),
+    Graph {
+        graph: &'s mut hrx::Graph<'g>,
+        /// What the next launch waits for. `None` at the start of an independent chain.
+        after: Option<hrx::Node>,
+    },
+}
+
+impl Sink<'_, '_> {
+    /// What the next launch will wait for.
+    ///
+    /// These three exist to spell a fan-out: take the head, `resume` from it once per branch,
+    /// collect each branch's head, and `join` them. On a stream they are all nothing, because a
+    /// stream is already a chain.
+    pub fn head(&self) -> Option<hrx::Node> {
+        match self {
+            Sink::Stream(_) => None,
+            Sink::Graph { after, .. } => *after,
+        }
+    }
+
+    /// Make the next launch wait for `node` rather than for the launch just recorded.
+    pub fn resume(&mut self, node: Option<hrx::Node>) {
+        if let Sink::Graph { after, .. } = self {
+            *after = node;
+        }
+    }
+
+    /// Make the next launch wait for all of `ends`.
+    pub fn join(&mut self, ends: &[Option<hrx::Node>]) -> Result<()> {
+        if let Sink::Graph { graph, after } = self {
+            let nodes: Vec<hrx::Node> = ends.iter().flatten().copied().collect();
+            *after = match nodes.len() {
+                0 => None,
+                1 => Some(nodes[0]),
+                _ => Some(graph.join(&nodes)?),
+            };
+        }
+        Ok(())
+    }
+}
+
+/// A launch whose bindings have been checked, sent wherever `sink` says.
+#[allow(clippy::too_many_arguments)]
+pub fn emit<'g>(
+    sink: &mut Sink<'_, 'g>,
+    kernel: &'g crate::compile::Kernel,
+    profile: Option<&mut Profile>,
+    stage: &str,
+    grid: [u32; 3],
+    block: [u32; 3],
+    scalars: &[u32],
+    bindings: &[View<'g>],
+    required: &[usize],
+) -> Result<()> {
     debug_assert_eq!(
         bindings.len(),
         required.len(),
@@ -143,16 +220,35 @@ pub(crate) fn checked(
             )));
         }
     }
-    // The kernel is built here if its batch has not been built already, which is what makes the
-    // handle safe to hold: nothing can dispatch one that was never compiled.
-    let kernel = kernel.resolve(stream)?;
-    // Safety: every binding is at least as long as the extent this kernel was compiled to address,
-    // checked immediately above, and the grid, block and scalars come from the same builder that
-    // compiled it.
-    unsafe {
-        launch(
-            stream, kernel, profile, stage, grid, block, scalars, bindings,
-        )
+    match sink {
+        Sink::Stream(stream) => {
+            // The kernel is built here if its batch has not been built already, which is what makes
+            // the handle safe to hold: nothing can dispatch one that was never compiled.
+            let kernel = kernel.resolve(stream)?;
+            // Safety: every binding is at least as long as the extent this kernel was compiled to
+            // address, checked immediately above, and the grid, block and scalars come from the same
+            // builder that compiled it.
+            unsafe {
+                launch(
+                    stream, kernel, profile, stage, grid, block, scalars, bindings,
+                )
+            }
+        }
+        Sink::Graph { graph, after } => {
+            // Recording cannot build a kernel: there is no stream to load it onto. A recording is
+            // therefore made after the same work has run once, which is what leaves them all built.
+            let kernel = kernel.built().ok_or_else(|| {
+                crate::compile::Error::Io(format!("{stage}: recorded before its kernel was built"))
+            })?;
+            let constants = hrx::Constants::indices(kernel, scalars)?;
+            // Safety: as the eager arm — the bindings are checked above and the geometry is the
+            // builder's own. Fixed for every replay, which is what the caller records for.
+            let node = unsafe {
+                graph.dispatch(after.as_slice(), kernel, grid, block, &constants, bindings)?
+            };
+            *after = Some(node);
+            Ok(())
+        }
     }
 }
 
@@ -398,6 +494,31 @@ impl Prepare {
         a_q: View<'_>,
         a_s: Option<View<'_>>,
     ) -> Result<()> {
+        self.emit(
+            &mut Sink::Stream(stream),
+            profile,
+            stage,
+            tokens,
+            x,
+            norm,
+            a_q,
+            a_s,
+        )
+    }
+
+    /// As [`Prepare::run`], sent wherever `sink` says.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit<'g>(
+        &'g self,
+        sink: &mut Sink<'_, 'g>,
+        profile: Option<&mut Profile>,
+        stage: &str,
+        tokens: u32,
+        x: View<'g>,
+        norm: Option<(View<'g>, View<'g>, ClassRows<'g>)>,
+        a_q: View<'g>,
+        a_s: Option<View<'g>>,
+    ) -> Result<()> {
         let t = tokens as usize;
         // the norm forms read the f32 residual stream; `plain` narrows an f16 row that a GEMM
         // already wrote
@@ -415,8 +536,8 @@ impl Prepare {
         if quantised(&self.elem) {
             args.push(a_s.expect("an int8 prepare writes a token scale"), t * 4);
         }
-        checked(
-            stream,
+        emit(
+            sink,
             &self.kernel,
             profile,
             stage,
@@ -572,6 +693,7 @@ impl Gemm {
 
     /// `(tokens, a_q, w_q[, w_s, a_s], out[, gate, cls][, bias])` — the float operands carry no scales.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
         stream: &mut hrx::Stream,
@@ -584,6 +706,35 @@ impl Gemm {
         out: View<'_>,
         residual: Option<(View<'_>, ClassRows<'_>)>,
         bias: Option<View<'_>>,
+    ) -> Result<()> {
+        self.emit(
+            &mut Sink::Stream(stream),
+            profile,
+            stage,
+            tokens,
+            a_q,
+            w_q,
+            scales,
+            out,
+            residual,
+            bias,
+        )
+    }
+
+    /// As [`Gemm::run`], sent wherever `sink` says.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit<'g>(
+        &'g self,
+        sink: &mut Sink<'_, 'g>,
+        profile: Option<&mut Profile>,
+        stage: &str,
+        tokens: u32,
+        a_q: View<'g>,
+        w_q: View<'g>,
+        scales: Option<(View<'g>, View<'g>)>,
+        out: View<'g>,
+        residual: Option<(View<'g>, ClassRows<'g>)>,
+        bias: Option<View<'g>>,
     ) -> Result<()> {
         let t = tokens as usize;
         let bytes = elem_bits(&self.elem) / 8;
@@ -606,8 +757,8 @@ impl Gemm {
         if self.bias {
             args.push(bias.expect("a biased GEMM needs its bias"), self.n * 4);
         }
-        checked(
-            stream,
+        emit(
+            sink,
             &self.kernel,
             profile,
             stage,

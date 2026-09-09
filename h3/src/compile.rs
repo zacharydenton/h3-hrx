@@ -96,6 +96,14 @@ pub struct Kernel {
 }
 
 impl Kernel {
+    /// The loaded kernel, if its batch has already been built.
+    ///
+    /// For callers with no stream to build one on — recording into a graph, which cannot load an
+    /// executable. Everywhere else wants [`Kernel::resolve`].
+    pub(crate) fn built(&self) -> Option<&hrx::Kernel> {
+        self.cell.get()
+    }
+
     /// The loaded kernel, building the outstanding batch if this is the first call that needs it.
     pub(crate) fn resolve(&self, stream: &mut hrx::Stream) -> Result<&hrx::Kernel> {
         if let Some(kernel) = self.cell.get() {

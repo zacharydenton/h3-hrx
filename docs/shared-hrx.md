@@ -111,10 +111,39 @@ dispatch is the kernel running, not the host enqueuing it, and one enqueue costs
 The kernels are inefficient at short lengths -- `audio res conv2` averages 635 us over a 1024x5
 tensor -- which is a kernel problem worth its own look, and not one a recording addresses.
 
-Graphs are therefore not used anywhere in this model. All three recordable paths were measured
-first: a denoise step averages tens of milliseconds of GPU work per dispatch, a video decode tile
-about 1.08 ms, and an audio decode 145 us. Against 175 ns to enqueue, none of them is bound by the
-host, and no arrangement of dependencies changes the arithmetic they are actually waiting on.
+## Recording, and what it is worth
+
+`Sink` in `h3::dispatch` decides where a launch goes: onto the stream now, or into a graph to replay
+later. `Prepare::emit`, `Gemm::emit` and `Stack::emit` take one, and `run`/`forward` are the eager
+wrappers, so the dispatch path is written once and the recorded path cannot drift from it. A
+recording chains every launch behind the one before it, because the stacks reuse one scratch pair
+between stages and consecutive launches therefore conflict even where their operands do not. The one
+exception is declared: `prep_q`, `prep_k` and the V transpose read `q`, `k` and `v`, share `zmean`
+read-only, and write six allocations no other two of them touch, so each waits on what came before
+rather than on its neighbours.
+
+`H3_GRAPH=1` records and replays two paths: the video decoder's stack, which a clip repeats over a
+hundred times with identical bindings, and the DiT's fifty blocks, whose every binding, grid and
+constant is the same at every step -- only the modulation table's contents and the residual stream
+change, and the recording already points at both. The step cache stays eager, since the host decides
+after block 0 whether the rest of the step runs at all and a recording cannot branch.
+
+It is off by default because it is not faster. Timed in process, interleaved, median of nine
+batches: replaying a 256-node chain costs **0.58x** an eager dispatch when each node is a 256-wide
+prepare that does nothing, and **0.99x** when each node is a 4096x1024 prepare that does the work a
+real stack's node does. The per-node cost is around 2 us, which is a win against a 4.5 us launch of
+nothing and invisible against 130 us of arithmetic. Whole-decode comparisons on this machine were
+too noisy to separate the two at all -- a contended box swung the same configuration between 31 s
+and 45 s -- which is its own reason to trust the in-process measurement and not the wall clock.
+
+What the recording does prove is that it is a faithful one. Under `H3_GRAPH=1` the seven video
+decodes and the ten reference denoise cases are byte-identical to the eager path, the latter
+exercising the concurrent operand prepares in all fifty blocks.
+
+All three candidate paths were measured before any of this: a denoise step averages tens of
+milliseconds of GPU work per dispatch, a video decode tile about 1.08 ms, and an audio decode 145 us.
+Against 175 ns to enqueue, none is bound by the host, and no arrangement of dependencies changes the
+arithmetic they are waiting on.
 
 A separate copy stream is not used either. Weights become resident on first use, and later steps
 reuse them; overlapping those first-use uploads would need its own measurement, including peak

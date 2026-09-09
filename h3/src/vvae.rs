@@ -81,6 +81,9 @@ struct Built {
     /// them again for every tile
     stage_in: Vec<half::f16>,
     stage_out: Vec<half::f16>,
+    /// `H3_GRAPH=1`: the stack's blocks recorded once and replayed per tile. A clip is a hundred
+    /// tiles of identical work over identical allocations, which is the shape a recording wants.
+    graph: Option<hrx::GraphExec>,
 }
 
 pub struct VideoVae {
@@ -215,6 +218,7 @@ impl VideoVae {
             norm_table,
             stage_in: vec![half::f16::ZERO; grid.voxels() * VAE_KIN],
             stage_out: vec![half::f16::ZERO; grid.voxels() * VAE_OUT],
+            graph: None,
         });
         Ok(())
     }
@@ -312,8 +316,34 @@ impl VideoVae {
             gate_mlp: scales[i].1,
         };
         let (x, cls, cos, sin) = (b.x.binding(), b.cls.all(), b.cos.binding(), b.sin.binding());
-        b.stack
-            .forward(stream, prof, x, cls, cos, sin, &cond, 0, None)?;
+        let recording = crate::stack::env_once("H3_GRAPH").is_some_and(|v| v != "0");
+        if recording && b.graph.is_none() {
+            // The recording borrows the stack and its operands; `finish` ends those borrows and
+            // hands back something the runtime owns, so it can be kept beside them.
+            let mut graph = stream.graph()?;
+            b.stack.emit(
+                &mut crate::dispatch::Sink::Graph {
+                    graph: &mut graph,
+                    after: None,
+                },
+                prof,
+                x,
+                cls,
+                cos,
+                sin,
+                &cond,
+                0,
+                None,
+                false,
+            )?;
+            b.graph = Some(graph.finish()?);
+        }
+        match &mut b.graph {
+            Some(replay) => stream.launch(replay)?,
+            None => b
+                .stack
+                .forward(stream, prof, x, cls, cos, sin, &cond, 0, None)?,
+        }
 
         let w_norm = weights.at(stream, "vae.norm_out.w", VAE_HID * 4)?;
         b.norm_out.run(

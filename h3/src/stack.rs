@@ -6,7 +6,7 @@
 //! count and the QK^T width, and whether a projection needs a `prepare` at all follows from whether the
 //! kernel before it already wrote its operand at the right pitch.
 use crate::compile::{num, Cfg, Compiler};
-use crate::dispatch::{checked, ClassRows, Gemm, Prepare, Profile, Tile};
+use crate::dispatch::{emit, ClassRows, Gemm, Prepare, Profile, Sink, Tile};
 use crate::model::*;
 use crate::weights::Weights;
 use hrx::View;
@@ -757,6 +757,7 @@ impl Stack {
     /// `x`: f32 `[capacity][hidden]`, rows past `tokens` untouched. `cls`: a checked class per row.
     /// `cos`/`sin`: f32 `[tokens][rope_dim/2]`.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn forward<'a>(
         &mut self,
         stream: &mut hrx::Stream,
@@ -769,25 +770,63 @@ impl Stack {
         first: usize,
         last: Option<usize>,
     ) -> Result<()> {
-        let t = self.tokens as u32;
-        let last = last.unwrap_or(self.layers);
-
         // H3_DUMP_BLOCKS=<dir>: this stack's x before the first block and after every one, as
-        // [tokens][hidden] f32, on its H3_DUMP_CALL-th forward. The counter is bumped before the
-        // Q/K/V views are taken, since those borrow the fused allocation for the rest of the call.
-        let dump_dir = env_once("H3_DUMP_BLOCKS");
-        let dump_call: usize = env_once("H3_DUMP_CALL")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        let dumping = dump_dir.is_some() && {
+        // [tokens][hidden] f32, on its H3_DUMP_CALL-th forward. The counter is bumped here, before
+        // anything borrows the stack, and only a run on a stream can dump: a recording has no host
+        // to read back to.
+        let dumping = env_once("H3_DUMP_BLOCKS").is_some() && {
+            let call: usize = env_once("H3_DUMP_CALL")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             let this = self.calls;
             self.calls += 1;
-            this == dump_call && first == 0
+            this == call && first == 0
         };
+        self.emit(
+            &mut Sink::Stream(stream),
+            prof,
+            x,
+            cls,
+            cos,
+            sin,
+            cond,
+            first,
+            last,
+            dumping,
+        )
+    }
+
+    /// The stack's blocks, sent wherever `sink` says.
+    ///
+    /// A recording is a faithful chain: every launch waits for the one before it, except the three
+    /// that prepare the attention operands, which write six disjoint allocations and say so. The
+    /// stack's scratch is shared between stages, so nothing else here may overlap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit<'a, 'g>(
+        &'g self,
+        sink: &mut Sink<'_, 'g>,
+        prof: &mut Profile,
+        x: View<'g>,
+        cls: ClassRows<'g>,
+        cos: View<'g>,
+        sin: View<'g>,
+        cond: &dyn Fn(usize) -> LayerCond<'a>,
+        first: usize,
+        last: Option<usize>,
+        dumping: bool,
+    ) -> Result<()>
+    where
+        'a: 'g,
+    {
+        let t = self.tokens as u32;
+        let last = last.unwrap_or(self.layers);
+        let dump_dir = env_once("H3_DUMP_BLOCKS");
         let (cap, rows) = (self.capacity, self.tokens);
         let (q, k, v) = self.qkv_views();
         if dumping {
-            self.dump(stream, dump_dir.unwrap(), "h_in", x)?;
+            if let Sink::Stream(stream) = &mut *sink {
+                self.dump(stream, dump_dir.unwrap(), "h_in", x)?;
+            }
         }
 
         for i in first..last {
@@ -801,8 +840,8 @@ impl Stack {
                     b.knorm.binding(),
                 )
             };
-            self.prep_norm.run(
-                stream,
+            self.prep_norm.emit(
+                sink,
                 Some(prof),
                 "prepare norm",
                 t,
@@ -821,8 +860,8 @@ impl Stack {
                     .binding();
                 // the fused path is the 2048-wide, 32-head, 64-deep VAE stack alone, so its
                 // operands are that shape exactly
-                checked(
-                    stream,
+                emit(
+                    sink,
                     kernel,
                     Some(prof),
                     "gemm qkv + rope",
@@ -859,8 +898,8 @@ impl Stack {
             } else {
                 let b = &self.blocks[i];
                 let scales = b.qkv_s.as_ref().map(|s| (s.binding(), self.a_s.binding()));
-                self.gemm_qkv.as_ref().expect("built when not fused").run(
-                    stream,
+                self.gemm_qkv.as_ref().expect("built when not fused").emit(
+                    sink,
                     Some(prof),
                     "gemm qkv",
                     t,
@@ -871,8 +910,8 @@ impl Stack {
                     None,
                     b.qkv_b.as_ref().map(|x| x.binding()),
                 )?;
-                checked(
-                    stream,
+                emit(
+                    sink,
                     self.rope.as_ref().expect("built when not fused"),
                     Some(prof),
                     "qk norm + rope",
@@ -893,7 +932,7 @@ impl Stack {
                 )?;
             }
 
-            self.attend(stream, prof, t, q, k, v)?;
+            self.attend(sink, prof, t, q, k, v)?;
 
             let attn_operand = if self.direct_attn {
                 self.attn.binding()
@@ -901,8 +940,8 @@ impl Stack {
                 self.prep_attn
                     .as_ref()
                     .expect("built when not direct")
-                    .run(
-                        stream,
+                    .emit(
+                        sink,
                         Some(prof),
                         "prepare out input",
                         t,
@@ -916,8 +955,8 @@ impl Stack {
             {
                 let b = &self.blocks[i];
                 let scales = b.out_s.as_ref().map(|s| (s.binding(), self.a_s.binding()));
-                self.gemm_out.run(
-                    stream,
+                self.gemm_out.emit(
+                    sink,
                     Some(prof),
                     "gemm out + residual",
                     t,
@@ -930,8 +969,8 @@ impl Stack {
                 )?;
             }
 
-            self.prep_norm.run(
-                stream,
+            self.prep_norm.emit(
+                sink,
                 Some(prof),
                 "prepare norm",
                 t,
@@ -943,8 +982,8 @@ impl Stack {
             {
                 let b = &self.blocks[i];
                 let scales = b.gu_s.as_ref().map(|s| (s.binding(), self.a_s.binding()));
-                self.gemm_gu.run(
-                    stream,
+                self.gemm_gu.emit(
+                    sink,
                     Some(prof),
                     "gemm ff + swiglu",
                     t,
@@ -962,8 +1001,8 @@ impl Stack {
                 self.prep_down
                     .as_ref()
                     .expect("built when not direct")
-                    .run(
-                        stream,
+                    .emit(
+                        sink,
                         Some(prof),
                         "prepare down input",
                         t,
@@ -977,8 +1016,8 @@ impl Stack {
             {
                 let b = &self.blocks[i];
                 let scales = b.down_s.as_ref().map(|s| (s.binding(), self.a_s.binding()));
-                self.gemm_down.run(
-                    stream,
+                self.gemm_down.emit(
+                    sink,
                     Some(prof),
                     "gemm down + residual",
                     t,
@@ -991,21 +1030,23 @@ impl Stack {
                 )?;
             }
             if dumping {
-                self.dump(stream, dump_dir.unwrap(), &format!("blk_{i:02}"), x)?;
+                if let Sink::Stream(stream) = &mut *sink {
+                    self.dump(stream, dump_dir.unwrap(), &format!("blk_{i:02}"), x)?;
+                }
             }
         }
         Ok(())
     }
 
     /// Attention, on f16 Q/K/V or on the narrowed integer operands.
-    fn attend(
-        &self,
-        stream: &mut hrx::Stream,
+    fn attend<'g>(
+        &'g self,
+        sink: &mut Sink<'_, 'g>,
         prof: &mut Profile,
         t: u32,
-        q: View<'_>,
-        k: View<'_>,
-        v: View<'_>,
+        q: View<'g>,
+        k: View<'g>,
+        v: View<'g>,
     ) -> Result<()> {
         let query_block = 16 * self.waves as u32;
         // every operand here is one of the capacity-sized allocations made in `build`, at the same
@@ -1024,8 +1065,8 @@ impl Stack {
             } else {
                 [32 * self.waves as u32, 1, 1]
             };
-            return checked(
-                stream,
+            return emit(
+                sink,
                 &self.attention,
                 Some(prof),
                 "attention",
@@ -1045,8 +1086,8 @@ impl Stack {
         // K mean smoothing: off by default, having measured worse.
         let smooth = env_once("H3_KSMOOTH") == Some("1");
         if smooth {
-            checked(
-                stream,
+            emit(
+                sink,
                 self.colmean.as_ref().expect("built with integer QK"),
                 Some(prof),
                 "attention operands",
@@ -1068,8 +1109,13 @@ impl Stack {
             rows * self.d.heads * codes,
             rows * self.d.heads * 4,
         ];
-        checked(
-            stream,
+        // The only three launches in a block that may overlap. They read `q`, `k` and `v`, share
+        // `zmean` read-only, and write six allocations no other two of them touch, so each waits for
+        // what came before rather than for its neighbours.
+        let before = sink.head();
+        let mut ends = [None; 3];
+        emit(
+            sink,
             self.prep_q.as_ref().expect("built with integer QK"),
             Some(prof),
             "attention operands",
@@ -1084,8 +1130,10 @@ impl Stack {
             ],
             &operand,
         )?;
-        checked(
-            stream,
+        ends[0] = sink.head();
+        sink.resume(before);
+        emit(
+            sink,
             self.prep_k.as_ref().expect("built with integer QK"),
             Some(prof),
             "attention operands",
@@ -1104,8 +1152,10 @@ impl Stack {
             ],
             &operand,
         )?;
-        checked(
-            stream,
+        ends[1] = sink.head();
+        sink.resume(before);
+        emit(
+            sink,
             self.transpose.as_ref().expect("built with integer QK"),
             Some(prof),
             "attention operands",
@@ -1115,8 +1165,10 @@ impl Stack {
             &[v, int_qk.vt.binding()],
             &[rows * self.d.inner() * 2, self.d.inner() * cap * 2],
         )?;
-        checked(
-            stream,
+        ends[2] = sink.head();
+        sink.join(&ends)?;
+        emit(
+            sink,
             &self.attention,
             Some(prof),
             "attention",
