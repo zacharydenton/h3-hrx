@@ -78,6 +78,8 @@ pub struct Dit {
     refiner: Option<Refiner>,
     cond: Option<Conditioning>,
     blocks: Option<Blocks>,
+    /// The recording binds both `seq` and `blocks`; replacing either invalidates it.
+    block_graph: Option<hrx::GraphExec>,
     cache: Option<CacheBuffers>,
     euler: Option<crate::sampler::device::Euler>,
 }
@@ -97,6 +99,7 @@ impl Dit {
             refiner: None,
             cond: None,
             blocks: None,
+            block_graph: None,
             cache: None,
             euler: None,
         })
@@ -112,6 +115,7 @@ impl Dit {
         if self.seq.as_ref().is_some_and(|s| seq <= s.capacity) {
             return Ok(());
         }
+        self.block_graph = None;
         self.seq = None;
         let t = seq_capacity(seq);
         let zeroed = |bytes: usize| -> Result<hrx::Buffer> {
@@ -341,10 +345,6 @@ struct Blocks {
     final_out: Projection,
     /// the text rows, kept so they can be restored each step
     text_copy: hrx::Buffer,
-    /// `H3_GRAPH=1`: the fifty blocks recorded once and replayed per step. Every binding, grid and
-    /// constant in them is the same at every step; only the modulation table's contents and the
-    /// residual stream change, and both are buffers the recording already points at.
-    graph: Option<hrx::GraphExec>,
 }
 
 /// A projection and its resident operands, prepared outside the denoise loop.
@@ -658,6 +658,7 @@ impl Dit {
         {
             return Ok(());
         }
+        self.block_graph = None;
         self.blocks = None;
         let mut d = StackDims {
             hidden: HID,
@@ -706,7 +707,6 @@ impl Dit {
             // the final head has only the video and audio timestep classes
             final_norm: NormMod::build(c, stream, HID, 1e-5, 2)?,
             final_norm_scale: self.weights.at(stream, "h3.final.norm", HID * 4)?,
-            graph: None,
             audio_in: Projection::build(c, stream, &self.weights, "h3.audio_in", AUDIO_CH, HID)?,
             video_in: Projection::build(c, stream, &self.weights, "h3.video_in", VIDEO_PATCH, HID)?,
             final_out: Projection::build(c, stream, &self.weights, "h3.final.out", HID, FINAL_N)?,
@@ -1265,6 +1265,7 @@ impl Dit {
         let Dit {
             seq,
             blocks,
+            block_graph,
             cache: cbuf,
             cond,
             ..
@@ -1286,7 +1287,7 @@ impl Dit {
             // record once and replay. With the cache on the host decides after block 0 whether the
             // rest runs at all, which a recording cannot express, so that path stays eager.
             if crate::stack::env_once("H3_GRAPH").is_some_and(|v| v != "0") {
-                if b.graph.is_none() {
+                if block_graph.is_none() {
                     let mut graph = stream.graph()?;
                     b.stack.emit(
                         &mut crate::dispatch::Sink::Graph {
@@ -1303,9 +1304,9 @@ impl Dit {
                         None,
                         false,
                     )?;
-                    b.graph = Some(graph.finish()?);
+                    *block_graph = Some(graph.finish()?);
                 }
-                stream.launch(b.graph.as_mut().expect("recorded above"))?;
+                stream.launch(block_graph.as_mut().expect("recorded above"))?;
                 return Ok(());
             }
             b.stack
@@ -1404,6 +1405,66 @@ fn layer_cond(mods: &hrx::Buffer, i: usize) -> crate::stack::LayerCond<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires gfx1151; no model checkpoints or Loom compiler"]
+    fn growing_sequence_storage_invalidates_its_recording() {
+        let mut stream = hrx::Stream::open().unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        // An empty checkpoint suffices: resizing sequence storage loads no weights.
+        std::fs::write(
+            file.path(),
+            [8u64.to_le_bytes().as_slice(), b"{}      "].concat(),
+        )
+        .unwrap();
+        // Safety: this test owns the file and leaves it unchanged while mapped.
+        let weights = unsafe { Weights::open(file.path(), |_, _| Ok(())) }.unwrap();
+        let mut dit = Dit {
+            weights,
+            constants: Constants::new(&mut stream).unwrap(),
+            seq: None,
+            refiner: None,
+            cond: None,
+            blocks: None,
+            block_graph: None,
+            cache: None,
+            euler: None,
+        };
+        dit.ensure_seq(&mut stream, 1).unwrap();
+        let capacity = dit.seq.as_ref().unwrap().capacity;
+        let mut graph = stream.graph().unwrap();
+        graph
+            .fill(&[], dit.seq.as_ref().unwrap().x.binding(), 1)
+            .unwrap();
+        dit.block_graph = Some(graph.finish().unwrap());
+        stream.launch(dit.block_graph.as_mut().unwrap()).unwrap();
+
+        dit.ensure_seq(&mut stream, 1).unwrap();
+        assert!(
+            dit.block_graph.is_some(),
+            "unchanged storage keeps the recording"
+        );
+        // This is the allocation change caused by an intervening, longer text_in.
+        dit.ensure_seq(&mut stream, capacity + 1).unwrap();
+        assert!(
+            dit.block_graph.is_none(),
+            "replacement storage needs a new recording"
+        );
+        // Returning to the original token count must not revive the old bindings.
+        dit.ensure_seq(&mut stream, 1).unwrap();
+        assert!(dit.block_graph.is_none());
+        let mut graph = stream.graph().unwrap();
+        graph
+            .fill(&[], dit.seq.as_ref().unwrap().x.binding(), 7)
+            .unwrap();
+        dit.block_graph = Some(graph.finish().unwrap());
+        stream.launch(dit.block_graph.as_mut().unwrap()).unwrap();
+        let mut actual = [0u8; 16];
+        stream
+            .read_blocking(dit.seq.as_ref().unwrap().x.slice(0, 16), &mut actual)
+            .unwrap();
+        assert_eq!(actual, [7; 16]);
+    }
 
     #[test]
     fn a_reference_grid_is_whole_patches() {

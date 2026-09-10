@@ -150,7 +150,7 @@ pub(crate) fn checked(
 /// launch behind the one before it, which is what every builder here assumes: the stacks reuse one
 /// scratch pair between stages, so consecutive launches conflict on it even where their operands say
 /// otherwise. Independence has to be declared deliberately, against buffers shown to be disjoint,
-/// and [`Sink::fork`] is how a caller says so.
+/// and [`Sink::resume`] and [`Sink::join`] are how a caller says so.
 pub enum Sink<'s, 'g> {
     Stream(&'s mut hrx::Stream),
     Graph {
