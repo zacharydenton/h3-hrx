@@ -5,15 +5,15 @@ binary rpath build scripts are removed. The model still exposes `Session` as its
 Rust API. It does not require Python, Torch,
 ROCm development headers or an LLVM build.
 
-The workspace pins one reviewed Git revision in `Cargo.toml` and all consumer
-lockfiles. It includes HRX 0.3's NPU APIs, compiler cache fixes and keyed pending
-requests. H3 enables only `download` and `loom`; ordinary inference does not
-initialize an NPU.
+The workspace uses `hrx-rs` 0.4 from crates.io, with the exact release pinned
+in all consumer lockfiles. It includes the coordinated GPU/NPU APIs, compiler
+cache fixes and keyed pending requests. H3 enables only `download` and `loom`;
+ordinary inference does not initialize an NPU.
 
 For local HRX development, put this in an ignored `.cargo/config.toml`:
 
 ```toml
-[patch."https://github.com/zacharydenton/hrx-rs"]
+[patch.crates-io]
 hrx-rs = { path = "../hrx.rs" }
 ```
 
