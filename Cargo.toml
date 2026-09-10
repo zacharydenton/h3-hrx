@@ -45,7 +45,7 @@ name = "differentials"
 required-features = ["internals"]
 
 [dependencies]
-hrx = { package = "hrx-rs", version = "0.2.0", default-features = false, features = ["download", "loom"] }
+hrx = { package = "hrx-rs", git = "https://github.com/zacharydenton/hrx-rs", rev = "5f5c2cc", default-features = false, features = ["download", "loom"] }
 memmap2 = "0.9"
 safetensors = "0.8"
 half = { version = "2", features = ["bytemuck"] }
