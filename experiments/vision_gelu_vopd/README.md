@@ -5,7 +5,7 @@ The template preserves the GELU arithmetic. Its different register allocation
 causes the planner to combine two FMAs whose addends use the same SRC2 bank.
 
 The fix is preserved in
-[HRX’s vendored compiler patch](https://github.com/zacharydenton/hrx.rs/blob/main/patches/loom/0001-vopd-source-cache-banks.patch)
+[HRX’s vendored compiler patch](https://github.com/zacharydenton/hrx-rs/blob/main/patches/loom/0001-vopd-source-cache-banks.patch)
 and fork commit
 [`675cc43bc`](https://github.com/zacharydenton/hrx-system/commit/675cc43bc).
 The rebuilt compiler passes both cases below. On gfx1151, all three shared

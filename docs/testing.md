@@ -166,7 +166,7 @@ three shared vision epilogues, with bitwise baseline and CPU-oracle checks.
 Workspace tests, formatting and Clippy pass. The compiler's available fixture
 corpus passed 550 suites in that historical bundle; its validation record is
 preserved in Git history. Current compiler validation lives in
-[HRX](https://github.com/zacharydenton/hrx.rs/blob/main/patches/loom/README.md).
+[HRX](https://github.com/zacharydenton/hrx-rs/blob/main/patches/loom/README.md).
 
 Resource checks across 36 float export/shape combinations retain the same VGPR
 counts, 55,296 bytes of LDS, no scratch memory, and 64 static WMMA instructions.

@@ -1,7 +1,7 @@
 # Native patch ownership
 
 Compiler patches, the public upstream pin, build instructions and current
-validation live in [hrx.rs](https://github.com/zacharydenton/hrx.rs/tree/main/patches/loom).
+validation live in [hrx-rs](https://github.com/zacharydenton/hrx-rs/tree/main/patches/loom).
 H3 loads that compiler in process; `HRX_LOOM_LIBRARY` selects a development
 `libloomc.so`. Compiler patches are no longer duplicated here.
 
