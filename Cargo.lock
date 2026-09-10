@@ -1102,7 +1102,9 @@ dependencies = [
 name = "h3"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytemuck",
+ "clap",
  "half",
  "hf-hub",
  "hrx-rs",
@@ -1116,15 +1118,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokenizers",
-]
-
-[[package]]
-name = "h3-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "h3",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 //! Paired resident GEMM comparisons against a source snapshot.
-//! cargo run --release -p h3 --example compare_gemm -- BASELINE_DIR [FILTER]
+//! cargo run --release --example compare_gemm -- BASELINE_DIR [FILTER]
 //! Weights rotate through more than 64 MiB as well as repeatedly using one matrix.
 //! H3_COMPARE_BATCHES sets the number of paired timing batches (default 10, even and >= 2).
 use half::{bf16, f16};

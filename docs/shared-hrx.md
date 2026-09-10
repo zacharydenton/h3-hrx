@@ -34,9 +34,9 @@ SHA-256 identity, integrity checks and atomic publication to `hrx::loom`. It
 compiles for the architecture the stream's device reports, and asking for a kernel
 does not build it: requests accumulate, and `Compiler::flush` hands the whole
 outstanding set to `hrx::loom::Compiler::compile_all`, which owns the thread
-budget. Sources are read once per compiler session. The source files and tokenizer are
-inside the `h3` package at `h3/kernels` and `h3/assets`. Tests and examples use
-these paths directly.
+budget. Sources are read once per compiler session. The source files and tokenizer sit at the
+repository root, in `kernels/` and `assets/`, and are embedded into an installed binary; tests and
+examples read them from the working tree.
 Compiled kernels use HRX’s shared per-user kernel cache.
 
 The pinned native release includes the VOPD register-bank fix and Loom's
@@ -58,11 +58,11 @@ select a developer compiler. See the shared crate README for the bundle contract
 
 `Config::loom_library` selects a shared compiler library, or `HRX_LOOM_LIBRARY`
 does; either empty takes the pinned bundle's. There is no C ABI any more — the
-crate's `Session` is the interface, `examples/rustler` is the interop, and
+crate's `Session` is the interface, `clients/rustler` is the interop, and
 `scripts/parity.py` reaches the host through the `parity_dump` example rather
 than by linking it.
 
-`examples/rustler` is a minimal, working Rustler adapter owned by an Elixir app.
+`clients/rustler` is a minimal, working Rustler adapter owned by an Elixir app.
 Its worker owns an H3 Rust session; jobs contain owned data and a bounded queue.
 It calls the Rust API directly. No Rustler dependency is added to H3 or HRX.
 
@@ -157,8 +157,8 @@ grows, compiler target checks, conditioning, sampling, GEMMs, attention and
 convolutions. Repeat the native checks with:
 
 ```sh
-HRX_OFFLINE=1 cargo test -p h3 -- --ignored --test-threads=1
-HRX_OFFLINE=1 cargo run --release -p h3 --example dispatch_cost
+HRX_OFFLINE=1 cargo test -- --ignored --test-threads=1
+HRX_OFFLINE=1 cargo run --release --example dispatch_cost
 ```
 
 Checkpoint-backed `denoise_cases` runs compared `H3_GRAPH=0` with `H3_GRAPH=1`

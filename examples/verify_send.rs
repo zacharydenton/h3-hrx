@@ -18,10 +18,10 @@ fn main() {
     assert_send::<hrx::Kernel>();
     assert_send::<Gemm>();
 
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let exe = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
     let mut stream = hrx::Stream::open().expect("stream");
-    let compiler = Compiler::new(exe, root.join("h3/kernels"));
+    let compiler = Compiler::new(exe, root.join("kernels"));
 
     let (m, k, n) = (64usize, 2048usize, 2048usize);
     let k_stride = gemm_pitch(k, 16);

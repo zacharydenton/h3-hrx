@@ -35,7 +35,7 @@ Workspace unit tests cover model shapes, checkpoint layouts, CPU sampling,
 tokenization, compiler/source behavior and dispatch bounds.
 The C smoke test in the shared HRX repository builds against generated H3 and
 Krea headers and loads both model libraries in one process. Rustler remains an
-application adapter under `examples/rustler`.
+application adapter under `clients/rustler`.
 
 Loom sources are maintained directly. Python generators, reference model
 implementations, wrappers and one-off studies are retired. Historical reports
@@ -113,12 +113,12 @@ To reproduce the comparison, extract the pre-consolidation sources:
 
 ```sh
 mkdir -p build/kernel-baseline
-git archive 62f837d h3/kernels | tar -x -C build/kernel-baseline
-export H3_KERNEL_BASELINE="$PWD/build/kernel-baseline/h3/kernels"
-cargo test -p h3 --test kernels -- --ignored --test-threads=1 --nocapture
-H3_KERNEL_TIMING=1 cargo test -p h3 --test kernels preparation -- --ignored --test-threads=1 --nocapture
-cargo run --release -p h3 --example compare_gemm -- "$H3_KERNEL_BASELINE"
-cargo run --release -p h3 --example compare_vision -- "$H3_KERNEL_BASELINE"
+git archive 62f837d kernels | tar -x -C build/kernel-baseline
+export H3_KERNEL_BASELINE="$PWD/build/kernel-baseline/kernels"
+cargo test --test kernels -- --ignored --test-threads=1 --nocapture
+H3_KERNEL_TIMING=1 cargo test --test kernels preparation -- --ignored --test-threads=1 --nocapture
+cargo run --release --example compare_gemm -- "$H3_KERNEL_BASELINE"
+cargo run --release --example compare_vision -- "$H3_KERNEL_BASELINE"
 ```
 
 The test harness compares every binding bit-for-bit before the independent CPU
@@ -133,12 +133,12 @@ For a resident decoder comparison, group the original independent exports into
 the new module filenames in the **baseline fixture only**:
 
 ```sh
-for module in h3/kernels/*_family.loom h3/kernels/gemm_packed_256.loom; do
+for module in kernels/*_family.loom kernels/gemm_packed_256.loom; do
   sed -n 's/.*export("h3_\([^"]*\)").*/\1/p' "$module" |
     while IFS= read -r entry; do cat "$H3_KERNEL_BASELINE/$entry.loom"; done |
     awk '!/^amdgpu.target/ || !seen[$0]++' > "$H3_KERNEL_BASELINE/$(basename "$module")"
 done
-cargo run --release -p h3 --example compare_decode -- \
+cargo run --release --example compare_decode -- \
   "$H3_KERNEL_BASELINE" "$VAE_CHECKPOINT" "$LATENTS_F32" 480 864 22
 ```
 

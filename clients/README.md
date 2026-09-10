@@ -11,12 +11,12 @@ for the five-second example at the normal evaluation count.
 
 | | build | run |
 | --- | --- | --- |
-| Rust (the crate, resolved as an outside consumer would) | `(cd examples/rust && cargo build --release)` | `examples/rust/target/release/minimal "$(cat docs/prompts/cliff_rider_768p.txt)" 22 3 out` |
-| Elixir (Rustler, over the same crate) | `cargo build --manifest-path examples/rustler/Cargo.toml` | `H3_NIF="$PWD/examples/rustler/target/debug/libh3_nif" elixir examples/rustler/smoke.exs` |
+| Rust (the crate, resolved as an outside consumer would) | `(cd clients/rust && cargo build --release)` | `clients/rust/target/release/minimal "$(cat docs/prompts/cliff_rider_768p.txt)" 22 3 out` |
+| Elixir (Rustler, over the same crate) | `cargo build --manifest-path clients/rustler/Cargo.toml` | `H3_NIF="$PWD/clients/rustler/target/debug/libh3_nif" elixir clients/rustler/smoke.exs` |
 
 The positional arguments are the prompt, the frame count, the sigma grid points (evaluations + 1)
 and the output prefix. `ffmpeg -f rawvideo -pix_fmt rgb24 -s 864x480 -r 24 -i out.rgb -i out.wav out.mp4`
 muxes the result.
 
-`examples/rust` is deliberately outside the workspace, with its own lockfile: building it the way
+`clients/rust` is deliberately a package of its own, with its own lockfile: building it the way
 someone outside this repository would is the point of it.

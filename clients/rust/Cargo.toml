@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name = "h3-minimal"
 version = "0.1.0"
@@ -5,7 +7,7 @@ edition = "2021"
 description = "The h3 crate from Rust: prompt -> frames + samples"
 
 [dependencies]
-h3 = { path = "../../h3" }
+h3 = { path = "../..", default-features = false }
 
 [[bin]]
 name = "minimal"

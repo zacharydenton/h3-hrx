@@ -195,7 +195,7 @@ fn tempfile_probe(dir: &Path) -> bool {
     false
 }
 
-/// The repository root: the binary's parent's parent, so `build/h3` finds `h3/kernels/` beside it.
+/// The repository root: the binary's parent's parent, so `build/h3` finds `kernels/` beside it.
 fn exe_root() -> PathBuf {
     std::env::current_exe()
         .ok()
@@ -456,7 +456,7 @@ fn run(cli: Cli) -> Result<()> {
     // Installed binaries use their packaged kernel sources; --root opts into a working tree's
     // instead. Compiled artifacts always go to the one per-user HRX cache, whoever built them.
     let sources = if cli.root.is_some() {
-        root.join("h3/kernels")
+        root.join("kernels")
     } else {
         PathBuf::new()
     };

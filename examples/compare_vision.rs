@@ -1,5 +1,5 @@
 //! Compare production vision shapes against a source snapshot, with resident weights.
-//! cargo run --release -p h3 --example compare_vision -- BASELINE_DIR
+//! cargo run --release --example compare_vision -- BASELINE_DIR
 use half::bf16;
 use hrx::{Buffer, Constants, Kernel, Stream};
 use std::{path::Path, time::Instant};

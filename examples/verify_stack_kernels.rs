@@ -18,7 +18,7 @@ fn main() {
         .expect("usage: verify_stack_kernels <checkpoint> <tokens>");
     let tokens: usize = args.next().expect("tokens").parse().expect("a number");
 
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     // The one per-user cache HRX keeps, which is where every consumer's artifacts land now.
     let cache = hrx::bundle::kernel_cache().expect("cache root");
     let before: std::collections::HashSet<String> = std::fs::read_dir(&cache)
@@ -28,7 +28,7 @@ fn main() {
 
     let exe = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
     let mut stream = hrx::Stream::open().expect("stream");
-    let compiler = Compiler::new(exe, root.join("h3/kernels"));
+    let compiler = Compiler::new(exe, root.join("kernels"));
     // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
     let weights = unsafe { Weights::open(&path, h3::plan::vvae::plan) }.expect("plan");
 

@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 case "${1:---cpu}" in --cpu) gpu=0;; --gpu|--quick) gpu=1;; *) echo 'usage: scripts/test.sh [--cpu|--gpu]' >&2; exit 2;; esac
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --all-targets -- -D warnings
+cargo test
 if [ "$gpu" = 1 ]; then
-  cargo test -p h3 -- --ignored --test-threads=1
+  cargo test -- --ignored --test-threads=1
 fi

@@ -7,8 +7,8 @@ Model files must remain immutable while the worker is alive.
 Build and run the GPU smoke test without Mix or Python:
 
 ```sh
-cargo build --manifest-path examples/rustler/Cargo.toml
-H3_NIF="$PWD/examples/rustler/target/debug/libh3_nif" elixir examples/rustler/smoke.exs
+cargo build --manifest-path clients/rustler/Cargo.toml
+H3_NIF="$PWD/clients/rustler/target/debug/libh3_nif" elixir clients/rustler/smoke.exs
 ```
 
 The example exports `open/1`, `ping/2`, and `encode_audio/5`. For audio, pass a

@@ -6,6 +6,6 @@ __pycache__/
 *.log
 
 /target/
-/examples/rust/target/
-/examples/rustler/target/
+/clients/rust/target/
+/clients/rustler/target/
 .cargo/

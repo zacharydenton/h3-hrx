@@ -31,10 +31,10 @@ fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let n: usize = a[4].parse().expect("a count");
 
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let exe = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
     let mut stream = hrx::Stream::open().expect("stream");
-    let compiler = Compiler::new(exe, root.join("h3/kernels"));
+    let compiler = Compiler::new(exe, root.join("kernels"));
     // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
     let mut vae = unsafe { AudioVae::open(&mut stream, &a[1]) }.expect("audio VAE checkpoint");
     let mut prof = Profile::from_env();

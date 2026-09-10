@@ -1,18 +1,52 @@
-# One workspace: the crates share a lockfile, a target directory and one `cargo test`.
+# One crate: the library, its kernels, and the `h3` command that drives them.
 #
-# examples/rust is deliberately excluded. It is a client, and building it the way someone outside this
-# repository would — its own lockfile, resolved against the crate as published — is the point of it.
-[workspace]
-resolver = "2"
-members = ["h3", "cli"]
-exclude = ["examples/rust"]
-
-[workspace.package]
+# `clients/` holds the outside consumers — a Rust binary and a Rustler NIF — each with its own
+# lockfile, because building them the way someone outside this repository would is the point of them.
+[package]
+name = "h3"
 version = "0.1.0"
 edition = "2021"
+description = "MiniMax H3 inference: ComfyUI checkpoints in, video and audio out, every kernel in Loom"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+# `doc = false`: the command's own modules are not API, and the library's docs are the crate's.
+[[bin]]
+name = "h3"
+path = "src/bin/h3/main.rs"
+doc = false
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# The command line, and nothing the library needs. A consumer takes the library with
+# `default-features = false` and compiles neither.
+cli = ["dep:anyhow", "dep:clap"]
+
+[dependencies]
+hrx = { package = "hrx-rs", version = "0.2.0", default-features = false, features = ["download", "loom"] }
+memmap2 = "0.9"
+safetensors = "0.8"
+half = { version = "2", features = ["bytemuck"] }
+bytemuck = "1"
+libc = "0.2"
+thiserror = "2"
+# fancy-regex, not onig: onig is a C library, and the point of this crate is that there is no C.
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+hf-hub = { version = "1.0.0", default-features = false, features = ["blocking", "rustls-tls"] }
+# ChaCha rather than StdRng: rand does not promise StdRng's stream across major versions, and a seed
+# has to keep naming the same clip.
+rand = { version = "0.9", default-features = false, features = ["std"] }
+rand_chacha = "0.9"
+rand_distr = "0.5"
+anyhow = { version = "1", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+
+[dev-dependencies]
+libm = "0.2"
+tempfile = "3"
 
 [profile.release]
 opt-level = 2
-
-[workspace.dependencies]
-hrx = { package = "hrx-rs", version = "0.2.0", default-features = false, features = ["download", "loom"] }

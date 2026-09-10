@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the CLI. All Rust, all on libhrx — no ROCm headers, no hipcc, and no
-# device code outside h3/kernels/.
+# device code outside kernels/.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mkdir -p build
@@ -10,7 +10,7 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-cargo build --workspace --release --quiet
+cargo build --release --quiet
 # A link, not a copy: `build/` is the ignored working area, and a copy of the binary would go stale
 # exactly the way the library's did while nothing rebuilt it.
 ln -sf ../target/release/h3 build/h3

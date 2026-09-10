@@ -1,5 +1,5 @@
 //! Native GPU regressions against independent scalar CPU oracles.
-//! Run `cargo test -p h3 --test kernels -- --ignored --test-threads=1` on gfx1151.
+//! Run `cargo test --test kernels -- --ignored --test-threads=1` on gfx1151.
 use half::{bf16, f16};
 use hrx::{Buffer, Constants, Stream};
 use std::path::Path;
@@ -42,7 +42,7 @@ impl Harness {
         let path = if path.is_file() {
             path
         } else {
-            root.join("../experiments").join(format!("{stem}.loom"))
+            root.join("experiments").join(format!("{stem}.loom"))
         };
         let source = std::fs::read_to_string(path).unwrap();
         let symbol = format!("h3_{stem}");

@@ -31,7 +31,7 @@ fn main() {
         te: file("text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
         video_vae: file("vae/minimax_h3_video_vae_fp16.safetensors"),
         audio_vae: file("vae/minimax_h3_audio_vae_fp32.safetensors"),
-        kernel_sources: format!("{root}/h3/kernels").into(),
+        kernel_sources: format!("{root}/kernels").into(),
         loom_library: std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from),
         attention: h3::Attention::I8,
     })

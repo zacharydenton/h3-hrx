@@ -8,7 +8,7 @@ Run commands from the repository root unless stated otherwise.
   128 GB Strix Halo system. Allow room for activations as well as weights;
   smaller memory configurations have not been validated.
 - ffmpeg for input decoding and MP4/WAV output.
-- `cargo` (Rust). Everything outside `h3/kernels/` is Rust: the library and the
+- `cargo` (Rust). Everything outside `kernels/` is Rust: the library and the
   `h3` command. No ROCm headers and no `hipcc` — the runtime surface is `libhrx`,
   loaded on demand from the HRX bundle.
 - Nothing else. [`hrx-rs`](shared-hrx.md) comes from crates.io like any other
@@ -42,7 +42,7 @@ at a pinned mirror, and `HRX_OFFLINE` refuses the network outright. `HRX_LOOM_LI
 selects a developer `libloomc.so` in place of the bundle’s.
 
 The build produces `target/release/h3`, linked as `build/h3`. An installed binary carries the Loom
-sources and the tokenizer inside it; `h3 --root DIR` opts back into a working tree's `h3/kernels/`
+sources and the tokenizer inside it; `h3 --root DIR` opts back into a working tree's `kernels/`
 instead. Compiled kernels go to one cache per user under `$XDG_CACHE_HOME/hrx` whichever sources
 they came from, because an artifact's name already covers the compiler, the source, the export, the
 target and the configuration. `hrx gc [DAYS]` sweeps it by last use.
