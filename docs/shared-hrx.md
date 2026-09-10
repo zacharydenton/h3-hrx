@@ -91,8 +91,9 @@ transfers 10 MiB -- and 3 ms of unpatchify. Across the decode, every host phase 
 gather, unpatchify, pixel blend) is **106 ms of 25.2 s, 0.4%**. The first tile carries about 21 s of
 one-time weight upload and kernel setup, which amortises over a real clip's 105 tiles.
 
-That is roughly 1.08 ms of GPU time per dispatch against 175 ns to enqueue one, so the decoder is
-bound by its kernels and not by the host. Queuing the readback to hide the host phase is worth about
+That is roughly 1.08 ms of elapsed time per dispatch against 175 ns to enqueue one -- elapsed, not
+GPU time, which nothing here can isolate; the point is only that the interval a dispatch occupies
+dwarfs anything the host or a recording could give back. Queuing the readback to hide the host phase is worth about
 1%, and recording the fifteen independent tiles as concurrent workstreams competes for the same
 margin, since the device is already busy for 92% of a tile's wall time.
 
@@ -104,12 +105,31 @@ in a tile's token count. The 256-pixel tiling is the efficient configuration.
 
 `docs/archive/notes.md` calls BigVGAN launch-bound, which was true of the torch implementation this
 one replaced. It is not true here. A warm stereo decode of 500 latents takes 1.49 s in process, and
-one latent -- where the ~836 dispatches are the same but the work is not -- takes 121 ms. Under
-`H3_PROFILE=1` that short case reports 126 ms of kernel time against 128 ms of wall, so 145 us per
-dispatch is the kernel running, not the host enqueuing it, and one enqueue costs 175 ns.
+one latent -- where the ~836 dispatches are the same but the work is not -- takes 121 ms. That is
+145 us of elapsed time per dispatch.
+
+**What `H3_PROFILE=1` does and does not tell you.** It synchronises before and after each launch and
+times the pair on the CPU (`h3/src/dispatch.rs`), so what it reports is a round trip: submission,
+execution and the wait, together. It is not GPU execution time, and an earlier version of this note
+called it that. It does establish one thing -- the short case reports 126 ms against 128 ms of
+unprofiled wall, so per-launch synchronisation is not what the path is spending, since adding a
+drain around all 836 launches changed the total by 2%.
+
+Separating submission from execution needs GPU timestamps, which are not exposed. What settles the
+question instead is asking the runtime directly: `dispatch_cost` runs the audio VAE's own residual
+convolution, at both extremes of its upsampling levels, as 256 eager dispatches and as a recorded
+256-node chain over the same allocations. A recording is the thing that would remove submission
+overhead if submission overhead were the cost. It does not: the chain comes back between 0.82x and
+1.43x of eager across runs, never a systematic win, while a dispatch of that kernel takes between
+0.19 ms and 7.3 ms. Whatever those milliseconds consist of, they are not something a graph reaches.
+
+Those ratios are wide because the machine they were taken on was running at load average 24. They
+want a quiet box to tighten, but no plausible tightening turns a 2 us per-node saving into a share
+of 145 us.
 
 The kernels are inefficient at short lengths -- `audio res conv2` averages 635 us over a 1024x5
-tensor -- which is a kernel problem worth its own look, and not one a recording addresses.
+tensor under the profiler -- which is a kernel problem worth its own look, and not one a recording
+addresses.
 
 ## Recording, and what it is worth
 
@@ -141,7 +161,8 @@ decodes and the ten reference denoise cases are byte-identical to the eager path
 exercising the concurrent operand prepares in all fifty blocks.
 
 All three candidate paths were measured before any of this: a denoise step averages tens of
-milliseconds of GPU work per dispatch, a video decode tile about 1.08 ms, and an audio decode 145 us.
+milliseconds of elapsed time per dispatch, a video decode tile about 1.08 ms, and an audio decode
+145 us.
 Against 175 ns to enqueue, none is bound by the host, and no arrangement of dependencies changes the
 arithmetic they are waiting on.
 

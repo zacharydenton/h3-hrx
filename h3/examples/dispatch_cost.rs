@@ -98,5 +98,88 @@ fn main() -> Fallible {
         stream.read_blocking(output.binding().slice(0, 512)?, &mut sample)?;
         assert_eq!(sample, vec![0u8; 512]);
     }
+
+    // The audio VAE's own residual convolution, at the shape its first upsample level runs: this is
+    // the path a profile makes look launch-bound, so it is the one worth asking directly.
+    for (chan, len) in [(1024usize, 5usize), (8, 165_600)] {
+        let (kk, dil) = (7usize, 3usize);
+        let ns = "h3.conv1d4_f32.";
+        let cfg: h3::compile::Cfg = vec![
+            (format!("{ns}cin"), chan.to_string()),
+            (format!("{ns}cout"), chan.to_string()),
+            (format!("{ns}ksize"), kk.to_string()),
+            (format!("{ns}dilation"), dil.to_string()),
+            (format!("{ns}pad"), ((kk * dil - dil) / 2).to_string()),
+            (format!("{ns}accumulate"), "0".into()),
+            (
+                format!("{ns}len_bound"),
+                len.div_ceil(256).max(1).saturating_mul(256).to_string(),
+            ),
+        ];
+        let kernel = compiler.get(&mut stream, "conv1d4_f32", "h3_conv1d4_f32", &cfg)?;
+        compiler.flush(&mut stream)?;
+        let plane = stream.allocate(chan * len.div_ceil(256).max(1) * 256 * 4)?;
+        let out = stream.allocate(chan * len.div_ceil(256).max(1) * 256 * 4)?;
+        let weight = stream.allocate(chan * chan * kk * 4)?;
+        let bias = stream.allocate(chan * 4)?;
+        for b in [&plane, &out, &weight, &bias] {
+            stream.fill(b.binding(), 0)?;
+        }
+        let grid = [len.div_ceil(256) as u32, chan as u32, 1];
+        let need = [plane.bytes(), weight.bytes(), bias.bytes(), out.bytes()];
+        let views = [
+            plane.binding(),
+            weight.binding(),
+            bias.binding(),
+            out.binding(),
+        ];
+
+        let (host, eager) = measure(&mut stream, LAUNCHES, |stream| {
+            for _ in 0..LAUNCHES {
+                h3::dispatch::emit(
+                    &mut Sink::Stream(stream),
+                    &kernel,
+                    None,
+                    "res conv",
+                    grid,
+                    [64, 1, 1],
+                    &[len as u32],
+                    &views,
+                    &need,
+                )?;
+            }
+            Ok(())
+        })?;
+
+        let mut graph = stream.graph()?;
+        {
+            let mut sink = Sink::Graph {
+                graph: &mut graph,
+                after: None,
+            };
+            for _ in 0..LAUNCHES {
+                h3::dispatch::emit(
+                    &mut sink,
+                    &kernel,
+                    None,
+                    "res conv",
+                    grid,
+                    [64, 1, 1],
+                    &[len as u32],
+                    &views,
+                    &need,
+                )?;
+            }
+        }
+        let mut replay = graph.finish()?;
+        let (_, replayed) = measure(&mut stream, LAUNCHES, |stream| {
+            stream.launch(&mut replay)?;
+            Ok(())
+        })?;
+        println!(
+            "conv1d4 {chan}x{len}: eager {host:.0} ns host, {eager:.0} ns completed;              graph {replayed:.0} ns completed ({:.2}x)",
+            replayed / eager
+        );
+    }
     Ok(())
 }
