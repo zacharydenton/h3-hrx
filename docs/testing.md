@@ -25,7 +25,7 @@ to another stream, a path that resolves to the wrong tree. Inputs are generated 
 generator written out in the test, so nothing is stored; the outputs would be gigabytes and a digest
 compares them exactly as well.
 
-`H3_GRAPH=1 cargo test --test differentials --release -- --ignored` runs the same cases through the
+`H3_GRAPH=1 cargo test --features internals --test differentials --release -- --ignored --test-threads=1` runs the same cases through the
 recorded graphs, which is how the recordings are known to be faithful.
 
 A failed assertion reports the actual and expected digests. Before updating an expected digest

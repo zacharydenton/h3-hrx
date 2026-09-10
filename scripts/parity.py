@@ -64,7 +64,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 # --------------------------------------------------------------------------------------------------
-# The host, through the parity_dump example
+# The host, through h3-dev parity-dump
 # --------------------------------------------------------------------------------------------------
 
 MODELS = Path(os.environ.get("H3_MODELS") or Path.home() / "comfy-models")
@@ -74,20 +74,24 @@ TE = MODELS / "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
 VIDEO_VAE = MODELS / "vae/minimax_h3_video_vae_fp16.safetensors"
 AUDIO_VAE = MODELS / "vae/minimax_h3_audio_vae_fp32.safetensors"
 
-DUMP = ROOT / "target/release/examples/parity_dump"
+DUMP = ROOT / "target/release/h3-dev"
 
 
 class H3Error(RuntimeError):
     pass
 
 
+def host_command(command: str) -> list[str]:
+    if not DUMP.is_file():
+        raise H3Error(f"{DUMP} is missing; cargo build --release --features internals --bin h3-dev")
+    return [str(DUMP), "parity-dump", command]
+
+
 def host(command: str, out: Path, dumps: Path | None = None, env: dict | None = None, **flags) -> Path:
-    """Run one `parity_dump` command. Python never links the library: it writes the inputs as files,
+    """Run one `h3-dev parity-dump` command. Python never links the library: it writes the inputs as files,
     the host writes its artefacts as files, and everything below reads them back. There is no
     foreign-function boundary here to drift out of step with the crate."""
-    if not DUMP.is_file():
-        raise H3Error(f"{DUMP} is missing; cargo build --release -p h3 --example parity_dump")
-    argv = [str(DUMP), command, "--out", str(out)]
+    argv = host_command(command) + ["--out", str(out)]
     for key, value in flags.items():
         if value is None:
             continue
@@ -107,7 +111,7 @@ def host(command: str, out: Path, dumps: Path | None = None, env: dict | None = 
 
 def host_shape(height: int, width: int, frames: int) -> dict:
     """The model's own sizing, so nothing here reimplements the 17n+5 snapping or the /16 grids."""
-    argv = [str(DUMP), "shape", "--height", str(height), "--width", str(width), "--frames", str(frames)]
+    argv = host_command("shape") + ["--height", str(height), "--width", str(width), "--frames", str(frames)]
     done = subprocess.run(argv, capture_output=True, text=True)
     if done.returncode:
         raise H3Error((done.stderr or done.stdout).strip())

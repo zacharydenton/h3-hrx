@@ -59,7 +59,7 @@ select a developer compiler. See the shared crate README for the bundle contract
 `Config::loom_library` selects a shared compiler library, or `HRX_LOOM_LIBRARY`
 does; either empty takes the pinned bundle's. There is no C ABI any more — the
 crate's `Session` is the interface, `clients/rustler` is the interop, and
-`scripts/parity.py` reaches the host through the `parity_dump` example rather
+`scripts/parity.py` reaches the host through `h3-dev parity-dump` rather
 than by linking it.
 
 `clients/rustler` is a minimal, working Rustler adapter owned by an Elixir app.
