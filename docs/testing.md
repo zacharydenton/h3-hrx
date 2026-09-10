@@ -139,10 +139,10 @@ To reproduce the comparison, extract the pre-consolidation sources:
 mkdir -p build/kernel-baseline
 git archive 62f837d kernels | tar -x -C build/kernel-baseline
 export H3_KERNEL_BASELINE="$PWD/build/kernel-baseline/kernels"
-cargo test --test kernels -- --ignored --test-threads=1 --nocapture
-H3_KERNEL_TIMING=1 cargo test --test kernels preparation -- --ignored --test-threads=1 --nocapture
-cargo run --release --example compare_gemm -- "$H3_KERNEL_BASELINE"
-cargo run --release --example compare_vision -- "$H3_KERNEL_BASELINE"
+cargo test --features internals --test kernels -- --ignored --test-threads=1 --nocapture
+H3_KERNEL_TIMING=1 cargo test --features internals --test kernels preparation -- --ignored --test-threads=1 --nocapture
+cargo run --release --features internals --bin h3-dev -- compare-gemm "$H3_KERNEL_BASELINE"
+cargo run --release --features internals --bin h3-dev -- compare-vision "$H3_KERNEL_BASELINE"
 ```
 
 The test harness compares every binding bit-for-bit before the independent CPU
@@ -162,7 +162,7 @@ for module in kernels/*_family.loom kernels/gemm_packed_256.loom; do
     while IFS= read -r entry; do cat "$H3_KERNEL_BASELINE/$entry.loom"; done |
     awk '!/^amdgpu.target/ || !seen[$0]++' > "$H3_KERNEL_BASELINE/$(basename "$module")"
 done
-cargo run --release --example compare_decode -- \
+cargo run --release --features internals --bin h3-dev -- compare-decode \
   "$H3_KERNEL_BASELINE" "$VAE_CHECKPOINT" "$LATENTS_F32" 480 864 22
 ```
 

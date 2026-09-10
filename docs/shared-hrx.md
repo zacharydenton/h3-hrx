@@ -115,7 +115,7 @@ machine. Those results are not evidence that concurrent execution cannot help.
 GPU timestamps and native partition/workstream counters are not exposed by the
 pinned API.
 
-`dispatch_cost` compares the same prepared kernels and allocations eagerly and
+`h3-dev dispatch-cost` compares the same prepared kernels and allocations eagerly and
 as a serial graph. Both arms receive three warmups and nine measured batches,
 with alternating A/B and B/A order. Samples end with a completion wait. Each
 arm must overwrite poisoned output with the expected zeros; reset and readback
@@ -133,6 +133,23 @@ pass, so repeat the paired benchmark before using it to select an execution path
 | Prepare 4096×1024 | 45.89 µs | 46.03 µs |
 | Conv1d4 1024×5 | 7.17 ms | 7.23 ms |
 | Conv1d4 8×165600 | 251.3 µs | 186.0 µs |
+
+Repeated on 2026-09-10 at load average 1.3, three consecutive runs, after the
+diagnostics moved into `h3-dev`. Every absolute figure roughly halves, which is
+the earlier pass measuring contention rather than either path:
+
+| Kernel and shape | Eager | Graph | Ratio |
+| --- | ---: | ---: | ---: |
+| Prepare 256×1 | 2.35 µs | 2.07 µs | 0.88–0.89× |
+| Prepare 4096×1024 | 21.2 µs | 21.1 µs | 0.91–1.13× |
+| Conv1d4 1024×5 | 4.83 ms | 4.83 ms | 1.00× three times |
+| Conv1d4 8×165600 | 111.2 µs | 110.8 µs | 0.99–1.00× |
+
+This resolves the one row that had looked like a win. Conv1d4 8×165600 came back
+251 µs against 186 µs on the busy machine, and 111 µs both ways on the idle one:
+that 26% was load, not the graph. What survives is a saving of roughly 280 ns per
+node, which shows against a kernel doing nothing and disappears against one doing
+microseconds of arithmetic.
 
 The historical decoder profiles are useful for locating costs: a warm video
 tile spent about 20 ms enqueueing, 271 ms in blocking readback and 3 ms
@@ -157,8 +174,8 @@ grows, compiler target checks, conditioning, sampling, GEMMs, attention and
 convolutions. Repeat the native checks with:
 
 ```sh
-HRX_OFFLINE=1 cargo test -- --ignored --test-threads=1
-HRX_OFFLINE=1 cargo run --release --example dispatch_cost
+HRX_OFFLINE=1 cargo test --features internals -- --ignored --test-threads=1
+HRX_OFFLINE=1 cargo run --release --features internals --bin h3-dev -- dispatch-cost
 ```
 
 Checkpoint-backed `denoise_cases` runs compared `H3_GRAPH=0` with `H3_GRAPH=1`

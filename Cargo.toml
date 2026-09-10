@@ -24,6 +24,25 @@ default = ["cli"]
 # The command line, and nothing the library needs. A consumer takes the library with
 # `default-features = false` and compiles neither.
 cli = ["dep:anyhow", "dep:clap"]
+# Opens the crate's interior to the diagnostics binary and the integration tests. Off by default,
+# which is what makes the interior private: a normal build of this library exposes `Session` and
+# the types it takes, and nothing else.
+internals = []
+
+# One stage of the pipeline at a time, for comparing against a reference or a previous kernel.
+[[bin]]
+name = "h3-dev"
+path = "src/bin/h3-dev/main.rs"
+doc = false
+required-features = ["internals"]
+
+[[test]]
+name = "kernels"
+required-features = ["internals"]
+
+[[test]]
+name = "differentials"
+required-features = ["internals"]
 
 [dependencies]
 hrx = { package = "hrx-rs", version = "0.2.0", default-features = false, features = ["download", "loom"] }

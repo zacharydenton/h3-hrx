@@ -43,8 +43,8 @@ fn median(values: &mut [f64]) -> f64 {
     (values[values.len() / 2 - 1] + values[values.len() / 2]) / 2.
 }
 
-fn main() {
-    let baseline = std::env::args().nth(1).expect("BASELINE_DIR");
+pub fn run(args: Vec<String>) {
+    let baseline = args.into_iter().next().expect("BASELINE_DIR");
     let batches: usize = std::env::var("H3_COMPARE_BATCHES")
         .map(|v| v.parse().expect("H3_COMPARE_BATCHES must be an integer"))
         .unwrap_or(10);

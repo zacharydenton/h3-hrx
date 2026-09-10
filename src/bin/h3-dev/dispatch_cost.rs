@@ -50,7 +50,11 @@ fn measure_pair(
     }))
 }
 
-fn main() -> Fallible {
+pub fn run(_args: Vec<String>) {
+    inner().expect("dispatch cost");
+}
+
+fn inner() -> Fallible {
     let mut stream = hrx::Stream::open()?;
     let compiler = Compiler::new(None, "");
     const LAUNCHES: usize = 256;

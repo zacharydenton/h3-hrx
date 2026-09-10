@@ -8,6 +8,8 @@ use crate::model::*;
 
 pub(crate) mod device;
 
+/// The reference the resident sampler is checked against; nothing dispatches it.
+#[cfg(test)]
 /// `x' = r x + (1 - r) (x + sigma v)`, in f32, exactly as written.
 ///
 /// Algebraically this is `x + (1 - r) sigma v`, which is not the same in f32; the form here is the one
@@ -19,18 +21,14 @@ pub fn euler_update(x: &mut [f32], v: &[f32], sigma: f32, r: f32) {
 }
 
 /// The video's denoised estimate: `D = x + sigma_v * out`, where the network's output is `-v`.
-pub fn denoised_video(x: &[f32], out: &[f32], sigma_v: f32) -> Vec<f32> {
-    let mut result = vec![0.0; x.len().min(out.len())];
-    denoised_video_into(x, out, sigma_v, &mut result);
-    result
-}
-
 pub(crate) fn denoised_video_into(x: &[f32], out: &[f32], sigma_v: f32, result: &mut [f32]) {
     for ((xi, oi), di) in x.iter().zip(out).zip(result) {
         *di = xi + sigma_v * oi;
     }
 }
 
+/// The reference the resident sampler is checked against; nothing dispatches it.
+#[cfg(test)]
 /// The audio's denoised estimate for the carried variable.
 ///
 /// The network sees `x_a` at `t_a = 1 - sigma_a`, but the pack advances `y = (sigma_v / sigma_a) x_a`,

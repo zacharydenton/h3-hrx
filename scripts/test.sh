@@ -2,6 +2,9 @@
 # CPU checks by default. --gpu adds the kernel regressions, which need gfx1151 and a provisioned
 # HRX but no checkpoints. --full adds the whole-pipeline digests, which need the checkpoints and
 # take about three minutes; H3_GRAPH=1 runs them again through the recorded graphs.
+#
+# Clippy runs twice: once as a consumer sees the crate, and once with `internals`, which is the
+# build that compiles the tests and `h3-dev` and so the one that can see unreachable code.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 case "${1:---cpu}" in
@@ -12,11 +15,12 @@ case "${1:---cpu}" in
 esac
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --all-targets --features internals -- -D warnings
+cargo test --features internals
 if [ "$gpu" = 1 ]; then
-  cargo test --lib --release -- --ignored --test-threads=1
-  cargo test --test kernels --release -- --ignored --test-threads=1
+  cargo test --lib --release --features internals -- --ignored --test-threads=1
+  cargo test --test kernels --release --features internals -- --ignored --test-threads=1
 fi
 if [ "$full" = 1 ]; then
-  cargo test --test differentials --release -- --ignored --test-threads=1
+  cargo test --test differentials --release --features internals -- --ignored --test-threads=1
 fi

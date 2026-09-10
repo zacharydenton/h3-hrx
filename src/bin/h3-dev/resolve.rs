@@ -1,7 +1,7 @@
 //! Resolves a checkpoint path the way the pipeline will: local directory, then the shared Hugging Face
 //! cache, then the hub.  resolve [--offline] <relative-path>
-fn main() {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
+pub fn run(args: Vec<String>) {
+    let mut args = args;
     let offline = args.first().map(|a| a == "--offline").unwrap_or(false);
     if offline {
         args.remove(0);

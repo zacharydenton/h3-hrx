@@ -21,8 +21,8 @@ fn plan_for(
     }
 }
 
-fn main() {
-    let mut args = std::env::args().skip(1);
+pub fn run(args: Vec<String>) {
+    let mut args = args.into_iter();
     let which = args
         .next()
         .expect("usage: verify_upload <plan> <checkpoint>");

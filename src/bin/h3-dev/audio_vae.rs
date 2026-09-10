@@ -27,8 +27,8 @@ fn write(path: &str, v: &[f32]) {
     f.flush().unwrap();
 }
 
-fn main() {
-    let a: Vec<String> = std::env::args().skip(1).collect();
+pub fn run(args: Vec<String>) {
+    let a = args;
     let n: usize = a[4].parse().expect("a count");
 
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));

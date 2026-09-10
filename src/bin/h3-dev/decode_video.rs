@@ -10,8 +10,8 @@ use h3::dispatch::Profile;
 use h3::layout::shape_for;
 use h3::vvae::VideoVae;
 
-fn main() {
-    let a: Vec<String> = std::env::args().skip(1).collect();
+pub fn run(args: Vec<String>) {
+    let a = args;
     let (height, width, frames): (i32, i32, i32) = (
         a[3].parse().unwrap(),
         a[4].parse().unwrap(),

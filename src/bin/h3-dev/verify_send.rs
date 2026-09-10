@@ -11,7 +11,7 @@ use half::f16;
 
 fn assert_send<T: Send>() {}
 
-fn main() {
+pub fn run(_args: Vec<String>) {
     // A compile-time statement of the claim, before any of it runs.
     assert_send::<hrx::Stream>();
     assert_send::<hrx::Buffer>();

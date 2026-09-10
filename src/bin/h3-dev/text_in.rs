@@ -12,8 +12,8 @@ use h3::model::HID;
 use h3::te::TextEncoder;
 use std::io::Write;
 
-fn main() {
-    let a: Vec<String> = std::env::args().skip(1).collect();
+pub fn run(args: Vec<String>) {
+    let a = args;
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let exe = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
     let mut stream = hrx::Stream::open().expect("stream");

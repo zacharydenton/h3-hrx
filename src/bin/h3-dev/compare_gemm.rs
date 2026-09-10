@@ -52,8 +52,8 @@ fn median(v: &mut [f64]) -> f64 {
     v.sort_by(f64::total_cmp);
     (v[v.len() / 2 - 1] + v[v.len() / 2]) / 2.
 }
-fn main() {
-    let args: Vec<_> = std::env::args().collect();
+pub fn run(args: Vec<String>) {
+    let args: Vec<String> = std::iter::once("h3-dev".to_string()).chain(args).collect();
     let baseline = Path::new(args.get(1).expect("BASELINE_DIR [FILTER]"));
     let filter = args.get(2).map(String::as_str).unwrap_or("");
     let batches: usize = std::env::var("H3_COMPARE_BATCHES")

@@ -5,8 +5,8 @@
 use h3::{compile::Compiler, dispatch::Profile, layout::shape_for, vvae::VideoVae};
 use std::{path::Path, time::Instant};
 
-fn main() {
-    let a: Vec<_> = std::env::args().collect();
+pub fn run(args: Vec<String>) {
+    let a: Vec<String> = std::iter::once("h3-dev".to_string()).chain(args).collect();
     assert_eq!(
         a.len(),
         7,

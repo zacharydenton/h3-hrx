@@ -5,6 +5,7 @@
 //! layer's projection, and the projection's chunks are permuted into the row order the kernels index
 //! by class. The accumulation is f32 in a fixed order and the permutation is semantic, so both are
 //! carried over exactly rather than tidied.
+#[cfg(test)]
 use crate::model::*;
 
 pub(crate) mod device;
@@ -27,6 +28,7 @@ pub fn temb(curve: &[f32], t: f32) -> [f32; 8] {
 }
 
 /// One layer's projection: `bias + weight * te`, accumulated in f32 in the weights' own order.
+#[cfg(test)]
 fn project(w: &[f32], b: &[f32], te: &[f32; 8], out: &mut [f32]) {
     for (r, o) in out.iter_mut().enumerate() {
         let mut acc = b[r];
@@ -43,6 +45,7 @@ fn project(w: &[f32], b: &[f32], te: &[f32; 8], out: &mut [f32]) {
 /// (scale_mlp, shift_mlp), `[5C, 6C)` gate_mlp, where a class is `timestep index * 3 + modality`. The
 /// projection produces its chunks in a different order — shift, scale, gate for each of msa and mlp —
 /// so the copy below swaps shift and scale. That swap is the layout, not a tidy-up.
+#[cfg(test)]
 pub fn mods_table(
     adaln_w: &[Vec<f32>],
     adaln_b: &[Vec<f32>],
@@ -83,6 +86,7 @@ pub fn mods_table(
 
 /// The final layer's (scale, shift) per timestep class: row `2c` scale, `2c + 1` shift. The projection
 /// hands back (shift | scale), so the halves land the other way round.
+#[cfg(test)]
 pub fn final_table(final_w: &[f32], final_b: &[f32], tv: &[f32; 8], ta: &[f32; 8]) -> Vec<f32> {
     let mut ft = vec![0.0f32; 4 * HID];
     for m in 0..2 {

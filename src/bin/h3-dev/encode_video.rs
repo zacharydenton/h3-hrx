@@ -9,8 +9,8 @@ use h3::dispatch::Profile;
 use h3::vvae::{Clip, VideoVae};
 use std::io::Write;
 
-fn main() {
-    let a: Vec<String> = std::env::args().skip(1).collect();
+pub fn run(args: Vec<String>) {
+    let a = args;
     let (frames, height, width): (usize, usize, usize) = (
         a[3].parse().unwrap(),
         a[4].parse().unwrap(),

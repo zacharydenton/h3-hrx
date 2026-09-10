@@ -1,5 +1,5 @@
 //! Sequential and overlapping session creation, and one from another thread.
-fn main() {
+pub fn run(_args: Vec<String>) {
     for i in 0..3 {
         match hrx::Stream::open() {
             Ok(_g) => println!("sequential open {i}: OK"),

@@ -11,8 +11,8 @@ use h3::model::*;
 use h3::stack::{Stack, StackDims};
 use h3::weights::Weights;
 
-fn main() {
-    let mut args = std::env::args().skip(1);
+pub fn run(args: Vec<String>) {
+    let mut args = args.into_iter();
     let path = args
         .next()
         .expect("usage: verify_stack_kernels <checkpoint> <tokens>");

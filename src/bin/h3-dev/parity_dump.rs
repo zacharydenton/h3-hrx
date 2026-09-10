@@ -161,8 +161,8 @@ fn params(a: &Args) -> DenoiseParams {
     }
 }
 
-fn main() {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+pub fn run(args: Vec<String>) {
+    let argv = args;
     let Some(command) = argv.first().cloned() else {
         fail("a command is required: shape, text, encode, decode or denoise");
     };

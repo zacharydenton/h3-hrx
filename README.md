@@ -109,7 +109,7 @@ but not the CLI.
 
 - [Setup](docs/setup.md) — dependencies, checkpoints, and configuration.
 - [Prompting](docs/prompting.md) and [other modes](docs/tricks.md) — references, audio, and stills.
-- [Examples](examples/README.md) — the `h3` crate from Rust, and a Rustler adapter for Elixir.
+- [Clients](clients/README.md) — the `h3` crate from Rust, and a Rustler adapter for Elixir.
 - [Contributing](CONTRIBUTING.md) — repository layout, tests, and benchmarking.
 - [Performance](docs/performance.md) and [research archive](docs/archive/README.md).
 

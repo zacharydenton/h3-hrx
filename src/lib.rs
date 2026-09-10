@@ -21,9 +21,10 @@
 //! # What is not supported
 //!
 //! Everything else — the transformer stack, the kernel compiler and cache, the packed layout, the
-//! samplers, the checkpoint reader — is an implementation detail. Those modules are public, and
-//! `#[doc(hidden)]`, so the diagnostic examples in `h3/examples/` can drive one stage at a time; that
-//! is not a promise about them. They carry no stability guarantee and change with the model.
+//! samplers, the checkpoint reader — is an implementation detail, and private. The `internals`
+//! feature opens it, so that `h3-dev` and the integration tests can drive one stage at a time; that
+//! is not a promise about it. Nothing under that feature carries a stability guarantee, and all of
+//! it changes with the model.
 //!
 //! # What this crate trusts
 //!
@@ -32,54 +33,95 @@
 //! library has already validated, or shrink the file under reads that are in flight. Point a session
 //! at files you control.
 
-// The implementation. Public so the diagnostic examples in `h3/examples/` can drive one stage at a
-// time, and `#[doc(hidden)]` because it is not an interface anyone should build against. Written
-// out as plain `mod` items rather than generated: rustfmt follows only literal module
-// declarations, and a macro here would keep every file below out of `cargo fmt`.
+// With the interior closed, the parts of it that only the diagnostics binary and the integration
+// tests reach have no caller, and every one of them would be reported as dead. The `internals` build
+// is where that report means something — it compiles those callers, and it is what `scripts/test.sh`
+// runs — so the warning is silenced only in the build that cannot see them.
+#![cfg_attr(not(feature = "internals"), allow(dead_code))]
+
+// The implementation. `internals` opens it to the diagnostics binary and the integration
+// tests, which drive one stage at a time; a normal build keeps it shut. Written out rather
+// than generated, because rustfmt follows only literal module declarations and a macro here
+// would keep every file below out of `cargo fmt`.
+
+#[cfg(feature = "internals")]
 #[doc(hidden)]
 pub mod avae;
-#[doc(hidden)]
-pub mod cache;
+#[cfg(not(feature = "internals"))]
+mod avae;
+#[cfg(feature = "internals")]
 #[doc(hidden)]
 pub mod checkpoint;
+#[cfg(not(feature = "internals"))]
+mod checkpoint;
+#[cfg(feature = "internals")]
 #[doc(hidden)]
 pub mod compile;
-#[doc(hidden)]
-pub mod conditioning;
+#[cfg(not(feature = "internals"))]
+mod compile;
+#[cfg(feature = "internals")]
 #[doc(hidden)]
 pub mod dispatch;
+#[cfg(not(feature = "internals"))]
+mod dispatch;
+#[cfg(feature = "internals")]
 #[doc(hidden)]
 pub mod dit;
+#[cfg(not(feature = "internals"))]
+mod dit;
+#[cfg(feature = "internals")]
 #[doc(hidden)]
 pub mod layout;
+#[cfg(not(feature = "internals"))]
+mod layout;
+#[cfg(feature = "internals")]
 #[doc(hidden)]
 pub mod model;
-#[doc(hidden)]
-pub mod noise;
-#[doc(hidden)]
-pub mod pixels;
+#[cfg(not(feature = "internals"))]
+mod model;
+#[cfg(feature = "internals")]
 #[doc(hidden)]
 pub mod plan;
-#[doc(hidden)]
-pub mod rope;
-#[doc(hidden)]
-pub mod sampler;
+#[cfg(not(feature = "internals"))]
+mod plan;
+#[cfg(feature = "internals")]
 #[doc(hidden)]
 pub mod stack;
+#[cfg(not(feature = "internals"))]
+mod stack;
+#[cfg(feature = "internals")]
 #[doc(hidden)]
 pub mod te;
-#[doc(hidden)]
-pub mod tiles;
+#[cfg(not(feature = "internals"))]
+mod te;
+#[cfg(feature = "internals")]
 #[doc(hidden)]
 pub mod vision;
+#[cfg(not(feature = "internals"))]
+mod vision;
+#[cfg(feature = "internals")]
 #[doc(hidden)]
 pub mod vvae;
+#[cfg(not(feature = "internals"))]
+mod vvae;
+#[cfg(feature = "internals")]
 #[doc(hidden)]
 pub mod weights;
+#[cfg(not(feature = "internals"))]
+mod weights;
 
+// Reached from nowhere outside this crate, and so never public.
+
+mod cache;
+mod conditioning;
 pub mod error;
 pub mod models;
+mod noise;
+mod pixels;
+mod rope;
+mod sampler;
 pub mod session;
+mod tiles;
 pub mod tokenizer;
 
 pub use dit::{

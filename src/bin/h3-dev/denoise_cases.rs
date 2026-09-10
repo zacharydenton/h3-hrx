@@ -82,8 +82,8 @@ struct Case {
     kfs: Vec<OwnedKeyframe>,
 }
 
-fn main() {
-    let a: Vec<String> = std::env::args().skip(1).collect();
+pub fn run(args: Vec<String>) {
+    let a = args;
     let text = std::fs::read_to_string(&a[2]).expect("manifest");
 
     let mut ids: Vec<i32> = Vec::new();

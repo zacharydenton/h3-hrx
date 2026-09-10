@@ -35,7 +35,7 @@ fn cosine(a: &[f64], b: &[f64]) -> f64 {
     dot / (na.sqrt() * nb.sqrt()).max(f64::MIN_POSITIVE)
 }
 
-fn main() {
+pub fn run(_args: Vec<String>) {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let exe = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
     let mut stream = hrx::Stream::open().expect("stream");
