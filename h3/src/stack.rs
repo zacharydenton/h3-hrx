@@ -757,7 +757,6 @@ impl Stack {
     /// `x`: f32 `[capacity][hidden]`, rows past `tokens` untouched. `cls`: a checked class per row.
     /// `cos`/`sin`: f32 `[tokens][rope_dim/2]`.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn forward<'a>(
         &mut self,
         stream: &mut hrx::Stream,
@@ -794,6 +793,49 @@ impl Stack {
             last,
             dumping,
         )
+    }
+
+    /// Replay a fixed block range, falling back to eager execution for stage
+    /// profiling or block dumps. The owner clears `recorded` when bindings,
+    /// shape or range change.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_cached<'a>(
+        &mut self,
+        stream: &mut hrx::Stream,
+        prof: &mut Profile,
+        recorded: &mut Option<hrx::GraphExec>,
+        x: View<'a>,
+        cls: ClassRows<'a>,
+        cos: View<'a>,
+        sin: View<'a>,
+        cond: &dyn Fn(usize) -> LayerCond<'a>,
+        first: usize,
+        last: Option<usize>,
+    ) -> Result<()> {
+        if !crate::dispatch::graph_enabled(prof) {
+            return self.forward(stream, prof, x, cls, cos, sin, cond, first, last);
+        }
+        if recorded.is_none() {
+            let mut graph = stream.graph()?;
+            self.emit(
+                &mut Sink::Graph {
+                    graph: &mut graph,
+                    after: Default::default(),
+                },
+                prof,
+                x,
+                cls,
+                cos,
+                sin,
+                cond,
+                first,
+                last,
+                false,
+            )?;
+            *recorded = Some(graph.finish()?);
+        }
+        stream.launch(recorded.as_mut().expect("recorded above"))?;
+        Ok(())
     }
 
     /// The stack's blocks, sent wherever `sink` says.
@@ -1113,7 +1155,7 @@ impl Stack {
         // `zmean` read-only, and write six allocations no other two of them touch, so each waits for
         // what came before rather than for its neighbours.
         let before = sink.head();
-        let mut ends = [None; 3];
+        let mut ends = [Default::default(); 3];
         emit(
             sink,
             self.prep_q.as_ref().expect("built with integer QK"),
@@ -1166,7 +1208,7 @@ impl Stack {
             &[rows * self.d.inner() * 2, self.d.inner() * cap * 2],
         )?;
         ends[2] = sink.head();
-        sink.join(&ends)?;
+        sink.after_branches(ends)?;
         emit(
             sink,
             &self.attention,

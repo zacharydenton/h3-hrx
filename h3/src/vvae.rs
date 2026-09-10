@@ -86,7 +86,9 @@ struct Built {
     graph: Option<hrx::GraphExec>,
 }
 
+/// Resident video VAE state, used only on the stream passed to `open`.
 pub struct VideoVae {
+    stream_id: usize,
     weights: Weights,
     constants: Constants,
     built: Option<Built>,
@@ -112,6 +114,7 @@ impl VideoVae {
         // the attention's per-head norms are ones for this stack, and its AdaLN tables are zero: it
         // modulates with a learned per-block scale alone
         Ok(Self {
+            stream_id: stream.id(),
             pq_w: weights.host_f32("vae.post_quant_conv.w", LATENT_CH * LATENT_CH)?,
             pq_b: weights.host_f32("vae.post_quant_conv.b", LATENT_CH)?,
             latents_mean: weights.host_f32("vae.latents_mean", LATENT_CH)?,
@@ -124,9 +127,17 @@ impl VideoVae {
         })
     }
 
+    fn check_stream(&self, stream: &hrx::Stream) -> Result<()> {
+        if stream.id() != self.stream_id {
+            return crate::error::invalid("a video VAE must use the stream that created it");
+        }
+        Ok(())
+    }
+
     /// Builds the stack, the two projections and the buffers for one latent grid, if the last call was
     /// for a different one.
     fn ensure(&mut self, stream: &mut hrx::Stream, c: &Compiler, grid: Grid) -> Result<()> {
+        self.check_stream(stream)?;
         if self.built.as_ref().is_some_and(|b| b.grid == grid) {
             return Ok(());
         }
@@ -316,34 +327,8 @@ impl VideoVae {
             gate_mlp: scales[i].1,
         };
         let (x, cls, cos, sin) = (b.x.binding(), b.cls.all(), b.cos.binding(), b.sin.binding());
-        let recording = crate::stack::env_once("H3_GRAPH").is_some_and(|v| v != "0");
-        if recording && b.graph.is_none() {
-            // The recording borrows the stack and its operands; `finish` ends those borrows and
-            // hands back something the runtime owns, so it can be kept beside them.
-            let mut graph = stream.graph()?;
-            b.stack.emit(
-                &mut crate::dispatch::Sink::Graph {
-                    graph: &mut graph,
-                    after: None,
-                },
-                prof,
-                x,
-                cls,
-                cos,
-                sin,
-                &cond,
-                0,
-                None,
-                false,
-            )?;
-            b.graph = Some(graph.finish()?);
-        }
-        match &mut b.graph {
-            Some(replay) => stream.launch(replay)?,
-            None => b
-                .stack
-                .forward(stream, prof, x, cls, cos, sin, &cond, 0, None)?,
-        }
+        b.stack
+            .forward_cached(stream, prof, &mut b.graph, x, cls, cos, sin, &cond, 0, None)?;
 
         let w_norm = weights.at(stream, "vae.norm_out.w", VAE_HID * 4)?;
         b.norm_out.run(
@@ -979,6 +964,7 @@ impl VideoVae {
         prof: &mut Profile,
         clip: Clip<'_>,
     ) -> Result<(Vec<f32>, usize)> {
+        self.check_stream(stream)?;
         let (frames, height, width) = (clip.frames, clip.height, clip.width);
         let (ys, yo) = tiles::split_tiles(height);
         let (xs, xo) = tiles::split_tiles(width);

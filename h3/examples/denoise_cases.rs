@@ -232,6 +232,7 @@ fn main() {
             },
             None => Noise::default(),
         };
+        prof.take();
         let start = std::time::Instant::now();
         let out = dit
             .denoise(
@@ -256,6 +257,9 @@ fn main() {
             case.p.width,
             start.elapsed().as_secs_f64()
         );
+        if prof.on {
+            eprintln!("{}", prof.report(0.01));
+        }
         write(&format!("{out_dir}/{}.video", case.name), &out.video);
         write(&format!("{out_dir}/{}.audio", case.name), &out.audio);
     }

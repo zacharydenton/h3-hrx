@@ -11,17 +11,16 @@ The workspace takes it from crates.io by version, under the name `hrx`:
 hrx = { package = "hrx-rs", version = "0.2.0", default-features = false, features = ["download", "loom"] }
 ```
 
-So a clean clone builds with `cargo build` and nothing else — no credentials, no
-sibling checkout, no `[patch]` table.
-
-**0.2.0 is not yet on crates.io.** Until it is, point Cargo at a local checkout
-from an uncommitted `.cargo/config.toml`, which keeps the override off the
-dependency itself:
+Normal builds use the published crate. For local HRX development, point Cargo
+at a sibling checkout from an ignored `.cargo/config.toml`:
 
 ```toml
 [patch.crates-io]
 hrx-rs = { path = "../hrx.rs" }
 ```
+
+Remove the override and restore the registry dependency in `Cargo.lock` before
+committing changes made with a local HRX checkout.
 
 `hrx gc [DAYS]` collects what provisioning leaves behind: runtime bundles the
 crate's manifest no longer pins, and kernel artifacts unused for longer than
@@ -38,7 +37,7 @@ outstanding set to `hrx::loom::Compiler::compile_all`, which owns the thread
 budget. Sources are read once per compiler session. The source files and tokenizer are
 inside the `h3` package at `h3/kernels` and `h3/assets`. Tests and examples use
 these paths directly.
-Compiled kernels go to an `hrx-v1` cache subdirectory.
+Compiled kernels use HRX’s shared per-user kernel cache.
 
 The pinned native release includes the VOPD register-bank fix and Loom's
 fragment-repack and SMEM storage-reuse fixes on the public upstream compiler. The
@@ -80,117 +79,98 @@ without waiting for GPU completion. These are staged transfers, not zero-copy DM
 Prepared kernel handles borrow their loaded export during each dispatch; they do
 not clone an `Arc` or take the compiler queue lock after the first resolution.
 A compiler is fixed to one target and rejects a different stream target even on
-a module-cache hit. `Stream::read` supplies the completion wait for host readback;
+a module-cache hit. `Stream::read_blocking` supplies the completion wait for host readback;
 normal inference does not enable per-kernel profiling.
 
-## Video decode is compute-bound, measured 2026-09-09
+## Graph execution
 
-A 480x864x22 decode runs as fifteen 256x256 spatial tiles. Timed per phase, a warm tile costs about
-20 ms of host enqueue, 271 ms blocked in `read_blocking` -- which drains the queue before it
-transfers 10 MiB -- and 3 ms of unpatchify. Across the decode, every host phase together (latent
-gather, unpatchify, pixel blend) is **106 ms of 25.2 s, 0.4%**. The first tile carries about 21 s of
-one-time weight upload and kernel setup, which amortises over a real clip's 105 tiles.
+`H3_GRAPH=1` enables cached recordings of the video decoder's stack and the DiT
+block loop. With the step cache enabled, block 0 and its metric remain eager;
+the host decides whether to replay a separate recording of blocks 1–49 or add
+the cached residual. The host branch stays outside the graph.
 
-That is roughly 1.08 ms of elapsed time per dispatch against 175 ns to enqueue one -- elapsed, not
-GPU time, which nothing here can isolate; the point is only that the interval a dispatch occupies
-dwarfs anything the host or a recording could give back. Queuing the readback to hide the host phase is worth about
-1%, and recording the fifteen independent tiles as concurrent workstreams competes for the same
-margin, since the device is already busy for 92% of a tile's wall time.
+Profiling (`H3_PROFILE`) and intermediate block dumps (`H3_DUMP_BLOCKS`) select
+eager execution on every call, including after a graph has been cached. Video
+VAE and DiT objects require their creating stream. Replacing DiT sequence or
+block storage clears both the full-loop and cache-miss recordings; changing the
+VAE grid replaces its workspace and recording together.
 
-Larger tiles are not the answer either: one 480x864 tile takes 26.2 s where fifteen 256x256 tiles
-take 25.2 s, despite covering 2.4x less total tile area, because the decoder's attention is quadratic
-in a tile's token count. The 256-pixel tiling is the efficient configuration.
+The adapters share the eager kernel builders. Most launches form a chain because
+stages reuse scratch. Integer attention preparation branches from its producer:
+Q preparation, K preparation and V transpose write separate spans. Attention
+names those three nodes directly, without an empty join. In the pinned runtime,
+empty joins create separate queue-barrier partitions. Edges have no universal
+price; several dependencies can be discharged by one barrier.
 
-## The audio VAE is compute-bound too, measured 2026-09-09
+Addresses, constants and geometry are fixed at recording time. Modulation and
+residual **contents** change in their existing allocations before replay. Native
+retention keeps resources allocated; recording a pooled workspace would also
+require keeping its pool owners alive to prevent reuse.
 
-`docs/archive/notes.md` calls BigVGAN launch-bound, which was true of the torch implementation this
-one replaced. It is not true here. A warm stereo decode of 500 latents takes 1.49 s in process, and
-one latent -- where the ~836 dispatches are the same but the work is not -- takes 121 ms. That is
-145 us of elapsed time per dispatch.
+## Performance evidence
 
-**What `H3_PROFILE=1` does and does not tell you.** It synchronises before and after each launch and
-times the pair on the CPU (`h3/src/dispatch.rs`), so what it reports is a round trip: submission,
-execution and the wait, together. It is not GPU execution time, and an earlier version of this note
-called it that. It does establish one thing -- the short case reports 126 ms against 128 ms of
-unprofiled wall, so per-launch synchronisation is not what the path is spending, since adding a
-drain around all 836 launches changed the total by 2%.
+Graphs remain opt-in. Earlier full-decode runs were too noisy to establish an
+end-to-end benefit: the same configuration ranged from 31 s to 45 s on a busy
+machine. Those results are not evidence that concurrent execution cannot help.
+GPU timestamps and native partition/workstream counters are not exposed by the
+pinned API.
 
-Separating submission from execution needs GPU timestamps, which are not exposed. What settles the
-question instead is asking the runtime directly: `dispatch_cost` runs the audio VAE's own residual
-convolution, at both extremes of its upsampling levels, as 256 eager dispatches and as a recorded
-256-node chain over the same allocations. A recording is the thing that would remove submission
-overhead if submission overhead were the cost. It does not: the chain comes back between 0.82x and
-1.43x of eager across runs, never a systematic win, while a dispatch of that kernel takes between
-0.19 ms and 7.3 ms. Whatever those milliseconds consist of, they are not something a graph reaches.
+`dispatch_cost` compares the same prepared kernels and allocations eagerly and
+as a serial graph. Both arms receive three warmups and nine measured batches,
+with alternating A/B and B/A order. Samples end with a completion wait. Each
+arm must overwrite poisoned output with the expected zeros; reset and readback
+are outside the timer. The two prepare sizes and two audio-convolution shapes separate small launches from
+larger workloads. These are wall-clock measurements of submission, execution
+and waiting together, not isolated GPU timings or model-wide predictions.
 
-Those ratios are wide because the machine they were taken on was running at load average 24. They
-want a quiet box to tighten, but no plausible tightening turns a 2 us per-node saving into a share
-of 145 us.
+A 2026-09-10 run with the local HRX checkout measured these completed times per
+kernel. Both paths passed the output checks. System load varied during this
+pass, so repeat the paired benchmark before using it to select an execution path.
 
-The kernels are inefficient at short lengths -- `audio res conv2` averages 635 us over a 1024x5
-tensor under the profiler -- which is a kernel problem worth its own look, and not one a recording
-addresses.
+| Kernel and shape | Eager | Graph |
+| --- | ---: | ---: |
+| Prepare 256×1 | 4.10 µs | 4.34 µs |
+| Prepare 4096×1024 | 45.89 µs | 46.03 µs |
+| Conv1d4 1024×5 | 7.17 ms | 7.23 ms |
+| Conv1d4 8×165600 | 251.3 µs | 186.0 µs |
 
-## Recording, and what it is worth
+The historical decoder profiles are useful for locating costs: a warm video
+tile spent about 20 ms enqueueing, 271 ms in blocking readback and 3 ms
+unpatchifying; a warm stereo audio decode of 500 latents took 1.49 s. Profiling
+synchronizes around each launch, so its stage durations also include submission
+and waiting. Kernel grids and these elapsed times alone do not prove hardware
+resource saturation.
 
-`Sink` in `h3::dispatch` decides where a launch goes: onto the stream now, or into a graph to replay
-later. `Prepare::emit`, `Gemm::emit` and `Stack::emit` take one, and `run`/`forward` are the eager
-wrappers, so the dispatch path is written once and the recorded path cannot drift from it. A
-recording chains every launch behind the one before it, because the stacks reuse one scratch pair
-between stages and consecutive launches therefore conflict even where their operands do not. The one
-exception is declared: `prep_q`, `prep_k` and the V transpose read `q`, `k` and `v`, share `zmean`
-read-only, and write six allocations no other two of them touch, so each waits on what came before
-rather than on its neighbours.
+Audio and video decode use disjoint inputs and outputs and could run on separate
+streams with separate workspaces. Measuring the benefit requires paired
+completed runs, output parity and peak-memory measurements. Resident weights
+make transfer overlap mainly a first-use question, which should be measured
+separately.
 
-`H3_GRAPH=1` records and replays two paths: the video decoder's stack, which a clip repeats over a
-hundred times with identical bindings, and the DiT's fifty blocks, whose every binding, grid and
-constant is the same at every step -- only the modulation table's contents and the residual stream
-change, and the recording already points at both. The step cache stays eager, since the host decides
-after block 0 whether the rest of the step runs at all and a recording cannot branch.
+## Integration checks, 2026-09-10
 
-It is off by default because it is not faster. Timed in process, interleaved, median of nine
-batches: replaying a 256-node chain costs **0.58x** an eager dispatch when each node is a 256-wide
-prepare that does nothing, and **0.99x** when each node is a 4096x1024 prepare that does the work a
-real stack's node does. The per-node cost is around 2 us, which is a win against a 4.5 us launch of
-nothing and invisible against 130 us of arithmetic. Whole-decode comparisons on this machine were
-too noisy to separate the two at all -- a contended box swung the same configuration between 31 s
-and 45 s -- which is its own reason to trust the in-process measurement and not the wall clock.
-
-What the recording does prove is that it is a faithful one. Under `H3_GRAPH=1` the seven video
-decodes and the ten reference denoise cases are byte-identical to the eager path, the latter
-exercising the concurrent operand prepares in all fifty blocks.
-
-All three candidate paths were measured before any of this: a denoise step averages tens of
-milliseconds of elapsed time per dispatch, a video decode tile about 1.08 ms, and an audio decode
-145 us.
-Against 175 ns to enqueue, none is bound by the host, and no arrangement of dependencies changes the
-arithmetic they are waiting on.
-
-A second stream to overlap the two decodes is not used either, for the same arithmetic. Video and
-audio decode are independent -- different checkpoints, disjoint inputs, disjoint outputs -- but both
-are bound by the one GPU, so running them together does not reduce the work, only fills whatever
-idle the other leaves. Video decode leaves about 7 ms of idle per tile, the host's unpatchify and
-blend, which is 0.74 s across a 124-frame clip's 105 tiles. Audio decode needs 1.54 s of GPU. So the
-ceiling is about 0.8 s of 35.85 s, for a second stream, a thread, and an end to `Session`'s
-single-threaded contract.
-
-A separate copy stream is not used either. Weights become resident on first use, and later steps
-reuse them; overlapping those first-use uploads would need its own measurement, including peak
-memory, rather than a claim from the dispatch cost alone.
-
-## Integration checks, 2026-09-09
-
-Workspace CPU tests, clippy with warnings denied, library rustdoc, and all 19
-native tests passed. The native suite covers compiler target checks, recovery from
-a batch holding a kernel that will not build, conditioning, resident sampling,
-GEMMs, attention and convolutions. Repeat it with:
+With HRX 0.2.0, all 22 native tests passed. Locked workspace builds, CPU tests,
+clippy and workspace rustdoc with warnings denied also passed using the crates.io
+package. Coverage includes graph replay with changed input bytes, direct
+branch dependencies, invalidation of both DiT recordings when sequence storage
+grows, compiler target checks, conditioning, sampling, GEMMs, attention and
+convolutions. Repeat the native checks with:
 
 ```sh
 HRX_OFFLINE=1 cargo test -p h3 -- --ignored --test-threads=1
 HRX_OFFLINE=1 cargo run --release -p h3 --example dispatch_cost
 ```
 
-Three release runs on Ryzen AI MAX+ 395 / gfx1151 with Rust 1.95 nightly and
+Checkpoint-backed `denoise_cases` runs compared `H3_GRAPH=0` with `H3_GRAPH=1`
+at 32×32, five frames, Euler sampler and seed 7. Three steps exercised the full
+loop; four steps with cache thresholds `1000000` and `0.000000001` exercised
+cache hits and forced misses. All six video/audio latent files were finite and
+byte-identical. A further run with `H3_GRAPH=1`, `H3_PROFILE=1` and
+`H3_DUMP_BLOCKS` produced identical latents, reported stage timings and wrote
+all 50 DiT block dumps. These check replay correctness and diagnostics; visual
+quality and throughput require separate measurements.
+
+Three historical release runs on Ryzen AI MAX+ 395 / gfx1151 with Rust 1.95 nightly and
 hrx-rs 0.1.0 measured 159–176 ns of host time per `Prepare::run`, including binding
 checks, kernel resolution and scalar packing. Each run takes the median of nine
 2,048-launch batches after three warmups and checks the output. Completed batches

@@ -1,14 +1,15 @@
 //! `h3`: the whole MiniMax H3 pipeline from the shell, through the `h3` crate (every kernel in Loom).
 //!
-//!   h3 [ref1.jpg ref2.png voice.wav ...] [-p "prompt"] [options] < prompt
+//! ```text
+//! h3 [ref1.jpg ref2.png voice.wav ...] [-p "prompt"] [options] < prompt
+//! ```
 //!
 //! Positional files are references by extension: images are presented as `<Picture i>` and encoded by the
 //! video VAE's encoder, audio as `<Audio j>` through the audio VAE's encoder. The prompt is read from stdin
 //! unless `-p` is given; `docs/prompting.md` is the format the model expects. ffmpeg decodes the inputs and
 //! muxes the output.
 //!
-//! This is also the worked example of the C ABI: `ffi.rs` declares it by hand and `pipe.rs` wraps it, so a
-//! client in any language can be read off these two files. `examples/rust` is the minimal version.
+//! The CLI owns a Rust `Session`; application adapters call that same API.
 mod media;
 mod resize;
 
@@ -51,7 +52,7 @@ enum Sampler {
     disable_help_subcommand = true
 )]
 struct Cli {
-    /// Reference files, by extension: images become <Picture i>, audio becomes <Audio j>
+    /// Reference files, by extension: images become `<Picture i>`, audio becomes `<Audio j>`
     #[arg(value_name = "FILE")]
     files: Vec<PathBuf>,
 
@@ -63,7 +64,7 @@ struct Cli {
     #[arg(long, value_name = "IMG")]
     first_frame: Option<PathBuf>,
 
-    /// Output clip; <out>.wav is kept next to it
+    /// Output clip; `<out>.wav` is kept next to it
     #[arg(long, default_value = "h3_out.mp4", value_name = "CLIP")]
     out: PathBuf,
 
@@ -116,7 +117,7 @@ struct Cli {
     #[arg(long)]
     no_decode: bool,
 
-    /// Voice and sound only: skip the video decoder and write <out>.wav (use a 32x32 canvas)
+    /// Voice and sound only: skip the video decoder and write `<out>.wav` (use a 32x32 canvas)
     #[arg(long)]
     audio_only: bool,
 
@@ -127,7 +128,7 @@ struct Cli {
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i32).range(0..=1 << 20))]
     still_frame: i32,
 
-    /// Write the raw latents as <prefix>.video.f32 and <prefix>.audio.f32
+    /// Write the raw latents as `<prefix>.video.f32` and `<prefix>.audio.f32`
     #[arg(long, value_name = "PREFIX")]
     latents: Option<PathBuf>,
 

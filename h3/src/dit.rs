@@ -71,7 +71,9 @@ struct Refiner {
     norm: NormMod,
 }
 
+/// Resident DiT state and recordings, used only on the stream passed to `open`.
 pub struct Dit {
+    stream_id: usize,
     weights: Weights,
     constants: Constants,
     seq: Option<Seq>,
@@ -80,6 +82,8 @@ pub struct Dit {
     blocks: Option<Blocks>,
     /// The recording binds both `seq` and `blocks`; replacing either invalidates it.
     block_graph: Option<hrx::GraphExec>,
+    /// Blocks 1..49, replayed only when the host step cache misses.
+    suffix_graph: Option<hrx::GraphExec>,
     cache: Option<CacheBuffers>,
     euler: Option<crate::sampler::device::Euler>,
 }
@@ -93,6 +97,7 @@ impl Dit {
         path: impl AsRef<std::path::Path>,
     ) -> Result<Self> {
         Ok(Self {
+            stream_id: stream.id(),
             weights: unsafe { Weights::open(path, crate::plan::dit::plan) }?,
             constants: Constants::new(stream)?,
             seq: None,
@@ -100,6 +105,7 @@ impl Dit {
             cond: None,
             blocks: None,
             block_graph: None,
+            suffix_graph: None,
             cache: None,
             euler: None,
         })
@@ -109,13 +115,22 @@ impl Dit {
         &self.weights
     }
 
+    fn check_stream(&self, stream: &hrx::Stream) -> Result<()> {
+        if stream.id() != self.stream_id {
+            return invalid("a DiT must use the stream that created it");
+        }
+        Ok(())
+    }
+
     /// Grows the sequence buffers if this length does not fit. The capacity is rounded to 256 rows
     /// plus 32, which is the slack the attention kernels read past the end of a sequence.
     pub fn ensure_seq(&mut self, stream: &mut hrx::Stream, seq: usize) -> Result<()> {
+        self.check_stream(stream)?;
         if self.seq.as_ref().is_some_and(|s| seq <= s.capacity) {
             return Ok(());
         }
         self.block_graph = None;
+        self.suffix_graph = None;
         self.seq = None;
         let t = seq_capacity(seq);
         let zeroed = |bytes: usize| -> Result<hrx::Buffer> {
@@ -235,6 +250,7 @@ impl Dit {
 
     /// The sequence's first `rows` rows, `[rows][5376]` f32 — what `h3_text_in` hands back.
     pub fn read_rows(&self, stream: &mut hrx::Stream, rows: usize, out: &mut [f32]) -> Result<()> {
+        self.check_stream(stream)?;
         let seq = self.seq.as_ref().expect("a sequence has been sized");
         stream.read_blocking(
             seq.x.slice(0, rows * HID * 4),
@@ -659,6 +675,7 @@ impl Dit {
             return Ok(());
         }
         self.block_graph = None;
+        self.suffix_graph = None;
         self.blocks = None;
         let mut d = StackDims {
             hidden: HID,
@@ -776,6 +793,7 @@ impl Dit {
         kfs: &[Keyframe<'_>],
         mut progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
     ) -> Result<Latents> {
+        self.check_stream(stream)?;
         let sh = crate::layout::shape_for(p.height, p.width, p.frames)
             .ok_or_else(|| crate::error::Error::Invalid("no such shape".into()))?;
         if !(2..=1000).contains(&p.steps) {
@@ -1266,6 +1284,7 @@ impl Dit {
             seq,
             blocks,
             block_graph,
+            suffix_graph,
             cache: cbuf,
             cond,
             ..
@@ -1283,34 +1302,18 @@ impl Dit {
             seq.sin.binding(),
         );
         let Some(cache) = cache else {
-            // The step cache is off, so every step runs all fifty blocks over the same allocations:
-            // record once and replay. With the cache on the host decides after block 0 whether the
-            // rest runs at all, which a recording cannot express, so that path stays eager.
-            if crate::stack::env_once("H3_GRAPH").is_some_and(|v| v != "0") {
-                if block_graph.is_none() {
-                    let mut graph = stream.graph()?;
-                    b.stack.emit(
-                        &mut crate::dispatch::Sink::Graph {
-                            graph: &mut graph,
-                            after: None,
-                        },
-                        prof,
-                        x,
-                        cls,
-                        cos,
-                        sin,
-                        &cond_fn,
-                        0,
-                        None,
-                        false,
-                    )?;
-                    *block_graph = Some(graph.finish()?);
-                }
-                stream.launch(block_graph.as_mut().expect("recorded above"))?;
-                return Ok(());
-            }
-            b.stack
-                .forward(stream, prof, x, cls, cos, sin, &cond_fn, 0, None)?;
+            b.stack.forward_cached(
+                stream,
+                prof,
+                block_graph,
+                x,
+                cls,
+                cos,
+                sin,
+                &cond_fn,
+                0,
+                None,
+            )?;
             return Ok(());
         };
 
@@ -1369,8 +1372,20 @@ impl Dit {
             )?;
         } else {
             stream.copy(cb.xb0.slice(0, n * 4), seq.x.slice(0, n * 4))?;
-            b.stack
-                .forward(stream, prof, x, cls, cos, sin, &cond_fn, 1, None)?;
+            // The host decision stays outside the recording. A miss replays
+            // the same suffix; a hit only adds the cached residual.
+            b.stack.forward_cached(
+                stream,
+                prof,
+                suffix_graph,
+                x,
+                cls,
+                cos,
+                sin,
+                &cond_fn,
+                1,
+                None,
+            )?;
             // the residual of blocks 1..49, which a skipped step adds instead of running them
             stream.copy(cb.resid.slice(0, n * 4), seq.x.slice(0, n * 4))?;
             axpy(
@@ -1409,7 +1424,8 @@ mod tests {
     #[test]
     #[ignore = "requires gfx1151; no model checkpoints or Loom compiler"]
     fn growing_sequence_storage_invalidates_its_recording() {
-        let mut stream = hrx::Stream::open().unwrap();
+        let device = hrx::Device::open(0).unwrap();
+        let mut stream = device.stream().unwrap();
         let file = tempfile::NamedTempFile::new().unwrap();
         // An empty checkpoint suffices: resizing sequence storage loads no weights.
         std::fs::write(
@@ -1420,6 +1436,7 @@ mod tests {
         // Safety: this test owns the file and leaves it unchanged while mapped.
         let weights = unsafe { Weights::open(file.path(), |_, _| Ok(())) }.unwrap();
         let mut dit = Dit {
+            stream_id: stream.id(),
             weights,
             constants: Constants::new(&mut stream).unwrap(),
             seq: None,
@@ -1427,6 +1444,7 @@ mod tests {
             cond: None,
             blocks: None,
             block_graph: None,
+            suffix_graph: None,
             cache: None,
             euler: None,
         };
@@ -1438,17 +1456,37 @@ mod tests {
             .unwrap();
         dit.block_graph = Some(graph.finish().unwrap());
         stream.launch(dit.block_graph.as_mut().unwrap()).unwrap();
+        let mut graph = stream.graph().unwrap();
+        graph
+            .fill(&[], dit.seq.as_ref().unwrap().x.binding(), 2)
+            .unwrap();
+        dit.suffix_graph = Some(graph.finish().unwrap());
+        stream.launch(dit.suffix_graph.as_mut().unwrap()).unwrap();
+
+        let mut other = device.stream().unwrap();
+        assert!(dit.ensure_seq(&mut other, capacity + 1).is_err());
+        assert!(dit.block_graph.is_some());
+        assert!(dit.suffix_graph.is_some());
+        assert_eq!(dit.seq.as_ref().unwrap().capacity, capacity);
 
         dit.ensure_seq(&mut stream, 1).unwrap();
         assert!(
             dit.block_graph.is_some(),
             "unchanged storage keeps the recording"
         );
+        assert!(
+            dit.suffix_graph.is_some(),
+            "unchanged storage keeps the suffix"
+        );
         // This is the allocation change caused by an intervening, longer text_in.
         dit.ensure_seq(&mut stream, capacity + 1).unwrap();
         assert!(
             dit.block_graph.is_none(),
             "replacement storage needs a new recording"
+        );
+        assert!(
+            dit.suffix_graph.is_none(),
+            "replacement storage invalidates the suffix"
         );
         // Returning to the original token count must not revive the old bindings.
         dit.ensure_seq(&mut stream, 1).unwrap();

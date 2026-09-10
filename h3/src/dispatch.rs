@@ -143,55 +143,74 @@ pub(crate) fn checked(
     )
 }
 
-/// Where a launch goes: onto a stream now, or into a graph to be replayed later.
-///
-/// A recording fixes addresses, constants and geometry, so it is worth only what a path repeats
-/// unchanged — and the graph orders nothing it is not told to order. `Graph` therefore chains each
-/// launch behind the one before it, which is what every builder here assumes: the stacks reuse one
-/// scratch pair between stages, so consecutive launches conflict on it even where their operands say
-/// otherwise. Independence has to be declared deliberately, against buffers shown to be disjoint,
-/// and [`Sink::resume`] and [`Sink::join`] are how a caller says so.
+/// Dependencies passed directly to the next graph dispatch.
+#[derive(Clone, Copy, Default)]
+pub enum Dependencies {
+    #[default]
+    None,
+    One(hrx::Node),
+    Three([hrx::Node; 3]),
+}
+
+impl Dependencies {
+    fn as_slice(&self) -> &[hrx::Node] {
+        match self {
+            Self::None => &[],
+            Self::One(node) => std::slice::from_ref(node),
+            Self::Three(nodes) => nodes,
+        }
+    }
+}
+
+/// Where a launch goes: onto an ordered stream or into a dependency graph.
+/// Consecutive launches depend on their predecessors unless a builder resumes
+/// from a common producer and passes the branch endings to their consumer.
 pub enum Sink<'s, 'g> {
     Stream(&'s mut hrx::Stream),
     Graph {
         graph: &'s mut hrx::Graph<'g>,
-        /// What the next launch waits for. `None` at the start of an independent chain.
-        after: Option<hrx::Node>,
+        after: Dependencies,
     },
 }
 
 impl Sink<'_, '_> {
-    /// What the next launch will wait for.
-    ///
-    /// These three exist to spell a fan-out: take the head, `resume` from it once per branch,
-    /// collect each branch's head, and `join` them. On a stream they are all nothing, because a
-    /// stream is already a chain.
-    pub fn head(&self) -> Option<hrx::Node> {
+    /// The next launch's dependencies, for starting independent branches from
+    /// the same producer. An eager stream already orders every operation.
+    pub fn head(&self) -> Dependencies {
         match self {
-            Sink::Stream(_) => None,
+            Sink::Stream(_) => Dependencies::None,
             Sink::Graph { after, .. } => *after,
         }
     }
 
-    /// Make the next launch wait for `node` rather than for the launch just recorded.
-    pub fn resume(&mut self, node: Option<hrx::Node>) {
+    /// Start a branch from these dependencies.
+    pub fn resume(&mut self, dependencies: Dependencies) {
         if let Sink::Graph { after, .. } = self {
-            *after = node;
+            *after = dependencies;
         }
     }
 
-    /// Make the next launch wait for all of `ends`.
-    pub fn join(&mut self, ends: &[Option<hrx::Node>]) -> Result<()> {
-        if let Sink::Graph { graph, after } = self {
-            let nodes: Vec<hrx::Node> = ends.iter().flatten().copied().collect();
-            *after = match nodes.len() {
-                0 => None,
-                1 => Some(nodes[0]),
-                _ => Some(graph.join(&nodes)?),
+    /// Have the next launch wait directly for three branch endings. This does
+    /// not insert an empty native node or split the command-buffer partition.
+    pub fn after_branches(&mut self, ends: [Dependencies; 3]) -> Result<()> {
+        if let Sink::Graph { after, .. } = self {
+            let [Dependencies::One(a), Dependencies::One(b), Dependencies::One(c)] = ends else {
+                return Err(crate::compile::Error::Io(
+                    "each branch must end in a dispatch".into(),
+                ));
             };
+            *after = Dependencies::Three([a, b, c]);
         }
         Ok(())
     }
+}
+
+/// Graph execution cannot report individual stages or read intermediate blocks.
+/// Check this on every call, including when a graph is already cached.
+pub(crate) fn graph_enabled(profile: &Profile) -> bool {
+    crate::stack::env_once("H3_GRAPH").is_some_and(|v| !v.is_empty() && v != "0")
+        && !profile.on
+        && crate::stack::env_once("H3_DUMP_BLOCKS").is_none()
 }
 
 /// A launch whose bindings have been checked, sent wherever `sink` says.
@@ -246,7 +265,7 @@ pub fn emit<'g>(
             let node = unsafe {
                 graph.dispatch(after.as_slice(), kernel, grid, block, &constants, bindings)?
             };
-            *after = Some(node);
+            *after = Dependencies::One(node);
             Ok(())
         }
     }

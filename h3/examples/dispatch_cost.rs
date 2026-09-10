@@ -1,35 +1,53 @@
 //! What a launch costs through H3's prepared dispatch path, eagerly and as a replayed graph.
 //!
-//! Both arms run identical launches over identical allocations, so the difference between them is
-//! the runtime's and nothing else. The two sizes are the point: a recording's per-node cost is
-//! roughly fixed, so a graph looks best against a kernel that does nothing, and the question this
-//! answers is whether it still wins once a node does the work a real stack's node does.
+//! Both arms run identical launches over identical allocations. Paired sampling
+//! reduces drift, but timings still include contention from other work. The two
+//! sizes compare small launches with kernels doing a real stack's amount of work.
 use h3::compile::Compiler;
 use h3::dispatch::{Prepare, Sink};
 
 type Fallible = Result<(), Box<dyn std::error::Error>>;
 
-/// Median of nine batches after three warmups: nanoseconds per launch, recorded and completed.
-fn measure(
+/// Paired medians after three warmups of each arm. Alternate A/B and B/A
+/// so clock and load drift do not consistently favour one execution path.
+/// These zero-input kernels must overwrite the poisoned output with zeros.
+/// Reset and readback are outside the measured interval.
+fn measure_pair(
     stream: &mut hrx::Stream,
     launches: usize,
-    mut batch: impl FnMut(&mut hrx::Stream) -> Fallible,
-) -> Result<(f64, f64), Box<dyn std::error::Error>> {
-    let (mut host, mut complete) = (Vec::new(), Vec::new());
+    output: hrx::View<'_>,
+    mut eager: impl FnMut(&mut hrx::Stream) -> Fallible,
+    mut recorded: impl FnMut(&mut hrx::Stream) -> Fallible,
+) -> Result<[(f64, f64); 2], Box<dyn std::error::Error>> {
+    let mut host = [Vec::new(), Vec::new()];
+    let mut complete = [Vec::new(), Vec::new()];
+    let mut actual = vec![0u8; output.len()];
     for round in 0..12 {
-        stream.synchronize()?;
-        let began = std::time::Instant::now();
-        batch(stream)?;
-        let recorded = began.elapsed();
-        stream.synchronize()?;
-        if round >= 3 {
-            host.push(recorded.as_secs_f64() * 1e9 / launches as f64);
-            complete.push(began.elapsed().as_secs_f64() * 1e9 / launches as f64);
+        for arm in if round % 2 == 0 { [0, 1] } else { [1, 0] } {
+            stream.fill(output, 0x7f)?;
+            stream.synchronize()?;
+            let began = std::time::Instant::now();
+            if arm == 0 {
+                eager(stream)?;
+            } else {
+                recorded(stream)?;
+            }
+            let submitted = began.elapsed();
+            stream.synchronize()?;
+            let elapsed = began.elapsed();
+            if round >= 3 {
+                host[arm].push(submitted.as_secs_f64() * 1e9 / launches as f64);
+                complete[arm].push(elapsed.as_secs_f64() * 1e9 / launches as f64);
+            }
+            stream.read_blocking(output, &mut actual)?;
+            assert!(actual.iter().all(|&v| v == 0), "arm {arm} output");
         }
     }
-    host.sort_by(f64::total_cmp);
-    complete.sort_by(f64::total_cmp);
-    Ok((host[4], complete[4]))
+    Ok(std::array::from_fn(|arm| {
+        host[arm].sort_by(f64::total_cmp);
+        complete[arm].sort_by(f64::total_cmp);
+        (host[arm][4], complete[arm][4])
+    }))
 }
 
 fn main() -> Fallible {
@@ -46,29 +64,13 @@ fn main() -> Fallible {
         stream.fill(input.binding(), 0)?;
         stream.fill(output.binding(), 0x7f)?;
 
-        let (host, eager) = measure(&mut stream, LAUNCHES, |stream| {
-            for _ in 0..LAUNCHES {
-                prepare.run(
-                    stream,
-                    None,
-                    "prepare",
-                    tokens,
-                    input.binding(),
-                    None,
-                    output.binding(),
-                    None,
-                )?;
-            }
-            Ok(())
-        })?;
-
         // The same launches as a chain. Every node writes `output`, so every edge is real: this is
         // the shape a recording of any of this model's stacks has.
         let mut graph = stream.graph()?;
         {
             let mut sink = Sink::Graph {
                 graph: &mut graph,
-                after: None,
+                after: Default::default(),
             };
             for _ in 0..LAUNCHES {
                 prepare.emit(
@@ -84,19 +86,38 @@ fn main() -> Fallible {
             }
         }
         let mut replay = graph.finish()?;
-        let (_, replayed) = measure(&mut stream, LAUNCHES, |stream| {
-            stream.launch(&mut replay)?;
-            Ok(())
-        })?;
+        let results = measure_pair(
+            &mut stream,
+            LAUNCHES,
+            output.binding(),
+            |stream| {
+                for _ in 0..LAUNCHES {
+                    prepare.run(
+                        stream,
+                        None,
+                        "prepare",
+                        tokens,
+                        input.binding(),
+                        None,
+                        output.binding(),
+                        None,
+                    )?;
+                }
+                Ok(())
+            },
+            |stream| {
+                stream.launch(&mut replay)?;
+                Ok(())
+            },
+        )?;
+        let (host, eager) = results[0];
+        let replayed = results[1].1;
 
         println!(
             "prepare {width}x{tokens}: eager {host:.0} ns host, {eager:.0} ns completed; \
              graph {replayed:.0} ns completed ({:.2}x)",
             replayed / eager
         );
-        let mut sample = vec![0u8; 512];
-        stream.read_blocking(output.binding().slice(0, 512)?, &mut sample)?;
-        assert_eq!(sample, vec![0u8; 512]);
     }
 
     // The audio VAE's own residual convolution, at the shape its first upsample level runs: this is
@@ -134,28 +155,11 @@ fn main() -> Fallible {
             out.binding(),
         ];
 
-        let (host, eager) = measure(&mut stream, LAUNCHES, |stream| {
-            for _ in 0..LAUNCHES {
-                h3::dispatch::emit(
-                    &mut Sink::Stream(stream),
-                    &kernel,
-                    None,
-                    "res conv",
-                    grid,
-                    [64, 1, 1],
-                    &[len as u32],
-                    &views,
-                    &need,
-                )?;
-            }
-            Ok(())
-        })?;
-
         let mut graph = stream.graph()?;
         {
             let mut sink = Sink::Graph {
                 graph: &mut graph,
-                after: None,
+                after: Default::default(),
             };
             for _ in 0..LAUNCHES {
                 h3::dispatch::emit(
@@ -172,12 +176,36 @@ fn main() -> Fallible {
             }
         }
         let mut replay = graph.finish()?;
-        let (_, replayed) = measure(&mut stream, LAUNCHES, |stream| {
-            stream.launch(&mut replay)?;
-            Ok(())
-        })?;
+        let results = measure_pair(
+            &mut stream,
+            LAUNCHES,
+            out.binding().slice(0, chan * len * 4)?,
+            |stream| {
+                for _ in 0..LAUNCHES {
+                    h3::dispatch::emit(
+                        &mut Sink::Stream(stream),
+                        &kernel,
+                        None,
+                        "res conv",
+                        grid,
+                        [64, 1, 1],
+                        &[len as u32],
+                        &views,
+                        &need,
+                    )?;
+                }
+                Ok(())
+            },
+            |stream| {
+                stream.launch(&mut replay)?;
+                Ok(())
+            },
+        )?;
+        let (host, eager) = results[0];
+        let replayed = results[1].1;
         println!(
-            "conv1d4 {chan}x{len}: eager {host:.0} ns host, {eager:.0} ns completed;              graph {replayed:.0} ns completed ({:.2}x)",
+            "conv1d4 {chan}x{len}: eager {host:.0} ns host, {eager:.0} ns completed; \
+             graph {replayed:.0} ns completed ({:.2}x)",
             replayed / eager
         );
     }

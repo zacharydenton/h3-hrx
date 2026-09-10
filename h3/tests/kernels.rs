@@ -1641,7 +1641,7 @@ fn a_recorded_chain_replays_to_what_dispatching_it_produces() {
                 {
                     let mut sink = Sink::Graph {
                         graph: &mut graph,
-                        after: None,
+                        after: Default::default(),
                     };
                     for (from, to) in chain {
                         prepare
@@ -1688,4 +1688,90 @@ fn a_recorded_chain_replays_to_what_dispatching_it_produces() {
         outcome[0], outcome[1],
         "the replay differs from the launches"
     );
+}
+
+/// Three disjoint branches read a shared producer and feed one consumer. Reuse
+/// the recording with different bytes to catch missing producer or fan-in edges.
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn recorded_branches_feed_their_consumer_on_every_replay() {
+    use h3::compile::Compiler;
+    use h3::dispatch::{Prepare, Sink};
+    const ROWS: u32 = 64;
+    const PART: usize = 256 * ROWS as usize * 2;
+    const BYTES: usize = PART * 3;
+    let mut stream = Stream::open().unwrap();
+    let compiler = Compiler::new(None, "");
+    let narrow = Prepare::build(&compiler, &mut stream, "plain", "f16", 256, 0.0, 1, 256).unwrap();
+    let wide = Prepare::build(&compiler, &mut stream, "plain", "f16", 768, 0.0, 1, 768).unwrap();
+    compiler.flush(&mut stream).unwrap();
+    let buffers: Vec<_> = (0..4).map(|_| stream.allocate(BYTES).unwrap()).collect();
+    let mut graph = stream.graph().unwrap();
+    {
+        let mut sink = Sink::Graph {
+            graph: &mut graph,
+            after: Default::default(),
+        };
+        wide.emit(
+            &mut sink,
+            None,
+            "producer",
+            ROWS,
+            buffers[0].binding(),
+            None,
+            buffers[1].binding(),
+            None,
+        )
+        .unwrap();
+        let before = sink.head();
+        let mut ends = [Default::default(); 3];
+        for (branch, end) in ends.iter_mut().enumerate() {
+            sink.resume(before);
+            narrow
+                .emit(
+                    &mut sink,
+                    None,
+                    "branch",
+                    ROWS,
+                    buffers[1].binding().slice(branch * PART, PART).unwrap(),
+                    None,
+                    buffers[2].binding().slice(branch * PART, PART).unwrap(),
+                    None,
+                )
+                .unwrap();
+            *end = sink.head();
+        }
+        sink.after_branches(ends).unwrap();
+        wide.emit(
+            &mut sink,
+            None,
+            "consumer",
+            ROWS,
+            buffers[2].binding(),
+            None,
+            buffers[3].binding(),
+            None,
+        )
+        .unwrap();
+    }
+    let mut replay = graph.finish().unwrap();
+    for phase in 0..4 {
+        let source: Vec<u8> = (0..BYTES / 2)
+            .flat_map(|i| {
+                f16::from_f32(((i + phase * 19) % 97) as f32 / 128.0)
+                    .to_bits()
+                    .to_le_bytes()
+            })
+            .collect();
+        stream.upload(buffers[0].binding(), &source).unwrap();
+        for buffer in &buffers[1..] {
+            stream.fill(buffer.binding(), 0x7f).unwrap();
+        }
+        stream.launch(&mut replay).unwrap();
+        let mut actual = vec![0u8; BYTES];
+        stream
+            .read_blocking(buffers[3].binding(), &mut actual)
+            .unwrap();
+        assert_eq!(actual, source);
+    }
 }
