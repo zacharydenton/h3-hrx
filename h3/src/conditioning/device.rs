@@ -157,8 +157,7 @@ mod tests {
     #[ignore = "requires gfx1151 and the packaged Loom compiler"]
     fn projections_match_cpu_tables_bit_for_bit() -> Result<()> {
         let mut stream = hrx::Stream::open()?;
-        let cache = tempfile::tempdir().unwrap();
-        let compiler = Compiler::new(None, "", cache.path());
+        let compiler = Compiler::new(None, "");
         let ramp = |n: usize, layer: usize| {
             (0..n)
                 .map(|i| ((i + layer * 7) % 97) as f32 * 0.01 - 0.5)

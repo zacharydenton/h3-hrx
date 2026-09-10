@@ -50,7 +50,6 @@ fn main() {
         .unwrap_or(10);
     assert!(batches >= 2 && batches.is_multiple_of(2));
     let compiler = hrx::loom::Compiler::resolve(None).unwrap();
-    let cache = hrx::bundle::cache_root().unwrap().join("kernels");
     let source = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels/matmul_bf16_family.loom"),
     )
@@ -73,11 +72,8 @@ fn main() {
             .into_iter()
             .map(|(key, value)| (format!("h3.{stem}.{key}"), value.to_string()))
             .collect();
-        let old = compiler
-            .module(&original)
-            .compile(&request, &cache)
-            .unwrap();
-        let new = compiler.module(&source).compile(&request, &cache).unwrap();
+        let old = compiler.module(&original).compile(&request).unwrap();
+        let new = compiler.module(&source).compile(&request).unwrap();
         let identical = old.bytes() == new.bytes();
         // Safety: both artifacts were compiled from the trusted sources above.
         let kernels = unsafe {

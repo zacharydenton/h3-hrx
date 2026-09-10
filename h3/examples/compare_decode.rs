@@ -29,15 +29,11 @@ fn main() {
         24 * shape.latent_t as usize * shape.lat_h as usize * shape.lat_w as usize
     );
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
-    let cache = hrx::bundle::cache_root().unwrap().join("kernels");
     let exe = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
     let baseline_exe = std::env::var_os("H3_BASELINE_LOOM_LIBRARY")
         .map(std::path::PathBuf::from)
         .or_else(|| exe.clone());
-    let compilers = [
-        Compiler::new(baseline_exe, &a[1], &cache),
-        Compiler::new(exe, root, &cache),
-    ];
+    let compilers = [Compiler::new(baseline_exe, &a[1]), Compiler::new(exe, root)];
     let mut stream = hrx::Stream::open().unwrap();
     // Safety: caller-owned checkpoint, which is not modified during this comparison.
     let mut vaes = [

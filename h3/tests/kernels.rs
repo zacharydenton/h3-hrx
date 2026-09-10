@@ -51,14 +51,7 @@ impl Harness {
             .iter()
             .map(|(key, value)| (format!("h3.{stem}.{key}"), value.clone()))
             .collect();
-        let path = self
-            .compiler
-            .module(&source)
-            .compile(
-                &request,
-                &hrx::bundle::cache_root().unwrap().join("kernels"),
-            )
-            .unwrap();
+        let path = self.compiler.module(&source).compile(&request).unwrap();
         let baseline = std::env::var_os("H3_KERNEL_BASELINE")
             .filter(|_| module != stem)
             .map(|dir| {
@@ -66,11 +59,7 @@ impl Harness {
                     .expect("baseline kernel source");
                 let mut old = hrx::loom::Specialization::new(&symbol);
                 old.config = request.config.clone();
-                let old_path = self
-                    .compiler
-                    .module(&source)
-                    .compile(&old, &hrx::bundle::cache_root().unwrap().join("kernels"))
-                    .unwrap();
+                let old_path = self.compiler.module(&source).compile(&old).unwrap();
                 eprintln!(
                     "artifact {stem}: {}",
                     if old_path.bytes() == path.bytes() {
@@ -1625,7 +1614,7 @@ fn a_recorded_chain_replays_to_what_dispatching_it_produces() {
     const BYTES: usize = WIDTH * TOKENS as usize * 2;
 
     let mut stream = Stream::open().expect("gfx1151 device");
-    let compiler = Compiler::new(None, "", "");
+    let compiler = Compiler::new(None, "");
     let prepare = Prepare::build(&compiler, &mut stream, "plain", "f16", WIDTH, 0.0, 1, WIDTH)
         .expect("prepare");
     compiler.flush(&mut stream).expect("build the kernel");

@@ -27,7 +27,7 @@ fn main() {
 
     let exe = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
     let mut stream = hrx::Stream::open().expect("stream");
-    let compiler = Compiler::new(exe, root.join("h3/kernels"), &cache);
+    let compiler = Compiler::new(exe, root.join("h3/kernels"));
     // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
     let weights = unsafe { Weights::open(&path, h3::plan::vvae::plan) }.expect("plan");
 

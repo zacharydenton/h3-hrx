@@ -34,7 +34,7 @@ fn measure(
 
 fn main() -> Fallible {
     let mut stream = hrx::Stream::open()?;
-    let compiler = Compiler::new(None, "", "");
+    let compiler = Compiler::new(None, "");
     const LAUNCHES: usize = 256;
 
     for (width, tokens) in [(256usize, 1u32), (4096, 1024)] {

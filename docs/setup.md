@@ -42,9 +42,10 @@ at a pinned mirror, and `HRX_OFFLINE` refuses the network outright. `HRX_LOOM_LI
 selects a developer `libloomc.so` in place of the bundle’s.
 
 The build produces `target/release/h3`, linked as `build/h3`. An installed binary carries the Loom
-sources and the tokenizer inside it and caches compiled kernels per user under
-`$XDG_CACHE_HOME/hrx`; `h3 --root DIR` opts back into a working tree's
-`h3/kernels/` and `build/kernel_cache` instead.
+sources and the tokenizer inside it; `h3 --root DIR` opts back into a working tree's `h3/kernels/`
+instead. Compiled kernels go to one cache per user under `$XDG_CACHE_HOME/hrx` whichever sources
+they came from, because an artifact's name already covers the compiler, the source, the export, the
+target and the configuration. `hrx gc [DAYS]` sweeps it by last use.
 
 Optional CLI installation:
 

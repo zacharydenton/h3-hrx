@@ -452,15 +452,10 @@ fn run(cli: Cli) -> Result<()> {
         if ref2va { ", ref2va weights" } else { "" }
     );
 
-    // Installed binaries use their packaged sources and the writable shared
-    // cache. --root explicitly opts into a developer's source/cache tree.
+    // Installed binaries use their packaged kernel sources; --root opts into a working tree's
+    // instead. Compiled artifacts always go to the one per-user HRX cache, whoever built them.
     let sources = if cli.root.is_some() {
         root.join("h3/kernels")
-    } else {
-        PathBuf::new()
-    };
-    let cache = if cli.root.is_some() {
-        root.join("build/kernel_cache")
     } else {
         PathBuf::new()
     };
@@ -471,7 +466,6 @@ fn run(cli: Cli) -> Result<()> {
         video_vae: Some(video_vae),
         audio_vae: Some(audio_vae),
         kernel_sources: sources,
-        cache_dir: cache,
         loom_library,
         attention: match cli.attn {
             Attn::F16 => Attn16::F16,

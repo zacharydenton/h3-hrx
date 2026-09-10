@@ -135,7 +135,6 @@ struct Request {
 /// Shared by the compiler and every handle it has issued, so a handle can build its own batch
 /// without holding a borrow of the compiler and without a lifetime of its own.
 struct Queue {
-    cache: PathBuf,
     /// Built on the first request, for the target that request's stream reported.
     compiler: OnceLock<hrx::loom::Compiler>,
     pending: Mutex<Vec<Request>>,
@@ -158,7 +157,7 @@ impl Queue {
             .compiler
             .get()
             .expect("a request was recorded, so its compiler exists")
-            .compile_all(&batch, &Compiler::cache_dir(&self.cache)?);
+            .compile_all(&batch);
         let mut outcome = Ok(());
         let mut unbuilt = Vec::new();
         {
@@ -219,18 +218,13 @@ pub struct Compiler {
     queue: Arc<Queue>,
 }
 impl Compiler {
-    pub fn new(
-        library: Option<PathBuf>,
-        sources: impl Into<PathBuf>,
-        cache: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn new(library: Option<PathBuf>, sources: impl Into<PathBuf>) -> Self {
         Self {
             library,
             modules: Mutex::new(HashMap::new()),
             sources: sources.into(),
             source_cache: Mutex::new(HashMap::new()),
             queue: Arc::new(Queue {
-                cache: cache.into(),
                 compiler: OnceLock::new(),
                 pending: Mutex::new(Vec::new()),
                 loaded: Mutex::new(HashMap::new()),
@@ -289,17 +283,6 @@ impl Compiler {
             .insert(stem.into(), source.clone());
         Ok(source)
     }
-    /// Where compiled artifacts go. An empty `cache` means the caller expressed no preference, and
-    /// gets the shared per-user one; resolving it here rather than at the call sites keeps a
-    /// `Compiler::new(_, _, "")` from quietly writing a cache into the process's current directory.
-    fn cache_dir(cache: &Path) -> Result<PathBuf> {
-        if cache.as_os_str().is_empty() {
-            Ok(hrx::bundle::cache_root()?.join("h3/kernels/hrx-v1"))
-        } else {
-            Ok(cache.join("hrx-v1"))
-        }
-    }
-
     fn module(&self, target: Option<&hrx::Target>, stem: &str) -> Result<hrx::loom::Module> {
         let mut modules = self.modules.lock().expect("module cache poisoned");
         if let Some(module) = modules.get(stem) {
@@ -405,10 +388,10 @@ mod tests {
 
     #[test]
     fn embedded_sources_need_no_checkout_and_explicit_directories_are_honored() {
-        let c = Compiler::new(None, PathBuf::new(), PathBuf::new());
+        let c = Compiler::new(None, PathBuf::new());
         assert!(c.source("gn_silu_f16").unwrap().contains("h3_gn_silu_f16"));
         let directory = tempfile::tempdir().unwrap();
-        let c = Compiler::new(None, directory.path(), PathBuf::new());
+        let c = Compiler::new(None, directory.path());
         assert!(c.source("gn_silu_f16").is_err());
     }
 
@@ -475,7 +458,7 @@ mod tests {
     #[ignore = "requires gfx1151 and provisioned HRX"]
     fn a_failed_batch_still_builds_the_requests_behind_it() {
         let mut stream = hrx::Stream::open().expect("stream");
-        let compiler = Compiler::new(None, "", "");
+        let compiler = Compiler::new(None, "");
         let cfg: Cfg = vec![
             ("h3.gn_silu_f16.channels".into(), "128".into()),
             ("h3.gn_silu_f16.groups".into(), "32".into()),
@@ -501,7 +484,7 @@ mod tests {
     #[test]
     #[ignore = "requires the provisioned Loom compiler"]
     fn cached_modules_reject_a_different_stream_target() {
-        let compiler = Compiler::new(None, "", "");
+        let compiler = Compiler::new(None, "");
         let first = hrx::Target::new("gfx1151").unwrap();
         let other = hrx::Target::new("gfx1100").unwrap();
         compiler.module(Some(&first), "prepare_i8_family").unwrap();
@@ -517,11 +500,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let library = dir.path().join("libloomc.so");
         write(&library, b"v").unwrap();
-        let c = Compiler::new(
-            Some(library.clone()),
-            dir.path().join("kernels"),
-            dir.path(),
-        );
+        let c = Compiler::new(Some(library.clone()), dir.path().join("kernels"));
         let message = c.tag("nope", "s", &vec![]).unwrap_err().to_string();
         assert!(message.contains("nope.loom"), "{message}");
     }
@@ -531,11 +510,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sources = dir.path().join("kernels");
         write(&sources.join("k.loom"), b"src").unwrap();
-        let c = Compiler::new(
-            Some(PathBuf::from("definitely-not-on-path-h3")),
-            &sources,
-            dir.path(),
-        );
+        let c = Compiler::new(Some(PathBuf::from("definitely-not-on-path-h3")), &sources);
         let message = c.tag("k", "s", &vec![]).unwrap_err().to_string();
         assert!(message.contains("definitely-not-on-path-h3"), "{message}");
     }

@@ -64,7 +64,6 @@ fn main() {
         "H3_COMPARE_BATCHES must be even and >= 2"
     );
     let compiler = hrx::loom::Compiler::resolve(None).unwrap();
-    let cache = hrx::bundle::cache_root().unwrap().join("kernels");
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels");
     let mut stream = Stream::open().unwrap();
     println!("stem,M,K,N,weights,artifact_identical,baseline_ms,candidate_ms,ratio");
@@ -113,8 +112,8 @@ fn main() {
                     let new = std::fs::read_to_string(root.join(format!("{module}.loom"))).unwrap();
                     let mut request = hrx::loom::Specialization::new(&symbol);
                     request.config = cfg;
-                    let old_path = compiler.module(&old).compile(&request, &cache).unwrap();
-                    let new_path = compiler.module(&new).compile(&request, &cache).unwrap();
+                    let old_path = compiler.module(&old).compile(&request).unwrap();
+                    let new_path = compiler.module(&new).compile(&request).unwrap();
                     let identical = old_path.bytes() == new_path.bytes();
                     // Safety: trusted baseline and candidate sources compiled through HRX.
                     let kernels = [
