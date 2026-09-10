@@ -5,22 +5,21 @@ binary rpath build scripts are removed. The model still exposes `Session` as its
 Rust API. It does not require Python, Torch,
 ROCm development headers or an LLVM build.
 
-The workspace takes it from crates.io by version, under the name `hrx`:
+The workspace pins one reviewed Git revision in `Cargo.toml` and all consumer
+lockfiles. It includes HRX 0.3's NPU APIs, compiler cache fixes and keyed pending
+requests. H3 enables only `download` and `loom`; ordinary inference does not
+initialize an NPU.
+
+For local HRX development, put this in an ignored `.cargo/config.toml`:
 
 ```toml
-hrx = { package = "hrx-rs", version = "0.2.0", default-features = false, features = ["download", "loom"] }
-```
-
-Normal builds use the published crate. For local HRX development, point Cargo
-at a sibling checkout from an ignored `.cargo/config.toml`:
-
-```toml
-[patch.crates-io]
+[patch."https://github.com/zacharydenton/hrx-rs"]
 hrx-rs = { path = "../hrx.rs" }
 ```
 
-Remove the override and restore the registry dependency in `Cargo.lock` before
-committing changes made with a local HRX checkout.
+Restore the pinned dependency before committing lockfiles. HRX's
+`scripts/check-consumers.py` checks committed consumer snapshots against a
+candidate HRX tree without modifying the original checkouts.
 
 `hrx gc [DAYS]` collects what provisioning leaves behind: runtime bundles the
 crate's manifest no longer pins, and kernel artifacts unused for longer than
@@ -34,7 +33,10 @@ SHA-256 identity, integrity checks and atomic publication to `hrx::loom`. It
 compiles for the architecture the stream's device reports, and asking for a kernel
 does not build it: requests accumulate, and `Compiler::flush` hands the whole
 outstanding set to `hrx::loom::Compiler::compile_all`, which owns the thread
-budget. Sources are read once per compiler session. The source files and tokenizer sit at the
+budget. `KeyedKernels::request_or_insert_with` identifies requests by source name,
+export and sorted configuration. Warm requests skip source lookup, text hashing
+and specialization-map construction. The first miss still joins the batch.
+Sources are immutable within a compiler session and are read once. The source files and tokenizer sit at the
 repository root, in `kernels/` and `assets/`, and are embedded into an installed binary; tests and
 examples read them from the working tree.
 Compiled kernels use HRX’s shared per-user kernel cache.
@@ -193,3 +195,10 @@ checks, kernel resolution and scalar packing. Each run takes the median of nine
 2,048-launch batches after three warmups and checks the output. Completed batches
 averaged 2.15–2.21 µs per kernel. This is a small prepared-kernel benchmark; full
 video/audio latency, checkpoint-scale load time and peak memory were not remeasured.
+
+## NPU scope
+
+Audio remains on the GPU. No NPU artifact, buffer import or runtime initialization
+is added to H3's inference path. A future audio port needs its own measured stage
+boundary and quality qualification; enabling the HRX NPU feature alone does not
+provide an offload.

@@ -120,15 +120,21 @@ fn workers() -> usize {
         .min(8)
 }
 
-/// Model-specific source selection and loaded exports. Compilation, integrity,
-/// process locks, publication, the loaded-kernel cache and the compiler's own
-/// memoization are provided by the shared HRX crate.
+#[derive(Hash, PartialEq, Eq)]
+struct RequestKey {
+    stem: String,
+    symbol: String,
+    config: Cfg,
+}
+
+/// Model-specific source selection and pending requests. HRX owns compilation,
+/// artifact integrity and the loaded executable cache.
 pub struct Compiler {
     library: Option<PathBuf>,
     sources: PathBuf,
     source_cache: Mutex<HashMap<String, Arc<str>>>,
     /// Built on the first request, for the target that request's stream reported.
-    kernels: OnceLock<hrx::loom::Kernels>,
+    kernels: OnceLock<hrx::loom::KeyedKernels<RequestKey>>,
 }
 impl Compiler {
     pub fn new(library: Option<PathBuf>, sources: impl Into<PathBuf>) -> Self {
@@ -146,9 +152,12 @@ impl Compiler {
     /// kernels will actually run on. [`Compiler::get`] passes the stream's own, which is what the
     /// device reports; only [`Compiler::tag`], which has no device to ask, leaves it unset and takes
     /// the crate's default. Whichever comes first fixes it for this `Compiler`.
-    fn kernels(&self, target: Option<&hrx::Target>) -> Result<&hrx::loom::Kernels> {
+    fn kernels(
+        &self,
+        target: Option<&hrx::Target>,
+    ) -> Result<&hrx::loom::KeyedKernels<RequestKey>> {
         if let Some(kernels) = self.kernels.get() {
-            let built = kernels.compiler().target();
+            let built = kernels.kernels().compiler().target();
             if target.is_some_and(|target| target != built) {
                 return Err(Error::Io(format!(
                     "compiler target {} differs from stream target {}",
@@ -164,7 +173,7 @@ impl Compiler {
             ..Default::default()
         };
         let compiler = hrx::loom::Compiler::shared(self.library.as_deref(), options)?;
-        let _ = self.kernels.set(hrx::loom::Kernels::new(compiler));
+        let _ = self.kernels.set(hrx::loom::Kernels::new(compiler).keyed());
         self.kernels(target)
     }
     fn source(&self, stem: &str) -> Result<Arc<str>> {
@@ -198,6 +207,7 @@ impl Compiler {
         let source = self.source(stem)?;
         Ok(self
             .kernels(None)?
+            .kernels()
             .compiler()
             .module(&source)
             .key(&request)?)
@@ -215,13 +225,33 @@ impl Compiler {
         symbol: &str,
         cfg: &Cfg,
     ) -> Result<Kernel> {
-        let mut spec = hrx::loom::Specialization::new(symbol);
-        spec.config = config(stem, cfg)?;
-        let source = self.source(stem)?;
-        Ok(Kernel(
+        let mut canonical = cfg.clone();
+        canonical.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        if canonical.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(Error::Configuration {
+                stem: stem.into(),
+                message: "a configuration key was given twice".into(),
+            });
+        }
+        let key = RequestKey {
+            stem: stem.into(),
+            symbol: symbol.into(),
+            config: canonical,
+        };
+        // Sources are immutable within this Compiler. Equal keys include every
+        // specialization input; hits skip source lookup and hashing entirely.
+        let pending = unsafe {
             self.kernels(Some(stream.target()))?
-                .request(&source, &spec)?,
-        ))
+                .request_or_insert_with(stream, key, |key| {
+                    let source = self
+                        .source(&key.stem)
+                        .map_err(|e| hrx::Error::Message(e.to_string()))?;
+                    let mut spec = hrx::loom::Specialization::new(&key.symbol);
+                    spec.config = key.config.iter().cloned().collect();
+                    Ok((source, spec))
+                })
+        }?;
+        Ok(Kernel(pending))
     }
 
     /// Build every kernel asked for so far.
@@ -230,7 +260,7 @@ impl Compiler {
     /// compile is reported where it was configured rather than at the launch that first needs it.
     pub fn flush(&self, stream: &mut hrx::Stream) -> Result<()> {
         // Safety: every requested source is this repository's own, checked in or embedded.
-        Ok(unsafe { self.kernels(Some(stream.target()))?.build(stream) }?)
+        Ok(unsafe { self.kernels(Some(stream.target()))?.kernels().build(stream) }?)
     }
 }
 
