@@ -145,6 +145,14 @@ milliseconds of GPU work per dispatch, a video decode tile about 1.08 ms, and an
 Against 175 ns to enqueue, none is bound by the host, and no arrangement of dependencies changes the
 arithmetic they are waiting on.
 
+A second stream to overlap the two decodes is not used either, for the same arithmetic. Video and
+audio decode are independent -- different checkpoints, disjoint inputs, disjoint outputs -- but both
+are bound by the one GPU, so running them together does not reduce the work, only fills whatever
+idle the other leaves. Video decode leaves about 7 ms of idle per tile, the host's unpatchify and
+blend, which is 0.74 s across a 124-frame clip's 105 tiles. Audio decode needs 1.54 s of GPU. So the
+ceiling is about 0.8 s of 35.85 s, for a second stream, a thread, and an end to `Session`'s
+single-threaded contract.
+
 A separate copy stream is not used either. Weights become resident on first use, and later steps
 reuse them; overlapping those first-use uploads would need its own measurement, including peak
 memory, rather than a claim from the dispatch cost alone.
