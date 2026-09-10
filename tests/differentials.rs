@@ -70,18 +70,9 @@ fn digest_f32(values: &[f32]) -> String {
     hrx::bundle::digest(bytemuck::cast_slice(values))
 }
 
-/// Compare a digest against the one recorded for this case, or record it.
-///
-/// `H3_REBASE=1` prints what the pipeline produces now instead of asserting, which is how the
-/// constants below are written. It is deliberately a separate run and not a fallback for an empty
-/// constant: rebasing is a claim that the new bytes are correct, and that claim comes from the
-/// checks in `scripts/parity.py` against diffusers, not from this file agreeing with itself.
+/// Compare a digest against the one recorded for this case.
 #[track_caller]
 fn check(got: String, want: &str, case: &str) {
-    if std::env::var_os("H3_REBASE").is_some() {
-        println!("    ({case:>26}) {got:?}");
-        return;
-    }
     assert_eq!(got, want, "{case}");
 }
 

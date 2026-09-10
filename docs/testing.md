@@ -28,10 +28,9 @@ compares them exactly as well.
 `H3_GRAPH=1 cargo test --test differentials --release -- --ignored` runs the same cases through the
 recorded graphs, which is how the recordings are known to be faithful.
 
-A digest that changes is a change to the model's arithmetic. `H3_REBASE=1` prints what the pipeline
-produces now rather than asserting, but rebasing is a claim that the new bytes are *correct*, and
-that claim comes from `scripts/parity.py` against diffusers — not from this file agreeing with
-itself.
+A failed assertion reports the actual and expected digests. Before updating an expected digest
+for an intentional numerical change, validate the new output independently with
+`scripts/parity.py` against diffusers, then edit the constant explicitly.
 
 The GPU suite compares independent scalar CPU references against:
 
