@@ -55,9 +55,8 @@ cargo install --locked --path cli   # or: ln -s "$PWD/build/h3" ~/.local/bin/h3
 
 For a local compiler build, follow
 [HRX’s upstream pin and compiler patches](https://github.com/zacharydenton/hrx-rs/tree/main/patches/loom).
-HRX owns the required native fixes; H3 loads the resulting `libloomc.so` through
-`HRX_LOOM_LIBRARY`. The [historical H3 patch record](../patches/loom/README.md)
-documents the previous bundle.
+HRX owns the required native fixes, and the bundle it pins carries them; H3 loads the
+resulting `libloomc.so` through `HRX_LOOM_LIBRARY`.
 
 ## Checkpoints
 

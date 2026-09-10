@@ -33,7 +33,7 @@ runtime dimensions retain their ordinary semantics.
 
 Validated on 2026-09-09 with compiler SHA-256
 `74a0c9dc5f387e89b85a3cd9d2000644dc0e20a0657d9fe79dfcd627ff5ecdb6`.
-The [compiler patch record](../../patches/loom/README.md) identifies its source.
+[HRX's patch record](https://github.com/zacharydenton/hrx-rs/tree/main/patches/loom) identifies its source.
 
 These probes establish language and code-generation behavior. Numerical and
 performance checks remain necessary for production schedule changes. Native

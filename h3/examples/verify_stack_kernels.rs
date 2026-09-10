@@ -19,7 +19,8 @@ fn main() {
     let tokens: usize = args.next().expect("tokens").parse().expect("a number");
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    let cache = root.join("build/kernel_cache");
+    // The one per-user cache HRX keeps, which is where every consumer's artifacts land now.
+    let cache = hrx::bundle::kernel_cache().expect("cache root");
     let before: std::collections::HashSet<String> = std::fs::read_dir(&cache)
         .expect("cache")
         .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))

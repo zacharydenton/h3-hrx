@@ -32,7 +32,6 @@ fn main() {
         video_vae: file("vae/minimax_h3_video_vae_fp16.safetensors"),
         audio_vae: file("vae/minimax_h3_audio_vae_fp32.safetensors"),
         kernel_sources: format!("{root}/h3/kernels").into(),
-        cache_dir: format!("{root}/build/kernel_cache").into(),
         loom_library: std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from),
         attention: h3::Attention::I8,
     })

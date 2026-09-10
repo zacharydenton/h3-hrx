@@ -1,14 +1,11 @@
 .venv/
 build/
-host/loomrun
 __pycache__/
 *.pyc
 *.hsaco
 *.log
-/examples/c/minimal
-/examples/go/minimal
+
 /target/
 /examples/rust/target/
-
 /examples/rustler/target/
 .cargo/

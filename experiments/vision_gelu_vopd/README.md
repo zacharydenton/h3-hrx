@@ -12,7 +12,7 @@ The rebuilt compiler passes both cases below. On gfx1151, all three shared
 vision epilogues match the original baseline bitwise (4,160 outputs each), and
 all 15 H3 GPU kernel tests pass. The production `matmul_bf16_family.loom` now uses the shared body. The pinned
 native bundle contains the fix; a developer compiler can still be selected
-through `HRX_LOOM_LIBRARY` (the path to `libloomc.so`). See the [compiler patch record](../../patches/loom/README.md).
+through `HRX_LOOM_LIBRARY` (the path to `libloomc.so`). See [HRX's patch record](https://github.com/zacharydenton/hrx-rs/tree/main/patches/loom).
 
 ## Minimal CPU reproducer
 
