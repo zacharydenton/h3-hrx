@@ -1,12 +1,37 @@
 # Native test coverage
 
-`scripts/test.sh --cpu` runs formatting, Clippy, workspace tests and C-header drift checks.
-`scripts/test.sh --gpu` additionally runs `h3/tests/kernels.rs` and the resident
-Euler and conditioning unit tests on gfx1151.
+Three tiers, each needing more of the machine than the last:
+
+| | needs | runs |
+| --- | --- | --- |
+| `scripts/test.sh --cpu` | nothing | formatting, Clippy, the unit tests |
+| `scripts/test.sh --gpu` | gfx1151 and a provisioned HRX | the above, plus `tests/kernels.rs` and the resident Euler and conditioning tests |
+| `scripts/test.sh --full` | the checkpoints as well | the above, plus `tests/differentials.rs`, about three minutes |
+
 The native tests compile through `hrx::loom::Compiler`, upload owned buffers,
 dispatch through `hrx::Stream`, and read results back through HRX staging. They
 are ignored by default; explicitly running them requires working hardware and
 the provisioned native bundle. No Python or Torch dependency is involved.
+
+## Whole-pipeline digests
+
+`tests/differentials.rs` runs thirty-one cases — seven video decodes across every tiling the
+decoder chooses, fourteen audio conversions at its padding boundaries, and five denoising
+trajectories over both samplers and the step cache — and compares a SHA-256 of each result against a
+constant in the file.
+
+These are the checks that catch what types cannot: a recorded graph missing an edge, a stage moved
+to another stream, a path that resolves to the wrong tree. Inputs are generated from a seed by a
+generator written out in the test, so nothing is stored; the outputs would be gigabytes and a digest
+compares them exactly as well.
+
+`H3_GRAPH=1 cargo test --test differentials --release -- --ignored` runs the same cases through the
+recorded graphs, which is how the recordings are known to be faithful.
+
+A digest that changes is a change to the model's arithmetic. `H3_REBASE=1` prints what the pipeline
+produces now rather than asserting, but rebasing is a claim that the new bytes are *correct*, and
+that claim comes from `scripts/parity.py` against diffusers — not from this file agreeing with
+itself.
 
 The GPU suite compares independent scalar CPU references against:
 
