@@ -1,5 +1,4 @@
-//! Resolves a checkpoint path the way the pipeline will: local directory, then the shared Hugging Face
-//! cache, then the hub.  resolve [--offline] <relative-path>
+//! Resolves a checkpoint through the shared Hugging Face cache, downloading if needed.  resolve [--offline] <relative-path>
 pub fn run(args: Vec<String>) {
     let mut args = args;
     let offline = args.first().map(|a| a == "--offline").unwrap_or(false);

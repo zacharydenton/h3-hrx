@@ -4,7 +4,7 @@ Run commands from the repository root unless stated otherwise.
 
 ## Dependencies
 
-- Linux and AMD Strix Halo (Radeon 8060S, `gfx1151`). Development and
+- Linux and AMD Strix Halo (`gfx1151`). Development and
   measurements used a 128 GB system. Allow room for activations as well as weights;
   smaller memory configurations have not been validated.
 - ffmpeg for input decoding and MP4/WAV output.
@@ -31,8 +31,8 @@ To provision it ahead of time, or on a machine that will not have the network
 later, install the crate's runner and unpack the release yourself:
 
 ```sh
-cargo install --locked hrx-rs --features runner
-gh release download native-20260909-reviewed --repo zacharydenton/hrx-rs \
+cargo install --locked hrx-rs --version 0.4.0 --features runner
+gh release download native-20260910-gpu-npu --repo zacharydenton/hrx-rs \
   --pattern hrx-linux-x86_64-gfx1151.tar.gz --dir build --clobber
 hrx prepare build/hrx-linux-x86_64-gfx1151.tar.gz
 ```

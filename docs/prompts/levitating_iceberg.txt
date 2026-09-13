@@ -1,0 +1,7 @@
+For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
+
+integrated_multimodal_description: [Shot 1] Live-action, cinematic, a continuous low-angle shot of the colossal iceberg suspended in clear air above the Arctic fjord. The camera pushes in with small amplitude at slow speed, staying close to the water. The huge iceberg remains at a constant height, with the broad open band of air beneath its entire jagged underside clearly visible throughout the shot. Two narrow waterfalls stream steadily from the blue ice into the sea, throwing up soft white spray and widening circular ripples. The tiny red fishing boat moves slowly to the right beneath the floating ice, leaving a delicate wake. Warm early-morning sunlight glows through the translucent ice edges and sparkles across the gently moving water. Fine mist drifts sideways beneath the iceberg. Preserve the iceberg's shape and the distant mountain silhouettes. Realistic expedition cinematography, natural ice and water textures, subtle atmospheric haze, a single uninterrupted five-second shot.
+
+overall_soundscape: The steady rush of two distant waterfalls mixes with gentle water lapping near the camera. A small fishing boat engine pulses quietly beneath occasional deep creaks from the immense ice overhead.
+
+non_diegetic_music: A low cello note and a sparse luminous string chord rise slowly, remaining quiet beneath the natural sounds, with no percussion.

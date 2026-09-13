@@ -1,0 +1,57 @@
+In file included from /usr/include/python3.13/pyconfig.h:6,
+                 from /usr/include/python3.13/Python.h:14,
+                 from /tmp/tmpf92r8hxv/hip_utils.c:5:
+/usr/include/python3.13/pyconfig-64.h:1972:9: warning: ‘_POSIX_C_SOURCE’ redefined
+ 1972 | #define _POSIX_C_SOURCE 200809L
+      |         ^~~~~~~~~~~~~~~
+In file included from /usr/include/bits/libc-header-start.h:33,
+                 from /usr/include/stdint.h:26,
+                 from /usr/lib/gcc/x86_64-redhat-linux/16/include/stdint.h:11,
+                 from /opt/venv/lib/python3.13/site-packages/triton/backends/amd/include/hip/hip_runtime.h:48,
+                 from /tmp/tmpf92r8hxv/hip_utils.c:2:
+/usr/include/features.h:319:10: note: this is the location of the previous definition
+  319 | # define _POSIX_C_SOURCE        202405L
+      |          ^~~~~~~~~~~~~~~
+conditioning in 18.5 s
+  step 1/20  87.8 s
+  step 2/20  86.1 s
+  step 3/20  85.5 s
+  step 4/20  84.5 s
+  step 5/20  86.0 s
+  step 6/20  85.8 s
+  step 7/20  84.8 s
+  step 8/20  85.7 s
+  step 9/20  85.8 s
+  step 10/20  85.2 s
+  step 11/20  86.4 s
+  step 12/20  85.5 s
+  step 13/20  85.1 s
+  step 14/20  85.8 s
+  step 15/20  85.5 s
+  step 16/20  85.6 s
+  step 17/20  85.3 s
+  step 18/20  84.7 s
+  step 19/20  85.6 s
+  step 20/20  85.2 s
+sampled 20 evaluations (res_multistep, simple) in 1711.9 s
+frames (124, 480, 864, 3)
+audio (2, 165600) 32000
+[vost#0:0 @ 0x556d4160d600] Unknown encoder 'libx264'
+[vost#0:0 @ 0x556d4160d600] Error selecting an encoder
+Error opening output file build/showcase-20260913/comfy_floating_glacier/video.mp4.
+Error opening output files: Encoder not found
+Traceback (most recent call last):
+  File "/home/zach/code/h3-hrx/scripts/comfy_dump.py", line 137, in <module>
+    subprocess.run([
+    ~~~~~~~~~~~~~~^^
+        "ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        "-c:a", "aac", "-b:a", "192k", "-shortest", str(a.video_out),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ], input=memoryview(raw_frames).cast("B"), check=True)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib64/python3.13/subprocess.py", line 577, in run
+    raise CalledProcessError(retcode, process.args,
+                             output=stdout, stderr=stderr)
+subprocess.CalledProcessError: Command '['ffmpeg', '-y', '-loglevel', 'error', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', '864x480', '-r', '24', '-i', '-', '-i', 'build/showcase-20260913/comfy_floating_glacier/audio.wav', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18', '-c:a', 'aac', '-b:a', '192k', '-shortest', 'build/showcase-20260913/comfy_floating_glacier/video.mp4']' returned non-zero exit status 8.

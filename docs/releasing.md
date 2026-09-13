@@ -66,8 +66,9 @@ h3 --width 864 --height 480 --frames 124 --steps 31 --seed 7 \
 Confirm the intended version, Apache-2.0 code license, separate model terms,
 bundled-asset attribution, README links, and package contents. Review tracked
 files and Git history for credentials and private data before making the
-repository public. Keep generated clips, checkpoints, and local configuration
-out of the repository.
+repository public. Keep scratch renders, checkpoints, and local configuration out of the repository.
+Curated showcase clips belong under `docs/media/`, with their prompts and settings
+documented; they are excluded from the source package.
 
 Prepare release notes with supported hardware, limitations, and actual validation
 results. Publishing a crate, creating a release tag, and changing repository

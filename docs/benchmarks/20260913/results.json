@@ -1,0 +1,109 @@
+{
+  "h3": {
+    "evaluation_seconds": [
+      26.8,
+      26.9,
+      26.8,
+      27.0,
+      26.9,
+      27.0,
+      27.9,
+      28.1,
+      28.1,
+      28.1,
+      28.2,
+      28.1,
+      28.1,
+      28.1,
+      28.1,
+      28.0,
+      28.1,
+      28.0,
+      28.1,
+      28.0
+    ],
+    "steady_evaluations": 19,
+    "steady_median_seconds": 28.1,
+    "steady_mean_seconds": 27.76842105263158,
+    "steady_min_seconds": 26.8,
+    "steady_max_seconds": 28.2
+  },
+  "comfyui": {
+    "evaluation_seconds": [
+      87.77764096600004,
+      86.10426386300242,
+      85.5105458170001,
+      84.4865915570117,
+      85.96113560500089,
+      85.79935002498678,
+      84.76574184600031,
+      85.65558451999095,
+      85.75637688999996,
+      85.24359817901859,
+      86.39835366999614,
+      85.53480057799607,
+      85.11345156299649,
+      85.84890151300351,
+      85.54141205199994,
+      85.591977959004,
+      85.3084052859922,
+      84.7080535569985,
+      85.62154411399388,
+      85.19409816199914
+    ],
+    "steady_evaluations": 19,
+    "steady_median_seconds": 85.54141205199994,
+    "steady_mean_seconds": 85.48127298715745,
+    "steady_min_seconds": 84.4865915570117,
+    "steady_max_seconds": 86.39835366999614
+  },
+  "steady_median_speedup": 3.0441783648398553,
+  "memory": {
+    "h3": {
+      "memory_sampling_interval_seconds": 5,
+      "baseline_system_memory_bytes": {
+        "MemTotal": 134145699840,
+        "MemAvailable": 92364083200,
+        "MemFree": 86508183552,
+        "Cached": 12853665792,
+        "SwapTotal": 67074256896,
+        "SwapFree": 28151914496,
+        "Dirty": 1032192
+      },
+      "sampled_peak_process_rss_bytes": 1420660736,
+      "sampled_peak_process_pss_bytes": 1416281088,
+      "sampled_peak_drm_resident_bytes": 55560650752,
+      "sampled_peak_drm_allocated_bytes": 55560663040,
+      "minimum_system_available_bytes": 36573392896,
+      "maximum_system_swap_used_bytes": 39301541888,
+      "memory_note": "Sampled process PSS and DRM memory are separate views and must not be summed. Five-second sampling may miss brief peaks. System counters include other applications."
+    },
+    "comfyui": {
+      "memory_sampling_interval_seconds": 5,
+      "baseline_system_memory_bytes": {
+        "MemTotal": 134145699840,
+        "MemAvailable": 93541285888,
+        "MemFree": 81958465536,
+        "Cached": 18012557312,
+        "SwapTotal": 67074256896,
+        "SwapFree": 27779457024,
+        "Dirty": 1056768
+      },
+      "sampled_peak_process_rss_bytes": 24830844928,
+      "sampled_peak_process_pss_bytes": 24822938624,
+      "sampled_peak_drm_resident_bytes": 27331371008,
+      "sampled_peak_drm_allocated_bytes": 27331383296,
+      "minimum_system_available_bytes": 44644159488,
+      "maximum_system_swap_used_bytes": 39422566400,
+      "memory_note": "Sampled process PSS and DRM memory are separate views and must not be summed. Five-second sampling may miss brief peaks. System counters include other applications."
+    }
+  },
+  "h3_wall_seconds": 731.7170906229876,
+  "comfyui_observed_process_seconds": 1806.0750810980098,
+  "exit_codes": {
+    "h3": 0,
+    "comfyui": 1
+  },
+  "wall_time_note": "ComfyUI completed sampling and video/audio decoding but MP4 encoding failed because its FFmpeg lacks libx264. No end-to-end speedup is reported. Memory covers the observed processes, including decoding and output attempts.",
+  "method": "One completed sampling trajectory per engine; discard the first evaluation. The remaining evaluations are within-run observations, not independent repeated runs. h3 callback timestamps are rounded to 0.1 seconds."
+}

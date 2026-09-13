@@ -1,0 +1,42 @@
+{
+  "started_utc": "2026-09-13T17:51:08.469601+00:00",
+  "command": [
+    "env",
+    "HF_HUB_OFFLINE=1",
+    "HRX_OFFLINE=1",
+    "target/release/h3",
+    "--width",
+    "864",
+    "--height",
+    "480",
+    "--frames",
+    "124",
+    "--steps",
+    "21",
+    "--seed",
+    "1618",
+    "--out",
+    "build/showcase-20260913/floating_glacier.mp4"
+  ],
+  "stdin": "docs/prompts/floating_glacier.txt",
+  "wall_seconds": 731.7170906229876,
+  "exit_code": 0,
+  "max_rss_kib": 1418116,
+  "memory_sampling_interval_seconds": 5,
+  "baseline_system_memory_bytes": {
+    "MemTotal": 134145699840,
+    "MemAvailable": 92364083200,
+    "MemFree": 86508183552,
+    "Cached": 12853665792,
+    "SwapTotal": 67074256896,
+    "SwapFree": 28151914496,
+    "Dirty": 1032192
+  },
+  "sampled_peak_process_rss_bytes": 1420660736,
+  "sampled_peak_process_pss_bytes": 1416281088,
+  "sampled_peak_drm_resident_bytes": 55560650752,
+  "sampled_peak_drm_allocated_bytes": 55560663040,
+  "minimum_system_available_bytes": 36573392896,
+  "maximum_system_swap_used_bytes": 39301541888,
+  "memory_note": "Sampled process PSS and DRM memory are separate views and must not be summed. Five-second sampling may miss brief peaks. System counters include other applications."
+}

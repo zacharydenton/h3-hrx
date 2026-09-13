@@ -1,0 +1,7 @@
+124 frames at 864x480: 37x30x54 latents, 207 audio latents; 251 prompt tokens (0 keyframe, 0 reference images, 0 reference audio)
+session in 0.4 s (minimax_h3_fl2va_pruned_int8_convrot.safetensors, i8 attention)
+  step 1/20   26.8 s  step 2/20   53.7 s  step 3/20   80.5 s  step 4/20  107.5 s  step 5/20  134.4 s  step 6/20  161.4 s  step 7/20  189.3 s  step 8/20  217.4 s  step 9/20  245.5 s  step 10/20  273.6 s  step 11/20  301.8 s  step 12/20  329.9 s  step 13/20  358.0 s  step 14/20  386.1 s  step 15/20  414.2 s  step 16/20  442.2 s  step 17/20  470.3 s  step 18/20  498.3 s  step 19/20  526.4 s  step 20/20  554.4 s
+denoised in 674.9 s
+decoded in 55.2 s
+wrote build/showcase-20260913/floating_glacier.mp4 (124 frames, 864x480, 5.17 s) and build/showcase-20260913/floating_glacier.wav
+build/showcase-20260913/floating_glacier.mp4

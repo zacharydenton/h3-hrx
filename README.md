@@ -4,20 +4,23 @@
 
 Run MiniMax H3 (Hailuo 3.0) locally with every GPU kernel written in
 [Loom](https://github.com/ROCm/hrx-system) and compiled, cached, and dispatched
-through [HRX](https://github.com/zacharydenton/hrx-rs). Load ComfyUI-format
-checkpoints directly and generate video with sound from text, a first frame,
-or image and audio references.
+through [HRX](https://github.com/zacharydenton/hrx-rs). Load Comfy-Org quantized
+checkpoints from the standard Hugging Face cache and generate video with sound
+from text, a first frame, or image and audio references.
+
+**3.04× faster steady denoising than ComfyUI** in a measured 480p comparison on
+Strix Halo, with higher GPU-resident memory use. [Timings and memory](#performance).
 
 The inference pipeline needs no Python, PyTorch, Triton, or vendor math libraries.
 Building it needs no ROCm headers or `hipcc`. HRX provisions the native compiler
 and runtime on first GPU use; the CLI embeds the Loom kernel sources and tokenizer.
 
-**Experimental:** tested on Linux with AMD Strix Halo, Radeon 8060S (`gfx1151`),
+**Experimental:** tested on Linux with AMD Strix Halo (`gfx1151`)
 and 128 GB of unified memory. Other GPUs and memory configurations are unvalidated.
 
-https://github.com/user-attachments/assets/41a98dcf-48f0-4328-a0f4-7f17119243e6
+[![A whale glides above an alpine valley at sunrise](docs/media/showcase/alpine_whale.jpg)](docs/media/showcase/alpine_whale.mp4)
 
-[Demo prompt](docs/prompts/cliff_rider_768p.txt) · [Setup](docs/setup.md) ·
+[Watch the surreal video showcase](docs/showcase.md) · [Demo prompt](docs/prompts/alpine_whale.txt) · [Setup](docs/setup.md) ·
 [Prompt guide](docs/prompting.md) · [Performance](docs/performance.md) ·
 [Rust and Elixir clients](clients/README.md)
 
@@ -49,15 +52,16 @@ Ensure Cargo's binary directory (normally `~/.cargo/bin`) is on your `PATH`.
 Start with the included [structured prompt](docs/prompting.md):
 
 ```sh
-h3 --width 864 --height 480 --frames 124 --steps 31 --seed 7 \
-  --out clip.mp4 < docs/prompts/cliff_rider_768p.txt
+h3 --width 864 --height 480 --frames 124 --steps 21 --seed 2718 \
+  --out clip.mp4 < docs/prompts/alpine_whale.txt
 ```
 
 This writes `clip.mp4` and `clip.wav`. The first run downloads missing checkpoints
 and the pinned HRX native bundle, and compiles kernels for the requested shape.
-`--steps 31` means 30 model evaluations. A five-second clip takes roughly
-**15 minutes at 480p** or **55 minutes at 768p**, including setup and decoding
-in recorded runs. For the demo's resolution, use `--width 1344 --height 768`.
+`--steps 21` means 20 model evaluations. The measured 480p workload completed
+in **12 minutes 12 seconds** with checkpoints already cached, including loading,
+text encoding, sampling, decoding, and output encoding. First-run downloads and
+compilation can take longer; see the [benchmark conditions](docs/benchmarks/20260913/README.md).
 
 ### Weights
 
@@ -106,19 +110,29 @@ See [other modes](docs/tricks.md) for audio-only output and still images.
 
 ## Performance
 
-Recorded **per model evaluation** on an idle AMD Strix Halo system, using int8 weights.
-ComfyUI was measured on the same GPU. These are development measurements, not
-whole-clip timings or a fresh release benchmark.
+Measured on AMD Strix Halo with 128 GB unified memory: 864×480, 124 frames,
+20 evaluations, the same prompt and Comfy-Org int8 ConvRot checkpoints.
 
-| Clip | h3-hrx (Loom / HRX) | ComfyUI | Speedup |
-| --- | ---: | ---: | ---: |
-| 1344×768, 124 frames | 101 s | 771 s | 7.6× |
-| 864×480, 124 frames | 26.7 s | 103 s | 3.9× |
-| 864×480, 22 frames | 4.2 s | 3.8 s | 0.9× |
+| Measurement | h3-hrx (Loom / HRX) | ComfyUI |
+| --- | ---: | ---: |
+| Steady denoising, median per evaluation | **28.1 s** | 85.5 s |
+| Observed evaluation range | 26.8–28.2 s | 84.5–86.4 s |
+| Sampled peak GPU-resident buffers | 51.74 GiB | 25.45 GiB |
+| Sampled peak process PSS | 1.32 GiB | 23.12 GiB |
 
-Outputs are numerically checked against ComfyUI, but are not bit-identical.
-See [performance and validation](docs/performance.md) for conditions, quality
-measurements, and decoder timings.
+**3.04× faster denoising, with about twice the GPU-resident buffer memory.**
+PSS and GPU residency overlap on unified memory: do not add them or interpret
+PSS alone as total RAM usage. Memory was sampled every five seconds through
+loading, inference, decoding, and output attempts.
+
+This is one sampling trajectory per engine, excluding the first evaluation from
+steady timing. h3 uses int8 products and QK attention; ComfyUI uses bf16 compute
+on the same quantized weights. Outputs are not identical. ComfyUI completed
+sampling and decoding, but its container lacked the `libx264` encoder for MP4
+output, so **no end-to-end speedup is claimed**.
+
+See the [reproducible benchmark, raw measurements, and memory plot](docs/benchmarks/20260913/README.md)
+and [performance and numerical validation](docs/performance.md).
 
 ## Library and development
 

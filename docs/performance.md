@@ -1,18 +1,48 @@
 # Performance and numerical validation
 
-These are recorded development measurements on AMD Strix Halo (Radeon 8060S, `gfx1151`),
-not a fresh release benchmark. Timings depend on sequence length, prompt,
-cache state, and competing CPU/GPU work on the APU.
+The current comparison measures h3-hrx and ComfyUI on AMD Strix Halo (`gfx1151`),
+with 128 GB unified memory. Timings depend on sequence length, prompt, cache state,
+and competing CPU/GPU work on the APU.
 
-## End-to-end generation
+## September 2026 comparison
 
-The [README table](../README.md#performance) measures one denoising evaluation
-with `H3_PROFILE=1`, int8 checkpoint rows, and default int8 QK attention.
-ComfyUI was measured on the same hardware using
-`bench_comfyui_h3.py` (a retired development script) in the Strix Halo ComfyUI
-container. A full generation also pays for weight loading, text encoding,
-kernel compilation on a new shape, decoding, and output encoding. The default
-is 30 evaluations. Short sequences do not show the long-clip speedup.
+For 864×480, 124 frames and 20 evaluations, h3-hrx's steady median was **28.1 s per
+evaluation**, versus **85.5 s** for ComfyUI: **3.04× faster denoising**. This uses the
+same prompt and Comfy-Org quantized checkpoints, with one trajectory per engine
+and the first evaluation excluded. h3 computes int8 products with default int8 QK
+attention; ComfyUI dequantizes the weights for bf16 compute.
+
+Sampled peak GPU-resident buffers were **51.74 GiB for h3-hrx** and **25.45 GiB for
+ComfyUI**. Process PSS peaks were **1.32 GiB** and **23.12 GiB**, respectively.
+These views overlap on unified memory and must not be added together; PSS alone
+does not represent the complete memory footprint. Five-second samples may miss
+brief peaks.
+
+h3 produced its MP4/WAV in 731.7 seconds with cached checkpoints. ComfyUI finished
+sampling and video/audio decoding, then failed at MP4 encoding because the
+container's FFmpeg lacked `libx264`. No end-to-end speedup is reported.
+
+The [benchmark report](benchmarks/20260913/README.md) includes commands, versions,
+checkpoint hashes, raw logs, telemetry, and a memory timeline. These are practical
+within-run observations, not independent repetitions or a statistical-significance
+claim. The output images and random noise streams are not identical.
+
+## Historical development measurements
+
+These older timings used `H3_PROFILE=1`, int8 checkpoint rows, and default int8 QK
+attention. ComfyUI was measured with `bench_comfyui_h3.py`, a retired development
+script, in the Strix Halo ComfyUI container. They are retained as historical context;
+they are not the current reproducible comparison above.
+
+| Clip | h3-hrx per evaluation | ComfyUI per evaluation | Observed speedup |
+| --- | ---: | ---: | ---: |
+| 1344×768, 124 frames | 101 s | 771 s | 7.6× |
+| 864×480, 124 frames | 26.7 s | 103 s | 3.9× |
+| 864×480, 22 frames | 4.2 s | 3.8 s | 0.9× |
+
+A full generation also pays for weight loading, text encoding, kernel compilation
+on a new shape, decoding, and output encoding. The default is 30 evaluations.
+Short sequences do not show the long-clip speedup.
 
 For the 864×480, 124-frame decoder workload, the current representative
 resident video-plus-audio timing is **33.02 s**, down from **44.1 s**. It is
