@@ -20,9 +20,9 @@ and runtime on first GPU use; the CLI embeds the Loom kernel sources and tokeniz
 **Experimental:** tested on Linux with AMD Strix Halo (`gfx1151`)
 and 128 GB of unified memory. Other GPUs and memory configurations are unvalidated.
 
-[![A whale glides above an alpine valley at sunrise](docs/media/showcase/alpine_whale.jpg)](docs/media/showcase/alpine_whale.mp4)
+https://github.com/user-attachments/assets/d6863dea-e655-4ced-81a3-1c96a63a6c06
 
-[Watch the surreal video showcase](docs/showcase.md) · [Demo prompt](docs/prompts/alpine_whale.txt) · [Setup](docs/setup.md) ·
+[Showcase](docs/showcase.md) · [Demo prompt](docs/prompts/alpine_whale.txt) · [Setup](docs/setup.md) ·
 [Prompt guide](docs/prompting.md) · [Performance](docs/performance.md) ·
 [Rust and Elixir clients](clients/README.md)
 
