@@ -98,8 +98,8 @@ transformer, so it costs 10 GB rather than 62.
 
 The parity tools use Python with `numpy` and `huggingface_hub` for array and
 cache access; install them with `python3 -m pip install numpy huggingface_hub`.
-They reuse the standard Hugging Face cache, with `H3_MODELS` as an optional
-local override, and do not download missing checkpoints during validation.
+They reuse the standard Hugging Face cache and do not download missing
+checkpoints during validation.
 
 Whole-model parity lives in `scripts/parity.py`, outside this suite and outside
 `scripts/test.sh`: it needs the checkpoints, a device and dumps produced inside the
@@ -145,8 +145,8 @@ git archive 62f837d kernels | tar -x -C build/kernel-baseline
 export H3_KERNEL_BASELINE="$PWD/build/kernel-baseline/kernels"
 cargo test --test kernels -- --ignored --test-threads=1 --nocapture
 H3_KERNEL_TIMING=1 cargo test --test kernels preparation -- --ignored --test-threads=1 --nocapture
-cargo run --release --bin h3-hrx-dev -- compare-gemm "$H3_KERNEL_BASELINE"
-cargo run --release --bin h3-hrx-dev -- compare-vision "$H3_KERNEL_BASELINE"
+cargo run --release --bin h3-dev -- compare-gemm "$H3_KERNEL_BASELINE"
+cargo run --release --bin h3-dev -- compare-vision "$H3_KERNEL_BASELINE"
 ```
 
 The test harness compares every binding bit-for-bit before the independent CPU
@@ -166,7 +166,7 @@ for module in kernels/*_family.loom kernels/gemm_packed_256.loom; do
     while IFS= read -r entry; do cat "$H3_KERNEL_BASELINE/$entry.loom"; done |
     awk '!/^amdgpu.target/ || !seen[$0]++' > "$H3_KERNEL_BASELINE/$(basename "$module")"
 done
-cargo run --release --bin h3-hrx-dev -- compare-decode \
+cargo run --release --bin h3-dev -- compare-decode \
   "$H3_KERNEL_BASELINE" "$VAE_CHECKPOINT" "$LATENTS_F32" 480 864 22
 ```
 

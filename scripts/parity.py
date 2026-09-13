@@ -60,15 +60,11 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 # --------------------------------------------------------------------------------------------------
-# The host, through h3-hrx-dev parity-dump
+# The host, through h3-dev parity-dump
 # --------------------------------------------------------------------------------------------------
 
 def model_path(relative: str) -> Path:
-    """Use an explicit local override or the shared Hub cache; never download during validation."""
-    if directory := os.environ.get("H3_MODELS"):
-        local = Path(directory) / relative
-        if local.is_file():
-            return local
+    """Use the standard Hub cache; never download during validation."""
     cached = try_to_load_from_cache("Comfy-Org/MiniMax-H3", relative)
     if isinstance(cached, str):
         return Path(cached)
@@ -99,7 +95,7 @@ def official_path(component: str, explicit: str | None) -> Path:
 
 DIT_FILE = "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"
 
-DUMP = ROOT / "target/release/h3-hrx-dev"
+DUMP = ROOT / "target/release/h3-dev"
 
 
 class H3Error(RuntimeError):
@@ -108,12 +104,12 @@ class H3Error(RuntimeError):
 
 def host_command(command: str) -> list[str]:
     if not DUMP.is_file():
-        raise H3Error(f"{DUMP} is missing; cargo build --release --bin h3-hrx-dev")
+        raise H3Error(f"{DUMP} is missing; cargo build --release --bin h3-dev")
     return [str(DUMP), "parity-dump", command]
 
 
 def host(command: str, out: Path, dumps: Path | None = None, env: dict | None = None, **flags) -> Path:
-    """Run one `h3-hrx-dev parity-dump` command. Python never links the library: it writes the inputs as files,
+    """Run one `h3-dev parity-dump` command. Python never links the library: it writes the inputs as files,
     the host writes its artefacts as files, and everything below reads them back. There is no
     foreign-function boundary here to drift out of step with the crate."""
     argv = host_command(command) + ["--out", str(out)]
@@ -555,7 +551,7 @@ R = sys.modules[__name__]   # the reference section above, under the name the ch
 def comparison_options() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--case", choices=["t2va", "fl2va"], default="t2va"); ap.add_argument("--mode", choices=["trajectory", "blocks"], default="trajectory")
-    ap.add_argument("--truth", required=True, help="scripts/comfy_dump.py --out directory"); ap.add_argument("--dit", default=None, help="the DiT checkpoint (default: the fl2va file in the Hugging Face cache or $H3_MODELS)"); ap.add_argument("--attn", choices=["i4", "i8", "f16"], default="i8")
+    ap.add_argument("--truth", required=True, help="scripts/comfy_dump.py --out directory"); ap.add_argument("--dit", default=None, help="the DiT checkpoint (default: the fl2va file in the Hugging Face cache)"); ap.add_argument("--attn", choices=["i4", "i8", "f16"], default="i8")
     ap.add_argument("--prompt", default="A red fox trotting through a snowy forest at dawn, cinematic"); ap.add_argument("--first-frame", default=str(ROOT / "build/refs/fox_clean.png"))
     ap.add_argument("--width", type=int, default=864); ap.add_argument("--height", type=int, default=480); ap.add_argument("--frames", type=int, default=22); ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--dump", default=None, help="directory for the per-step / per-block dumps (default: <truth>/mine_<blocks>_<attn>)")

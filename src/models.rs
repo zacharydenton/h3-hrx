@@ -1,10 +1,7 @@
-//! Finding checkpoints in the standard Hugging Face cache, downloading missing files on demand.
+//! Resolve checkpoint files through the standard Hugging Face Hub cache.
 //!
-//! The repository lays its files out the same way ComfyUI does — `diffusion_models/`, `text_encoders/`,
-//! `vae/` — so one relative path names a file in either place. An explicitly configured local
-//! directory (`--models` or `H3_MODELS`) is tried first, then
-//! whatever is already in the shared cache, and only then the network. That order means an existing
-//! download is reused wherever it lives, and nothing is fetched twice.
+//! Repository-relative filenames are passed directly to the Hub client, which owns
+//! snapshot paths, cache lookup, and downloads. No separate model directory is used.
 use std::path::PathBuf;
 
 pub const REPO_OWNER: &str = "Comfy-Org";
@@ -39,9 +36,8 @@ fn hub_offline() -> bool {
     })
 }
 
-/// Where checkpoints are looked for, in order.
+/// Resolve Comfy-Org checkpoints through the shared Hugging Face Hub cache.
 pub struct Resolver {
-    dir: Option<PathBuf>,
     revision: Option<String>,
     /// When false, only files already on disk are used and the hub is never contacted.
     download: bool,
@@ -54,24 +50,12 @@ impl Default for Resolver {
 }
 
 impl Resolver {
-    /// Use the standard Hugging Face cache, with an optional `H3_MODELS` override.
-    /// Missing checkpoints are downloaded into that cache on demand.
+    /// Resolve through the standard Hugging Face cache, downloading missing files on demand.
     pub fn new() -> Self {
-        let dir = std::env::var_os("H3_MODELS")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from);
         Self {
-            dir,
             revision: None,
             download: true,
         }
-    }
-
-    pub fn with_dir(mut self, dir: Option<PathBuf>) -> Self {
-        if dir.is_some() {
-            self.dir = dir;
-        }
-        self
     }
 
     pub fn revision(mut self, revision: Option<String>) -> Self {
@@ -85,11 +69,8 @@ impl Resolver {
         self
     }
 
-    /// The path of one checkpoint, fetching it into the shared cache if it is not already somewhere.
+    /// The path of one checkpoint, fetching it into the shared cache if it is not already cached.
     pub fn find(&self, relative: &str) -> Result<PathBuf> {
-        if let Some(path) = self.local(relative) {
-            return Ok(path);
-        }
         // Already in the shared cache? This never touches the network.
         if let Ok(path) = self.hub(relative, true) {
             return Ok(path);
@@ -103,13 +84,7 @@ impl Resolver {
     /// As [`Resolver::find`], but a file that is simply absent is not an error: the ref2va checkpoint
     /// is optional, and asking for it must not start a 21 GB download.
     pub fn find_local(&self, relative: &str) -> Option<PathBuf> {
-        self.local(relative)
-            .or_else(|| self.hub(relative, true).ok())
-    }
-
-    fn local(&self, relative: &str) -> Option<PathBuf> {
-        let path = self.dir.as_ref()?.join(relative);
-        path.is_file().then_some(path)
+        self.hub(relative, true).ok()
     }
 
     fn hub(&self, relative: &str, cached_only: bool) -> Result<PathBuf> {
@@ -131,15 +106,7 @@ impl Resolver {
     }
 
     fn missing(&self, relative: &str) -> Error {
-        let mut tried = String::new();
-        if let Some(dir) = &self.dir {
-            tried.push_str(&format!("not under {}", dir.display()));
-        } else {
-            tried.push_str("no local override (--models or H3_MODELS)");
-        }
-        tried.push_str(&format!(
-            ", and not in the Hugging Face cache for {REPO_OWNER}/{REPO_NAME}"
-        ));
+        let tried = format!("not in the Hugging Face cache for {REPO_OWNER}/{REPO_NAME}");
         Error::NotFound {
             name: relative.into(),
             tried,
@@ -175,53 +142,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_local_directory_wins_and_needs_no_network() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(VIDEO_VAE);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"not really a checkpoint").unwrap();
-        let r = Resolver::new()
-            .with_dir(Some(dir.path().to_path_buf()))
-            .offline(true);
-        assert_eq!(r.find(VIDEO_VAE).unwrap(), path);
-    }
-
-    #[test]
     fn offline_reports_where_it_looked() {
-        let dir = tempfile::tempdir().unwrap();
-        let r = Resolver::new()
-            .with_dir(Some(dir.path().to_path_buf()))
-            .offline(true);
+        let r = Resolver::new().offline(true);
         // A name the repository does not have, so the result cannot depend on what this machine
         // happens to have cached.
         const ABSENT: &str = "vae/not-a-real-checkpoint.safetensors";
         let message = r.find(ABSENT).unwrap_err().to_string();
         assert!(message.contains(ABSENT), "{message}");
-        assert!(message.contains(dir.path().to_str().unwrap()), "{message}");
         assert!(message.contains("Hugging Face cache"), "{message}");
     }
 
     #[test]
     fn an_optional_checkpoint_does_not_start_a_download() {
-        let dir = tempfile::tempdir().unwrap();
-        // download allowed, but find_local must still not reach for the network
-        let r = Resolver::new().with_dir(Some(dir.path().to_path_buf()));
+        // Download is allowed, but find_local must still not reach for the network.
+        let r = Resolver::new();
         assert!(r
             .find_local("diffusion_models/definitely-not-a-real-file.safetensors")
             .is_none());
-    }
-
-    #[test]
-    fn the_repository_paths_match_what_the_readme_documents() {
-        // These are the --include arguments in the README's `hf download` line, and the same relative
-        // paths ComfyUI uses, which is why one string serves both.
-        for path in [DIT_FL2VA, DIT_REF2VA, TE, VIDEO_VAE, AUDIO_VAE] {
-            assert!(path.ends_with(".safetensors"), "{path}");
-            let dir = path.split('/').next().unwrap();
-            assert!(
-                matches!(dir, "diffusion_models" | "text_encoders" | "vae"),
-                "{path}"
-            );
-        }
     }
 }

@@ -13,7 +13,7 @@
 //! digests is a change to the model's arithmetic, and needs that same chain re-run — not a new
 //! constant pasted in.
 //!
-//! Checkpoints come from the Hugging Face cache; `H3_MODELS` is an optional override.
+//! Checkpoints come from the standard Hugging Face cache.
 use h3_hrx::avae::{AudioVae, AUDIO_CH, HOP};
 use h3_hrx::compile::Compiler;
 use h3_hrx::dispatch::Profile;

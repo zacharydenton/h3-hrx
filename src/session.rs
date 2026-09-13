@@ -16,7 +16,7 @@ use crate::vvae::{Clip, VideoVae};
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Explicit checkpoint paths override automatic resolution through the Hugging Face cache.
-    /// `None` resolves the corresponding checkpoint on first use, honoring `H3_MODELS`.
+    /// `None` resolves the corresponding checkpoint on first use.
     pub dit: Option<std::path::PathBuf>,
     pub te: Option<std::path::PathBuf>,
     pub video_vae: Option<std::path::PathBuf>,
@@ -421,6 +421,12 @@ mod tests {
         std::fs::write(repo.join("refs/main"), revision).unwrap();
         std::fs::write(&checkpoint, b"cached checkpoint fixture").unwrap();
 
+        // The retired model-directory override must not shadow the Hub cache.
+        let legacy = dir.path().join("legacy-models");
+        let legacy_checkpoint = legacy.join(crate::models::VIDEO_VAE);
+        std::fs::create_dir_all(legacy_checkpoint.parent().unwrap()).unwrap();
+        std::fs::write(legacy_checkpoint, b"legacy checkpoint fixture").unwrap();
+
         for (variable, value) in [
             ("HF_HUB_CACHE", cache.clone()),
             ("HF_HOME", dir.path().join("huggingface")),
@@ -432,7 +438,7 @@ mod tests {
                     "session::tests::default_checkpoints_reuse_the_standard_hub_cache",
                     "--nocapture",
                 ])
-                .env_remove("H3_MODELS")
+                .env("H3_MODELS", &legacy)
                 .env_remove("HF_HUB_CACHE")
                 .env_remove("HUGGINGFACE_HUB_CACHE")
                 .env_remove("HF_HOME")

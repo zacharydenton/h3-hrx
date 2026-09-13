@@ -14,12 +14,12 @@ repository = "https://github.com/zacharydenton/h3-hrx"
 homepage = "https://github.com/zacharydenton/h3-hrx"
 keywords = ["loom", "hrx", "minimax", "video-generation", "strix-halo"]
 categories = ["science", "multimedia::video", "multimedia::audio", "command-line-utilities"]
-default-run = "h3-hrx"
+default-run = "h3"
 exclude = ["/clients", "/experiments", "/docs/archive", "/docs/media", "/.github"]
 
 [[bin]]
-name = "h3-hrx"
-path = "src/bin/h3-hrx/main.rs"
+name = "h3"
+path = "src/bin/h3/main.rs"
 doc = false
 required-features = ["cli"]
 
@@ -29,8 +29,8 @@ default = ["cli"]
 cli = ["dep:anyhow", "dep:clap"]
 # One stage of the pipeline at a time, for comparing against a reference or a previous kernel.
 [[bin]]
-name = "h3-hrx-dev"
-path = "src/bin/h3-hrx-dev/main.rs"
+name = "h3-dev"
+path = "src/bin/h3-dev/main.rs"
 doc = false
 
 [dependencies]

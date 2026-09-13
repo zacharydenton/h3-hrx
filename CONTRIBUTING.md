@@ -1,6 +1,6 @@
 # Contributing to h3-hrx
 
-h3-hrx runs MiniMax H3 on AMD Strix Halo through Loom and HRX. Contributions
+h3 runs MiniMax H3 on AMD Strix Halo through Loom and HRX. Contributions
 to kernels, model correctness, documentation, and reproducible measurements
 are welcome. For larger changes, open an issue to discuss the approach first.
 

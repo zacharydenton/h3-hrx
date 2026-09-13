@@ -3,7 +3,7 @@
 ## Identity and discovery
 
 - Repository and Cargo package: `h3-hrx`.
-- CLI: `h3-hrx`; Rust library: `h3_hrx`; diagnostics: `h3-hrx-dev`.
+- CLI: `h3`; Rust library: `h3_hrx`; diagnostics: `h3-dev`.
 - Tagline: **MiniMax H3 video and audio generation on AMD Strix Halo, powered by Loom and HRX.**
 - Repository: <https://github.com/zacharydenton/h3-hrx>.
 
@@ -55,9 +55,9 @@ Do not describe CPU-only validation as a fully validated model release.
 Install the final package and run the README example on the supported hardware:
 
 ```sh
-cargo install --locked --path . --bin h3-hrx
-h3-hrx --version
-h3-hrx --width 864 --height 480 --frames 124 --steps 31 --seed 7 \
+cargo install --locked --path . --bin h3
+h3 --version
+h3 --width 864 --height 480 --frames 124 --steps 31 --seed 7 \
   --out clip.mp4 < docs/prompts/cliff_rider_768p.txt
 ```
 

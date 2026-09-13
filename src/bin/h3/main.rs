@@ -1,7 +1,7 @@
-//! `h3-hrx`: the MiniMax H3 pipeline from the shell, powered by Loom and HRX.
+//! `h3`: the MiniMax H3 pipeline from the shell, powered by Loom and HRX.
 //!
 //! ```text
-//! h3-hrx [ref1.jpg ref2.png voice.wav ...] [-p "prompt"] [options] < prompt
+//! h3 [ref1.jpg ref2.png voice.wav ...] [-p "prompt"] [options] < prompt
 //! ```
 //!
 //! Positional files are references by extension: images are presented as `<Picture i>` and encoded by the
@@ -47,9 +47,9 @@ enum Sampler {
 
 #[derive(Parser)]
 #[command(
-    name = "h3-hrx",
+    name = "h3",
     version,
-    about = "h3-hrx: MiniMax H3 video and audio generation on AMD Strix Halo, powered by Loom and HRX",
+    about = "MiniMax H3 video and audio generation on AMD Strix Halo, powered by Loom and HRX",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -91,11 +91,6 @@ struct Cli {
 
     #[arg(long, value_enum, default_value = "res_multistep")]
     sampler: Sampler,
-
-    /// Optional local models directory (or $H3_MODELS). Defaults to the standard Hugging Face
-    /// cache; missing checkpoints are downloaded into that cache
-    #[arg(long, value_name = "DIR")]
-    models: Option<PathBuf>,
 
     /// Use only checkpoints already on disk; never download
     #[arg(long)]
@@ -221,7 +216,7 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("h3-hrx: {e:#}");
+            eprintln!("h3: {e:#}");
             ExitCode::from(if e.downcast_ref::<UsageError>().is_some() {
                 EXIT_USAGE
             } else {
@@ -309,11 +304,9 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
 
-    // The checkpoints: a models directory first, then the shared Hugging Face cache, then the hub.
+    // Reuse the standard Hub cache before downloading missing checkpoints.
     // --offline stops at what is already on disk instead of downloading.
-    let resolver = h3_hrx::models::Resolver::new()
-        .with_dir(cli.models.clone())
-        .offline(cli.offline);
+    let resolver = h3_hrx::models::Resolver::new().offline(cli.offline);
     let want_refs = !image_files.is_empty() || !audio_files.is_empty();
     let ref2va = want_refs && !cli.base_weights;
     let resolve = |explicit: &Option<PathBuf>, relative: &str| -> Result<PathBuf> {
@@ -334,10 +327,7 @@ fn run(cli: Cli) -> Result<()> {
     let video_vae = resolve(&cli.video_vae, h3_hrx::models::VIDEO_VAE)?;
     let audio_vae = resolve(&cli.audio_vae, h3_hrx::models::AUDIO_VAE)?;
     if !dit.exists() {
-        usage!(
-            "{} not found (README, Weights; --models or --dit)",
-            dit.display()
-        );
+        usage!("{} not found (README, Weights; --dit)", dit.display());
     }
 
     let params = DenoiseParams {
@@ -663,7 +653,7 @@ mod tests {
 
     #[test]
     fn defaults_match_the_documented_ones() {
-        let c = Cli::try_parse_from(["h3-hrx"]).unwrap();
+        let c = Cli::try_parse_from(["h3"]).unwrap();
         assert_eq!(
             (c.frames, c.steps, c.width, c.height, c.seed),
             (124, 31, 864, 480, 0)
@@ -674,7 +664,7 @@ mod tests {
 
     #[test]
     fn a_prompt_may_look_like_an_option() {
-        let c = Cli::try_parse_from(["h3-hrx", "-p", "--help", "ref.jpg", "--no-decode"]).unwrap();
+        let c = Cli::try_parse_from(["h3", "-p", "--help", "ref.jpg", "--no-decode"]).unwrap();
         assert_eq!(c.prompt.as_deref(), Some("--help"));
         assert_eq!(c.files, vec![PathBuf::from("ref.jpg")]);
         assert!(c.no_decode);
@@ -682,23 +672,23 @@ mod tests {
 
     #[test]
     fn unknown_options_and_missing_values_are_rejected() {
-        assert!(Cli::try_parse_from(["h3-hrx", "--precison", "int8"]).is_err());
-        assert!(Cli::try_parse_from(["h3-hrx", "-p"]).is_err());
+        assert!(Cli::try_parse_from(["h3", "--precison", "int8"]).is_err());
+        assert!(Cli::try_parse_from(["h3", "-p"]).is_err());
     }
 
     #[test]
     fn numeric_ranges_are_enforced() {
-        assert!(Cli::try_parse_from(["h3-hrx", "--steps", "12x"]).is_err());
-        assert!(Cli::try_parse_from(["h3-hrx", "--width", "0"]).is_err());
-        assert!(Cli::try_parse_from(["h3-hrx", "--steps", "1"]).is_err());
+        assert!(Cli::try_parse_from(["h3", "--steps", "12x"]).is_err());
+        assert!(Cli::try_parse_from(["h3", "--width", "0"]).is_err());
+        assert!(Cli::try_parse_from(["h3", "--steps", "1"]).is_err());
         assert_eq!(
-            Cli::try_parse_from(["h3-hrx", "--height", "480"])
+            Cli::try_parse_from(["h3", "--height", "480"])
                 .unwrap()
                 .height,
             480
         );
         assert_eq!(
-            Cli::try_parse_from(["h3-hrx", "--frames", "124"])
+            Cli::try_parse_from(["h3", "--frames", "124"])
                 .unwrap()
                 .frames,
             124
@@ -707,29 +697,27 @@ mod tests {
 
     #[test]
     fn choices_are_closed() {
-        assert!(Cli::try_parse_from(["h3-hrx", "--attn", "int7"]).is_err());
-        assert!(Cli::try_parse_from(["h3-hrx", "--sampler", "heun"]).is_err());
+        assert!(Cli::try_parse_from(["h3", "--attn", "int7"]).is_err());
+        assert!(Cli::try_parse_from(["h3", "--sampler", "heun"]).is_err());
         assert!(matches!(
-            Cli::try_parse_from(["h3-hrx", "--attn", "f16"])
-                .unwrap()
-                .attn,
+            Cli::try_parse_from(["h3", "--attn", "f16"]).unwrap().attn,
             Attn::F16
         ));
         assert!(matches!(
-            Cli::try_parse_from(["h3-hrx", "--sampler", "euler"])
+            Cli::try_parse_from(["h3", "--sampler", "euler"])
                 .unwrap()
                 .sampler,
             Sampler::Euler
         ));
         // the documented spelling is the underscore one; the kebab spelling is accepted as an alias
         assert!(matches!(
-            Cli::try_parse_from(["h3-hrx", "--sampler", "res_multistep"])
+            Cli::try_parse_from(["h3", "--sampler", "res_multistep"])
                 .unwrap()
                 .sampler,
             Sampler::ResMultistep
         ));
         assert!(matches!(
-            Cli::try_parse_from(["h3-hrx", "--sampler", "res-multistep"])
+            Cli::try_parse_from(["h3", "--sampler", "res-multistep"])
                 .unwrap()
                 .sampler,
             Sampler::ResMultistep

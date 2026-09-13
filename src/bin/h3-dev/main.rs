@@ -1,6 +1,6 @@
 //! Diagnostics for individual model stages and kernels.
 //!
-//! Run with `cargo run --release --bin h3-hrx-dev -- <command> [args]`.
+//! Run with `cargo run --release --bin h3-dev -- <command> [args]`.
 
 mod audio_vae;
 mod compare_decode;
@@ -46,7 +46,7 @@ fn main() {
         "verify-upload" => verify_upload::run(args),
         "vision-embed" => vision_embed::run(args),
         other => {
-            eprintln!("h3-hrx-dev: unknown command {other:?}\n\ncommands:");
+            eprintln!("h3-dev: unknown command {other:?}\n\ncommands:");
             for name in [
                 "audio-vae",
                 "compare-decode",

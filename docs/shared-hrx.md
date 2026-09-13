@@ -61,7 +61,7 @@ select a developer compiler. See the shared crate README for the bundle contract
 `Config::loom_library` selects a shared compiler library, or `HRX_LOOM_LIBRARY`
 does; either empty takes the pinned bundle's. The crate's `Session` is the interface,
 `clients/rustler` provides Elixir interop, and
-`scripts/parity.py` reaches the host through `h3-hrx-dev parity-dump` rather
+`scripts/parity.py` reaches the host through `h3-dev parity-dump` rather
 than by linking it.
 
 `clients/rustler` is a minimal, working Rustler adapter owned by an Elixir app.
@@ -117,7 +117,7 @@ machine. Those results are not evidence that concurrent execution cannot help.
 GPU timestamps and native partition/workstream counters are not exposed by the
 pinned API.
 
-`h3-hrx-dev dispatch-cost` compares the same prepared kernels and allocations eagerly and
+`h3-dev dispatch-cost` compares the same prepared kernels and allocations eagerly and
 as a serial graph. Both arms receive three warmups and nine measured batches,
 with alternating A/B and B/A order. Samples end with a completion wait. Each
 arm must overwrite poisoned output with the expected zeros; reset and readback
@@ -137,7 +137,7 @@ pass, so repeat the paired benchmark before using it to select an execution path
 | Conv1d4 8×165600 | 251.3 µs | 186.0 µs |
 
 Repeated on 2026-09-10 at load average 1.3, three consecutive runs, after the
-diagnostics moved into `h3-hrx-dev`. Every absolute figure roughly halves, which is
+diagnostics moved into `h3-dev`. Every absolute figure roughly halves, which is
 the earlier pass measuring contention rather than either path:
 
 | Kernel and shape | Eager | Graph | Ratio |
@@ -177,7 +177,7 @@ convolutions. Repeat the native checks with:
 
 ```sh
 HRX_OFFLINE=1 cargo test -- --ignored --test-threads=1
-HRX_OFFLINE=1 cargo run --release --bin h3-hrx-dev -- dispatch-cost
+HRX_OFFLINE=1 cargo run --release --bin h3-dev -- dispatch-cost
 ```
 
 Checkpoint-backed `denoise_cases` runs compared `H3_GRAPH=0` with `H3_GRAPH=1`

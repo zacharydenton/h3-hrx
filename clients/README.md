@@ -3,8 +3,8 @@
 The Cargo package is `h3-hrx`; the Rust library is named `h3_hrx`.
 `Session` is the interface: open one against the four checkpoints, then denoise, decode and encode.
 The examples share the root Cargo workspace and lockfile. Checkpoints are resolved
-on demand from the standard Hugging Face cache. `H3_MODELS` explicitly selects
-a local override; see [setup](../docs/setup.md#checkpoints). The native runtime
+on demand from the standard Hugging Face cache; see
+[setup](../docs/setup.md#checkpoints). The native runtime
 comes from HRX and the kernel sources are embedded.
 The commands below use a short 22-frame, two-evaluation smoke run; use 124 frames and 31 grid points
 for the five-second example at the normal evaluation count.

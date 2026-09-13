@@ -3,20 +3,26 @@ cfg 1, the model's shifts): t2va, or fl2va from --first-frame. Ground truth for 
 look like, and the fixtures `scripts/parity.py gate` compares against.
 
 This is the half of the parity check that cannot live in `scripts/parity.py`: it runs inside the
-Strix Halo ComfyUI image, against ComfyUI's own modules, where nothing else here runs.
+Strix Halo ComfyUI image, with numpy and huggingface_hub installed, against
+ComfyUI's own modules.
 
     podman run --rm -v "$HOME:$HOME" -w "$PWD" -e PYTHONPATH=/opt/ComfyUI \
+      -e HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}/hub}" \
       --entrypoint /opt/venv/bin/python docker.io/kyuz0/amd-strix-halo-comfyui:latest \
       scripts/comfy_dump.py --dump-steps --dump-blocks 0,1,2,5,10,20,30,40,49 \
       --steps 2 --out build/comfy_t2va_blocks
+
+Checkpoints must already be downloaded into the standard Hugging Face Hub cache.
+If the cache is outside $HOME, bind-mount its directory into the container too.
 
 Writes frames.npy [F,H,W,3] uint8, audio.wav, video_latent.npy, audio_latent.npy; mp4 muxing is left
 to ffmpeg outside the container."""
 import argparse, logging, os, sys, time, wave
 from pathlib import Path
 import numpy as np
+from parity import model_path
 ap = argparse.ArgumentParser()
-ap.add_argument("--comfy", type=Path, default=Path("/opt/ComfyUI")); ap.add_argument("--models", type=Path, default=Path("/mnt/usb/models/comfy"))
+ap.add_argument("--comfy", type=Path, default=Path("/opt/ComfyUI"))
 ap.add_argument("--model", default="minimax_h3_fl2va_pruned_int8_convrot.safetensors")
 ap.add_argument("--width", type=int, default=864); ap.add_argument("--height", type=int, default=480); ap.add_argument("--length", type=int, default=22)
 ap.add_argument("--steps", type=int, default=20); ap.add_argument("--seed", type=int, default=7)
@@ -46,9 +52,9 @@ def stamp(): torch.cuda.synchronize(); return time.perf_counter()
 
 with torch.inference_mode():
     t0 = stamp()
-    clip = comfy.sd.load_clip([str(a.models / "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors")], clip_type=comfy.sd.CLIPType.MINIMAX)
-    vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(str(a.models / "vae/minimax_h3_video_vae_fp16.safetensors")))
-    audio_vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(str(a.models / "vae/minimax_h3_audio_vae_fp32.safetensors")))
+    clip = comfy.sd.load_clip([str(model_path("text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"))], clip_type=comfy.sd.CLIPType.MINIMAX)
+    vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(str(model_path("vae/minimax_h3_video_vae_fp16.safetensors"))))
+    audio_vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(str(model_path("vae/minimax_h3_audio_vae_fp32.safetensors"))))
     if a.first_frame:
         img = torch.from_numpy(np.asarray(Image.open(a.first_frame).convert("RGB"), dtype=np.float32) / 255.0)[None]
         out = H3.MiniMaxH3ImageToVideo.execute(clip, vae, a.prompt, a.width, a.height, a.length, first_frame=img)
@@ -58,7 +64,7 @@ with torch.inference_mode():
         positive = clip.encode_from_tokens_scheduled(clip.tokenize(a.prompt)); latent, _ = H3._empty_av_latent(a.width, a.height, a.length)
     print(f"conditioning in {stamp() - t0:.1f} s", flush=True)
     clip = None; comfy.model_management.unload_all_models(); comfy.model_management.soft_empty_cache()
-    model = comfy.sd.load_diffusion_model(str(a.models / "diffusion_models" / a.model))
+    model = comfy.sd.load_diffusion_model(str(model_path(f"diffusion_models/{a.model}")))
     noise = comfy.sample.prepare_noise(latent["samples"], a.seed)
     marks = [stamp()]
     if a.dump_steps:

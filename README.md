@@ -29,7 +29,7 @@ https://github.com/user-attachments/assets/41a98dcf-48f0-4328-a0f4-7f17119243e6
 - **Audio and stills:** use the CLI's audio-only and single-frame output modes.
 - **Embed inference:** use the Rust `Session` API or the example Rustler adapter for Elixir.
 
-The project is named `h3-hrx`; its command is `h3-hrx` and its Rust library is `h3_hrx`.
+The project is named `h3-hrx`; its command is `h3` and its Rust library is `h3_hrx`.
 
 ## Quick start
 
@@ -41,15 +41,15 @@ toolchain, and `ffmpeg` on your `PATH`. The base checkpoints occupy approximatel
 ```sh
 git clone https://github.com/zacharydenton/h3-hrx.git
 cd h3-hrx
-cargo install --locked --path . --bin h3-hrx
-h3-hrx --help
+cargo install --locked --path . --bin h3
+h3 --help
 ```
 
 Ensure Cargo's binary directory (normally `~/.cargo/bin`) is on your `PATH`.
 Start with the included [structured prompt](docs/prompting.md):
 
 ```sh
-h3-hrx --width 864 --height 480 --frames 124 --steps 31 --seed 7 \
+h3 --width 864 --height 480 --frames 124 --steps 31 --seed 7 \
   --out clip.mp4 < docs/prompts/cliff_rider_768p.txt
 ```
 
@@ -61,29 +61,23 @@ in recorded runs. For the demo's resolution, use `--width 1344 --height 768`.
 
 ### Weights
 
-`h3-hrx` stores and reuses checkpoints in the standard Hugging Face Hub cache,
+`h3` stores and reuses checkpoints in the standard Hugging Face Hub cache,
 **`~/.cache/huggingface/hub`** by default. Missing files are downloaded from
 [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3).
 `HF_HUB_CACHE` overrides the cache directory; `HF_HOME` sets its parent
 (the cache is then `$HF_HOME/hub`). `XDG_CACHE_HOME` is also respected.
 
-To reuse a separate ComfyUI models directory, explicitly pass `--models DIR`
-or set `H3_MODELS`. This override is checked before the Hub cache; downloads
-still go into the Hub cache:
-
-```sh
-H3_MODELS=/path/to/ComfyUI/models h3-hrx --out clip.mp4 \
-  < docs/prompts/cliff_rider_768p.txt
-```
+The Hub manages repository snapshots and cached files automatically. No model
+folder setup or conversion is needed.
 
 The base pipeline needs these four files:
 
 | Checkpoint | Purpose |
 | --- | --- |
-| `diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors` | Video and audio diffusion model |
-| `text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors` | Text encoder and vision tower |
-| `vae/minimax_h3_video_vae_fp16.safetensors` | Video encoder and decoder |
-| `vae/minimax_h3_audio_vae_fp32.safetensors` | Audio encoder and decoder |
+| `minimax_h3_fl2va_pruned_int8_convrot.safetensors` | Video and audio diffusion model |
+| `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` | Text encoder and vision tower |
+| `minimax_h3_video_vae_fp16.safetensors` | Video encoder and decoder |
+| `minimax_h3_audio_vae_fp32.safetensors` | Audio encoder and decoder |
 
 Image and audio references additionally need the ref2va checkpoint (about 21 GB);
 the CLI downloads it when needed. See [checkpoint setup](docs/setup.md#checkpoints)
@@ -101,8 +95,8 @@ source tree explicitly.
 Use prompts written for the corresponding [conditioning mode](docs/prompting.md):
 
 ```sh
-h3-hrx --first-frame image.png --out animated.mp4 < keyframe-prompt.txt
-h3-hrx ref.jpg voice.wav --out referenced.mp4 < reference-prompt.txt
+h3 --first-frame image.png --out animated.mp4 < keyframe-prompt.txt
+h3 ref.jpg voice.wav --out referenced.mp4 < reference-prompt.txt
 ```
 
 Sizes must be multiples of 32; frame counts round up to `17n + 5`.
