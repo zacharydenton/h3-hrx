@@ -4,7 +4,7 @@ H3 was trained on structured prompts, not free-form sentences. MiniMax publishes
 skill in the model repository, [`skills/h3-prompt-writing`](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills/h3-prompt-writing);
 `references/base-en.txt` covers the text and keyframe modes and `references/ref-en.txt` the full-reference one.
 This page is the short version plus the prompt behind the clip at the top of the README. Nothing here is
-enforced by `h3` — the prompt is passed to the text encoder verbatim, on stdin or after `-p`.
+enforced by `h3-hrx` — the prompt is passed to the text encoder verbatim, on stdin or after `-p`.
 
 ## The three fields
 
@@ -62,7 +62,7 @@ For the target video, at 0.00 seconds into the target video, <Picture 1> (from [
 The prompt is [cliff_rider_768p.txt](prompts/cliff_rider_768p.txt), and this reproduces the clip:
 
 ```sh
-h3 --width 1344 --height 768 --frames 124 --steps 31 --seed 7 \
+h3-hrx --width 1344 --height 768 --frames 124 --steps 31 --seed 7 \
    --out cliff_rider.mp4 < docs/prompts/cliff_rider_768p.txt
 ```
 

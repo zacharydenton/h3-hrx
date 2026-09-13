@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    name: CPU checks and package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      HRX_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: rustfmt, clippy
+      - name: Formatting, lint, and CPU tests
+        run: bash scripts/test.sh --cpu
+      - name: Library without CLI dependencies
+        run: cargo check --locked --no-default-features
+      - name: Rust consumer
+        run: cargo check --locked --manifest-path clients/rust/Cargo.toml
+      - name: Rustler consumer
+        run: cargo check --locked --manifest-path clients/rustler/Cargo.toml
+      - name: API documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps
+      - name: Verify source package
+        run: cargo package --locked

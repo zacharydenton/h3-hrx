@@ -1,6 +1,6 @@
 //! A session: the four checkpoints, the compiler and the device, opened lazily and reused.
 //!
-//! This is the Rust API — slices, borrows, `Result` — that `capi` wraps and that `cli/` uses directly.
+//! The CLI and application adapters use this API directly.
 //! Checkpoints open on first use because most callers want one or two of them: decoding a clip needs
 //! the video VAE alone, and opening the 32B text encoder to do it would cost two minutes for nothing.
 use crate::avae::AudioVae;
@@ -15,6 +15,8 @@ use crate::vvae::{Clip, VideoVae};
 /// Where the four checkpoints live, and how kernels are built.
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Explicit checkpoint paths override automatic resolution through the Hugging Face cache.
+    /// `None` resolves the corresponding checkpoint on first use, honoring `H3_MODELS`.
     pub dit: Option<std::path::PathBuf>,
     pub te: Option<std::path::PathBuf>,
     pub video_vae: Option<std::path::PathBuf>,
@@ -27,19 +29,29 @@ pub struct Config {
 }
 
 impl Default for Config {
-    /// Checkpoints under `H3_MODELS` or `~/comfy-models`, embedded kernel sources,
+    /// Checkpoints resolved on demand through the Hugging Face cache, embedded kernel sources,
     /// a shared per-user compiler cache, and int8 attention.
     fn default() -> Self {
-        let models = crate::models::Resolver::default_root();
         Self {
-            dit: Some(models.join(crate::models::DIT_FL2VA)),
-            te: Some(models.join(crate::models::TE)),
-            video_vae: Some(models.join(crate::models::VIDEO_VAE)),
-            audio_vae: Some(models.join(crate::models::AUDIO_VAE)),
+            dit: None,
+            te: None,
+            video_vae: None,
+            audio_vae: None,
             kernel_sources: std::path::PathBuf::new(),
             loom_library: None,
             attention: crate::dit::Attention::default(),
         }
+    }
+}
+
+/// Resolve only the checkpoint needed by a stage; constructing a config does no I/O.
+fn checkpoint_path(
+    explicit: &Option<std::path::PathBuf>,
+    relative: &str,
+) -> Result<std::path::PathBuf> {
+    match explicit {
+        Some(path) => Ok(path.clone()),
+        None => Ok(crate::models::Resolver::new().find(relative)?),
     }
 }
 
@@ -65,7 +77,7 @@ impl Session {
     ///
     /// # Safety
     ///
-    /// The checkpoint files named in `config` are memory-mapped, not copied — a 30 GB checkpoint has
+    /// The checkpoint files named in `config` or resolved from the cache are memory-mapped, not copied — a 30 GB checkpoint has
     /// to be — and stay mapped for as long as this session lives. The caller must ensure that none of
     /// them is modified or truncated in that time:
     ///
@@ -119,44 +131,36 @@ impl Session {
 
     fn dit(&mut self) -> Result<&mut Dit> {
         if self.dit.is_none() {
-            let Some(path) = &self.config.dit else {
-                return invalid("no DiT checkpoint was configured");
-            };
+            let path = checkpoint_path(&self.config.dit, crate::models::DIT_FL2VA)?;
             // Safety: the caller's, taken at Session::new.
-            self.dit = Some(unsafe { Dit::open(&mut self.stream, path) }?);
+            self.dit = Some(unsafe { Dit::open(&mut self.stream, &path) }?);
         }
         Ok(self.dit.as_mut().expect("opened above"))
     }
 
     fn te(&mut self) -> Result<&mut TextEncoder> {
         if self.te.is_none() {
-            let Some(path) = &self.config.te else {
-                return invalid("no text encoder checkpoint was configured");
-            };
+            let path = checkpoint_path(&self.config.te, crate::models::TE)?;
             // Safety: the caller's, taken at Session::new.
-            self.te = Some(unsafe { TextEncoder::open(&mut self.stream, path) }?);
+            self.te = Some(unsafe { TextEncoder::open(&mut self.stream, &path) }?);
         }
         Ok(self.te.as_mut().expect("opened above"))
     }
 
     fn vvae(&mut self) -> Result<&mut VideoVae> {
         if self.vvae.is_none() {
-            let Some(path) = &self.config.video_vae else {
-                return invalid("no video VAE checkpoint was configured");
-            };
+            let path = checkpoint_path(&self.config.video_vae, crate::models::VIDEO_VAE)?;
             // Safety: the caller's, taken at Session::new.
-            self.vvae = Some(unsafe { VideoVae::open(&mut self.stream, path) }?);
+            self.vvae = Some(unsafe { VideoVae::open(&mut self.stream, &path) }?);
         }
         Ok(self.vvae.as_mut().expect("opened above"))
     }
 
     fn avae(&mut self) -> Result<&mut AudioVae> {
         if self.avae.is_none() {
-            let Some(path) = &self.config.audio_vae else {
-                return invalid("no audio VAE checkpoint was configured");
-            };
+            let path = checkpoint_path(&self.config.audio_vae, crate::models::AUDIO_VAE)?;
             // Safety: the caller's, taken at Session::new.
-            self.avae = Some(unsafe { AudioVae::open(&mut self.stream, path) }?);
+            self.avae = Some(unsafe { AudioVae::open(&mut self.stream, &path) }?);
         }
         Ok(self.avae.as_mut().expect("opened above"))
     }
@@ -383,6 +387,69 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_checkpoints_reuse_the_standard_hub_cache() {
+        const CHILD: &str = "H3_TEST_CACHED_CHECKPOINT";
+        if let Some(expected) = std::env::var_os(CHILD) {
+            let config = Config::default();
+            let expected = std::path::PathBuf::from(expected);
+            assert_eq!(
+                checkpoint_path(&config.video_vae, crate::models::VIDEO_VAE).unwrap(),
+                expected
+            );
+            // A caller's explicit file must still win over a cached checkpoint.
+            let explicit = expected.with_file_name("explicit.safetensors");
+            assert_eq!(
+                checkpoint_path(&Some(explicit.clone()), crate::models::VIDEO_VAE).unwrap(),
+                explicit
+            );
+            return;
+        }
+
+        // Isolate environment changes in subprocesses so parallel tests cannot race on them.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("huggingface/hub");
+        let repo = cache.join("models--Comfy-Org--MiniMax-H3");
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let checkpoint = repo
+            .join("snapshots")
+            .join(revision)
+            .join(crate::models::VIDEO_VAE);
+        std::fs::create_dir_all(checkpoint.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("refs/main"), revision).unwrap();
+        std::fs::write(&checkpoint, b"cached checkpoint fixture").unwrap();
+
+        for (variable, value) in [
+            ("HF_HUB_CACHE", cache.clone()),
+            ("HF_HOME", dir.path().join("huggingface")),
+            ("XDG_CACHE_HOME", dir.path().to_path_buf()),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "session::tests::default_checkpoints_reuse_the_standard_hub_cache",
+                    "--nocapture",
+                ])
+                .env_remove("H3_MODELS")
+                .env_remove("HF_HUB_CACHE")
+                .env_remove("HUGGINGFACE_HUB_CACHE")
+                .env_remove("HF_HOME")
+                .env_remove("XDG_CACHE_HOME")
+                .env("HF_ENDPOINT", "http://127.0.0.1:1")
+                .env(variable, value)
+                .env(CHILD, &checkpoint)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{variable}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
     use crate::dit::{Keyframe, LatentGrid, Reference};
     use crate::vvae::Clip;
 

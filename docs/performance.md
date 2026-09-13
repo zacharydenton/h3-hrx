@@ -1,6 +1,6 @@
 # Performance and numerical validation
 
-These are recorded development measurements on a Radeon 8060S (`gfx1151`),
+These are recorded development measurements on AMD Strix Halo (Radeon 8060S, `gfx1151`),
 not a fresh release benchmark. Timings depend on sequence length, prompt,
 cache state, and competing CPU/GPU work on the APU.
 
@@ -9,7 +9,7 @@ cache state, and competing CPU/GPU work on the APU.
 The [README table](../README.md#performance) measures one denoising evaluation
 with `H3_PROFILE=1`, int8 checkpoint rows, and default int8 QK attention.
 ComfyUI was measured on the same hardware using
-[`bench_comfyui_h3.py`](../tools/bench_comfyui_h3.py) in the Strix Halo ComfyUI
+`bench_comfyui_h3.py` (a retired development script) in the Strix Halo ComfyUI
 container. A full generation also pays for weight loading, text encoding,
 kernel compilation on a new shape, decoding, and output encoding. The default
 is 30 evaluations. Short sequences do not show the long-clip speedup.
@@ -47,7 +47,7 @@ transformers bf16. The optimized f16 video decoder measured 63.95 dB PSNR
 against the f32 diffusers decoder on an 864×480×22 case. These measurements
 cover specific inputs, not all possible prompts or shapes.
 
-See [contributing](../CONTRIBUTING.md#tests) for the numerical gates and their
+See [test coverage](testing.md) for the numerical gates and their
 required reference data.
 
 ## Implementation and profiling

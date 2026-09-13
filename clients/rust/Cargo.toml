@@ -1,17 +1,14 @@
-[workspace]
 
 [package]
-name = "h3-minimal"
+name = "h3-hrx-example"
 version = "0.1.0"
 edition = "2021"
-description = "The h3 crate from Rust: prompt -> frames + samples"
+description = "Use h3-hrx from Rust: prompt to video frames and audio samples"
+publish = false
 
 [dependencies]
-h3 = { path = "../..", default-features = false }
+h3-hrx = { path = "../..", default-features = false }
 
 [[bin]]
 name = "minimal"
 path = "src/main.rs"
-
-[profile.release]
-opt-level = 2

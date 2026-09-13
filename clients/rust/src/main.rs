@@ -1,21 +1,14 @@
-//! The `h3` crate from Rust: prompt -> frames + samples, written as <out>.rgb and <out>.wav.
-//!   cargo run --release -- "A red fox ..." [frames] [steps] [out]     (from the repository root, or set H3_ROOT)
-//!
-//! A Rust caller does not go through the C ABI. `Session` is the library's own API — slices, borrows
-//! and `Result` — and this is what it looks like used directly. `examples/c` and `examples/go` are the
-//! C-ABI clients.
-use h3::{Config, DenoiseParams, Noise, Session, Tokenizer};
+//! Generate video frames and audio through the h3-hrx library.
+//! Run with `cargo run -p h3-hrx-example --release -- "prompt" [frames] [steps] [out]`.
+use h3_hrx::{Config, DenoiseParams, Noise, Session, Tokenizer};
 use std::io::Write;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("usage: minimal \"prompt\" [frames] [steps] [out]");
-        std::process::exit(64);
+        std::process::exit(2);
     }
-    let root = std::env::var("H3_ROOT").unwrap_or_else(|_| ".".into());
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let models = std::env::var("H3_MODELS").unwrap_or(format!("{home}/comfy-models"));
     let out = args.get(4).cloned().unwrap_or_else(|| "minimal".into());
 
     // the vocabulary compiled into the crate; H3_TOKENIZER names a file instead
@@ -24,18 +17,14 @@ fn main() {
         .encode(&args[1])
         .expect("cannot tokenize the prompt");
 
-    let file = |p: &str| Some(std::path::PathBuf::from(format!("{models}/{p}")));
     // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
-    let mut session = unsafe { Session::new(Config {
-        dit: file("diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"),
-        te: file("text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
-        video_vae: file("vae/minimax_h3_video_vae_fp16.safetensors"),
-        audio_vae: file("vae/minimax_h3_audio_vae_fp32.safetensors"),
-        kernel_sources: format!("{root}/kernels").into(),
-        loom_library: std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from),
-        attention: h3::Attention::I8,
-    })
-    .expect("session") };
+    let mut session = unsafe {
+        Session::new(Config {
+            loom_library: std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from),
+            ..Config::default()
+        })
+        .expect("session")
+    };
 
     let p = DenoiseParams {
         height: 480,
@@ -63,8 +52,7 @@ fn main() {
         .denoise(&ids, &p, Noise::default(), &[], &[], Some(&mut show))
         .expect("denoise");
 
-    let mut frames =
-        vec![0u8; sh.frames as usize * p.height as usize * p.width as usize * 3];
+    let mut frames = vec![0u8; sh.frames as usize * p.height as usize * p.width as usize * 3];
     session
         .decode_video(&sh, &latents.video, &mut frames)
         .expect("decode video");

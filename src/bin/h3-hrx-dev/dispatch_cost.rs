@@ -3,8 +3,8 @@
 //! Both arms run identical launches over identical allocations. Paired sampling
 //! reduces drift, but timings still include contention from other work. The two
 //! sizes compare small launches with kernels doing a real stack's amount of work.
-use h3::compile::Compiler;
-use h3::dispatch::{Prepare, Sink};
+use h3_hrx::compile::Compiler;
+use h3_hrx::dispatch::{Prepare, Sink};
 
 type Fallible = Result<(), Box<dyn std::error::Error>>;
 
@@ -129,7 +129,7 @@ fn inner() -> Fallible {
     for (chan, len) in [(1024usize, 5usize), (8, 165_600)] {
         let (kk, dil) = (7usize, 3usize);
         let ns = "h3.conv1d4_f32.";
-        let cfg: h3::compile::Cfg = vec![
+        let cfg: h3_hrx::compile::Cfg = vec![
             (format!("{ns}cin"), chan.to_string()),
             (format!("{ns}cout"), chan.to_string()),
             (format!("{ns}ksize"), kk.to_string()),
@@ -166,7 +166,7 @@ fn inner() -> Fallible {
                 after: Default::default(),
             };
             for _ in 0..LAUNCHES {
-                h3::dispatch::emit(
+                h3_hrx::dispatch::emit(
                     &mut sink,
                     &kernel,
                     None,
@@ -186,7 +186,7 @@ fn inner() -> Fallible {
             out.binding().slice(0, chan * len * 4)?,
             |stream| {
                 for _ in 0..LAUNCHES {
-                    h3::dispatch::emit(
+                    h3_hrx::dispatch::emit(
                         &mut Sink::Stream(stream),
                         &kernel,
                         None,

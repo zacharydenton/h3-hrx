@@ -6,9 +6,9 @@
 //! Latents are `[2][32][audio_t]` f32, samples `[2][n]` f32 at 32 kHz — the same arrays
 //! `h3_decode_audio` and `h3_encode_audio` take and write. The companion script runs the C on
 //! the same inputs.
-use h3::avae::{AudioVae, AUDIO_CH, HOP};
-use h3::compile::Compiler;
-use h3::dispatch::Profile;
+use h3_hrx::avae::{AudioVae, AUDIO_CH, HOP};
+use h3_hrx::compile::Compiler;
+use h3_hrx::dispatch::Profile;
 use std::io::Write;
 
 fn read(path: &str) -> Vec<f32> {

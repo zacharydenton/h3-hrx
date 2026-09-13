@@ -13,12 +13,12 @@
 //! digests is a change to the model's arithmetic, and needs that same chain re-run — not a new
 //! constant pasted in.
 //!
-//! `H3_MODELS` names the checkpoint directory (default `~/comfy-models`).
-use h3::avae::{AudioVae, AUDIO_CH, HOP};
-use h3::compile::Compiler;
-use h3::dispatch::Profile;
-use h3::vvae::VideoVae;
-use h3::{shape_for, DenoiseParams, Sampler, Session, Tokenizer};
+//! Checkpoints come from the Hugging Face cache; `H3_MODELS` is an optional override.
+use h3_hrx::avae::{AudioVae, AUDIO_CH, HOP};
+use h3_hrx::compile::Compiler;
+use h3_hrx::dispatch::Profile;
+use h3_hrx::vvae::VideoVae;
+use h3_hrx::{shape_for, DenoiseParams, Sampler, Session, Tokenizer};
 
 /// Deterministic standard normals, so an input is a seed rather than a file.
 ///
@@ -48,15 +48,6 @@ impl Normals {
     fn take(&mut self, n: usize) -> Vec<f32> {
         (0..n).map(|_| self.next()).collect()
     }
-}
-
-fn models() -> std::path::PathBuf {
-    std::env::var_os("H3_MODELS")
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME")).join("comfy-models")
-        })
 }
 
 fn compiler() -> Compiler {
@@ -127,7 +118,10 @@ fn video_decode_is_byte_stable_across_the_tilings() {
     ];
     let mut stream = hrx::Stream::open().expect("stream");
     let c = compiler();
-    let path = models().join("vae/minimax_h3_video_vae_fp16.safetensors");
+    let path = h3_hrx::models::Resolver::new()
+        .offline(true)
+        .find(h3_hrx::models::VIDEO_VAE)
+        .expect("cached video VAE");
     // Safety: this test does not write to the checkpoint while it is mapped.
     let mut vae = unsafe { VideoVae::open(&mut stream, &path) }.expect("video VAE checkpoint");
     let mut prof = Profile::default();
@@ -214,7 +208,10 @@ fn audio_conversions_are_byte_stable_at_the_boundaries() {
     ];
     let mut stream = hrx::Stream::open().expect("stream");
     let c = compiler();
-    let path = models().join("vae/minimax_h3_audio_vae_fp32.safetensors");
+    let path = h3_hrx::models::Resolver::new()
+        .offline(true)
+        .find(h3_hrx::models::AUDIO_VAE)
+        .expect("cached audio VAE");
     // Safety: this test does not write to the checkpoint while it is mapped.
     let mut vae = unsafe { AudioVae::open(&mut stream, &path) }.expect("audio VAE checkpoint");
     let mut prof = Profile::default();
@@ -325,7 +322,7 @@ fn denoising_is_byte_stable_across_samplers_and_the_step_cache() {
         .encode("a red fox trotting through a snowy forest at dawn, cinematic")
         .expect("encode the prompt");
     // Safety: this test does not write to the checkpoints while they are mapped.
-    let mut session = unsafe { Session::new(h3::Config::default()) }.expect("session");
+    let mut session = unsafe { Session::new(h3_hrx::Config::default()) }.expect("session");
 
     for &(name, height, width, frames, steps, sampler, cache_threshold, video, audio) in CASES {
         let params = DenoiseParams {
@@ -339,7 +336,7 @@ fn denoising_is_byte_stable_across_samplers_and_the_step_cache() {
             ..DenoiseParams::default()
         };
         let latents = session
-            .denoise(&ids, &params, h3::Noise::default(), &[], &[], None)
+            .denoise(&ids, &params, h3_hrx::Noise::default(), &[], &[], None)
             .expect("denoise");
         check(digest_f32(&latents.video), video, &format!("{name} video"));
         check(digest_f32(&latents.audio), audio, &format!("{name} audio"));

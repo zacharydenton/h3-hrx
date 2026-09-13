@@ -1,48 +1,37 @@
-# One crate: the library, its kernels, and the `h3` command that drives them.
-#
-# `clients/` holds the outside consumers — a Rust binary and a Rustler NIF — each with its own
-# lockfile, because building them the way someone outside this repository would is the point of them.
+[workspace]
+members = ["clients/rust", "clients/rustler"]
+default-members = ["."]
+resolver = "2"
+
 [package]
-name = "h3"
+name = "h3-hrx"
 version = "0.1.0"
 edition = "2021"
-description = "MiniMax H3 inference: ComfyUI checkpoints in, video and audio out, every kernel in Loom"
+description = "MiniMax H3 video and audio generation on AMD Strix Halo, powered by Loom and HRX"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/zacharydenton/h3-hrx"
+homepage = "https://github.com/zacharydenton/h3-hrx"
+keywords = ["loom", "hrx", "minimax", "video-generation", "strix-halo"]
+categories = ["science", "multimedia::video", "multimedia::audio", "command-line-utilities"]
+default-run = "h3-hrx"
+exclude = ["/clients", "/experiments", "/docs/archive", "/docs/media", "/.github"]
 
-[lib]
-path = "src/lib.rs"
-crate-type = ["rlib"]
-
-# `doc = false`: the command's own modules are not API, and the library's docs are the crate's.
 [[bin]]
-name = "h3"
-path = "src/bin/h3/main.rs"
+name = "h3-hrx"
+path = "src/bin/h3-hrx/main.rs"
 doc = false
 required-features = ["cli"]
 
 [features]
 default = ["cli"]
-# The command line, and nothing the library needs. A consumer takes the library with
-# `default-features = false` and compiles neither.
+# Disable default features when consuming only the library.
 cli = ["dep:anyhow", "dep:clap"]
-# Opens the crate's interior to the diagnostics binary and the integration tests. Off by default,
-# which is what makes the interior private: a normal build of this library exposes `Session` and
-# the types it takes, and nothing else.
-internals = []
-
 # One stage of the pipeline at a time, for comparing against a reference or a previous kernel.
 [[bin]]
-name = "h3-dev"
-path = "src/bin/h3-dev/main.rs"
+name = "h3-hrx-dev"
+path = "src/bin/h3-hrx-dev/main.rs"
 doc = false
-required-features = ["internals"]
-
-[[test]]
-name = "kernels"
-required-features = ["internals"]
-
-[[test]]
-name = "differentials"
-required-features = ["internals"]
 
 [dependencies]
 hrx = { package = "hrx-rs", version = "0.4.0", default-features = false, features = ["download", "loom"] }
@@ -52,7 +41,7 @@ half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"
 libc = "0.2"
 thiserror = "2"
-# fancy-regex, not onig: onig is a C library, and the point of this crate is that there is no C.
+# Use the Rust regex backend without a native regex dependency.
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 hf-hub = { version = "1.0.0", default-features = false, features = ["blocking", "rustls-tls"] }
 # ChaCha rather than StdRng: rand does not promise StdRng's stream across major versions, and a seed

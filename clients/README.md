@@ -1,22 +1,19 @@
-# The `h3` crate from other languages
+# h3-hrx clients: Rust and Elixir
 
+The Cargo package is `h3-hrx`; the Rust library is named `h3_hrx`.
 `Session` is the interface: open one against the four checkpoints, then denoise, decode and encode.
-There is no C ABI — a caller that is neither Rust nor on the BEAM would need one added back.
-
-Run from the repository root (or set `H3_ROOT`); the checkpoints come from `$H3_MODELS` (default
-`~/comfy-models`, [setup](../docs/setup.md#checkpoints)) and the native runtime from the HRX bundle,
-which the library loads on demand — nothing here needs `LD_LIBRARY_PATH` or a sourced environment.
+The examples share the root Cargo workspace and lockfile. Checkpoints are resolved
+on demand from the standard Hugging Face cache. `H3_MODELS` explicitly selects
+a local override; see [setup](../docs/setup.md#checkpoints). The native runtime
+comes from HRX and the kernel sources are embedded.
 The commands below use a short 22-frame, two-evaluation smoke run; use 124 frames and 31 grid points
 for the five-second example at the normal evaluation count.
 
 | | build | run |
 | --- | --- | --- |
-| Rust (the crate, resolved as an outside consumer would) | `(cd clients/rust && cargo build --release)` | `clients/rust/target/release/minimal "$(cat docs/prompts/cliff_rider_768p.txt)" 22 3 out` |
-| Elixir (Rustler, over the same crate) | `cargo build --manifest-path clients/rustler/Cargo.toml` | `H3_NIF="$PWD/clients/rustler/target/debug/libh3_nif" elixir clients/rustler/smoke.exs` |
+| Rust library example | `cargo build --release -p h3-hrx-example` | `target/release/minimal "$(cat docs/prompts/cliff_rider_768p.txt)" 22 3 out` |
+| Elixir (Rustler, over the same crate) | `cargo build --manifest-path clients/rustler/Cargo.toml` | `H3_NIF="$PWD/target/debug/libh3_nif" elixir clients/rustler/smoke.exs` |
 
 The positional arguments are the prompt, the frame count, the sigma grid points (evaluations + 1)
 and the output prefix. `ffmpeg -f rawvideo -pix_fmt rgb24 -s 864x480 -r 24 -i out.rgb -i out.wav out.mp4`
 muxes the result.
-
-`clients/rust` is deliberately a package of its own, with its own lockfile: building it the way
-someone outside this repository would is the point of it.

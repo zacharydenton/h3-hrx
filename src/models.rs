@@ -1,10 +1,11 @@
-//! Finding the four checkpoints: a local directory, the shared Hugging Face cache, or the hub.
+//! Finding checkpoints in the standard Hugging Face cache, downloading missing files on demand.
 //!
 //! The repository lays its files out the same way ComfyUI does — `diffusion_models/`, `text_encoders/`,
-//! `vae/` — so one relative path names a file in either place. A local directory is tried first, then
+//! `vae/` — so one relative path names a file in either place. An explicitly configured local
+//! directory (`--models` or `H3_MODELS`) is tried first, then
 //! whatever is already in the shared cache, and only then the network. That order means an existing
 //! download is reused wherever it lives, and nothing is fetched twice.
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub const REPO_OWNER: &str = "Comfy-Org";
 pub const REPO_NAME: &str = "MiniMax-H3";
@@ -28,6 +29,16 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Match Hugging Face's boolean environment convention.
+fn hub_offline() -> bool {
+    std::env::var("HF_HUB_OFFLINE").is_ok_and(|value| {
+        matches!(
+            value.to_ascii_uppercase().as_str(),
+            "1" | "ON" | "YES" | "TRUE"
+        )
+    })
+}
+
 /// Where checkpoints are looked for, in order.
 pub struct Resolver {
     dir: Option<PathBuf>,
@@ -43,27 +54,12 @@ impl Default for Resolver {
 }
 
 impl Resolver {
-    /// Where checkpoints are looked for by default: `H3_MODELS`, else `~/comfy-models`.
-    pub fn default_root() -> PathBuf {
-        std::env::var_os("H3_MODELS")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let home = std::env::var_os("HOME").unwrap_or_default();
-                Path::new(&home).join("comfy-models")
-            })
-    }
-
-    /// `H3_MODELS`, else `~/comfy-models` when it exists; downloads allowed.
+    /// Use the standard Hugging Face cache, with an optional `H3_MODELS` override.
+    /// Missing checkpoints are downloaded into that cache on demand.
     pub fn new() -> Self {
         let dir = std::env::var_os("H3_MODELS")
             .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                let home = std::env::var_os("HOME")?;
-                let guess = Path::new(&home).join("comfy-models");
-                guess.is_dir().then_some(guess)
-            });
+            .map(PathBuf::from);
         Self {
             dir,
             revision: None,
@@ -98,7 +94,7 @@ impl Resolver {
         if let Ok(path) = self.hub(relative, true) {
             return Ok(path);
         }
-        if !self.download {
+        if !self.download || hub_offline() {
             return Err(self.missing(relative));
         }
         self.hub(relative, false)
@@ -139,7 +135,7 @@ impl Resolver {
         if let Some(dir) = &self.dir {
             tried.push_str(&format!("not under {}", dir.display()));
         } else {
-            tried.push_str("no models directory (--models or H3_MODELS)");
+            tried.push_str("no local override (--models or H3_MODELS)");
         }
         tried.push_str(&format!(
             ", and not in the Hugging Face cache for {REPO_OWNER}/{REPO_NAME}"

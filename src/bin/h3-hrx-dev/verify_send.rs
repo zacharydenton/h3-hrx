@@ -4,9 +4,9 @@
 //! This builds a GEMM on the main thread, hands the GPU, the kernel and the buffers to a second thread,
 //! runs the kernel there, reads the result back there, and checks it — then hands what is left to a
 //! third thread so the allocations are also released somewhere other than where they were made.
-use h3::compile::Compiler;
-use h3::dispatch::{Gemm, Tile};
-use h3::model::gemm_pitch;
+use h3_hrx::compile::Compiler;
+use h3_hrx::dispatch::{Gemm, Tile};
+use h3_hrx::model::gemm_pitch;
 use half::f16;
 
 fn assert_send<T: Send>() {}

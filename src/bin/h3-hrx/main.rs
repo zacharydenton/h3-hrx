@@ -1,7 +1,7 @@
-//! `h3`: the whole MiniMax H3 pipeline from the shell, through the `h3` crate (every kernel in Loom).
+//! `h3-hrx`: the MiniMax H3 pipeline from the shell, powered by Loom and HRX.
 //!
 //! ```text
-//! h3 [ref1.jpg ref2.png voice.wav ...] [-p "prompt"] [options] < prompt
+//! h3-hrx [ref1.jpg ref2.png voice.wav ...] [-p "prompt"] [options] < prompt
 //! ```
 //!
 //! Positional files are references by extension: images are presented as `<Picture i>` and encoded by the
@@ -13,7 +13,7 @@
 mod media;
 mod resize;
 
-use h3::{
+use h3_hrx::{
     Attention as Attn16, Clip, Config, DenoiseParams, Keyframe, LatentGrid, Noise, Presented,
     Reference, Sampler as Sampler16, Session, Tokenizer,
 };
@@ -27,8 +27,8 @@ use std::time::Instant;
 const VISION_START: i32 = 151652;
 const VISION_END: i32 = 151653;
 
-/// Usage errors exit 64, as the C CLI did; runtime failures exit 1.
-const EXIT_USAGE: u8 = 64;
+/// Usage errors follow clap (2); runtime failures exit 1.
+const EXIT_USAGE: u8 = 2;
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum Attn {
@@ -47,8 +47,9 @@ enum Sampler {
 
 #[derive(Parser)]
 #[command(
-    name = "h3",
-    about = "MiniMax H3 text/image/audio -> video with sound, every kernel in Loom",
+    name = "h3-hrx",
+    version,
+    about = "h3-hrx: MiniMax H3 video and audio generation on AMD Strix Halo, powered by Loom and HRX",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -91,8 +92,8 @@ struct Cli {
     #[arg(long, value_enum, default_value = "res_multistep")]
     sampler: Sampler,
 
-    /// A models directory (default $H3_MODELS, else ~/comfy-models); checkpoints not found there come
-    /// from the shared Hugging Face cache, and are downloaded into it if they are not there either
+    /// Optional local models directory (or $H3_MODELS). Defaults to the standard Hugging Face
+    /// cache; missing checkpoints are downloaded into that cache
     #[arg(long, value_name = "DIR")]
     models: Option<PathBuf>,
 
@@ -109,7 +110,7 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     audio_vae: Option<PathBuf>,
 
-    /// The repository (default: the binary's parent's parent)
+    /// Optional developer source tree; defaults to embedded kernels
     #[arg(long, value_name = "DIR")]
     root: Option<PathBuf>,
 
@@ -132,7 +133,7 @@ struct Cli {
     #[arg(long, value_name = "PREFIX")]
     latents: Option<PathBuf>,
 
-    /// Run reference files on the base checkpoint when the ref2va one is absent
+    /// Use the base checkpoint for reference files instead of ref2va
     #[arg(long)]
     base_weights: bool,
 }
@@ -195,14 +196,6 @@ fn tempfile_probe(dir: &Path) -> bool {
     false
 }
 
-/// The repository root: the binary's parent's parent, so `build/h3` finds `kernels/` beside it.
-fn exe_root() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().and_then(|p| p.parent()).map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
 struct Image {
     pixels: Vec<f32>,
     w: i32,
@@ -228,7 +221,7 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("h3: {e:#}");
+            eprintln!("h3-hrx: {e:#}");
             ExitCode::from(if e.downcast_ref::<UsageError>().is_some() {
                 EXIT_USAGE
             } else {
@@ -238,7 +231,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Marks the failures that are the caller's mistake rather than the run's, so they exit 64.
+/// Marks the failures that are the caller's mistake rather than the run's, so they exit 2.
 #[derive(Debug)]
 struct UsageError(String);
 impl std::fmt::Display for UsageError {
@@ -287,7 +280,6 @@ fn run(cli: Cli) -> Result<()> {
         usage!("--no-decode decodes nothing; it cannot be combined with --still or --audio-only");
     }
 
-    let root = cli.root.clone().unwrap_or_else(exe_root);
     let mut out = cli.out.clone();
     if lower_ext(&out) != "mp4" {
         out.set_extension("mp4");
@@ -319,38 +311,28 @@ fn run(cli: Cli) -> Result<()> {
 
     // The checkpoints: a models directory first, then the shared Hugging Face cache, then the hub.
     // --offline stops at what is already on disk instead of downloading.
-    let resolver = h3::models::Resolver::new()
+    let resolver = h3_hrx::models::Resolver::new()
         .with_dir(cli.models.clone())
         .offline(cli.offline);
     let want_refs = !image_files.is_empty() || !audio_files.is_empty();
-    // The reference-conditioned checkpoint is only used when it is already here: substituting the base
-    // one changes what the model does, so that is said out loud rather than done quietly.
-    let ref2va_path = want_refs
-        .then(|| resolver.find_local(h3::models::DIT_REF2VA))
-        .flatten();
-    let ref2va = ref2va_path.is_some() && !cli.base_weights;
-    if want_refs && ref2va_path.is_none() && !cli.base_weights && cli.dit.is_none() {
-        usage!(
-            "reference files need the ref2va checkpoint, {} (README, Weights); --base-weights runs the base checkpoint anyway",
-            h3::models::DIT_REF2VA
-        );
-    }
+    let ref2va = want_refs && !cli.base_weights;
     let resolve = |explicit: &Option<PathBuf>, relative: &str| -> Result<PathBuf> {
         match explicit {
             Some(path) => Ok(path.clone()),
-            None => resolver
-                .find(relative)
-                .map_err(|e| UsageError(e.to_string()).into()),
+            None => Ok(resolver.find(relative)?),
         }
     };
-    let dit = match (&cli.dit, ref2va.then(|| ref2va_path.clone()).flatten()) {
-        (Some(path), _) => path.clone(),
-        (None, Some(path)) => path,
-        (None, None) => resolve(&None, h3::models::DIT_FL2VA)?,
-    };
-    let te = resolve(&cli.te, h3::models::TE)?;
-    let video_vae = resolve(&cli.video_vae, h3::models::VIDEO_VAE)?;
-    let audio_vae = resolve(&cli.audio_vae, h3::models::AUDIO_VAE)?;
+    let dit = resolve(
+        &cli.dit,
+        if ref2va {
+            h3_hrx::models::DIT_REF2VA
+        } else {
+            h3_hrx::models::DIT_FL2VA
+        },
+    )?;
+    let te = resolve(&cli.te, h3_hrx::models::TE)?;
+    let video_vae = resolve(&cli.video_vae, h3_hrx::models::VIDEO_VAE)?;
+    let audio_vae = resolve(&cli.audio_vae, h3_hrx::models::AUDIO_VAE)?;
     if !dit.exists() {
         usage!(
             "{} not found (README, Weights; --models or --dit)",
@@ -455,11 +437,11 @@ fn run(cli: Cli) -> Result<()> {
 
     // Installed binaries use their packaged kernel sources; --root opts into a working tree's
     // instead. Compiled artifacts always go to the one per-user HRX cache, whoever built them.
-    let sources = if cli.root.is_some() {
-        root.join("kernels")
-    } else {
-        PathBuf::new()
-    };
+    let sources = cli
+        .root
+        .as_ref()
+        .map(|root| root.join("kernels"))
+        .unwrap_or_default();
     let loom_library = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
     let config = Config {
         dit: Some(dit.clone()),
@@ -681,7 +663,7 @@ mod tests {
 
     #[test]
     fn defaults_match_the_documented_ones() {
-        let c = Cli::try_parse_from(["h3"]).unwrap();
+        let c = Cli::try_parse_from(["h3-hrx"]).unwrap();
         assert_eq!(
             (c.frames, c.steps, c.width, c.height, c.seed),
             (124, 31, 864, 480, 0)
@@ -692,7 +674,7 @@ mod tests {
 
     #[test]
     fn a_prompt_may_look_like_an_option() {
-        let c = Cli::try_parse_from(["h3", "-p", "--help", "ref.jpg", "--no-decode"]).unwrap();
+        let c = Cli::try_parse_from(["h3-hrx", "-p", "--help", "ref.jpg", "--no-decode"]).unwrap();
         assert_eq!(c.prompt.as_deref(), Some("--help"));
         assert_eq!(c.files, vec![PathBuf::from("ref.jpg")]);
         assert!(c.no_decode);
@@ -700,23 +682,23 @@ mod tests {
 
     #[test]
     fn unknown_options_and_missing_values_are_rejected() {
-        assert!(Cli::try_parse_from(["h3", "--precison", "int8"]).is_err());
-        assert!(Cli::try_parse_from(["h3", "-p"]).is_err());
+        assert!(Cli::try_parse_from(["h3-hrx", "--precison", "int8"]).is_err());
+        assert!(Cli::try_parse_from(["h3-hrx", "-p"]).is_err());
     }
 
     #[test]
     fn numeric_ranges_are_enforced() {
-        assert!(Cli::try_parse_from(["h3", "--steps", "12x"]).is_err());
-        assert!(Cli::try_parse_from(["h3", "--width", "0"]).is_err());
-        assert!(Cli::try_parse_from(["h3", "--steps", "1"]).is_err());
+        assert!(Cli::try_parse_from(["h3-hrx", "--steps", "12x"]).is_err());
+        assert!(Cli::try_parse_from(["h3-hrx", "--width", "0"]).is_err());
+        assert!(Cli::try_parse_from(["h3-hrx", "--steps", "1"]).is_err());
         assert_eq!(
-            Cli::try_parse_from(["h3", "--height", "480"])
+            Cli::try_parse_from(["h3-hrx", "--height", "480"])
                 .unwrap()
                 .height,
             480
         );
         assert_eq!(
-            Cli::try_parse_from(["h3", "--frames", "124"])
+            Cli::try_parse_from(["h3-hrx", "--frames", "124"])
                 .unwrap()
                 .frames,
             124
@@ -725,27 +707,29 @@ mod tests {
 
     #[test]
     fn choices_are_closed() {
-        assert!(Cli::try_parse_from(["h3", "--attn", "int7"]).is_err());
-        assert!(Cli::try_parse_from(["h3", "--sampler", "heun"]).is_err());
+        assert!(Cli::try_parse_from(["h3-hrx", "--attn", "int7"]).is_err());
+        assert!(Cli::try_parse_from(["h3-hrx", "--sampler", "heun"]).is_err());
         assert!(matches!(
-            Cli::try_parse_from(["h3", "--attn", "f16"]).unwrap().attn,
+            Cli::try_parse_from(["h3-hrx", "--attn", "f16"])
+                .unwrap()
+                .attn,
             Attn::F16
         ));
         assert!(matches!(
-            Cli::try_parse_from(["h3", "--sampler", "euler"])
+            Cli::try_parse_from(["h3-hrx", "--sampler", "euler"])
                 .unwrap()
                 .sampler,
             Sampler::Euler
         ));
         // the documented spelling is the underscore one; the kebab spelling is accepted as an alias
         assert!(matches!(
-            Cli::try_parse_from(["h3", "--sampler", "res_multistep"])
+            Cli::try_parse_from(["h3-hrx", "--sampler", "res_multistep"])
                 .unwrap()
                 .sampler,
             Sampler::ResMultistep
         ));
         assert!(matches!(
-            Cli::try_parse_from(["h3", "--sampler", "res-multistep"])
+            Cli::try_parse_from(["h3-hrx", "--sampler", "res-multistep"])
                 .unwrap()
                 .sampler,
             Sampler::ResMultistep

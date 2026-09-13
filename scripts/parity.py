@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Parity against the reference implementation: does this host compute what MiniMax's does?
 
-Self-contained — the C ABI binding, the prompt presentation, the PyTorch reference and the checks are
-all in this file. It is deliberately not part of `scripts/test.sh`: it needs the checkpoints, a GPU,
+The host subprocess adapter, prompt presentation, reference implementation, and checks
+are in this file. It is deliberately not part of `scripts/test.sh`: it needs the checkpoints, a GPU,
 and for the gate a directory of dumps produced inside the ComfyUI container by `scripts/comfy_dump.py`.
 Run it before a release, not on every change.
 
@@ -20,11 +20,6 @@ Everything else in this repository checks that the model agrees with its own ear
 the only check against something outside itself, which is why it is worth keeping even though it
 cannot run unattended.
 
-Assembled mechanically from the six modules this replaced, at commit 2ce3d0b: h3_loom.py,
-tools/h3tok_ids.py, reference/h3_ref.py, tools/compare_comfy.py, tests/test_comfy_parity.py and
-tests/test_stack_parity.py, in that order. That is why the sections below keep their original
-terse style, and why `R` is bound to this module: the stack checks call the reference section
-`R.Checkpoint`, `R.Layout` and so on, as they did when it was a separate import.
 """
 from __future__ import annotations
 
@@ -40,6 +35,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+from huggingface_hub import try_to_load_from_cache
 
 # torch is needed only by `stack`, and a ROCm torch takes tens of seconds to import, so it is loaded
 # on demand rather than here. Every annotation below is a string (see the __future__ import), so
@@ -64,17 +60,46 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 # --------------------------------------------------------------------------------------------------
-# The host, through h3-dev parity-dump
+# The host, through h3-hrx-dev parity-dump
 # --------------------------------------------------------------------------------------------------
 
-MODELS = Path(os.environ.get("H3_MODELS") or Path.home() / "comfy-models")
-DIT = MODELS / "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"
-DIT_REF = MODELS / "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"
-TE = MODELS / "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
-VIDEO_VAE = MODELS / "vae/minimax_h3_video_vae_fp16.safetensors"
-AUDIO_VAE = MODELS / "vae/minimax_h3_audio_vae_fp32.safetensors"
+def model_path(relative: str) -> Path:
+    """Use an explicit local override or the shared Hub cache; never download during validation."""
+    if directory := os.environ.get("H3_MODELS"):
+        local = Path(directory) / relative
+        if local.is_file():
+            return local
+    cached = try_to_load_from_cache("Comfy-Org/MiniMax-H3", relative)
+    if isinstance(cached, str):
+        return Path(cached)
+    raise FileNotFoundError(
+        f"{relative} is not cached for Comfy-Org/MiniMax-H3; "
+        f"download it with: hf download Comfy-Org/MiniMax-H3 --include {relative}"
+    )
 
-DUMP = ROOT / "target/release/h3-dev"
+
+def official_path(component: str, explicit: str | None) -> Path:
+    """Resolve a released model component without guessing snapshot revisions or downloading."""
+    if explicit is not None:
+        directory = Path(explicit)
+        if not (directory / "config.json").is_file():
+            directory = directory / component
+        if (directory / "config.json").is_file():
+            return directory
+        raise FileNotFoundError(f"no {component} config.json under {explicit}")
+    filename = f"{component}/config.json"
+    cached = try_to_load_from_cache("MiniMaxAI/MiniMax-H3", filename)
+    if isinstance(cached, str):
+        return Path(cached).parent
+    raise FileNotFoundError(
+        f"{component} is not cached for MiniMaxAI/MiniMax-H3; "
+        f"download it with: hf download MiniMaxAI/MiniMax-H3 --include '{component}/*'"
+    )
+
+
+DIT_FILE = "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+
+DUMP = ROOT / "target/release/h3-hrx-dev"
 
 
 class H3Error(RuntimeError):
@@ -83,12 +108,12 @@ class H3Error(RuntimeError):
 
 def host_command(command: str) -> list[str]:
     if not DUMP.is_file():
-        raise H3Error(f"{DUMP} is missing; cargo build --release --features internals --bin h3-dev")
+        raise H3Error(f"{DUMP} is missing; cargo build --release --bin h3-hrx-dev")
     return [str(DUMP), "parity-dump", command]
 
 
 def host(command: str, out: Path, dumps: Path | None = None, env: dict | None = None, **flags) -> Path:
-    """Run one `h3-dev parity-dump` command. Python never links the library: it writes the inputs as files,
+    """Run one `h3-hrx-dev parity-dump` command. Python never links the library: it writes the inputs as files,
     the host writes its artefacts as files, and everything below reads them back. There is no
     foreign-function boundary here to drift out of step with the crate."""
     argv = host_command(command) + ["--out", str(out)]
@@ -136,7 +161,6 @@ MODALITIES = 3                                 # AdaLN rows per timestep class: 
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 FRAME_RESCALE = 5.0 / 3.0
 SPATIAL_SCALE = 32.0
-CKPT = Path(os.environ["H3_CKPT"]) if os.environ.get("H3_CKPT") else Path.home() / "comfy-models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"   # H3_CKPT: the ref2va file for its export
 
 
 # --- rotation and quantisation (as krea2-loom) ---------------------------------------------------
@@ -236,7 +260,9 @@ class QuantLinear:
 class Checkpoint:
     """Lazy reader of the ComfyUI safetensors file; int8 ConvRot linears come back dequantised."""
 
-    def __init__(self, path: Path = CKPT, device="cpu", dtype=None):
+    def __init__(self, path: Path | None = None, device="cpu", dtype=None):
+        if path is None:
+            path = Path(os.environ["H3_CKPT"]) if os.environ.get("H3_CKPT") else model_path(DIT_FILE)
         # torch is imported on demand, so the default cannot be a default argument.
         dtype = torch.bfloat16 if dtype is None else dtype
         from safetensors import safe_open
@@ -529,7 +555,7 @@ R = sys.modules[__name__]   # the reference section above, under the name the ch
 def comparison_options() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--case", choices=["t2va", "fl2va"], default="t2va"); ap.add_argument("--mode", choices=["trajectory", "blocks"], default="trajectory")
-    ap.add_argument("--truth", required=True, help="scripts/comfy_dump.py --out directory"); ap.add_argument("--dit", default=None, help="the DiT checkpoint (default: the fl2va file under $H3_MODELS)"); ap.add_argument("--attn", choices=["i4", "i8", "f16"], default="i8")
+    ap.add_argument("--truth", required=True, help="scripts/comfy_dump.py --out directory"); ap.add_argument("--dit", default=None, help="the DiT checkpoint (default: the fl2va file in the Hugging Face cache or $H3_MODELS)"); ap.add_argument("--attn", choices=["i4", "i8", "f16"], default="i8")
     ap.add_argument("--prompt", default="A red fox trotting through a snowy forest at dawn, cinematic"); ap.add_argument("--first-frame", default=str(ROOT / "build/refs/fox_clean.png"))
     ap.add_argument("--width", type=int, default=864); ap.add_argument("--height", type=int, default=480); ap.add_argument("--frames", type=int, default=22); ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--dump", default=None, help="directory for the per-step / per-block dumps (default: <truth>/mine_<blocks>_<attn>)")
@@ -547,7 +573,7 @@ def compare(a) -> list:
         lines.append(text)
         print(text, **{k: v for k, v in kw.items() if k != "end"})
 
-    D = Path(a.truth); dit = a.dit or str(DIT)
+    D = Path(a.truth); dit = a.dit or str(model_path(DIT_FILE))
     dump = Path(a.dump or D / f"mine_{Path(dit).stem}_{a.attn}"); dump.mkdir(parents=True, exist_ok=True)
     work = dump / "host"; work.mkdir(parents=True, exist_ok=True)
     sh = host_shape(a.height, a.width, a.frames)
@@ -609,7 +635,11 @@ def run(args) -> list:
 
 
 def gate(require: bool) -> int:
-    missing = [str(f) for f in (ROOT / "build/comfy_t2va_blocks/blocks/blk_49.npy", ROOT / "build/comfy_fl2va/x_19.npy", DIT) if not f.exists()]
+    missing = [str(f) for f in (ROOT / "build/comfy_t2va_blocks/blocks/blk_49.npy", ROOT / "build/comfy_fl2va/x_19.npy") if not f.exists()]
+    try:
+        model_path(DIT_FILE)
+    except FileNotFoundError as error:
+        missing.append(str(error))
     if missing:
         print(f"{'FAIL' if require else 'SKIP'}: missing {', '.join(missing)} (scripts/comfy_dump.py --dump-steps --dump-blocks 0,1,2,5,10,20,30,40,49 --steps 2 --out build/comfy_t2va_blocks; README, Weights)")
         return 1 if require else 0
@@ -766,7 +796,7 @@ def vae_parity(a) -> int:
              frames=frames, dit="/unused/dit.safetensors", te="/unused/te.safetensors")
         got = np.fromfile(tmp / "frames.rgb", dtype=np.uint8).reshape(frames, h * 16, w * 16, 3)
 
-    vae, config = official_vae(Path(a.official), a.device)
+    vae, config = official_vae(official_path("vae", a.official), a.device)
     with torch.no_grad():
         zt = torch.from_numpy(z)[None].to(a.device)
         mean = zt.new_tensor(config["latents_mean"])[None, :, None, None, None]
@@ -804,7 +834,6 @@ def vae_parity(a) -> int:
 # The DiT blocks against diffusers on MiniMax's unquantized weights
 # --------------------------------------------------------------------------------------------------
 
-OFFICIAL = Path.home() / ".cache/huggingface/hub/models--MiniMaxAI--MiniMax-H3"
 
 
 def official_transformer(directory: Path, device: str):
@@ -852,13 +881,7 @@ def dit_parity(a) -> int:
     quantisation and this implementation together, measured against the reference rather than against
     ComfyUI's independent reimplementation of it.
     """
-    directory = Path(a.official)
-    if not (directory / "config.json").is_file():
-        snapshots = sorted((OFFICIAL / "snapshots").glob("*/transformer"))
-        if not snapshots:
-            print(f"no released transformer under {directory}", file=sys.stderr)
-            return 1
-        directory = snapshots[-1]
+    directory = official_path("transformer", a.official)
 
     depths = [int(x) for x in a.depths.split(",") if x]
     prompt = "A red fox trotting through a snowy forest at dawn, cinematic"
@@ -965,13 +988,7 @@ def conversion_parity(a) -> int:
 
     from safetensors import safe_open
 
-    directory = Path(a.official)
-    if not (directory / "config.json").is_file():
-        found = sorted((OFFICIAL / "snapshots").glob("*/transformer"))
-        if not found:
-            print(f"no released transformer under {directory}", file=sys.stderr)
-            return 1
-        directory = found[-1]
+    directory = official_path("transformer", a.official)
     index = json.loads(
         (directory / "diffusion_pytorch_model.safetensors.index.json").read_text()
     )["weight_map"]
@@ -981,7 +998,7 @@ def conversion_parity(a) -> int:
             return f.get_tensor(name).float()
 
     worst, aligned, checked, unmapped = 0.0, 0, 0, []
-    with safe_open(str(a.converted), framework="pt", device="cpu") as f:
+    with safe_open(str(a.converted or model_path(DIT_FILE)), framework="pt", device="cpu") as f:
         for name in sorted(f.keys()):
             if not name.endswith(".weight_scale"):
                 continue
@@ -1045,13 +1062,7 @@ def te_parity(a) -> int:
     from transformers import AutoConfig
     from transformers.models.qwen3_vl import modeling_qwen3_vl as impl
 
-    directory = Path(a.official)
-    if not (directory / "config.json").is_file():
-        found = sorted((OFFICIAL / "snapshots").glob("*/text_encoder"))
-        if not found:
-            print(f"no released text encoder under {directory}", file=sys.stderr)
-            return 1
-        directory = found[-1]
+    directory = official_path("text_encoder", a.official)
 
     depths = [int(x) for x in a.depths.split(",") if x]
     with tempfile.TemporaryDirectory(prefix="h3-te-official-") as tmp:
@@ -1118,12 +1129,12 @@ def main() -> int:
     g.add_argument("--require", action="store_true", help="a missing dump or checkpoint is a failure, not a skip")
     sub.add_parser("compare", parents=[comparison_options()], add_help=False, help="one comparison, verbose")
     v = sub.add_parser("vae", help="the video decoder against diffusers on MiniMax's own weights")
-    v.add_argument("--official", default=str(Path.home() / "h3-models/vae"), help="the released VAE, diffusers layout")
+    v.add_argument("--official", default=None, help="the released VAE, diffusers layout")
     v.add_argument("--latents", type=Path, help="a .npy of [24][t][h][w]; a fixed random draw by default")
     v.add_argument("--device", default="cuda")
     v.add_argument("--floor", type=float, default=40.0, help="PSNR the decoder must clear")
     d = sub.add_parser("dit", help="the blocks against diffusers on MiniMax's unquantized weights")
-    d.add_argument("--official", default=str(OFFICIAL), help="the released transformer, diffusers layout")
+    d.add_argument("--official", default=None, help="the released transformer, diffusers layout")
     d.add_argument("--depths", default="1,10,25,50", help="block counts to compare")
     d.add_argument("--height", type=int, default=64)
     d.add_argument("--width", type=int, default=96)
@@ -1131,11 +1142,11 @@ def main() -> int:
     d.add_argument("--device", default="cuda")
     d.add_argument("--floor", type=float, default=0.99, help="cosine every depth must clear")
     c = sub.add_parser("convert", help="ComfyUI's int8 conversion against the released weights")
-    c.add_argument("--official", default=str(OFFICIAL), help="the released transformer, diffusers layout")
-    c.add_argument("--converted", default=str(DIT), help="the ComfyUI checkpoint the host runs")
+    c.add_argument("--official", default=None, help="the released transformer, diffusers layout")
+    c.add_argument("--converted", default=None, help="the ComfyUI checkpoint the host runs")
     c.add_argument("--floor", type=float, default=0.005, help="relative group-norm error allowed")
     e = sub.add_parser("te", help="the text encoder against the released Qwen3-VL")
-    e.add_argument("--official", default=str(OFFICIAL), help="the released text encoder")
+    e.add_argument("--official", default=None, help="the released text encoder")
     e.add_argument("--depths", default="1,10,25,50", help="layer counts to compare")
     e.add_argument("--prompt", default="A red fox trotting through a snowy forest at dawn, cinematic")
     e.add_argument("--device", default="cuda")
@@ -1181,4 +1192,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except FileNotFoundError as error:
+        print(error, file=sys.stderr)
+        sys.exit(1)

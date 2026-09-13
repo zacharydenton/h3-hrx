@@ -6,7 +6,7 @@ Rust API. It does not require Python, Torch,
 ROCm development headers or an LLVM build.
 
 The workspace uses `hrx-rs` 0.4 from crates.io, with the exact release pinned
-in all consumer lockfiles. It includes the coordinated GPU/NPU APIs, compiler
+in the workspace lockfile. It includes the coordinated GPU/NPU APIs, compiler
 cache fixes and keyed pending requests. H3 enables only `download` and `loom`;
 ordinary inference does not initialize an NPU.
 
@@ -28,7 +28,7 @@ tracks last use rather than creation. Nothing is evicted implicitly.
 
 The shared runtime supplies per-session streams, allocator-based allocation,
 checked buffer ranges, dynamic native loading, and prepared binding dispatch.
-`h3::compile` now selects model sources/exports and delegates compilation,
+`h3_hrx::compile` now selects model sources/exports and delegates compilation,
 SHA-256 identity, integrity checks and atomic publication to `hrx::loom`. It
 compiles for the architecture the stream's device reports, and asking for a kernel
 does not build it: requests accumulate, and `Compiler::flush` hands the whole
@@ -59,9 +59,9 @@ refuses network access. Explicit model compiler arguments or `HRX_LOOM_LIBRARY`
 select a developer compiler. See the shared crate README for the bundle contract.
 
 `Config::loom_library` selects a shared compiler library, or `HRX_LOOM_LIBRARY`
-does; either empty takes the pinned bundle's. There is no C ABI any more — the
-crate's `Session` is the interface, `clients/rustler` is the interop, and
-`scripts/parity.py` reaches the host through `h3-dev parity-dump` rather
+does; either empty takes the pinned bundle's. The crate's `Session` is the interface,
+`clients/rustler` provides Elixir interop, and
+`scripts/parity.py` reaches the host through `h3-hrx-dev parity-dump` rather
 than by linking it.
 
 `clients/rustler` is a minimal, working Rustler adapter owned by an Elixir app.
@@ -117,7 +117,7 @@ machine. Those results are not evidence that concurrent execution cannot help.
 GPU timestamps and native partition/workstream counters are not exposed by the
 pinned API.
 
-`h3-dev dispatch-cost` compares the same prepared kernels and allocations eagerly and
+`h3-hrx-dev dispatch-cost` compares the same prepared kernels and allocations eagerly and
 as a serial graph. Both arms receive three warmups and nine measured batches,
 with alternating A/B and B/A order. Samples end with a completion wait. Each
 arm must overwrite poisoned output with the expected zeros; reset and readback
@@ -137,7 +137,7 @@ pass, so repeat the paired benchmark before using it to select an execution path
 | Conv1d4 8×165600 | 251.3 µs | 186.0 µs |
 
 Repeated on 2026-09-10 at load average 1.3, three consecutive runs, after the
-diagnostics moved into `h3-dev`. Every absolute figure roughly halves, which is
+diagnostics moved into `h3-hrx-dev`. Every absolute figure roughly halves, which is
 the earlier pass measuring contention rather than either path:
 
 | Kernel and shape | Eager | Graph | Ratio |
@@ -176,8 +176,8 @@ grows, compiler target checks, conditioning, sampling, GEMMs, attention and
 convolutions. Repeat the native checks with:
 
 ```sh
-HRX_OFFLINE=1 cargo test --features internals -- --ignored --test-threads=1
-HRX_OFFLINE=1 cargo run --release --features internals --bin h3-dev -- dispatch-cost
+HRX_OFFLINE=1 cargo test -- --ignored --test-threads=1
+HRX_OFFLINE=1 cargo run --release --bin h3-hrx-dev -- dispatch-cost
 ```
 
 Checkpoint-backed `denoise_cases` runs compared `H3_GRAPH=0` with `H3_GRAPH=1`

@@ -10,9 +10,9 @@ A 32×32 canvas minimizes the video stream; `--audio-only` skips video decoding
 and writes a WAV. The model still denoises both streams.
 
 ```sh
-./build/h3 --width 32 --height 32 --frames 124 --audio-only --out sound \
+h3-hrx --width 32 --height 32 --frames 124 --audio-only --out sound \
   < sound-prompt.txt
-./build/h3 voice.wav --width 32 --height 32 --frames 124 --audio-only --out voice \
+h3-hrx voice.wav --width 32 --height 32 --frames 124 --audio-only --out voice \
   < reference-prompt.txt
 ```
 
@@ -28,9 +28,9 @@ resident `Session` reuses loaded weights and compiled kernels across requests.
 which. Describe a static camera and still photograph in the prompt.
 
 ```sh
-./build/h3 --width 1344 --height 768 --frames 22 --steps 21 --still fox.png \
+h3-hrx --width 1344 --height 768 --frames 22 --steps 21 --still fox.png \
   < still-prompt.txt
-./build/h3 scene.jpg --width 864 --height 480 --frames 22 --steps 21 --still night.png \
+h3-hrx scene.jpg --width 864 --height 480 --frames 22 --steps 21 --still night.png \
   < edit-prompt.txt
 ```
 

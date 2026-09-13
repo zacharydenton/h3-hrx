@@ -5,10 +5,10 @@
 //! Latents are `[24][latent_t][H/16][W/16]` f32; the output is `[frames][H][W][3]` u8, the same bytes
 //! `h3_decode_video` writes. The companion script runs the C implementation on the same latents
 //! through its Python binding and compares.
-use h3::compile::Compiler;
-use h3::dispatch::Profile;
-use h3::layout::shape_for;
-use h3::vvae::VideoVae;
+use h3_hrx::compile::Compiler;
+use h3_hrx::dispatch::Profile;
+use h3_hrx::layout::shape_for;
+use h3_hrx::vvae::VideoVae;
 
 pub fn run(args: Vec<String>) {
     let a = args;

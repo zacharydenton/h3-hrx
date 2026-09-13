@@ -1606,8 +1606,8 @@ fn quantized_preparation_matches_group_rotation_and_packing() {
 #[test]
 #[ignore = "requires gfx1151 and provisioned HRX"]
 fn a_recorded_chain_replays_to_what_dispatching_it_produces() {
-    use h3::compile::Compiler;
-    use h3::dispatch::{Prepare, Sink};
+    use h3_hrx::compile::Compiler;
+    use h3_hrx::dispatch::{Prepare, Sink};
 
     const WIDTH: usize = 256;
     const TOKENS: u32 = 64;
@@ -1695,8 +1695,8 @@ fn a_recorded_chain_replays_to_what_dispatching_it_produces() {
 #[test]
 #[ignore = "requires gfx1151 and provisioned HRX"]
 fn recorded_branches_feed_their_consumer_on_every_replay() {
-    use h3::compile::Compiler;
-    use h3::dispatch::{Prepare, Sink};
+    use h3_hrx::compile::Compiler;
+    use h3_hrx::dispatch::{Prepare, Sink};
     const ROWS: u32 = 64;
     const PART: usize = 256 * ROWS as usize * 2;
     const BYTES: usize = PART * 3;

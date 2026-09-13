@@ -1,4 +1,6 @@
-This is an application-owned Rustler 0.38 adapter to the H3 Rust API. It does
+# h3-hrx Rustler adapter
+
+This is an application-owned Rustler 0.38 adapter to the h3-hrx Rust API. It
 calls the crate directly. Each resource has a bounded job channel; a dedicated thread
 owns the model, runs inference and releases the GPU session after the resource
 is collected. NIF inputs are copied into owned job data before the NIF returns.
@@ -8,7 +10,7 @@ Build and run the GPU smoke test without Mix or Python:
 
 ```sh
 cargo build --manifest-path clients/rustler/Cargo.toml
-H3_NIF="$PWD/clients/rustler/target/debug/libh3_nif" elixir clients/rustler/smoke.exs
+H3_NIF="$PWD/target/debug/libh3_nif" elixir clients/rustler/smoke.exs
 ```
 
 The example exports `open/1`, `ping/2`, and `encode_audio/5`. For audio, pass a

@@ -9,8 +9,8 @@
 //! result behind.
 //!
 //! ```no_run
-//! # fn main() -> h3::Result<()> {
-//! use h3::{Config, DenoiseParams, Noise, Session, Tokenizer};
+//! # fn main() -> h3_hrx::Result<()> {
+//! use h3_hrx::{Config, DenoiseParams, Noise, Session, Tokenizer};
 //! let ids = Tokenizer::new()?.encode("a red fox in snow")?;
 //! // Safety: the checkpoints are not written while this session lives.
 //! let mut session = unsafe { Session::new(Config::default()) }?;
@@ -18,13 +18,11 @@
 //! # let _ = latents; Ok(()) }
 //! ```
 //!
-//! # What is not supported
+//! # Low-level API
 //!
-//! Everything else — the transformer stack, the kernel compiler and cache, the packed layout, the
-//! samplers, the checkpoint reader — is an implementation detail, and private. The `internals`
-//! feature opens it, so that `h3-dev` and the integration tests can drive one stage at a time; that
-//! is not a promise about it. Nothing under that feature carries a stability guarantee, and all of
-//! it changes with the model.
+//! The model, kernel, and checkpoint modules support diagnostics and custom pipelines.
+//! Prefer [`Session`] for inference. This experimental crate's low-level API may change
+//! between releases.
 //!
 //! # What this crate trusts
 //!
@@ -33,82 +31,19 @@
 //! library has already validated, or shrink the file under reads that are in flight. Point a session
 //! at files you control.
 
-// With the interior closed, the parts of it that only the diagnostics binary and the integration
-// tests reach have no caller, and every one of them would be reported as dead. The `internals` build
-// is where that report means something — it compiles those callers, and it is what `scripts/test.sh`
-// runs — so the warning is silenced only in the build that cannot see them.
-#![cfg_attr(not(feature = "internals"), allow(dead_code))]
-
-// The implementation. `internals` opens it to the diagnostics binary and the integration
-// tests, which drive one stage at a time; a normal build keeps it shut. Written out rather
-// than generated, because rustfmt follows only literal module declarations and a macro here
-// would keep every file below out of `cargo fmt`.
-
-#[cfg(feature = "internals")]
-#[doc(hidden)]
 pub mod avae;
-#[cfg(not(feature = "internals"))]
-mod avae;
-#[cfg(feature = "internals")]
-#[doc(hidden)]
 pub mod checkpoint;
-#[cfg(not(feature = "internals"))]
-mod checkpoint;
-#[cfg(feature = "internals")]
-#[doc(hidden)]
 pub mod compile;
-#[cfg(not(feature = "internals"))]
-mod compile;
-#[cfg(feature = "internals")]
-#[doc(hidden)]
 pub mod dispatch;
-#[cfg(not(feature = "internals"))]
-mod dispatch;
-#[cfg(feature = "internals")]
-#[doc(hidden)]
 pub mod dit;
-#[cfg(not(feature = "internals"))]
-mod dit;
-#[cfg(feature = "internals")]
-#[doc(hidden)]
 pub mod layout;
-#[cfg(not(feature = "internals"))]
-mod layout;
-#[cfg(feature = "internals")]
-#[doc(hidden)]
 pub mod model;
-#[cfg(not(feature = "internals"))]
-mod model;
-#[cfg(feature = "internals")]
-#[doc(hidden)]
 pub mod plan;
-#[cfg(not(feature = "internals"))]
-mod plan;
-#[cfg(feature = "internals")]
-#[doc(hidden)]
 pub mod stack;
-#[cfg(not(feature = "internals"))]
-mod stack;
-#[cfg(feature = "internals")]
-#[doc(hidden)]
 pub mod te;
-#[cfg(not(feature = "internals"))]
-mod te;
-#[cfg(feature = "internals")]
-#[doc(hidden)]
 pub mod vision;
-#[cfg(not(feature = "internals"))]
-mod vision;
-#[cfg(feature = "internals")]
-#[doc(hidden)]
 pub mod vvae;
-#[cfg(not(feature = "internals"))]
-mod vvae;
-#[cfg(feature = "internals")]
-#[doc(hidden)]
 pub mod weights;
-#[cfg(not(feature = "internals"))]
-mod weights;
 
 // Reached from nowhere outside this crate, and so never public.
 

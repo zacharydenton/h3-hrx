@@ -1,12 +1,11 @@
 [package]
-name = "h3-rustler-example"
+name = "h3-hrx-rustler"
 version = "0.1.0"
 edition = "2024"
 publish = false
-[workspace]
 [lib]
 name = "h3_nif"
 crate-type = ["cdylib"]
 [dependencies]
-h3 = { path = "../..", default-features = false }
+h3-hrx = { path = "../..", default-features = false }
 rustler = "0.38"

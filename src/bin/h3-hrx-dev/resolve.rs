@@ -9,7 +9,7 @@ pub fn run(args: Vec<String>) {
     let relative = args
         .first()
         .expect("usage: resolve [--offline] <relative-path>");
-    let resolver = h3::models::Resolver::new().offline(offline);
+    let resolver = h3_hrx::models::Resolver::new().offline(offline);
     match resolver.find(relative) {
         Ok(path) => println!("{}", path.display()),
         Err(e) => {

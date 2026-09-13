@@ -3,9 +3,9 @@
 //! This is what proves the dispatch layer as distinct from the layout: the stem it picks, the config it
 //! passes, the order it binds its operands in, and the grid it launches. A mistake in any of those
 //! produces wrong numbers rather than an error.
-use h3::compile::Compiler;
-use h3::dispatch::{Gemm, Tile};
-use h3::model::gemm_pitch;
+use h3_hrx::compile::Compiler;
+use h3_hrx::dispatch::{Gemm, Tile};
+use h3_hrx::model::gemm_pitch;
 use half::f16;
 
 /// Rounds through f16 the way the operands are stored, so the reference sees the same inputs.

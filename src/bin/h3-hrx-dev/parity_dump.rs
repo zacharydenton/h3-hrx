@@ -3,9 +3,7 @@
 //! The parity checks compare this host against MiniMax's released weights through diffusers and
 //! transformers, so the oracle has to be Python. The host does not: this produces everything those
 //! checks need — token ids, refined text rows, latents, decoded frames, and the per-block dumps
-//! `H3_DUMP_BLOCKS` writes — and Python only reads files. That keeps the comparison honest while
-//! leaving no foreign-function boundary to drift: the ABI mismatch that used to break the harness
-//! was a ctypes struct tracking a C ABI, and there is no longer either.
+//! `H3_DUMP_BLOCKS` writes. Python reads these files without linking the model library.
 //!
 //!   parity_dump shape   --height H --width W --frames F
 //!   parity_dump text    --prompt P --out DIR
@@ -17,7 +15,9 @@
 //!
 //! Scalars go to `<out>/shape.json` so Python needs no arithmetic of its own; everything else is
 //! little-endian f32 except `ids.i32` and `frames.rgb`.
-use h3::{shape_for, Clip, Config, DenoiseParams, Keyframe, Noise, Sampler, Session, Tokenizer};
+use h3_hrx::{
+    shape_for, Clip, Config, DenoiseParams, Keyframe, Noise, Sampler, Session, Tokenizer,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -92,10 +92,10 @@ fn write_f32(dir: &Path, name: &str, values: &[f32]) {
     write(dir, name, bytemuck::cast_slice(values));
 }
 
-/// The presentation the model is trained on, built the way `cli/` builds it: a vision span per
+/// The presentation the model is trained on, built the way the CLI builds it: a vision span per
 /// keyframe and reference image, then the audio labels, then the prompt. Doing it here rather than
 /// in Python means the checks exercise the host's own presentation.
-fn presentation(prompt: &str, spans: &[(i32, i32)], audios: usize) -> h3::Result<Vec<i32>> {
+fn presentation(prompt: &str, spans: &[(i32, i32)], audios: usize) -> h3_hrx::Result<Vec<i32>> {
     let tok = Tokenizer::new()?;
     let mut ids: Vec<i32> = Vec::new();
     for (i, (height, width)) in spans.iter().enumerate() {
@@ -124,9 +124,10 @@ fn config(a: &Args) -> Config {
     }
     if let Some(bits) = a.opt("attn") {
         config.attention = match bits {
-            "f16" | "16" => h3::Attention::F16,
-            "i4" | "4" => h3::Attention::I4,
-            _ => h3::Attention::I8,
+            "f16" | "16" => h3_hrx::Attention::F16,
+            "i4" | "4" => h3_hrx::Attention::I4,
+            "i8" | "8" => h3_hrx::Attention::I8,
+            _ => fail("--attn must be f16, i8, or i4"),
         };
     }
     config
@@ -185,7 +186,7 @@ pub fn run(args: Vec<String>) {
                 presentation(a.get("prompt"), &[], 0).unwrap_or_else(|e| fail(&format!("{e}")));
             let mut session = unsafe { open(&a) };
             // the refined rows are at the DiT's hidden width, not the encoder's
-            let mut rows = vec![0f32; ids.len() * h3::model::HID];
+            let mut rows = vec![0f32; ids.len() * h3_hrx::model::HID];
             session
                 .text_in(&ids, &mut rows)
                 .unwrap_or_else(|e| fail(&format!("text_in: {e}")));
@@ -252,7 +253,7 @@ pub fn run(args: Vec<String>) {
                     frame_index: 0,
                     latents,
                     audio: None,
-                    presented: Some(h3::Presented {
+                    presented: Some(h3_hrx::Presented {
                         pixels,
                         height: p.height as usize,
                         width: p.width as usize,

@@ -16,12 +16,12 @@
 //!   ref <kind> <video.f32|-> <t> <h> <w> <audio.f32|-> <audio_t> <pixels.f32|-> <ph> <pw>
 //!   keyframe <index> <video.f32> <audio.f32|-> <audio_t> <pixels.f32|-> <ph> <pw>
 //!   out <dir>
-use h3::compile::Compiler;
-use h3::dispatch::Profile;
-use h3::dit::{
+use h3_hrx::compile::Compiler;
+use h3_hrx::dispatch::Profile;
+use h3_hrx::dit::{
     Attention, DenoiseParams, Dit, Keyframe, LatentGrid, Noise, Presented, Reference, Sampler,
 };
-use h3::te::TextEncoder;
+use h3_hrx::te::TextEncoder;
 use std::io::Write;
 
 fn read(path: &str) -> Vec<f32> {

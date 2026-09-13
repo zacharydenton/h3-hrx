@@ -1,10 +1,6 @@
-//! Diagnostics: one stage of the pipeline at a time, driven from the shell.
+//! Diagnostics for individual model stages and kernels.
 //!
-//! These reach inside the library, which is why they are a binary behind the `internals`
-//! feature rather than examples. An example would have to be listed in `Cargo.toml` one stanza
-//! at a time to say the same thing, and would hold the crate's modules open for every build.
-//!
-//!   cargo run --release --features internals --bin h3-dev -- <command> [args]
+//! Run with `cargo run --release --bin h3-hrx-dev -- <command> [args]`.
 
 mod audio_vae;
 mod compare_decode;
@@ -50,7 +46,7 @@ fn main() {
         "verify-upload" => verify_upload::run(args),
         "vision-embed" => vision_embed::run(args),
         other => {
-            eprintln!("h3-dev: unknown command {other:?}\n\ncommands:");
+            eprintln!("h3-hrx-dev: unknown command {other:?}\n\ncommands:");
             for name in [
                 "audio-vae",
                 "compare-decode",

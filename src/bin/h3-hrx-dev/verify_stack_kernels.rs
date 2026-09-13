@@ -6,10 +6,10 @@
 //! shape, asks for kernels that are all already there, then every decision it made along the way — the
 //! operand element type, the tile, the row groups, the pitches, the attention stem, whether each
 //! projection needs a prepare — matches what the C decided. A single wrong choice appears as a compile.
-use h3::compile::Compiler;
-use h3::model::*;
-use h3::stack::{Stack, StackDims};
-use h3::weights::Weights;
+use h3_hrx::compile::Compiler;
+use h3_hrx::model::*;
+use h3_hrx::stack::{Stack, StackDims};
+use h3_hrx::weights::Weights;
 
 pub fn run(args: Vec<String>) {
     let mut args = args.into_iter();
@@ -30,7 +30,7 @@ pub fn run(args: Vec<String>) {
     let mut stream = hrx::Stream::open().expect("stream");
     let compiler = Compiler::new(exe, root.join("kernels"));
     // Safety: a diagnostic run over checkpoints the operator named and is not writing to.
-    let weights = unsafe { Weights::open(&path, h3::plan::vvae::plan) }.expect("plan");
+    let weights = unsafe { Weights::open(&path, h3_hrx::plan::vvae::plan) }.expect("plan");
 
     // The video decoder's stack, exactly as the C constructs it.
     let dims = StackDims {

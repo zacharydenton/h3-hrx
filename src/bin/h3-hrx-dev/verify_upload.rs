@@ -5,18 +5,18 @@
 //! This is what proves the device path, as distinct from the layout: the three upload routes — a built
 //! array, one straight run of the mapping, and rows gathered at a wider pitch — must all land exactly
 //! what `assemble` produces, pad included.
-use h3::checkpoint::Checkpoint;
-use h3::weights::{Recipe, Weights};
+use h3_hrx::checkpoint::Checkpoint;
+use h3_hrx::weights::{Recipe, Weights};
 use std::collections::BTreeMap;
 
 fn plan_for(
     which: &str,
-) -> fn(&Checkpoint, &mut BTreeMap<String, Recipe>) -> h3::weights::Result<()> {
+) -> fn(&Checkpoint, &mut BTreeMap<String, Recipe>) -> h3_hrx::weights::Result<()> {
     match which {
-        "dit" => h3::plan::dit::plan,
-        "te" => h3::plan::te::plan,
-        "vvae" => h3::plan::vvae::plan,
-        "avae" => h3::plan::avae::plan,
+        "dit" => h3_hrx::plan::dit::plan,
+        "te" => h3_hrx::plan::te::plan,
+        "vvae" => h3_hrx::plan::vvae::plan,
+        "avae" => h3_hrx::plan::avae::plan,
         other => panic!("unknown plan {other}"),
     }
 }

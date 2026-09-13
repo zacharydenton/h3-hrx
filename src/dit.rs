@@ -677,7 +677,7 @@ impl Dit {
         self.block_graph = None;
         self.suffix_graph = None;
         self.blocks = None;
-        let mut d = StackDims {
+        let d = StackDims {
             hidden: HID,
             heads: HEADS,
             kv_heads: HEADS,
@@ -694,16 +694,6 @@ impl Dit {
             attn_qk_bits: qk_bits,
             bf16: false,
         };
-        // H3_ATTN_QK=f16|i8|i4 overrides the configured width
-        if let Some(v) = crate::stack::env_once("H3_ATTN_QK") {
-            let bits = match v {
-                "f16" => 16,
-                "i8" => 8,
-                _ => 4,
-            };
-            d.attn_qk_bits = bits;
-            d.attn_i4 = bits == 4;
-        }
         let qk = d.attn_qk_bits;
         let stack = Stack::new(
             c,

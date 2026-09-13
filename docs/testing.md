@@ -25,7 +25,7 @@ to another stream, a path that resolves to the wrong tree. Inputs are generated 
 generator written out in the test, so nothing is stored; the outputs would be gigabytes and a digest
 compares them exactly as well.
 
-`H3_GRAPH=1 cargo test --features internals --test differentials --release -- --ignored --test-threads=1` runs the same cases through the
+`H3_GRAPH=1 cargo test --test differentials --release -- --ignored --test-threads=1` runs the same cases through the
 recorded graphs, which is how the recordings are known to be faithful.
 
 A failed assertion reports the actual and expected digests. Before updating an expected digest
@@ -57,9 +57,7 @@ The GPU suite compares independent scalar CPU references against:
 
 Workspace unit tests cover model shapes, checkpoint layouts, CPU sampling,
 tokenization, compiler/source behavior and dispatch bounds.
-The C smoke test in the shared HRX repository builds against generated H3 and
-Krea headers and loads both model libraries in one process. Rustler remains an
-application adapter under `clients/rustler`.
+The Rust and Rustler examples are workspace members under `clients/`.
 
 Loom sources are maintained directly. Python generators, reference model
 implementations, wrappers and one-off studies are retired. Historical reports
@@ -94,8 +92,14 @@ permuted. It needs no GPU.
 weights MiniMax released, rather than against ComfyUI's conversion or a
 reimplementation. It measures the f16 narrowing plus whatever the Loom decoder
 does differently, and clears 62.5 dB PSNR at 384x320x22. It needs `diffusers`,
-`torch` and the released VAE in diffusers layout (`~/h3-models/vae`); no
+`torch` and the released VAE in diffusers layout (the Hugging Face cache or
+`--official DIR`); no
 transformer, so it costs 10 GB rather than 62.
+
+The parity tools use Python with `numpy` and `huggingface_hub` for array and
+cache access; install them with `python3 -m pip install numpy huggingface_hub`.
+They reuse the standard Hugging Face cache, with `H3_MODELS` as an optional
+local override, and do not download missing checkpoints during validation.
 
 Whole-model parity lives in `scripts/parity.py`, outside this suite and outside
 `scripts/test.sh`: it needs the checkpoints, a device and dumps produced inside the
@@ -139,10 +143,10 @@ To reproduce the comparison, extract the pre-consolidation sources:
 mkdir -p build/kernel-baseline
 git archive 62f837d kernels | tar -x -C build/kernel-baseline
 export H3_KERNEL_BASELINE="$PWD/build/kernel-baseline/kernels"
-cargo test --features internals --test kernels -- --ignored --test-threads=1 --nocapture
-H3_KERNEL_TIMING=1 cargo test --features internals --test kernels preparation -- --ignored --test-threads=1 --nocapture
-cargo run --release --features internals --bin h3-dev -- compare-gemm "$H3_KERNEL_BASELINE"
-cargo run --release --features internals --bin h3-dev -- compare-vision "$H3_KERNEL_BASELINE"
+cargo test --test kernels -- --ignored --test-threads=1 --nocapture
+H3_KERNEL_TIMING=1 cargo test --test kernels preparation -- --ignored --test-threads=1 --nocapture
+cargo run --release --bin h3-hrx-dev -- compare-gemm "$H3_KERNEL_BASELINE"
+cargo run --release --bin h3-hrx-dev -- compare-vision "$H3_KERNEL_BASELINE"
 ```
 
 The test harness compares every binding bit-for-bit before the independent CPU
@@ -162,7 +166,7 @@ for module in kernels/*_family.loom kernels/gemm_packed_256.loom; do
     while IFS= read -r entry; do cat "$H3_KERNEL_BASELINE/$entry.loom"; done |
     awk '!/^amdgpu.target/ || !seen[$0]++' > "$H3_KERNEL_BASELINE/$(basename "$module")"
 done
-cargo run --release --features internals --bin h3-dev -- compare-decode \
+cargo run --release --bin h3-hrx-dev -- compare-decode \
   "$H3_KERNEL_BASELINE" "$VAE_CHECKPOINT" "$LATENTS_F32" 480 864 22
 ```
 
