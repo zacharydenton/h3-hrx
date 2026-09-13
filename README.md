@@ -8,8 +8,10 @@ through [HRX](https://github.com/zacharydenton/hrx-rs). Load Comfy-Org quantized
 checkpoints from the standard Hugging Face cache and generate video with sound
 from text, a first frame, or image and audio references.
 
-**3.04× faster steady denoising than ComfyUI** in a measured 480p comparison on
-Strix Halo, with higher GPU-resident memory use. [Timings and memory](#performance).
+**7.48× faster steady denoising than ComfyUI at 768p**, and **3.04× at 480p**,
+in measured Strix Halo comparisons. A five-second 768p clip takes **37 min 33 s**
+with h3, versus **roughly 4 h 20 min with ComfyUI** at 20 evaluations.
+[Timings and memory](#performance).
 
 The inference pipeline needs no Python, PyTorch, Triton, or vendor math libraries.
 Building it needs no ROCm headers or `hipcc`. HRX provisions the native compiler
@@ -110,29 +112,40 @@ See [other modes](docs/tricks.md) for audio-only output and still images.
 
 ## Performance
 
-Measured on AMD Strix Halo with 128 GB unified memory: 864×480, 124 frames,
-20 evaluations, the same prompt and Comfy-Org int8 ConvRot checkpoints.
+For a 124-frame 768p clip at 20 evaluations, h3 produces MP4/WAV output in
+**37 min 33 s**, versus **roughly 4 h 20 min for ComfyUI**—about **6.9× faster
+overall**. [Calculation and benchmark details](docs/benchmarks/20260913-768p/README.md#end-to-end-timing).
 
-| Measurement | h3-hrx (Loom / HRX) | ComfyUI |
-| --- | ---: | ---: |
-| Steady denoising, median per evaluation | **28.1 s** | 85.5 s |
-| Observed evaluation range | 26.8–28.2 s | 84.5–86.4 s |
-| Sampled peak GPU-resident buffers | 51.74 GiB | 25.45 GiB |
-| Sampled peak process PSS | 1.32 GiB | 23.12 GiB |
+Measured on AMD Strix Halo with 128 GB unified memory, using the same prompt,
+124 frames, and Comfy-Org int8 ConvRot checkpoints. The table reports medians per
+denoising evaluation, excluding each engine's first evaluation.
 
-**3.04× faster denoising, with about twice the GPU-resident buffer memory.**
-PSS and GPU residency overlap on unified memory: do not add them or interpret
-PSS alone as total RAM usage. Memory was sampled every five seconds through
-loading, inference, decoding, and output attempts.
+| Resolution | h3-hrx (Loom / HRX) | ComfyUI | Observed speedup |
+| --- | ---: | ---: | ---: |
+| 1344×768 | **103.2 s** | 772.4 s | **7.48×** |
+| 864×480 | **28.1 s** | 85.5 s | **3.04×** |
 
-This is one sampling trajectory per engine, excluding the first evaluation from
-steady timing. h3 uses int8 products and QK attention; ComfyUI uses bf16 compute
-on the same quantized weights. Outputs are not identical. ComfyUI completed
-sampling and decoding, but its container lacked the `libx264` encoder for MP4
-output, so **no end-to-end speedup is claimed**.
+At 768p, h3 completed 20 evaluations; ComfyUI was intentionally stopped after four,
+so the steady medians use **19 h3 observations and 3 ComfyUI observations**.
+At 480p, both completed 20 evaluations. These are observations within one trajectory
+per engine, not independent repeated runs or identical output images. h3 uses int8
+products and QK attention; ComfyUI uses bf16 compute on the same quantized weights.
 
-See the [reproducible benchmark, raw measurements, and memory plot](docs/benchmarks/20260913/README.md)
-and [performance and numerical validation](docs/performance.md).
+| Resolution | Engine | Sampled peak GPU residency | Sampled peak process PSS | Observed scope |
+| --- | --- | ---: | ---: | --- |
+| 768p | h3-hrx | 56.51 GiB | 2.48 GiB | Full generation |
+| 768p | ComfyUI | 26.19 GiB | 25.23 GiB | Loading and sampling |
+| 480p | h3-hrx | 51.74 GiB | 1.32 GiB | Full generation |
+| 480p | ComfyUI | 25.45 GiB | 23.12 GiB | Through decoding |
+
+PSS and GPU residency overlap on unified memory: **do not add them or interpret
+PSS alone as total RAM usage**. Sampling intervals were one second at 768p and
+five seconds at 480p. ComfyUI's 768p measurements exclude decoding and export,
+so they are not full-pipeline memory peaks.
+
+See the [768p report, video, and memory plot](docs/benchmarks/20260913-768p/README.md),
+[480p report](docs/benchmarks/20260913/README.md), and
+[performance and numerical validation](docs/performance.md).
 
 ## Library and development
 

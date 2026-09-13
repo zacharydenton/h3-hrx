@@ -57,6 +57,11 @@
     "steady_min_seconds": 84.4865915570117,
     "steady_max_seconds": 86.39835366999614
   },
+  "planned_evaluations": 20,
+  "completed_evaluations": {
+    "h3": 20,
+    "comfyui": 20
+  },
   "steady_median_speedup": 3.0441783648398553,
   "memory": {
     "h3": {

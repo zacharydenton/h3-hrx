@@ -4,7 +4,34 @@ The current comparison measures h3-hrx and ComfyUI on AMD Strix Halo (`gfx1151`)
 with 128 GB unified memory. Timings depend on sequence length, prompt, cache state,
 and competing CPU/GPU work on the APU.
 
-## September 2026 comparison
+## September 2026: 768p
+
+At 1344×768 and 124 frames, h3-hrx's steady median was **103.2 seconds per
+evaluation**, versus **772.4 seconds** for ComfyUI: **7.48× faster denoising**.
+h3 completed the 20-evaluation schedule; ComfyUI was intentionally stopped during
+evaluation five. Excluding the first evaluation gives 19 h3 observations and
+3 ComfyUI observations. Their ranges were 99.8–103.4 s and 770.8–775.6 s.
+This is an observed within-run difference, not a statistical-significance claim.
+
+h3's full MP4/WAV output took **37 min 33 s**. ComfyUI takes **roughly 4 h 20 min**
+for the same dimensions and 20-evaluation schedule, making h3 **about 6.9× faster
+overall**. The ComfyUI total combines observed sampling with overhead from the
+earlier benchmark; the [calculation](benchmarks/20260913-768p/README.md#end-to-end-timing)
+records the inputs and scaling. The intended output encoder was the same validated
+FFmpeg binary in both environments.
+
+One-second memory samples found peaks of **56.51 GiB GPU residency / 2.48 GiB
+process PSS for h3**, and **26.19 GiB / 25.23 GiB for ComfyUI**. These overlapping
+memory views must not be added. h3's peaks cover the full pipeline; ComfyUI's
+cover loading and observed sampling only, including the interrupted fifth
+evaluation. They do not establish ComfyUI's full-pipeline peak at 768p.
+
+See the [768p report, video, raw data, and memory timeline](benchmarks/20260913-768p/README.md).
+The same quantized checkpoints, prompt, seed, and 20-evaluation schedule were
+used in both engines. Different arithmetic and random streams mean the outputs
+are not expected to be identical.
+
+## September 2026: 480p
 
 For 864×480, 124 frames and 20 evaluations, h3-hrx's steady median was **28.1 s per
 evaluation**, versus **85.5 s** for ComfyUI: **3.04× faster denoising**. This uses the

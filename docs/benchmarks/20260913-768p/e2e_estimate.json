@@ -1,0 +1,19 @@
+{
+  "method": "20 times the observed 768p steady median, plus prior process overhead, area-scaled decode/save, and an assumed five seconds for encoding.",
+  "prior_source_commit": "416a3c4c6a5fe0ee20fcad60c18e35c027692aaf",
+  "historical_768p_source_commit": "52827db9f05ca0b6012dfeb05f535abc0d4f9c81",
+  "historical_768p_evaluation_seconds": [
+    772.7,
+    772.4,
+    768.8
+  ],
+  "prior_decode_and_save_seconds": 50.15114356498816,
+  "spatial_area_ratio": 2.488888888888889,
+  "projected_sampling_seconds": 15448.440012920182,
+  "projected_decode_and_save_seconds": 124.82062398397053,
+  "prior_other_process_seconds": 44.0005547630135,
+  "assumed_encoding_seconds": 5.0,
+  "comfyui_estimated_wall_seconds": 15622.261191667167,
+  "h3_measured_wall_seconds": 2253.010116116988,
+  "estimated_end_to_end_speedup": 6.933950753222441
+}

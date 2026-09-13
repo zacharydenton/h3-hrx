@@ -1,0 +1,19 @@
+In file included from /usr/include/python3.13/pyconfig.h:6,
+                 from /usr/include/python3.13/Python.h:14,
+                 from /tmp/tmp8lbtuelf/hip_utils.c:5:
+/usr/include/python3.13/pyconfig-64.h:1972:9: warning: ‘_POSIX_C_SOURCE’ redefined
+ 1972 | #define _POSIX_C_SOURCE 200809L
+      |         ^~~~~~~~~~~~~~~
+In file included from /usr/include/bits/libc-header-start.h:33,
+                 from /usr/include/stdint.h:26,
+                 from /usr/lib/gcc/x86_64-redhat-linux/16/include/stdint.h:11,
+                 from /opt/venv/lib/python3.13/site-packages/triton/backends/amd/include/hip/hip_runtime.h:48,
+                 from /tmp/tmp8lbtuelf/hip_utils.c:2:
+/usr/include/features.h:319:10: note: this is the location of the previous definition
+  319 | # define _POSIX_C_SOURCE        202405L
+      |          ^~~~~~~~~~~~~~~
+conditioning in 18.7 s
+  step 1/20  777.8 s
+  step 2/20  775.6 s
+  step 3/20  772.4 s
+  step 4/20  770.8 s

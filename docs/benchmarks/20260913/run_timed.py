@@ -20,6 +20,8 @@ parser.add_argument('--wait-pid', type=int)
 parser.add_argument('--container', help='Podman container name, for tracking its host PID')
 parser.add_argument('--min-available-gib', type=float, default=70)
 parser.add_argument('--abort-available-gib', type=float, default=8)
+parser.add_argument('--sample-interval', type=float, default=5,
+                    help='seconds between memory samples and pressure checks')
 parser.add_argument('--gpu-device', type=pathlib.Path,
                     default=pathlib.Path('/sys/class/drm/card1/device'))
 parser.add_argument('command', nargs=argparse.REMAINDER)
@@ -28,6 +30,8 @@ if args.command and args.command[0] == '--':
     args.command.pop(0)
 if not args.command:
     parser.error('a command is required after --')
+if args.sample_interval <= 0:
+    parser.error('--sample-interval must be positive')
 
 root = args.out_dir
 root.mkdir(parents=True, exist_ok=True)
@@ -122,7 +126,7 @@ with (root / f'{args.name}.log').open('w') as log, \
                 stop_workload(process)
                 break
             try:
-                process.wait(timeout=5)
+                process.wait(timeout=args.sample_interval)
             except subprocess.TimeoutExpired:
                 pass
         wall_seconds = time.perf_counter() - start
@@ -142,7 +146,7 @@ result = {
     'minimum_starting_available_gib': args.min_available_gib,
     'abort_available_gib': args.abort_available_gib,
     'max_rss_kib': resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
-    'memory_sampling_interval_seconds': 5,
+    'memory_sampling_interval_seconds': args.sample_interval,
     'baseline_system_memory_bytes': baseline_system,
     'sampled_peak_process_rss_bytes': max((s['process_memory_bytes']['Rss'] for s in samples), default=0),
     'sampled_peak_process_pss_bytes': max((s['process_memory_bytes']['Pss'] for s in samples), default=0),
@@ -150,7 +154,7 @@ result = {
     'sampled_peak_drm_allocated_bytes': max((s['drm_memory']['allocated_bytes'] for s in samples), default=0),
     'minimum_system_available_bytes': min((s['system_memory_bytes']['MemAvailable'] for s in samples), default=None),
     'maximum_system_swap_used_bytes': max((s['system_memory_bytes']['SwapTotal'] - s['system_memory_bytes']['SwapFree'] for s in samples), default=0),
-    'memory_note': 'Sampled process PSS and DRM memory are separate views and must not be summed. Five-second sampling may miss brief peaks. System counters include other applications.',
+    'memory_note': f'Sampled process PSS and DRM memory are separate views and must not be summed. {args.sample_interval:g}-second sampling may miss brief peaks. System counters include other applications.',
 }
 (root / f'{args.name}.timing.json').write_text(json.dumps(result, indent=2) + '\n')
 print(json.dumps(result), flush=True)
