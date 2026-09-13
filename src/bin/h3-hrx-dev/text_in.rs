@@ -28,8 +28,10 @@ pub fn run(args: Vec<String>) {
     for pair in a[2..].chunks(2) {
         let ids: Vec<i32> = std::fs::read(&pair[0])
             .expect("ids")
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect();
         let start = std::time::Instant::now();
         dit.text_in(&mut stream, &compiler, &mut prof, &mut te, &ids, &[])

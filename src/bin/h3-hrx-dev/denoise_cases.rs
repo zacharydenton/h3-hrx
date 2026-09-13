@@ -27,8 +27,10 @@ use std::io::Write;
 fn read(path: &str) -> Vec<f32> {
     std::fs::read(path)
         .unwrap_or_else(|e| panic!("{path}: {e}"))
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -98,8 +100,10 @@ pub fn run(args: Vec<String>) {
             "ids" => {
                 let v: Vec<i32> = std::fs::read(f[1])
                     .expect("ids")
-                    .chunks_exact(4)
-                    .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| i32::from_le_bytes(*c))
                     .collect();
                 match cases.last_mut() {
                     Some(c) => c.ids = v,

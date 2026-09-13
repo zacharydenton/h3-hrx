@@ -32,8 +32,10 @@ pub fn run(args: Vec<String>) {
 
     let pixels: Vec<f32> = std::fs::read(&a[1])
         .expect("pixels")
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     assert_eq!(pixels.len(), height * width * 3, "wrong pixel count");
 

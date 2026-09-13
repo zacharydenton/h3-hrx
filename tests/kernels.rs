@@ -177,14 +177,18 @@ fn bytes<T: bytemuck::Pod>(v: &[T]) -> Vec<u8> {
     bytemuck::cast_slice(v).to_vec()
 }
 fn floats(v: &[u8]) -> Vec<f64> {
-    v.chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()) as f64)
+    v.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b) as f64)
         .collect()
 }
 fn halves(v: &[u8], bf: bool) -> Vec<f64> {
-    v.chunks_exact(2)
+    v.as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| {
-            let n = u16::from_le_bytes(b.try_into().unwrap());
+            let n = u16::from_le_bytes(*b);
             if bf {
                 bf16::from_bits(n).to_f64()
             } else {
@@ -674,7 +678,9 @@ fn quantized_gemms_match_integer_dot_products_bias_and_residual_classes() {
                             if bits == 8 {
                                 v.iter().map(|&x| x as u8).collect()
                             } else {
-                                v.chunks_exact(2)
+                                v.as_chunks::<2>()
+                                    .0
+                                    .iter()
                                     .map(|x| (x[0] as u8 & 15) | ((x[1] as u8 & 15) << 4))
                                     .collect()
                             }
@@ -972,8 +978,10 @@ fn prepare_qk_int8_rotates_quantises_and_packs_the_attention_operands() {
         ],
     );
     let words: Vec<i32> = out[2]
-        .chunks_exact(4)
-        .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| i32::from_le_bytes(*b))
         .collect();
     let differing = words
         .iter()
@@ -1259,7 +1267,9 @@ fn packed_attention_families_preserve_wave_layouts_and_skip_decisions() {
                         values.iter().map(|&v| v as u8).collect::<Vec<_>>()
                     } else {
                         values
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|v| (v[0] as u8 & 15) | ((v[1] as u8 & 15) << 4))
                             .collect()
                     }

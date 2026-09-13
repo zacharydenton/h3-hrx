@@ -108,7 +108,9 @@ pub fn run(_args: Vec<String>) {
             .read_blocking(out_buf.binding(), &mut raw)
             .expect("read back");
         let got: Vec<f32> = raw
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect();
         // row of ones dotted with a constant row j/K over K terms is exactly j

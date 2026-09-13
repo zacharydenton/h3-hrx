@@ -176,8 +176,8 @@ fn exp_f32(ck: &Checkpoint, src: &str, n: usize) -> Result<Recipe> {
         build: Box::new(move |ck| {
             let bytes = ck.bytes(ck.at(&src)?);
             let mut out = Vec::with_capacity(n * 4);
-            for chunk in bytes.chunks_exact(4) {
-                let v = f32::from_le_bytes(chunk.try_into().unwrap());
+            for chunk in bytes.as_chunks::<4>().0 {
+                let v = f32::from_le_bytes(*chunk);
                 out.extend_from_slice(&v.exp().to_le_bytes());
             }
             Ok(out)
