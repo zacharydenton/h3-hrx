@@ -40,7 +40,9 @@ PyTorch allocator peaks are also incomplete views of its DRM buffer allocations.
 - [Floating glacier prompt](../../prompts/floating_glacier.txt), seed 1618.
 - `res_multistep`, `simple` schedule, 20 evaluations, CFG 1.
 - h3 uses default int8 QK attention and int8 weight products. ComfyUI uses its
-  default PyTorch attention and bf16 compute on the same quantized checkpoints.
+  default BF16 PyTorch attention, BF16 activations, and quantized linear kernels
+  on the same checkpoints. BF16 inference dtype does not imply BF16 arithmetic
+  for every matrix product.
 - Model downloads are excluded. The engines run sequentially; no second GPU
   computation is intentionally run alongside them.
 
@@ -144,7 +146,7 @@ python3 docs/benchmarks/20260913/run_timed.py \
   -w "$PWD" -e HF_HUB_CACHE="$HOME/.cache/huggingface/hub" -e HF_HUB_OFFLINE=1 \
   --entrypoint /opt/venv/bin/python \
   docker.io/kyuz0/amd-strix-halo-comfyui@sha256:384aa1fecef6a841832e0d5552949977330308d8c25e212a94f5e8dfcc061cae \
-  scripts/comfy_dump.py --prompt-file docs/prompts/floating_glacier.txt \
+  scripts/comfy_dump.py --comfy /opt/ComfyUI --prompt-file docs/prompts/floating_glacier.txt \
   --width 864 --height 480 --length 124 --steps 20 --seed 1618 \
   --out build/showcase-20260913/comfy_floating_glacier \
   --video-out build/showcase-20260913/comfy_floating_glacier/video.mp4

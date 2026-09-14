@@ -129,7 +129,8 @@ At 768p, h3 completed 20 evaluations; ComfyUI was intentionally stopped after fo
 so the steady medians use **19 h3 observations and 3 ComfyUI observations**.
 At 480p, both completed 20 evaluations. These are observations within one trajectory
 per engine, not independent repeated runs or identical output images. h3 uses int8
-products and QK attention; ComfyUI uses bf16 compute on the same quantized weights.
+products and QK attention; ComfyUI uses quantized linear kernels with BF16
+activations and default BF16 PyTorch attention on the same checkpoints.
 
 | Resolution | Engine | Sampled peak GPU residency | Sampled peak process PSS | Observed scope |
 | --- | --- | ---: | ---: | --- |

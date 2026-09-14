@@ -5,7 +5,9 @@ This comparison increases the [480p workload](../20260913/README.md) to
 [floating-glacier prompt](../../prompts/floating_glacier.txt), and seed 1618.
 Both engines use the same Comfy-Org int8 ConvRot checkpoints in the standard
 Hugging Face Hub cache. h3 uses int8 products and default int8 QK attention;
-ComfyUI uses bf16 compute on those quantized weights.
+ComfyUI uses quantized linear kernels with BF16 activations and default BF16
+PyTorch attention. The reported BF16 inference dtype does not describe every
+matrix product's arithmetic.
 
 The engines run sequentially on AMD Strix Halo (`gfx1151`), with 128 GB unified
 memory. Versions, checkpoint hashes, and the shared encoder are recorded in
@@ -58,7 +60,7 @@ with h3's measured **37 min 33 s**, that is **about 6.9× faster overall**.
 
 The [September 6 measurement in Git history](https://github.com/zacharydenton/h3-hrx/blob/52827db9f05ca0b6012dfeb05f535abc0d4f9c81/docs/notes.md#head-to-head-with-comfyui-at-768-2026-09-06)
 recorded ComfyUI evaluations of 772.7, 772.4, and 768.8 seconds at the same
-1344×768 / 124-frame shape, using the same ComfyUI revision and bf16 compute.
+1344×768 / 124-frame shape, using the same ComfyUI revision and BF16 attention.
 That run used Euler and a different prompt, without decoding; it corroborates
 the current 772.422-second median.
 

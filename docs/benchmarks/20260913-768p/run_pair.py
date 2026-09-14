@@ -35,6 +35,7 @@ comfy = wrapper + [
     '-e', f'HF_HUB_CACHE={cache}', '-e', 'HF_HUB_OFFLINE=1',
     '-e', f'PATH={bin_dir}:/opt/venv/bin:/usr/local/bin:/usr/bin',
     '--entrypoint', '/opt/venv/bin/python', image, 'scripts/comfy_dump.py',
+    '--comfy', '/opt/ComfyUI',
     '--prompt-file', prompt, '--width', '1344', '--height', '768', '--length', '124',
     '--steps', '20', '--seed', '1618', '--out', str(out / f'comfy_{case}'),
     '--video-out', str(out / f'comfy_{case}/video.mp4'),

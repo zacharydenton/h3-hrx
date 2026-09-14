@@ -37,7 +37,8 @@ For 864×480, 124 frames and 20 evaluations, h3-hrx's steady median was **28.1 s
 evaluation**, versus **85.5 s** for ComfyUI: **3.04× faster denoising**. This uses the
 same prompt and Comfy-Org quantized checkpoints, with one trajectory per engine
 and the first evaluation excluded. h3 computes int8 products with default int8 QK
-attention; ComfyUI dequantizes the weights for bf16 compute.
+attention; ComfyUI uses quantized linear kernels with BF16 activations and
+default BF16 PyTorch attention.
 
 Sampled peak GPU-resident buffers were **51.74 GiB for h3-hrx** and **25.45 GiB for
 ComfyUI**. Process PSS peaks were **1.32 GiB** and **23.12 GiB**, respectively.
@@ -94,9 +95,9 @@ denoising evaluation:
 
 In the recorded 20-evaluation trajectory, relative error was about 0.01 after
 five evaluations and final latent cosine about 0.90. This is numerical
-agreement, not identical clips: ComfyUI dequantizes weights to bf16, while
-this implementation uses int8 products with int32 accumulation and stored
-row scales. Small rounding differences grow through the sampling trajectory.
+agreement, not identical clips. The implementations differ in attention
+precision, quantization details, and floating-point operation order. Small
+rounding differences grow through the sampling trajectory.
 
 Encoder comparisons recorded audio cosine 1.0000000, vision 0.99996, and video
 0.9994 against ComfyUI; the text encoder reached 1.0000 after 50 layers against
