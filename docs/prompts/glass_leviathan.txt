@@ -1,0 +1,7 @@
+For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
+
+integrated_multimodal_description: [Shot 1] Live-action, cinematic, a continuous aerial tracking shot alongside the immense alien creature in the reference image as it glides slowly over the Norwegian fjord. Preserve its pearlescent armored torso, three amber eyes, branching sensory tendrils, and broad translucent membrane-wings. Slow traveling waves pass along the thin veined membranes, bending them gently as sunlight shines through their amber edges. The body remains steady and the head turns slightly toward the water. Long trailing tendrils flex in the breeze, shedding a few droplets. Far below, the small red fishing boat moves forward and leaves a narrow wake across the reflection. The camera tracks alongside with small amplitude at slow speed, keeping the creature's head in frame as the distant mountain walls move in gentle parallax. Low mist drifts between the cliffs. Maintain the reference image's natural dawn lighting, fine wet surface detail, believable scale, and photographic exposure throughout the uninterrupted five-second shot.
+
+overall_soundscape: A deep resonant call rolls across the fjord, accompanied by the soft rustle of the creature's membranes in the wind. The distant fishing boat engine hums beneath quiet water and the occasional falling droplet.
+
+non_diegetic_music: A quiet low cello and a delicate glass-harmonica tone slowly open into a spacious string chord, leaving the natural sounds clear.

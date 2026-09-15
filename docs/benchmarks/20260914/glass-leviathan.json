@@ -1,0 +1,92 @@
+{
+  "case": "glass_leviathan",
+  "engine": "h3",
+  "wall_seconds": 2397.560613682,
+  "evaluations": 20,
+  "evaluation_seconds": [
+    105.8,
+    107.7,
+    110.6,
+    110.4,
+    110.5,
+    110.4,
+    110.5,
+    110.4,
+    110.5,
+    110.5,
+    110.4,
+    110.5,
+    110.5,
+    110.4,
+    110.4,
+    110.4,
+    110.4,
+    110.5,
+    110.5,
+    110.4
+  ],
+  "steady_median_seconds": 110.4,
+  "steady_range_seconds": [
+    107.7,
+    110.6
+  ],
+  "stages_seconds": {
+    "session": 0.2,
+    "preparation": 118.9,
+    "sampling": 2201.7,
+    "decode": 74.6,
+    "other_process_time": 2.1606136820005304
+  },
+  "prompt_tokens": 1329,
+  "memory": {
+    "sampled_peak_process_rss_bytes": 4156616704,
+    "sampled_peak_process_pss_bytes": 4151881728,
+    "sampled_peak_drm_resident_bytes": 62966812672,
+    "sampled_peak_drm_allocated_bytes": 62966824960,
+    "minimum_system_available_bytes": 62825594880,
+    "peak_drop_in_system_available_bytes": 65114968064
+  },
+  "output": {
+    "width": 1344,
+    "height": 768,
+    "frames": 124,
+    "video_codec": "h264",
+    "audio_codec": "aac",
+    "duration_seconds": 5.166667
+  },
+  "provenance": {
+    "mode": "image-to-video",
+    "h3_commit": "58b1ba3f7a82d1fb0ac5783d4fbab8e2de4cf60f",
+    "first_frame_generator": "Built-in OpenAI image-generation tool",
+    "first_frame_dimensions": [
+      1659,
+      948
+    ],
+    "first_frame_edited": false,
+    "input_sha256": {
+      "docs/media/showcase/glass_leviathan_keyframe.png": "85e666e7f5a35c2d758ab0dd868bfacf2a36bb02e204b8fdeba472e9e02f2692",
+      "docs/prompts/glass_leviathan_keyframe.txt": "a203f10d2625172718e96731c4331c574af8991adc79e6e9d48c6288dd81cace",
+      "docs/prompts/glass_leviathan.txt": "5ccb4acb674c0cd2a07018af88030e7ab201fbab2df83dbccb467be0aa52d2fd",
+      "target/release/h3": "dd34643ec2ff4fba54a440e86e06ba8018809f8b437965a10d626481c4306069"
+    },
+    "recorded_utc": "2026-09-15T00:18:38.389703+00:00",
+    "note": "Separate post-reboot showcase render. Not part of the text-to-video ComfyUI comparison. No intrusive profiler enabled."
+  },
+  "audio": {
+    "sample_rate": 32000,
+    "channels": 2,
+    "duration_seconds": 5.175,
+    "peak_absolute": 0.279754638671875,
+    "rms": 0.05742756217654288,
+    "near_full_scale_samples": 0
+  },
+  "artifact": {
+    "path": "docs/media/showcase/glass-leviathan.mp4",
+    "sha256": "2664221ef39c3d137341ac66603eea6231b70456bbd67c9c70b0e5ce5f0f1c4d"
+  },
+  "validation": {
+    "full_video_audio_decode": "Passed FFmpeg -xerror decoding both streams to null",
+    "visual_review": "25 sampled frames across the clip plus full-resolution start/end samples preserve creature identity, lighting and composition; restrained membrane and tendril motion. No obvious abrupt shape changes in reviewed samples.",
+    "latent_check": "Not collected for this showcase render."
+  }
+}

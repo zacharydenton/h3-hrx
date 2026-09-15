@@ -138,6 +138,25 @@ These two prompts used 81.7 s and 106.4 s of preparation before sampling, versus
 encoding, and any required compilation. These individual runs do not isolate
 the cause of that variation; their full process times include it.
 
+### September 15 follow-up: Glass Leviathan
+
+[Glass Leviathan](../../media/showcase/glass-leviathan.mp4) completed in
+**39 min 58 s**, using h3 to animate an OpenAI-generated first frame at 1344×768,
+124 frames, and 20 evaluations. Its steady median was **110.4 s**; preparation
+was **118.9 s**, sampling **2201.7 s**, and decoding **74.6 s**. This is a separate
+image-to-video showcase, with no matched ComfyUI run; it does not enter the
+text-to-video speedup calculations above.
+
+Sampled peaks were **58.64 GiB GPU residency** and **3.87 GiB process PSS**;
+the maximum drop in system available RAM was **60.64 GiB**. These memory views
+overlap and must not be added. No swap was used or memory guard triggered.
+The MP4 decodes completely, and its stereo WAV has no near-full-scale samples.
+A review of 25 sampled frames preserves the creature's armor, translucent wings,
+and lighting, with restrained motion and no obvious abrupt shape changes.
+
+[Original first frame, both prompts, and command](../../showcase.md#glass-leviathan--768p) ·
+[Measurements and provenance](glass-leviathan.json) · [Render log](raw/glass_leviathan.log).
+
 ## Memory measurement
 
 The wrapper samples the process tree and AMD DRM clients with a one-second

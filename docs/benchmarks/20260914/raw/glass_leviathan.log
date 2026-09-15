@@ -1,0 +1,7 @@
+124 frames at 1344x768: 37x48x84 latents, 207 audio latents; 1329 prompt tokens (1 keyframe, 0 reference images, 0 reference audio)
+session in 0.2 s (minimax_h3_fl2va_pruned_int8_convrot.safetensors, i8 attention)
+  step 1/20  105.8 s  step 2/20  213.5 s  step 3/20  324.1 s  step 4/20  434.5 s  step 5/20  545.0 s  step 6/20  655.4 s  step 7/20  765.9 s  step 8/20  876.3 s  step 9/20  986.8 s  step 10/20  1097.3 s  step 11/20  1207.7 s  step 12/20  1318.2 s  step 13/20  1428.7 s  step 14/20  1539.1 s  step 15/20  1649.5 s  step 16/20  1759.9 s  step 17/20  1870.3 s  step 18/20  1980.8 s  step 19/20  2091.3 s  step 20/20  2201.7 s
+denoised in 2320.6 s
+decoded in 74.6 s
+wrote build/benchmark-20260914/bonus/glass_leviathan.mp4 (124 frames, 1344x768, 5.17 s) and build/benchmark-20260914/bonus/glass_leviathan.wav
+build/benchmark-20260914/bonus/glass_leviathan.mp4
