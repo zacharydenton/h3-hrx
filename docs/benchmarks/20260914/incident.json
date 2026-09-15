@@ -1,0 +1,36 @@
+{
+  "affected_job": "comfy_kitchen_profile_alien_fjord",
+  "profiling_enabled": true,
+  "completed_evaluations": 1,
+  "requested_evaluations": 2,
+  "last_telemetry_file_mtime": "2026-09-14T23:37:43.964610+02:00",
+  "previous_journal_ends": "2026-09-14T23:36:45.618440+02:00",
+  "next_boot_local": "2026-09-15T01:51:59+02:00",
+  "user_report": "Machine required a power cycle.",
+  "last_complete_sample": {
+    "elapsed_seconds": 258.4989830299746,
+    "available_system_gib": 79.46566772460938,
+    "gpu_busy_percent": 100,
+    "temperature_C": 74.0
+  },
+  "evidence_limits": "No OOM, kernel panic, GPU reset/timeout, or orderly shutdown entry was found in the retained journal for the incident window. The final telemetry line is incomplete. A profiler/HIP interaction is a hypothesis, not a proven cause.",
+  "scope": "Separate intrusive diagnostic. Both full ComfyUI renders and all four full h3 renders completed successfully before this incident. Their results remain separate from this failed diagnostic.",
+  "remaining_render": "glass_leviathan image-to-video had not started; its waiting process was lost in the power cycle.",
+  "persistent_crash_dump": "No files in /sys/fs/pstore after reboot.",
+  "post_boot_evidence": "The new boot reports an unclean system-journal shutdown and an uncleanly unmounted EFI FAT volume, consistent with the reported power cycle.",
+  "sampled_temperature_comparison_C": {
+    "failed_comfy_profile": {
+      "median": 90,
+      "max": 98
+    },
+    "completed_comfy_kitchen": {
+      "median": 86,
+      "max": 98
+    },
+    "completed_h3_f16": {
+      "median": 84.5,
+      "max": 101
+    }
+  },
+  "completed_video_integrity": "All six curated MP4 SHA-256 hashes rechecked successfully after the power cycle."
+}

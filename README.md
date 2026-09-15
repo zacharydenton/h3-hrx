@@ -8,9 +8,9 @@ through [HRX](https://github.com/zacharydenton/hrx-rs). Load Comfy-Org quantized
 checkpoints from the standard Hugging Face cache and generate video with sound
 from text, a first frame, or image and audio references.
 
-**7.48× faster steady denoising than ComfyUI at 768p**, and **3.04× at 480p**,
-in measured Strix Halo comparisons. A five-second 768p clip takes **37 min 33 s**
-with h3, versus **roughly 4 h 20 min with ComfyUI** at 20 evaluations.
+Generate a five-second 768p clip with sound in **35 min 59 s** on Strix Halo.
+In complete runs, h3 was **6.78× faster than default ComfyUI** and **1.21× faster
+than ComfyUI with its built-in Comfy Kitchen INT8 attention** at 20 evaluations.
 [Timings and memory](#performance).
 
 The inference pipeline needs no Python, PyTorch, Triton, or vendor math libraries.
@@ -20,9 +20,10 @@ and runtime on first GPU use; the CLI embeds the Loom kernel sources and tokeniz
 **Experimental:** tested on Linux with AMD Strix Halo (`gfx1151`)
 and 128 GB of unified memory. Other GPUs and memory configurations are unvalidated.
 
-https://github.com/user-attachments/assets/d6863dea-e655-4ced-81a3-1c96a63a6c06
+[![An enormous alien creature gliding above a Norwegian fjord](docs/media/benchmarks/20260914/h3-i8.jpg)](docs/media/benchmarks/20260914/h3-i8.mp4)
 
-[Showcase](docs/showcase.md) · [Demo prompt](docs/prompts/alpine_whale.txt) · [Setup](docs/setup.md) ·
+[Watch the 768p alien](docs/media/benchmarks/20260914/h3-i8.mp4) ·
+[Showcase](docs/showcase.md) · [Demo prompt](docs/prompts/alien_fjord.txt) · [Setup](docs/setup.md) ·
 [Prompt guide](docs/prompting.md) · [Performance](docs/performance.md) ·
 [Rust and Elixir clients](clients/README.md)
 
@@ -54,16 +55,16 @@ Ensure Cargo's binary directory (normally `~/.cargo/bin`) is on your `PATH`.
 Start with the included [structured prompt](docs/prompting.md):
 
 ```sh
-h3 --width 864 --height 480 --frames 124 --steps 21 --seed 2718 \
-  --out clip.mp4 < docs/prompts/alpine_whale.txt
+h3 --width 1344 --height 768 --frames 124 --steps 21 --seed 1618 \
+  --out clip.mp4 < docs/prompts/alien_fjord.txt
 ```
 
 This writes `clip.mp4` and `clip.wav`. The first run downloads missing checkpoints
 and the pinned HRX native bundle, and compiles kernels for the requested shape.
-`--steps 21` means 20 model evaluations. The measured 480p workload completed
-in **12 minutes 12 seconds** with checkpoints already cached, including loading,
+`--steps 21` means 20 model evaluations. This measured 768p workload completed
+in **35 minutes 59 seconds** with checkpoints already cached, including loading,
 text encoding, sampling, decoding, and output encoding. First-run downloads and
-compilation can take longer; see the [benchmark conditions](docs/benchmarks/20260913/README.md).
+compilation can take longer; see the [benchmark conditions](docs/benchmarks/20260914/README.md).
 
 ### Weights
 
@@ -112,40 +113,40 @@ See [other modes](docs/tricks.md) for audio-only output and still images.
 
 ## Performance
 
-For a 124-frame 768p clip at 20 evaluations, h3 produces MP4/WAV output in
-**37 min 33 s**, versus **roughly 4 h 20 min for ComfyUI**—about **6.9× faster
-overall**. [Calculation and benchmark details](docs/benchmarks/20260913-768p/README.md#end-to-end-timing).
+Complete native runs on AMD Strix Halo with 128 GB unified memory, using the
+same alien-fjord prompt, Comfy-Org quantized checkpoints, **1344×768**, **124
+frames**, and **20 evaluations**. End-to-end time includes loading, conditioning,
+sampling, video/audio decoding, and completed MP4/WAV output.
 
-Measured on AMD Strix Halo with 128 GB unified memory, using the same prompt,
-124 frames, and Comfy-Org int8 ConvRot checkpoints. The table reports medians per
-denoising evaluation, excluding each engine's first evaluation.
-
-| Resolution | h3-hrx (Loom / HRX) | ComfyUI | Observed speedup |
+| Configuration | End to end | Steady median/evaluation | h3 end-to-end speedup |
 | --- | ---: | ---: | ---: |
-| 1344×768 | **103.2 s** | 772.4 s | **7.48×** |
-| 864×480 | **28.1 s** | 85.5 s | **3.04×** |
+| **h3-hrx · Loom / HRX** | **35 min 59 s** | **103.9 s** | — |
+| ComfyUI · default PyTorch BF16 attention | 4 h 3 min 53 s | 721.3 s | **6.78×** |
+| ComfyUI · built-in Comfy Kitchen INT8 attention | 43 min 33 s | 121.7 s | **1.21×** |
 
-At 768p, h3 completed 20 evaluations; ComfyUI was intentionally stopped after four,
-so the steady medians use **19 h3 observations and 3 ComfyUI observations**.
-At 480p, both completed 20 evaluations. These are observations within one trajectory
-per engine, not independent repeated runs or identical output images. h3 uses int8
-products and QK attention; ComfyUI uses quantized linear kernels with BF16
-activations and default BF16 PyTorch attention on the same checkpoints.
+Comfy Kitchen is selectable through ComfyUI's **Model Attention Backend** node;
+it needs no custom node or source patch. It removes most of the default
+attention bottleneck. h3 still saves **7 min 35 s** per clip against that
+configuration and runs without the Python/PyTorch stack. Both engines already
+use INT8 linear kernels for these checkpoints; attention implementations differ.
 
-| Resolution | Engine | Sampled peak GPU residency | Sampled peak process PSS | Observed scope |
-| --- | --- | ---: | ---: | --- |
-| 768p | h3-hrx | 56.51 GiB | 2.48 GiB | Full generation |
-| 768p | ComfyUI | 26.19 GiB | 25.23 GiB | Loading and sampling |
-| 480p | h3-hrx | 51.74 GiB | 1.32 GiB | Full generation |
-| 480p | ComfyUI | 25.45 GiB | 23.12 GiB | Through decoding |
+| Configuration | Sampled peak GPU residency | Sampled peak process PSS |
+| --- | ---: | ---: |
+| h3-hrx | 56.63 GiB | 2.70 GiB |
+| ComfyUI · default attention | 26.64 GiB | 26.45 GiB |
+| ComfyUI · Kitchen attention | 26.64 GiB | 26.06 GiB |
 
-PSS and GPU residency overlap on unified memory: **do not add them or interpret
-PSS alone as total RAM usage**. Sampling intervals were one second at 768p and
-five seconds at 480p. ComfyUI's 768p measurements exclude decoding and export,
-so they are not full-pipeline memory peaks.
+These peaks cover complete pipelines. GPU residency and PSS overlap on unified
+memory and **must not be added**. h3 retains its models across stages; the ComfyUI
+runner unloads them between conditioning, sampling, and decoding. Reducing h3's
+peak memory is a concrete improvement opportunity.
 
-See the [768p report, video, and memory plot](docs/benchmarks/20260913-768p/README.md),
-[480p report](docs/benchmarks/20260913/README.md), and
+Each configuration has one complete trajectory, with cached checkpoints and
+sequential execution. Steady medians exclude the first evaluation. Equal seeds
+across engines do not produce identical initial noise or clips.
+
+See the [full 768p evaluation and comparison videos](docs/benchmarks/20260914/README.md),
+[historical 480p measurements](docs/benchmarks/20260913/README.md), and
 [performance and numerical validation](docs/performance.md).
 
 ## Library and development

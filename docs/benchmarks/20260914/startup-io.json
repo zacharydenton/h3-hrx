@@ -1,0 +1,34 @@
+{
+  "run": "h3_profile_alien_fjord",
+  "samples": [
+    {
+      "utc": "2026-09-14T21:27:44.874892+00:00",
+      "pid": 2133983,
+      "io": {
+        "rchar": 82328305,
+        "wchar": 452,
+        "syscr": 8632,
+        "syscw": 130,
+        "read_bytes": 30991269888,
+        "write_bytes": 4096,
+        "cancelled_write_bytes": 0
+      },
+      "elapsed_seconds": 80.323657
+    },
+    {
+      "utc": "2026-09-14T21:28:26.512112+00:00",
+      "pid": 2133983,
+      "io": {
+        "rchar": 82505829,
+        "wchar": 516,
+        "syscr": 8728,
+        "syscw": 194,
+        "read_bytes": 39842607104,
+        "write_bytes": 4096,
+        "cancelled_write_bytes": 0
+      },
+      "elapsed_seconds": 121.960877
+    }
+  ],
+  "scope": "Linux /proc/PID/io snapshots during the separate diagnostic run. read_bytes counts storage I/O attributed to this process; these were not collected in the full comparison runs."
+}

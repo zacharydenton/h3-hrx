@@ -1,0 +1,8 @@
+124 frames at 1344x768: 37x48x84 latents, 207 audio latents; 309 prompt tokens (0 keyframe, 0 reference images, 0 reference audio)
+session in 0.2 s (minimax_h3_fl2va_pruned_int8_convrot.safetensors, i8 attention)
+  step 1/20   99.8 s  step 2/20  201.2 s  step 3/20  304.9 s  step 4/20  408.7 s  step 5/20  512.3 s  step 6/20  615.9 s  step 7/20  719.5 s  step 8/20  823.1 s  step 9/20  926.6 s  step 10/20  1030.2 s  step 11/20  1133.8 s  step 12/20  1237.5 s  step 13/20  1341.1 s  step 14/20  1444.7 s  step 15/20  1548.3 s  step 16/20  1651.7 s  step 17/20  1755.2 s  step 18/20  1858.7 s  step 19/20  1962.2 s  step 20/20  2065.7 s
+denoised in 2172.1 s
+wrote /home/zach/code/h3-hrx/build/benchmark-20260914/raw/midnight_tram.video.f32 and /home/zach/code/h3-hrx/build/benchmark-20260914/raw/midnight_tram.audio.f32
+decoded in 75.8 s
+wrote /home/zach/code/h3-hrx/build/benchmark-20260914/raw/midnight_tram.mp4 (124 frames, 1344x768, 5.17 s) and /home/zach/code/h3-hrx/build/benchmark-20260914/raw/midnight_tram.wav
+/home/zach/code/h3-hrx/build/benchmark-20260914/raw/midnight_tram.mp4

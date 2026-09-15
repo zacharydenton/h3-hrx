@@ -1,0 +1,18 @@
+{
+  "observed_utc": "2026-09-14T20:33:18.634729+00:00",
+  "cpu": {
+    "Architecture": "x86_64",
+    "CPU(s)": "32",
+    "Model name": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+    "Thread(s) per core": "2",
+    "Core(s) per socket": "16",
+    "Socket(s)": "1"
+  },
+  "cpu_scaling_governor": "powersave",
+  "gpu_power_and_clocks": {
+    "/sys/class/drm/card1/device/power_dpm_force_performance_level": "auto",
+    "/sys/class/drm/card1/device/pp_dpm_sclk": "0: 600Mhz \n1: 2872Mhz *\n2: 2900Mhz",
+    "/sys/class/drm/card1/device/pp_dpm_mclk": "0: 400Mhz \n1: 800Mhz \n2: 1000Mhz *"
+  },
+  "scope": "Configuration snapshot during the h3 F16 run; instantaneous clock markers are not a time series or fixed-clock claim."
+}

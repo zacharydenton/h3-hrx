@@ -1,0 +1,25 @@
+conditioning in 23.6 s
+  step 1/20  124.4 s
+  step 2/20  121.6 s
+  step 3/20  121.7 s
+  step 4/20  121.7 s
+  step 5/20  121.6 s
+  step 6/20  122.1 s
+  step 7/20  121.7 s
+  step 8/20  121.6 s
+  step 9/20  121.6 s
+  step 10/20  121.7 s
+  step 11/20  121.7 s
+  step 12/20  121.6 s
+  step 13/20  121.8 s
+  step 14/20  121.6 s
+  step 15/20  121.7 s
+  step 16/20  121.8 s
+  step 17/20  121.7 s
+  step 18/20  121.6 s
+  step 19/20  121.7 s
+  step 20/20  121.6 s
+sampled 20 evaluations (res_multistep, simple) in 2436.5 s
+frames (124, 768, 1344, 3)
+audio (2, 165600) 32000
+done

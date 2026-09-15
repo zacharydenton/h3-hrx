@@ -1,0 +1,8 @@
+124 frames at 1344x768: 37x48x84 latents, 207 audio latents; 349 prompt tokens (0 keyframe, 0 reference images, 0 reference audio)
+session in 0.2 s (minimax_h3_fl2va_pruned_int8_convrot.safetensors, i8 attention)
+  step 1/20   99.4 s  step 2/20  200.4 s  step 3/20  303.6 s  step 4/20  406.6 s  step 5/20  509.6 s  step 6/20  612.6 s  step 7/20  715.6 s  step 8/20  818.7 s  step 9/20  921.8 s  step 10/20  1024.8 s  step 11/20  1127.8 s  step 12/20  1230.8 s  step 13/20  1333.9 s  step 14/20  1436.9 s  step 15/20  1539.9 s  step 16/20  1642.9 s  step 17/20  1745.8 s  step 18/20  1848.7 s  step 19/20  1951.6 s  step 20/20  2054.4 s
+denoised in 2136.1 s
+wrote /home/zach/code/h3-hrx/build/benchmark-20260914/raw/tidal_sky.video.f32 and /home/zach/code/h3-hrx/build/benchmark-20260914/raw/tidal_sky.audio.f32
+decoded in 74.5 s
+wrote /home/zach/code/h3-hrx/build/benchmark-20260914/raw/tidal_sky.mp4 (124 frames, 1344x768, 5.17 s) and /home/zach/code/h3-hrx/build/benchmark-20260914/raw/tidal_sky.wav
+/home/zach/code/h3-hrx/build/benchmark-20260914/raw/tidal_sky.mp4

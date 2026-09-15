@@ -1,0 +1,10 @@
+124 frames at 1344x768: 37x48x84 latents, 207 audio latents; 338 prompt tokens (0 keyframe, 0 reference images, 0 reference audio)
+session in 0.2 s (minimax_h3_fl2va_pruned_int8_convrot.safetensors, i8 attention)
+  step 1/2   99.2 s  step 2/2  199.5 s
+denoised in 300.6 s
+  denoise stages (200.1 s:  attention 117.02s  gemm ff + swiglu 27.42s  gemm qkv 20.71s  gemm down + residual 14.19s  gemm out + residual 6.92s  attention operands 5.56s)
+wrote /home/zach/code/h3-hrx/build/benchmark-20260914/raw/h3_profile_alien_fjord.video.f32 and /home/zach/code/h3-hrx/build/benchmark-20260914/raw/h3_profile_alien_fjord.audio.f32
+decoded in 73.5 s
+  decode stages (57.0 s:  gemm ff + swiglu 23.31s  gemm down + residual 11.05s  gemm qkv + rope 9.97s  attention 7.00s  gemm out + residual 3.61s  prepare norm 0.91s)
+wrote /home/zach/code/h3-hrx/build/benchmark-20260914/raw/h3_profile_alien_fjord.mp4 (124 frames, 1344x768, 5.17 s) and /home/zach/code/h3-hrx/build/benchmark-20260914/raw/h3_profile_alien_fjord.wav
+/home/zach/code/h3-hrx/build/benchmark-20260914/raw/h3_profile_alien_fjord.mp4

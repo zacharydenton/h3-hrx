@@ -1,0 +1,23 @@
+{
+  "source_sha256": {
+    "comfy/ops.py": "6058f688d936b083c49fa49a57964837476db6d95750ea70198ad60e884ffed0",
+    "comfy/model_management.py": "ef3f3af0657c1b022ad69b25928fa52dd429db9aed9cb688e89c7fbe68ab50cd",
+    "comfy/quant_ops.py": "196e45349f46e5ca69f6b2251bbe01d4f8eb5d26f8ad38d62b1c002d80fb2089",
+    "comfy_kitchen/tensor/int8.py": "df5fea37f408a224060c7d89d5a074e4c59eda4937020fcc5693c465934cb3a0",
+    "comfy_kitchen/backends/hip/__init__.py": "6c7c9baf8c05358b6684283568cc6af0f9b04005c34776cc57b8da88574f46e6",
+    "comfy_kitchen/sage_attention.py": "a23058daecae103dfe0a0e50478edb7fd179db6d6be645c234c8c25e7163ca0c"
+  },
+  "finding": "Current ComfyUI defaults enable INT8 ConvRot linear dispatch on this GPU. BF16 inference dtype does not mean all GEMMs use BF16. Verify runtime operation mix with the separately queued profiler.",
+  "diffusion_quantization_configs": {
+    "{\"convrot\": true, \"convrot_groupsize\": 256, \"format\": \"int8_tensorwise\"}": 200
+  },
+  "video_vae_dtype_source_audit": {
+    "comfy_commit": "b00584967778871f329c2d31190a5e9b767b8366",
+    "selection": "torch.float16 under the recorded ROCm device and default CLI arguments",
+    "evidence": [
+      "comfy/sd.py MiniMax H3 video VAE allows [torch.float16, torch.float32]",
+      "comfy/model_management.py vae_dtype selects the first supported working dtype; should_use_fp16 returns True for torch.version.hip with no force-FP32 setting"
+    ],
+    "scope": "Source-derived VAE working dtype; this does not imply every internal operation or accumulation uses FP16."
+  }
+}

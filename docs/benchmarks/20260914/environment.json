@@ -1,0 +1,67 @@
+{
+  "checkpoint_sha256": {
+    "vae/minimax_h3_audio_vae_fp32.safetensors": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48",
+    "vae/minimax_h3_video_vae_fp16.safetensors": "7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522",
+    "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors": "9255f52b6677845ad238f20dfaafa94727053694127ab7f255c048f0f9365779",
+    "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors": "e889202c41dafb67b10d67b97f0d8541508036a6090af23425a5c2615d03c47a",
+    "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors": "bc2ced0fbea64757fa9acddccfc0b3f4819d1dcf1da6c124d690d368be283923"
+  },
+  "hrx_crate_version": "0.4.0",
+  "hrx_bundle_manifest_sha256": "9a8fef4d930620dd1db1d0881ed1d5da1b5726e70f9d80710ed15d8691203285",
+  "hrx_bundle": {
+    "schema": 1,
+    "target": "x86_64-unknown-linux-gnu-gfx1151",
+    "revision": "HRX ecaaf7376f7d + eight patches (interop ABI 1); TheRock 26672984641; Ubuntu 26.04",
+    "url": "https://github.com/zacharydenton/hrx-rs/releases/download/native-20260910-gpu-npu/hrx-linux-x86_64-gfx1151.tar.gz",
+    "archive_sha256": "b439d533ec0a95651198687fbf14eaafd7831ca670b052b87aedcf3a185c4ed0"
+  },
+  "h3_commit": "4e4eb2fd15e32a73fd0129778af131111dd1e6c2",
+  "comfy_commit": "b00584967778871f329c2d31190a5e9b767b8366",
+  "platform": "Linux-7.2.4-arch1-2-x86_64-with-glibc2.44",
+  "width": 1344,
+  "height": 768,
+  "frames": 124,
+  "fps": 24,
+  "evaluations": 20,
+  "seed": 1618,
+  "prompt": "docs/prompts/alien_fjord.txt",
+  "comfy_python": "/home/zach/code/ComfyUI/.venv-rocm/bin/python",
+  "torch": "2.14.0",
+  "hip": "7.2.53211",
+  "dynamic_vram": false,
+  "ffmpeg": "ffmpeg version n9.0.1 Copyright (c) 2000-2026 the FFmpeg developers",
+  "ffmpeg_sha256": "2e37495139c8cee4711b7e1475dac11ce54633431c4a025b7b70fa2e6d7ca3c3",
+  "h3_binary_sha256": "dd34643ec2ff4fba54a440e86e06ba8018809f8b437965a10d626481c4306069",
+  "memory_sampling_interval_seconds": 1,
+  "minimum_starting_available_gib": 80,
+  "abort_available_gib": 12,
+  "measurement_script_sha256": {
+    "scripts/comfy_dump.py": "8b286a1daa552ac7323bfe6040cfe16846499b793786f377cb23b33d8badecf7",
+    "docs/benchmarks/20260914/run_day.py": "82a0db94e3f677996ea9ccf738a442d9b483f052c21863134cdd94225d1bca0c",
+    "docs/benchmarks/20260913/run_timed.py": "6f596258693646548c02e59f05602e650c49461557e5c92911ea70fab52056ce",
+    "docs/benchmarks/20260913/memory.py": "715bae710813cede601f47b7ae6992a2dc88d2f7ff467e1e224bf5ea64515235"
+  },
+  "runtime_overrides": {
+    "ROCM_PATH": "/opt/rocm"
+  },
+  "distribution_packages": {
+    "python-pytorch-opt-rocm": "2.14.0-1",
+    "python-torchvision": "0.29.0-1",
+    "rocm-core": "7.2.4-1",
+    "hip-runtime-amd": "7.2.4-1"
+  },
+  "python_overlay_index": "https://rocm.nightlies.amd.com/v2/gfx1151/",
+  "concurrent_validation_note": {
+    "run": "comfy_alien_fjord",
+    "elapsed_seconds": [
+      1856.24,
+      1860.61
+    ],
+    "process_pid": 1853933,
+    "activity": "CPU-only ComfyUI workflow schema validation; library initialization opened a HIP context. No model weights loaded or generation executed."
+  },
+  "measurement_script_archive": {
+    "docs/benchmarks/20260914/run_day.py": "raw/run_day.measured.py.txt"
+  },
+  "runner_update": "The current runner defaults to the six full renders. The exact original runner, which also queued intrusive profiles, is archived with the recorded SHA-256."
+}

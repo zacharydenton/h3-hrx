@@ -4,32 +4,59 @@ The current comparison measures h3-hrx and ComfyUI on AMD Strix Halo (`gfx1151`)
 with 128 GB unified memory. Timings depend on sequence length, prompt, cache state,
 and competing CPU/GPU work on the APU.
 
-## September 2026: 768p
+## September 14: complete native 768p comparison
 
-At 1344×768 and 124 frames, h3-hrx's steady median was **103.2 seconds per
-evaluation**, versus **772.4 seconds** for ComfyUI: **7.48× faster denoising**.
-h3 completed the 20-evaluation schedule; ComfyUI was intentionally stopped during
-evaluation five. Excluding the first evaluation gives 19 h3 observations and
-3 ComfyUI observations. Their ranges were 99.8–103.4 s and 770.8–775.6 s.
-This is an observed within-run difference, not a statistical-significance claim.
+At 1344×768, 124 frames, and 20 evaluations, h3 completed video and audio output
+in **35 min 59 s**. Updated native ComfyUI took **4 h 3 min 53 s** with default
+PyTorch BF16 attention, or **43 min 33 s** with its built-in Comfy Kitchen INT8
+attention. The measured end-to-end advantages are **6.78×** and **1.21×**,
+respectively. Comfy Kitchen needs no custom node or source patch.
 
-h3's full MP4/WAV output took **37 min 33 s**. ComfyUI takes **roughly 4 h 20 min**
-for the same dimensions and 20-evaluation schedule, making h3 **about 6.9× faster
-overall**. The ComfyUI total combines observed sampling with overhead from the
-earlier benchmark; the [calculation](benchmarks/20260913-768p/README.md#end-to-end-timing)
-records the inputs and scaling. The intended output encoder was the same validated
-FFmpeg binary in both environments.
+Steady medians per evaluation were **103.9 s** for h3, **721.3 s** for default
+ComfyUI, and **121.7 s** for Comfy Kitchen. Both engines already use INT8 linear
+kernels for these quantized checkpoints. The large default-backend gap is mainly
+an attention issue, rather than evidence that only h3 computes INT8 products.
+A representative attention microbenchmark also finds a major PyTorch slowdown
+with the model's strided QKV layout; the complete Kitchen run demonstrates how
+much an available attention replacement changes the practical comparison.
 
-One-second memory samples found peaks of **56.51 GiB GPU residency / 2.48 GiB
-process PSS for h3**, and **26.19 GiB / 25.23 GiB for ComfyUI**. These overlapping
-memory views must not be added. h3's peaks cover the full pipeline; ComfyUI's
-cover loading and observed sampling only, including the interrupted fifth
-evaluation. They do not establish ComfyUI's full-pipeline peak at 768p.
+h3 decoded video/audio in **75.2 s**, versus **147.5 s** for the Kitchen run.
+This is a useful remaining advantage beyond sampling. Startup and conditioning
+also contribute to full process time, and vary with filesystem/cache state.
 
-See the [768p report, video, raw data, and memory timeline](benchmarks/20260913-768p/README.md).
-The same quantized checkpoints, prompt, seed, and 20-evaluation schedule were
-used in both engines. Different arithmetic and random streams mean the outputs
-are not expected to be identical.
+Sampled full-pipeline GPU residency peaked at **56.63 GiB for h3**, versus
+**26.64 GiB for either ComfyUI configuration**. Process PSS peaks were
+**2.70 GiB**, **26.45 GiB** (default), and **26.06 GiB** (Kitchen). These are
+overlapping memory views on the APU and must not be added. The maximum observed
+drop in system available RAM was **58.36 GiB**, **51.24 GiB**, and **50.00 GiB**,
+respectively; this whole-machine view includes other applications and caching.
+h3's small PSS does not establish a smaller total footprint.
+
+The headless ComfyUI runner releases conditioning models before sampling and
+the DiT before decoding. h3 currently keeps its models in the session. Stage-aware
+loading and release is a clear memory improvement opportunity for the CLI.
+
+There is one complete trajectory per configuration, with cached checkpoints and
+sequential fresh processes. Steady medians exclude evaluation one. Equal seeds
+across engines use different random streams, so output images are not identical.
+See the [full report, videos, raw data, and memory measurements](benchmarks/20260914/README.md).
+
+The h3 F16 attention control took **1 h 33 min 43 s**, with a **272.6 s** steady
+median: 2.60× the total time of default h3. It retains the same overall creature
+and composition in the sampled frames, with detail differences but no obvious
+visual improvement for this prompt. F16 uses an older attention kernel family;
+its cost is not a pure comparison of data types. Updating its operand layout and
+tiling is another concrete improvement target. Full numerical checks and both
+videos are in the current report.
+
+### Earlier 768p measurements
+
+The [September 13 report](benchmarks/20260913-768p/README.md) recorded a 103.2 s
+h3 steady median versus 772.4 s for ComfyUI's default attention, with the ComfyUI
+run intentionally stopped during evaluation five. Its roughly 4 h 20 min full
+ComfyUI time was extrapolated from observed sampling and earlier overhead.
+The complete native runs above supersede that estimate for the current comparison;
+the original logs and calculation remain available as historical measurements.
 
 ## September 2026: 480p
 

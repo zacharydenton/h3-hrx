@@ -1,0 +1,368 @@
+{
+  "runs": {
+    "h3_i8": {
+      "case": "alien_fjord",
+      "engine": "h3",
+      "wall_seconds": 2158.908143793,
+      "evaluations": 20,
+      "evaluation_seconds": [
+        99.9,
+        100.7,
+        103.8,
+        104.0,
+        104.0,
+        104.3,
+        104.0,
+        103.9,
+        103.9,
+        104.1,
+        103.9,
+        104.0,
+        103.9,
+        103.8,
+        104.0,
+        104.0,
+        103.8,
+        104.0,
+        103.7,
+        103.7
+      ],
+      "steady_median_seconds": 103.9,
+      "steady_range_seconds": [
+        100.7,
+        104.3
+      ],
+      "stages_seconds": {
+        "session": 0.2,
+        "preparation": 11.0,
+        "sampling": 2071.4,
+        "decode": 75.2,
+        "other_process_time": 1.1081437929997264
+      },
+      "prompt_tokens": 338,
+      "memory": {
+        "sampled_peak_process_rss_bytes": 2900058112,
+        "sampled_peak_process_pss_bytes": 2895468544,
+        "sampled_peak_drm_resident_bytes": 60804231168,
+        "sampled_peak_drm_allocated_bytes": 60804243456,
+        "minimum_system_available_bytes": 58046996480,
+        "peak_drop_in_system_available_bytes": 62665678848
+      },
+      "output": {
+        "width": 1344,
+        "height": 768,
+        "frames": 124,
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "duration_seconds": 5.166667
+      }
+    },
+    "comfy_pytorch": {
+      "case": "comfy_alien_fjord",
+      "engine": "comfy",
+      "wall_seconds": 14632.519803113013,
+      "evaluations": 20,
+      "evaluation_seconds": [
+        735.1296012910316,
+        724.3558657969697,
+        718.8696786730434,
+        721.3790555259911,
+        719.3831631129724,
+        721.7798337670392,
+        722.3833172159502,
+        722.2710010990268,
+        720.2330466390122,
+        719.413700916979,
+        723.553079113015,
+        723.3166976539651,
+        721.0369807560346,
+        720.6294081429951,
+        718.9378242180101,
+        721.2697499750066,
+        724.1505786459893,
+        721.7893168560113,
+        716.5581757199834,
+        721.3077629429754
+      ],
+      "steady_median_seconds": 721.3077629429754,
+      "steady_range_seconds": [
+        716.5581757199834,
+        724.3558657969697
+      ],
+      "stages_seconds": {
+        "initialization": 4.7266866019926965,
+        "conditioning": 39.4927333240048,
+        "dit_load_and_conditioning_unload": 0.18474507698556408,
+        "sampling": 14437.749910585,
+        "dit_unload": 0.05653300497215241,
+        "decode_and_save": 148.0253977070097,
+        "mux": 0.5366154049988836,
+        "other_process_time": 1.747181408049073
+      },
+      "prompt_tokens": null,
+      "memory": {
+        "sampled_peak_process_rss_bytes": 28420243456,
+        "sampled_peak_process_pss_bytes": 28396479488,
+        "sampled_peak_drm_resident_bytes": 28607033344,
+        "sampled_peak_drm_allocated_bytes": 28607045632,
+        "minimum_system_available_bytes": 65676144640,
+        "peak_drop_in_system_available_bytes": 55016677376
+      },
+      "output": {
+        "width": 1344,
+        "height": 768,
+        "frames": 124,
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "duration_seconds": 5.166667
+      }
+    },
+    "comfy_kitchen": {
+      "case": "comfy_kitchen_alien_fjord",
+      "engine": "comfy",
+      "wall_seconds": 2613.471323481004,
+      "evaluations": 20,
+      "evaluation_seconds": [
+        124.35187636100454,
+        121.60742819902953,
+        121.72023284196621,
+        121.65500398003496,
+        121.64369199099019,
+        122.09868445701431,
+        121.65837443398777,
+        121.63083776499843,
+        121.5572247809614,
+        121.69376180705149,
+        121.65381342498586,
+        121.6301202159957,
+        121.77776522596832,
+        121.64209732302697,
+        121.6856230670237,
+        121.77508171496447,
+        121.73459542298224,
+        121.63731189799728,
+        121.72098973300308,
+        121.63563700701343
+      ],
+      "steady_median_seconds": 121.65500398003496,
+      "steady_range_seconds": [
+        121.5572247809614,
+        122.09868445701431
+      ],
+      "stages_seconds": {
+        "initialization": 3.2808116279775277,
+        "conditioning": 23.575007510953583,
+        "dit_load_and_conditioning_unload": 0.1739692630362697,
+        "sampling": 2436.513267559989,
+        "dit_unload": 0.06651315896306187,
+        "decode_and_save": 147.46012770500965,
+        "mux": 0.5304104929673485,
+        "other_process_time": 1.8712161621078849
+      },
+      "prompt_tokens": null,
+      "memory": {
+        "sampled_peak_process_rss_bytes": 28008304640,
+        "sampled_peak_process_pss_bytes": 27984544768,
+        "sampled_peak_drm_resident_bytes": 28600029184,
+        "sampled_peak_drm_allocated_bytes": 28600041472,
+        "minimum_system_available_bytes": 66719567872,
+        "peak_drop_in_system_available_bytes": 53685506048
+      },
+      "output": {
+        "width": 1344,
+        "height": 768,
+        "frames": 124,
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "duration_seconds": 5.166667
+      }
+    },
+    "h3_f16": {
+      "case": "alien_fjord_f16",
+      "engine": "h3",
+      "wall_seconds": 5623.297622249986,
+      "evaluations": 20,
+      "evaluation_seconds": [
+        265.8,
+        268.3,
+        269.3,
+        274.6,
+        279.4,
+        281.9,
+        270.4,
+        267.7,
+        272.6,
+        274.5,
+        270.6,
+        276.5,
+        270.8,
+        262.0,
+        275.2,
+        261.9,
+        275.4,
+        274.1,
+        270.3,
+        280.0
+      ],
+      "steady_median_seconds": 272.6,
+      "steady_range_seconds": [
+        261.9,
+        281.9
+      ],
+      "stages_seconds": {
+        "session": 0.2,
+        "preparation": 107.7,
+        "sampling": 5441.3,
+        "decode": 73.0,
+        "other_process_time": 1.0976222499857613
+      },
+      "prompt_tokens": 338,
+      "memory": {
+        "sampled_peak_process_rss_bytes": 3092033536,
+        "sampled_peak_process_pss_bytes": 3087431680,
+        "sampled_peak_drm_resident_bytes": 59660820480,
+        "sampled_peak_drm_allocated_bytes": 59660832768,
+        "minimum_system_available_bytes": 58865242112,
+        "peak_drop_in_system_available_bytes": 61544128512
+      },
+      "output": {
+        "width": 1344,
+        "height": 768,
+        "frames": 124,
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "duration_seconds": 5.166667
+      }
+    },
+    "tidal_sky": {
+      "case": "tidal_sky",
+      "engine": "h3",
+      "wall_seconds": 2211.9623607019894,
+      "evaluations": 20,
+      "evaluation_seconds": [
+        99.4,
+        101.0,
+        103.2,
+        103.0,
+        103.0,
+        103.0,
+        103.0,
+        103.1,
+        103.1,
+        103.0,
+        103.0,
+        103.0,
+        103.1,
+        103.0,
+        103.0,
+        103.0,
+        102.9,
+        102.9,
+        102.9,
+        102.8
+      ],
+      "steady_median_seconds": 103.0,
+      "steady_range_seconds": [
+        101.0,
+        103.2
+      ],
+      "stages_seconds": {
+        "session": 0.2,
+        "preparation": 81.7,
+        "sampling": 2054.4,
+        "decode": 74.5,
+        "other_process_time": 1.1623607019892006
+      },
+      "prompt_tokens": 349,
+      "memory": {
+        "sampled_peak_process_rss_bytes": 3041533952,
+        "sampled_peak_process_pss_bytes": 3036973056,
+        "sampled_peak_drm_resident_bytes": 60785184768,
+        "sampled_peak_drm_allocated_bytes": 60785197056,
+        "minimum_system_available_bytes": 57415102464,
+        "peak_drop_in_system_available_bytes": 62974861312
+      },
+      "output": {
+        "width": 1344,
+        "height": 768,
+        "frames": 124,
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "duration_seconds": 5.166667
+      }
+    },
+    "midnight_tram": {
+      "case": "midnight_tram",
+      "engine": "h3",
+      "wall_seconds": 2249.271671695984,
+      "evaluations": 20,
+      "evaluation_seconds": [
+        99.8,
+        101.4,
+        103.7,
+        103.8,
+        103.6,
+        103.6,
+        103.6,
+        103.6,
+        103.5,
+        103.6,
+        103.6,
+        103.7,
+        103.6,
+        103.6,
+        103.6,
+        103.4,
+        103.5,
+        103.5,
+        103.5,
+        103.5
+      ],
+      "steady_median_seconds": 103.6,
+      "steady_range_seconds": [
+        101.4,
+        103.8
+      ],
+      "stages_seconds": {
+        "session": 0.2,
+        "preparation": 106.4,
+        "sampling": 2065.7,
+        "decode": 75.8,
+        "other_process_time": 1.1716716959840596
+      },
+      "prompt_tokens": 309,
+      "memory": {
+        "sampled_peak_process_rss_bytes": 3091742720,
+        "sampled_peak_process_pss_bytes": 3087156224,
+        "sampled_peak_drm_resident_bytes": 60572389376,
+        "sampled_peak_drm_allocated_bytes": 60572401664,
+        "minimum_system_available_bytes": 57767702528,
+        "peak_drop_in_system_available_bytes": 62298025984
+      },
+      "output": {
+        "width": 1344,
+        "height": 768,
+        "frames": 124,
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "duration_seconds": 5.166667
+      }
+    }
+  },
+  "comparisons": {
+    "comfy_pytorch": {
+      "wall_time_ratio_to_h3_i8": 6.777740796977607,
+      "steady_time_ratio_to_h3_i8": 6.942326881068098
+    },
+    "comfy_kitchen": {
+      "wall_time_ratio_to_h3_i8": 1.2105523484150553,
+      "steady_time_ratio_to_h3_i8": 1.170885505101395
+    },
+    "h3_f16": {
+      "wall_time_ratio_to_h3_i8": 2.6046951735382207,
+      "steady_time_ratio_to_h3_i8": 2.623676612127045
+    }
+  },
+  "memory_note": "Process PSS and GPU residency overlap on UMA; do not add. System available-memory changes include other applications and cache behavior.",
+  "method": "Full 124-frame 1344x768 outputs; 20 evaluations; cached checkpoints. Separate fresh processes, sequential runs. One trajectory per configuration; steady statistics omit the first evaluation. Intrusive profiles excluded."
+}

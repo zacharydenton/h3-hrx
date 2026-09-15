@@ -2,27 +2,28 @@
 cfg 1, the model's shifts): t2va, or fl2va from --first-frame. Ground truth for what a conditioned clip should
 look like, and the fixtures `scripts/parity.py gate` compares against.
 
-This is the half of the parity check that cannot live in `scripts/parity.py`: it runs inside the
-Strix Halo ComfyUI image, with numpy and huggingface_hub installed, against
-ComfyUI's own modules.
+Run against a local ComfyUI checkout with its Python dependencies and ROCm PyTorch:
 
-    podman run --rm -v "$HOME:$HOME" -w "$PWD" -e PYTHONPATH=/opt/ComfyUI \
-      -e HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}/hub}" \
-      --entrypoint /opt/venv/bin/python docker.io/kyuz0/amd-strix-halo-comfyui:latest \
-      scripts/comfy_dump.py --dump-steps --dump-blocks 0,1,2,5,10,20,30,40,49 \
+    ~/code/ComfyUI/.venv-rocm/bin/python scripts/comfy_dump.py \
+      --comfy ~/code/ComfyUI --dump-steps --dump-blocks 0,1,2,5,10,20,30,40,49 \
       --steps 2 --out build/comfy_t2va_blocks
 
 Checkpoints must already be downloaded into the standard Hugging Face Hub cache.
-If the cache is outside $HOME, bind-mount its directory into the container too.
 
 Writes frames.npy [F,H,W,3] uint8, audio.wav, video_latent.npy, audio_latent.npy by default.
 With --video-out, writes MP4/WAV instead; requires FFmpeg with libx264 and AAC encoders."""
 import argparse, json, logging, os, subprocess, sys, time, wave
+from contextlib import nullcontext
+process_start = time.perf_counter()
 from pathlib import Path
 import numpy as np
 from parity import model_path
 ap = argparse.ArgumentParser()
-ap.add_argument("--comfy", type=Path, default=Path("/opt/ComfyUI"))
+ap.add_argument("--comfy", type=Path, default=Path.home() / "code/ComfyUI")
+ap.add_argument("--comfy-args", nargs=argparse.REMAINDER, default=[], help="ComfyUI options, supplied last")
+ap.add_argument("--attention-backend", choices=["default", "pytorch-contiguous", "comfy-kitchen-int8"], default="default", help="DiT attention only; kitchen matches ComfyUI's Model Attention Backend node")
+ap.add_argument("--profile-sampling", action="store_true", help="record an intrusive torch profile; use a separate diagnostic run")
+ap.add_argument("--save-latents", action="store_true", help="also save initial noise and final video/audio latents with MP4 output")
 ap.add_argument("--model", default="minimax_h3_fl2va_pruned_int8_convrot.safetensors")
 ap.add_argument("--width", type=int, default=864); ap.add_argument("--height", type=int, default=480); ap.add_argument("--length", type=int, default=22)
 ap.add_argument("--steps", type=int, default=20); ap.add_argument("--seed", type=int, default=7)
@@ -41,12 +42,12 @@ if a.video_out is not None:
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-f", "mp4",
         "-movflags", "frag_keyframe+empty_moov", "-",
     ], stdout=subprocess.DEVNULL, check=True)
-sys.path.insert(0, str(a.comfy)); sys.argv = [sys.argv[0]]
+sys.path.insert(0, str(a.comfy)); sys.argv = [sys.argv[0], *a.comfy_args]
 import comfy.options; comfy.options.enable_args_parsing()
 logging.basicConfig(level=logging.WARNING)
 from comfy.cli_args import args as comfy_args, enables_dynamic_vram
 import comfy_aimdo.control
-os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
+os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
 if enables_dynamic_vram(): comfy_aimdo.control.init(simple_vram_headroom=None, nvml_pressure=not comfy_args.disable_nvml_pressure)
 import torch, comfy.sd, comfy.sample, comfy.samplers, comfy.model_management, comfy.utils, comfy.memory_management, comfy.model_patcher
 if enables_dynamic_vram() and comfy.model_management.rocm_version >= (7, 14):
@@ -55,6 +56,7 @@ if enables_dynamic_vram() and comfy.model_management.rocm_version >= (7, 14):
 from PIL import Image
 import comfy_extras.nodes_minimax_h3 as H3
 from comfy_extras.nodes_audio import vae_decode_audio
+from comfy.ldm.modules.attention import attention_pytorch, get_attention_function
 a.out.mkdir(parents=True, exist_ok=True)
 torch.cuda.reset_peak_memory_stats()
 metrics = {
@@ -65,6 +67,15 @@ metrics = {
     "sampler": a.sampler, "schedule": a.scheduler, "cfg": 1.0,
     "checkpoint": str(model_path(f"diffusion_models/{a.model}")),
     "prompt": a.prompt, "step_seconds": [],
+    "comfy_args": a.comfy_args,
+    "attention_backend": a.attention_backend,
+    "profile_sampling": a.profile_sampling,
+    "save_latents": a.save_latents,
+    "default_attention_implementation": get_attention_function("optimized").__name__,
+    "comfy_kitchen_backends": comfy.quant_ops.ck.list_backends(),
+    "torch_num_threads": torch.get_num_threads(),
+    "dynamic_vram": comfy.memory_management.aimdo_enabled,
+    "initialization_seconds": time.perf_counter() - process_start,
 }
 
 
@@ -77,11 +88,17 @@ def save_metrics():
 def stamp(): torch.cuda.synchronize(); return time.perf_counter()
 
 
+def contiguous_attention(q, k, v, *args, **kwargs):
+    return attention_pytorch(q.contiguous(), k.contiguous(), v.contiguous(), *args, **kwargs)
+
+
 with torch.inference_mode():
     t0 = stamp()
     clip = comfy.sd.load_clip([str(model_path("text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"))], clip_type=comfy.sd.CLIPType.MINIMAX)
     vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(str(model_path("vae/minimax_h3_video_vae_fp16.safetensors"))))
     audio_vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(str(model_path("vae/minimax_h3_audio_vae_fp32.safetensors"))))
+    metrics["conditioning_models_load_seconds"] = stamp() - t0
+    encode_start = stamp()
     if a.first_frame:
         img = torch.from_numpy(np.asarray(Image.open(a.first_frame).convert("RGB"), dtype=np.float32) / 255.0)[None]
         out = H3.MiniMaxH3ImageToVideo.execute(clip, vae, a.prompt, a.width, a.height, a.length, first_frame=img)
@@ -89,14 +106,21 @@ with torch.inference_mode():
         for kf in positive[0][1].get("minimax_keyframes", []): print("keyframe at frame", kf["resolved_frame_index"], flush=True)
     else:
         positive = clip.encode_from_tokens_scheduled(clip.tokenize(a.prompt)); latent, _ = H3._empty_av_latent(a.width, a.height, a.length)
+    metrics["text_encode_seconds"] = stamp() - encode_start
     metrics["conditioning_seconds"] = stamp() - t0
     print(f"conditioning in {metrics['conditioning_seconds']:.1f} s", flush=True)
+    load_start = stamp()
     clip = None; comfy.model_management.unload_all_models(); comfy.model_management.soft_empty_cache()
     model = comfy.sd.load_diffusion_model(str(model_path(f"diffusion_models/{a.model}")))
+    if a.attention_backend == "pytorch-contiguous":
+        model.set_model_optimized_attention(contiguous_attention)
+    elif a.attention_backend == "comfy-kitchen-int8":
+        model.set_model_optimized_attention(get_attention_function("comfy_kitchen_int8"))
+    metrics["dit_load_and_conditioning_unload_seconds"] = stamp() - load_start
     metrics["dit_inference_dtype"] = str(model.model.get_dtype_inference())
     noise = comfy.sample.prepare_noise(latent["samples"], a.seed)
     marks = [stamp()]
-    if a.dump_steps:
+    if a.dump_steps or a.save_latents:
         nv, na = noise.unbind(); np.save(a.out / "noise_video.npy", nv[0].float().cpu().numpy()); np.save(a.out / "noise_audio.npy", na[0].float().cpu().numpy())
     def cb(step, x0, x, total):
         marks.append(stamp())
@@ -118,24 +142,35 @@ with torch.inference_mode():
         for i in [int(v) for v in a.dump_blocks.split(",")]:
             hook(dm.blocks[i], f"blk_{i:02d}")
             if i == 0: hook(dm.blocks[0], "h_in", pick=lambda args, out: args[0])
-    samples = comfy.sample.sample(model, noise, a.steps, 1.0, a.sampler, a.scheduler, positive, positive, latent["samples"], seed=a.seed, callback=cb, disable_pbar=True)
+    profiling = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], record_shapes=True) if a.profile_sampling else nullcontext()
+    with profiling as profiler:
+        samples = comfy.sample.sample(model, noise, a.steps, 1.0, a.sampler, a.scheduler, positive, positive, latent["samples"], seed=a.seed, callback=cb, disable_pbar=True)
     metrics["sampling_seconds"] = stamp() - marks[0]; save_metrics()
+    if profiler is not None:
+        profiler.export_chrome_trace(str(a.out / "sampling-trace.json"))
+        (a.out / "sampling-profile.txt").write_text(profiler.key_averages().table(sort_by="self_device_time_total", row_limit=50))
+        (a.out / "sampling-profile-shapes.txt").write_text(profiler.key_averages(group_by_input_shape=True).table(sort_by="self_device_time_total", row_limit=80))
     print(f"sampled {a.steps} evaluations ({a.sampler}, {a.scheduler}) in {metrics['sampling_seconds']:.1f} s", flush=True)
+    unload_start = stamp()
     model = None; comfy.model_management.unload_all_models(); comfy.model_management.soft_empty_cache()
+    metrics["dit_unload_seconds"] = stamp() - unload_start
     v, au = samples.unbind() if getattr(samples, "is_nested", False) else (samples, None)
-    if a.video_out is None: np.save(a.out / "video_latent.npy", v[0].float().cpu().numpy())
+    if a.video_out is None or a.save_latents: np.save(a.out / "video_latent.npy", v[0].float().cpu().numpy())
     decode_start = stamp()
     images = vae.decode(v)
+    metrics["video_decode_seconds"] = stamp() - decode_start
     if images.ndim == 5: images = images.reshape(-1, *images.shape[-3:])
     frames = (images.clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
     if a.video_out is None: np.save(a.out / "frames.npy", frames)
     print("frames", frames.shape, flush=True)
     if au is not None:
-        if a.video_out is None: np.save(a.out / "audio_latent.npy", au[0].float().cpu().numpy())
+        audio_start = stamp()
+        if a.video_out is None or a.save_latents: np.save(a.out / "audio_latent.npy", au[0].float().cpu().numpy())
         audio = vae_decode_audio(audio_vae, {"samples": au}); wav = audio["waveform"][0].float().cpu().numpy(); sr = int(audio["sample_rate"])
         with wave.open(str(a.out / "audio.wav"), "wb") as wf:
             wf.setnchannels(wav.shape[0]); wf.setsampwidth(2); wf.setframerate(sr); wf.writeframes((np.clip(wav.T, -1, 1) * 32767).astype(np.int16).tobytes())
         print("audio", wav.shape, sr, flush=True)
+        metrics["audio_decode_and_save_seconds"] = stamp() - audio_start
     metrics["decode_and_save_seconds"] = stamp() - decode_start; save_metrics()
     if a.video_out is not None:
         if au is None: raise RuntimeError("MP4/WAV comparison requires the audio output")
@@ -151,4 +186,6 @@ with torch.inference_mode():
         metrics["mux_seconds"] = time.perf_counter() - mux_start
         metrics["video_out"] = str(a.video_out)
         save_metrics()
+    metrics["pipeline_seconds"] = time.perf_counter() - process_start
+    save_metrics()
     print("done", flush=True)

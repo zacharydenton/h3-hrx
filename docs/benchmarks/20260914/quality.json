@@ -1,0 +1,255 @@
+{
+  "runs": {
+    "h3_i8": {
+      "video_latent": {
+        "finite": true,
+        "elements": 3580416,
+        "shape": [
+          3580416
+        ],
+        "sha256": "32902d7154d371f549769552507916103071d3edb61711b20cc468a1665015a4"
+      },
+      "audio_latent": {
+        "finite": true,
+        "elements": 13248,
+        "shape": [
+          13248
+        ],
+        "sha256": "7cb8581a3706334bf317ac2bc82af4a9c24ffbe501c1d46e98536c0760c7e85e"
+      },
+      "audio": {
+        "channels": 2,
+        "sample_rate": 32000,
+        "duration_seconds": 5.175,
+        "rms": 0.09767610217998918,
+        "peak": 0.513824462890625,
+        "near_full_scale_fraction": 0.0,
+        "sha256": "9228338c4a826a5daea1e393552a6e869363aa89e01a4e46f1473f2c3d5dfa62"
+      }
+    },
+    "h3_f16": {
+      "video_latent": {
+        "finite": true,
+        "elements": 3580416,
+        "shape": [
+          3580416
+        ],
+        "sha256": "a460208f73ca1a3ebfd3c9b59c8ee97fe7236db6796511d8bc81edec6260cf83"
+      },
+      "audio_latent": {
+        "finite": true,
+        "elements": 13248,
+        "shape": [
+          13248
+        ],
+        "sha256": "0ea10a11b73a1ae029f8fe119fd7d521bd6ad34fca2dff514e98b40d92d0633a"
+      },
+      "audio": {
+        "channels": 2,
+        "sample_rate": 32000,
+        "duration_seconds": 5.175,
+        "rms": 0.1035669810508404,
+        "peak": 0.525421142578125,
+        "near_full_scale_fraction": 0.0,
+        "sha256": "780a313767c06869fd8a81757bf46d6e0420c15f06d03b4678da18eb8cc3a840"
+      }
+    },
+    "comfy_pytorch": {
+      "video_latent": {
+        "finite": true,
+        "elements": 3580416,
+        "shape": [
+          24,
+          37,
+          48,
+          84
+        ],
+        "sha256": "8a9ec8a6d287a7eb7fd8cef4ea6b4c9176524840f39c0d9991b8854f94653bdf"
+      },
+      "audio_latent": {
+        "finite": true,
+        "elements": 13248,
+        "shape": [
+          32,
+          2,
+          207
+        ],
+        "sha256": "118c6dcf20e39bcc700509385222666adeaddf6898f4d1da4bb3c6f663c31658"
+      },
+      "initial_noise": {
+        "video": {
+          "shape": [
+            24,
+            37,
+            48,
+            84
+          ],
+          "sha256": "e868aa5a97e442817bfe66e8b21eb075b2703f24a4ecc88dc4e4c6ab82a4b718",
+          "finite": true
+        },
+        "audio": {
+          "shape": [
+            32,
+            2,
+            207
+          ],
+          "sha256": "30857899447c6581ea261f6c40165cf7461c4600e8d4ac05ebd28ca8b129ff98",
+          "finite": true
+        }
+      },
+      "audio": {
+        "channels": 2,
+        "sample_rate": 32000,
+        "duration_seconds": 5.175,
+        "rms": 0.09827782853180465,
+        "peak": 0.433380126953125,
+        "near_full_scale_fraction": 0.0,
+        "sha256": "28fd5bb5afcbf7c59dcf305849ebed7aa9d017cb6cbd02c114389ddfd4eeb86e"
+      }
+    },
+    "comfy_kitchen": {
+      "video_latent": {
+        "finite": true,
+        "elements": 3580416,
+        "shape": [
+          24,
+          37,
+          48,
+          84
+        ],
+        "sha256": "50d6318aff42e04a4b75e5d752c5fa85cc9532027a86352f526d346192a21844"
+      },
+      "audio_latent": {
+        "finite": true,
+        "elements": 13248,
+        "shape": [
+          32,
+          2,
+          207
+        ],
+        "sha256": "017f3fe535f8c688968dfc10f76883c0c13e4fa9b4d3242df7c7b4b3c406b183"
+      },
+      "initial_noise": {
+        "video": {
+          "shape": [
+            24,
+            37,
+            48,
+            84
+          ],
+          "sha256": "e868aa5a97e442817bfe66e8b21eb075b2703f24a4ecc88dc4e4c6ab82a4b718",
+          "finite": true
+        },
+        "audio": {
+          "shape": [
+            32,
+            2,
+            207
+          ],
+          "sha256": "30857899447c6581ea261f6c40165cf7461c4600e8d4ac05ebd28ca8b129ff98",
+          "finite": true
+        }
+      },
+      "audio": {
+        "channels": 2,
+        "sample_rate": 32000,
+        "duration_seconds": 5.175,
+        "rms": 0.10980936183072083,
+        "peak": 0.452484130859375,
+        "near_full_scale_fraction": 0.0,
+        "sha256": "f8fd74e5229e5fdfd58c1109f082d1c6b13945a3bdc3e1bd08853327214a27e4"
+      }
+    },
+    "tidal_sky": {
+      "video_latent": {
+        "finite": true,
+        "elements": 3580416,
+        "shape": [
+          3580416
+        ],
+        "sha256": "efc2799d3a02c499027320bb5542e6da6f5f65b10d51f6d12f5cb025511ca0cf"
+      },
+      "audio_latent": {
+        "finite": true,
+        "elements": 13248,
+        "shape": [
+          13248
+        ],
+        "sha256": "ac3d4de70edd7c4401275d69f4fae067462db8fc7b6ceee72dde9faaa2f4b9d3"
+      },
+      "audio": {
+        "channels": 2,
+        "sample_rate": 32000,
+        "duration_seconds": 5.175,
+        "rms": 0.06046624180375123,
+        "peak": 0.299163818359375,
+        "near_full_scale_fraction": 0.0,
+        "sha256": "cdadf5606b2654ca1ca2713ee0e0ae7fc4205cc94f8c3f0f3fc3e5fad3da81c4"
+      }
+    },
+    "midnight_tram": {
+      "video_latent": {
+        "finite": true,
+        "elements": 3580416,
+        "shape": [
+          3580416
+        ],
+        "sha256": "8434a442ed31f698b698077104c625e2f5c485244a5e3bf7ffaa92b7faab5232"
+      },
+      "audio_latent": {
+        "finite": true,
+        "elements": 13248,
+        "shape": [
+          13248
+        ],
+        "sha256": "4a31d2c8f59d97abd920bff656eda1dcf933f6c29be046052e638437c2324f7d"
+      },
+      "audio": {
+        "channels": 2,
+        "sample_rate": 32000,
+        "duration_seconds": 5.175,
+        "rms": 0.028544971826271155,
+        "peak": 0.204986572265625,
+        "near_full_scale_fraction": 0.0,
+        "sha256": "36ada18df306e4cb118b51a3ee6b60935fa62d40ad10e92bf27150bf44b36585"
+      }
+    }
+  },
+  "within_engine_differences": {
+    "h3_i8_vs_h3_f16": {
+      "reference": "h3_f16",
+      "candidate": "h3_i8",
+      "initial_noise": "Same deterministic h3 RNG, seed, shape, and schedule; initial arrays were not exported",
+      "video": {
+        "cosine": 0.9425012719702446,
+        "relative_l2": 0.33932892712807994,
+        "rmse": 0.3573647684202282,
+        "max_abs_difference": 4.107119202613831
+      },
+      "audio": {
+        "cosine": 0.9976599610197453,
+        "relative_l2": 0.0684154057037539,
+        "rmse": 0.0349708410442856,
+        "max_abs_difference": 0.9172777533531189
+      }
+    },
+    "comfy_kitchen_vs_comfy_pytorch": {
+      "reference": "comfy_pytorch",
+      "candidate": "comfy_kitchen",
+      "initial_noise": "Identical saved video/audio arrays",
+      "video": {
+        "cosine": 0.9535327593663548,
+        "relative_l2": 0.3052709753955812,
+        "rmse": 0.3116304177538417,
+        "max_abs_difference": 4.302312731742859
+      },
+      "audio": {
+        "cosine": 0.9938648375823045,
+        "relative_l2": 0.11081668921362826,
+        "rmse": 0.05573892671027141,
+        "max_abs_difference": 0.7042743861675262
+      }
+    }
+  },
+  "interpretation": "Latent differences measure numerical divergence, not perceptual quality. No cross-engine similarity score is computed because initial random streams differ."
+}

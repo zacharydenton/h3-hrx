@@ -1,0 +1,37 @@
+{
+  "torch": "2.14.0",
+  "hip": "7.2.53211",
+  "shape": [
+    1,
+    56,
+    37754,
+    128
+  ],
+  "strides": [
+    7168,
+    128,
+    21504,
+    1
+  ],
+  "method": "Alternating layouts on identical bf16 QKV; contiguous timing includes all three copies. Flash SDPA only; one warmup per layout.",
+  "seconds": {
+    "strided": [
+      14.501976501022,
+      14.785972101963125,
+      14.223730775003787
+    ],
+    "contiguous": [
+      2.7042845679679886,
+      2.68971402104944,
+      2.698015558999032
+    ]
+  },
+  "output_cosine": 1.0,
+  "output_max_abs_difference": 0.0,
+  "finite": true,
+  "median_seconds": {
+    "strided": 14.501976501022,
+    "contiguous": 2.698015558999032
+  },
+  "speedup": 5.37505295425437
+}

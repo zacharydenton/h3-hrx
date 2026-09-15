@@ -1,0 +1,82 @@
+{
+  "h3": {
+    "denoise": {
+      "instrumented_seconds": 200.1,
+      "stages_above_one_percent": [
+        {
+          "stage": "attention",
+          "seconds": 117.02,
+          "share_of_instrumented_seconds": 0.584807596201899
+        },
+        {
+          "stage": "gemm ff + swiglu",
+          "seconds": 27.42,
+          "share_of_instrumented_seconds": 0.13703148425787107
+        },
+        {
+          "stage": "gemm qkv",
+          "seconds": 20.71,
+          "share_of_instrumented_seconds": 0.10349825087456273
+        },
+        {
+          "stage": "gemm down + residual",
+          "seconds": 14.19,
+          "share_of_instrumented_seconds": 0.07091454272863568
+        },
+        {
+          "stage": "gemm out + residual",
+          "seconds": 6.92,
+          "share_of_instrumented_seconds": 0.03458270864567716
+        },
+        {
+          "stage": "attention operands",
+          "seconds": 5.56,
+          "share_of_instrumented_seconds": 0.027786106946526737
+        }
+      ],
+      "other_instrumented_seconds": 8.280000000000001
+    },
+    "decode": {
+      "instrumented_seconds": 57.0,
+      "stages_above_one_percent": [
+        {
+          "stage": "gemm ff + swiglu",
+          "seconds": 23.31,
+          "share_of_instrumented_seconds": 0.4089473684210526
+        },
+        {
+          "stage": "gemm down + residual",
+          "seconds": 11.05,
+          "share_of_instrumented_seconds": 0.19385964912280704
+        },
+        {
+          "stage": "gemm qkv + rope",
+          "seconds": 9.97,
+          "share_of_instrumented_seconds": 0.1749122807017544
+        },
+        {
+          "stage": "attention",
+          "seconds": 7.0,
+          "share_of_instrumented_seconds": 0.12280701754385964
+        },
+        {
+          "stage": "gemm out + residual",
+          "seconds": 3.61,
+          "share_of_instrumented_seconds": 0.06333333333333332
+        },
+        {
+          "stage": "prepare norm",
+          "seconds": 0.91,
+          "share_of_instrumented_seconds": 0.015964912280701755
+        }
+      ],
+      "other_instrumented_seconds": 1.1499999999999986
+    }
+  },
+  "method": "Separate two-evaluation runs at full 768p shape. H3_PROFILE synchronizes around instrumented launches and disables graph replay. Totals describe instrumented dispatches, not all process time; stages below 1% are omitted from the source report. ComfyUI uses a separate torch CPU/HIP profiler. Do not use profiling wall times for generation speedups.",
+  "comfy": {
+    "status": "interrupted_by_host_freeze",
+    "usable_device_profile": false,
+    "incident": "incident.json"
+  }
+}
