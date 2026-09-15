@@ -20,7 +20,10 @@ and runtime on first GPU use; the CLI embeds the Loom kernel sources and tokeniz
 **Experimental:** tested on Linux with AMD Strix Halo (`gfx1151`)
 and 128 GB of unified memory. Other GPUs and memory configurations are unvalidated.
 
-[![Glass Leviathan: a translucent alien gliding above a Norwegian fjord](docs/media/showcase/glass-leviathan.jpg)](docs/media/showcase/glass-leviathan.mp4)
+
+
+https://github.com/user-attachments/assets/4f168457-3ea0-44d7-8f7d-abe1a6cd40e9
+
 
 *Glass Leviathan · 768p. First frame generated with OpenAI; video and sound
 generated locally with h3 in **39m58s**. [First frame and reproduction](docs/showcase.md#glass-leviathan--768p).*
