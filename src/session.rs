@@ -11,6 +11,7 @@ use crate::error::{invalid, Result};
 use crate::layout::{shape_for, Shape};
 use crate::te::TextEncoder;
 use crate::vvae::{Clip, VideoVae};
+mod residency;
 
 /// How long a session keeps completed models on the device.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -20,6 +21,9 @@ pub enum ResidencyPolicy {
     Retain,
     /// Release completed stages before loading the next model.
     StageScoped,
+    /// Keep idle units in the shared budget's LRU cache. Requires `new_in` with
+    /// a live ResidencyManager-backed memory budget. Active stages are pinned.
+    Budgeted,
 }
 
 /// Optional session behavior. Existing callers retain weights by default.
@@ -78,9 +82,16 @@ fn checkpoint_path(
 /// the kernels compiled for the shapes seen so far. Reuse a session across requests rather than
 /// opening one per request — that is what keeps the weights resident and the kernels compiled.
 ///
-/// Every method takes `&mut self`, so the borrow checker serialises the calls; nothing here needs a
-/// lock of its own.
+/// Every method takes `&mut self`, serializing native calls. Budgeted idle units
+/// can be evicted independently by other users of the shared allocation ceiling.
 pub struct Session {
+    context: hrx::inference::ModelContext,
+    options: SessionOptions,
+    attention: crate::dit::Attention,
+    native: hrx::execution::NativeSession<State>,
+}
+
+struct State {
     stream: hrx::Stream,
     compiler: Compiler,
     config: Config,
@@ -90,6 +101,7 @@ pub struct Session {
     te: Option<TextEncoder>,
     vvae: Option<VideoVae>,
     avae: Option<AudioVae>,
+    units: Option<residency::Units>,
 }
 
 impl Session {
@@ -120,11 +132,176 @@ impl Session {
     /// The checkpoint immutability requirements of [`Session::new`] apply for the
     /// entire session, including files temporarily released and reopened later.
     pub unsafe fn new_with_options(config: Config, options: SessionOptions) -> Result<Self> {
+        let context = hrx::inference::ModelContext::new(Default::default())?;
+        // SAFETY: forwarded unchanged from this constructor's contract.
+        unsafe { Self::new_in(config, options, &context) }
+    }
+
+    /// Open against an application's selected GPU and shared allocation budget.
+    /// All four lazy model units, growing workspaces and transfer staging use
+    /// that ceiling before allocating. StageScoped drains and releases finished
+    /// units; Retain pins them for reuse and Budgeted caches each idle unit until
+    /// allocation pressure evicts it. Each stage reserves the context's compute
+    /// lane while replaying its original private stream-bound graphs. Borrowed
+    /// inputs and progress callbacks stay on the calling thread.
+    ///
+    /// # Safety
+    /// The immutable checkpoint requirements of [`Session::new`] apply.
+    pub unsafe fn new_in(
+        config: Config,
+        options: SessionOptions,
+        context: &hrx::inference::ModelContext,
+    ) -> Result<Self> {
+        // SAFETY: checkpoint immutability is forwarded from the caller.
+        let state = unsafe { State::new_in(config, options, context) }?;
+        let attention = state.config.attention;
+        // SAFETY: State exclusively owns its stream, models and graph executions;
+        // construction submits no work. Every public stage uses `scheduled`.
+        let native = unsafe {
+            hrx::execution::NativeSession::new(context.runtime(), state, |state| {
+                state.stream.synchronize()
+            })
+        };
+        Ok(Self {
+            context: context.clone(),
+            options,
+            attention,
+            native,
+        })
+    }
+
+    fn scheduled<T>(&mut self, stage: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        // SAFETY: stages use only State's private stream/owners; synchronous host
+        // outputs never expose device pointers. NativeSession fences on success,
+        // errors and panic, retaining all owners if completion is uncertain.
+        unsafe { self.native.run(stage) }?
+    }
+
+    /// Shared scheduling and allocation domain. Native bytes appear in the
+    /// residency budget; native stage latency appears in the runtime trace.
+    pub fn context(&self) -> &hrx::inference::ModelContext {
+        &self.context
+    }
+
+    /// The lifetime policy selected when this session was opened.
+    pub fn residency(&self) -> ResidencyPolicy {
+        self.options.residency
+    }
+
+    /// Drain and reset optional `H3_PROFILE` diagnostic stage timings.
+    pub fn profile_report(&mut self) -> Result<Option<String>> {
+        self.scheduled(|state| Ok(state.profile_report()))
+    }
+
+    /// Attention width selected when this session was opened.
+    pub fn attention(&self) -> crate::dit::Attention {
+        self.attention
+    }
+
+    /// The shapes a request produces, or `None` for an unsupported request.
+    pub fn shape_for(height: i32, width: i32, frames: i32) -> Option<Shape> {
+        shape_for(height, width, frames)
+    }
+
+    /// Refined text rows `[ids.len()][5376]`; trailing output is unchanged.
+    pub fn text_in(&mut self, ids: &[i32], out: &mut [f32]) -> Result<()> {
+        self.scheduled(|state| state.text_in(ids, out))
+    }
+
+    /// Denoise on the shared compute lane. The borrowed progress callback runs
+    /// on the calling thread; returning true cancels after draining native work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise(
+        &mut self,
+        ids: &[i32],
+        p: &DenoiseParams,
+        noise: Noise<'_>,
+        refs: &[Reference<'_>],
+        kfs: &[Keyframe<'_>],
+        progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
+    ) -> Result<Latents> {
+        self.validate(ids, p, noise, refs, kfs)?;
+        self.scheduled(|state| state.denoise(ids, p, noise, refs, kfs, progress))
+    }
+
+    /// Check request metadata without reserving a lane or loading models.
+    pub fn validate(
+        &self,
+        ids: &[i32],
+        p: &DenoiseParams,
+        noise: Noise<'_>,
+        refs: &[Reference<'_>],
+        kfs: &[Keyframe<'_>],
+    ) -> Result<Shape> {
+        self.native.state()?.validate(ids, p, noise, refs, kfs)
+    }
+
+    /// The vision tower over one image, with borrowed host pixels.
+    pub fn vision_embed(
+        &mut self,
+        pixels: &[f32],
+        height: usize,
+        width: usize,
+    ) -> Result<crate::vision::Embedding> {
+        self.scheduled(|state| state.vision_embed(pixels, height, width))
+    }
+
+    /// Decode into borrowed RGB8 storage. Invalid arguments leave output intact;
+    /// a failure during execution can leave partially written temporal chunks.
+    pub fn decode_video(&mut self, shape: &Shape, latents: &[f32], out: &mut [u8]) -> Result<()> {
+        self.scheduled(|state| state.decode_video(shape, latents, out))
+    }
+
+    /// Encode a borrowed host clip into model-space latents.
+    pub fn encode_video(&mut self, clip: Clip<'_>) -> Result<(Vec<f32>, usize)> {
+        self.scheduled(|state| state.encode_video(clip))
+    }
+
+    /// Decode model-space audio latents into borrowed host storage.
+    pub fn decode_audio(
+        &mut self,
+        latents: &[f32],
+        audio_t: usize,
+        samples: &mut [f32],
+    ) -> Result<()> {
+        self.scheduled(|state| state.decode_audio(latents, audio_t, samples))
+    }
+
+    /// Encode borrowed host samples into model-space latents.
+    pub fn encode_audio(&mut self, samples: &[f32], n: usize) -> Result<(Vec<f32>, usize)> {
+        self.scheduled(|state| state.encode_audio(samples, n))
+    }
+}
+
+impl State {
+    unsafe fn new_in(
+        config: Config,
+        options: SessionOptions,
+        context: &hrx::inference::ModelContext,
+    ) -> Result<Self> {
         // An empty `kernel_sources` selects the sources embedded in this package. Compiled
         // artifacts go wherever HRX keeps them, which is one cache per user for every consumer.
         let compiler = Compiler::new(config.loom_library.clone(), config.kernel_sources.clone());
+        let units = if options.residency == ResidencyPolicy::Budgeted {
+            let manager = context
+                .runtime()
+                .memory_budget()
+                .and_then(hrx::residency::MemoryBudget::manager)
+                .ok_or_else(|| {
+                    crate::Error::Invalid(
+                        "budgeted residency requires a live shared residency manager".into(),
+                    )
+                })?;
+            Some(residency::Units::new(&manager))
+        } else {
+            None
+        };
+        let mut stream = hrx::Device::open(context.runtime().gpu()?.index())?.stream()?;
+        if let Some(budget) = context.runtime().memory_budget() {
+            stream = stream.with_memory_budget(budget.clone());
+        }
         Ok(Self {
-            stream: hrx::Stream::open()?,
+            stream,
             compiler,
             config,
             options,
@@ -133,12 +310,8 @@ impl Session {
             te: None,
             vvae: None,
             avae: None,
+            units,
         })
-    }
-
-    /// The lifetime policy selected when this session was opened.
-    pub fn residency(&self) -> ResidencyPolicy {
-        self.options.residency
     }
 
     /// Fence before dropping model owners and the graph executions they contain.
@@ -147,6 +320,19 @@ impl Session {
             return Ok(());
         }
         self.stream.synchronize()?;
+        if let Some(units) = &mut self.units {
+            if encoder {
+                units.te.checkin(&mut self.te);
+            }
+            if dit {
+                units.dit.checkin(&mut self.dit);
+            }
+            if vaes {
+                units.video.checkin(&mut self.vvae);
+                units.audio.checkin(&mut self.avae);
+            }
+            return Ok(());
+        }
         if encoder {
             self.te = None;
         }
@@ -172,19 +358,10 @@ impl Session {
         (!report.is_empty()).then_some(report)
     }
 
-    /// The attention this session was created with. The stack is built for it, so it is not a
-    /// per-run parameter — and a run that quietly ignored it would make a precision comparison
-    /// meaningless rather than wrong in any visible way.
-    pub fn attention(&self) -> crate::dit::Attention {
-        self.config.attention
-    }
-
-    /// The shapes a request produces, or `None` when it is not one this model serves.
-    pub fn shape_for(height: i32, width: i32, frames: i32) -> Option<Shape> {
-        shape_for(height, width, frames)
-    }
-
     fn dit(&mut self) -> Result<&mut Dit> {
+        if let Some(units) = &mut self.units {
+            units.dit.checkout(&mut self.dit)?;
+        }
         if self.dit.is_none() {
             let path = checkpoint_path(&self.config.dit, crate::models::DIT_FL2VA)?;
             crate::trace::checkpoint("dit", &path);
@@ -207,6 +384,9 @@ impl Session {
     }
 
     fn te(&mut self) -> Result<&mut TextEncoder> {
+        if let Some(units) = &mut self.units {
+            units.te.checkout(&mut self.te)?;
+        }
         if self.te.is_none() {
             let path = checkpoint_path(&self.config.te, crate::models::TE)?;
             crate::trace::checkpoint("te", &path);
@@ -217,6 +397,9 @@ impl Session {
     }
 
     fn vvae(&mut self) -> Result<&mut VideoVae> {
+        if let Some(units) = &mut self.units {
+            units.video.checkout(&mut self.vvae)?;
+        }
         if self.vvae.is_none() {
             let path = checkpoint_path(&self.config.video_vae, crate::models::VIDEO_VAE)?;
             crate::trace::checkpoint("video_vae", &path);
@@ -227,6 +410,9 @@ impl Session {
     }
 
     fn avae(&mut self) -> Result<&mut AudioVae> {
+        if let Some(units) = &mut self.units {
+            units.audio.checkout(&mut self.avae)?;
+        }
         if self.avae.is_none() {
             let path = checkpoint_path(&self.config.audio_vae, crate::models::AUDIO_VAE)?;
             crate::trace::checkpoint("audio_vae", &path);
@@ -283,9 +469,14 @@ impl Session {
                 out.len()
             ));
         }
-        let (stream, c, prof, dit, te) = self.prompt_pair()?;
-        dit.text_in(stream, c, prof, te, ids, &[])?;
-        dit.read_rows(stream, ids.len(), out)
+        self.release_completed(false, false, true)?;
+        let result = (|| {
+            let (stream, c, prof, dit, te) = self.prompt_pair()?;
+            dit.text_in(stream, c, prof, te, ids, &[])?;
+            dit.read_rows(stream, ids.len(), out)
+        })();
+        self.release_completed(true, true, false)?;
+        result
     }
 
     /// The whole denoising run.
@@ -439,6 +630,7 @@ impl Session {
         height: usize,
         width: usize,
     ) -> Result<crate::vision::Embedding> {
+        self.release_completed(false, true, true)?;
         self.te()?;
         let Self {
             stream,
@@ -448,7 +640,10 @@ impl Session {
             ..
         } = self;
         let te = te.as_ref().expect("opened");
-        crate::vision::embed(stream, compiler, prof, te.weights(), pixels, height, width)
+        let result =
+            crate::vision::embed(stream, compiler, prof, te.weights(), pixels, height, width);
+        self.release_completed(true, false, false)?;
+        result
     }
 
     /// Model-space latents to `[frames][height][width][3]` RGB8.
@@ -482,6 +677,7 @@ impl Session {
     }
 
     pub fn encode_video(&mut self, clip: Clip<'_>) -> Result<(Vec<f32>, usize)> {
+        self.release_completed(true, true, false)?;
         self.vvae()?;
         let Self {
             stream,
@@ -490,9 +686,12 @@ impl Session {
             vvae,
             ..
         } = self;
-        vvae.as_mut()
+        let result = vvae
+            .as_mut()
             .expect("opened")
-            .encode_video(stream, compiler, prof, clip)
+            .encode_video(stream, compiler, prof, clip);
+        self.release_completed(false, false, true)?;
+        result
     }
 
     pub fn decode_audio(
@@ -523,6 +722,7 @@ impl Session {
     }
 
     pub fn encode_audio(&mut self, samples: &[f32], n: usize) -> Result<(Vec<f32>, usize)> {
+        self.release_completed(true, true, false)?;
         self.avae()?;
         let Self {
             stream,
@@ -531,9 +731,12 @@ impl Session {
             avae,
             ..
         } = self;
-        avae.as_mut()
+        let result = avae
+            .as_mut()
             .expect("opened")
-            .encode(stream, compiler, prof, samples, n)
+            .encode(stream, compiler, prof, samples, n);
+        self.release_completed(false, false, true)?;
+        result
     }
 }
 
@@ -544,6 +747,23 @@ mod tests {
     #[test]
     fn existing_sessions_retain_models_by_default() {
         assert_eq!(SessionOptions::default().residency, ResidencyPolicy::Retain);
+    }
+
+    #[test]
+    fn budgeted_residency_requires_a_manager_before_opening_hardware() {
+        let context = hrx::inference::ModelContext::new(Default::default()).unwrap();
+        // SAFETY: the missing budget is rejected before any checkpoint is mapped.
+        let result = unsafe {
+            Session::new_in(
+                Config::default(),
+                SessionOptions {
+                    residency: ResidencyPolicy::Budgeted,
+                    ..Default::default()
+                },
+                &context,
+            )
+        };
+        assert!(matches!(result, Err(crate::Error::Invalid(_))));
     }
 
     #[test]
@@ -562,14 +782,44 @@ mod tests {
             seed: 7,
             ..DenoiseParams::default()
         };
+        let config = match std::env::var_os("H3_QUALIFICATION_SNAPSHOT") {
+            Some(snapshot) => {
+                let snapshot = std::path::PathBuf::from(snapshot);
+                Config {
+                    dit: Some(snapshot.join(crate::models::DIT_FL2VA)),
+                    te: Some(snapshot.join(crate::models::TE)),
+                    video_vae: Some(snapshot.join(crate::models::VIDEO_VAE)),
+                    audio_vae: Some(snapshot.join(crate::models::AUDIO_VAE)),
+                    ..Config::default()
+                }
+            }
+            None => Config::default(),
+        };
+        let residency = hrx::residency::ResidencyManager::new(80 << 30).unwrap();
+        let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
+            memory_budget: Some(residency.budget()),
+            ..Default::default()
+        })
+        .unwrap();
         // Safety: the fixture never modifies checkpoint files.
-        let mut session = unsafe { Session::new(Config::default()) }.unwrap();
+        let mut session =
+            unsafe { Session::new_in(config, SessionOptions::default(), &context) }.unwrap();
         let expected = session
             .denoise(&ids, &p, Noise::default(), &[], &[], None)
             .unwrap();
-        assert!(session.te.is_some() && session.dit.is_some());
-        session.options.residency = ResidencyPolicy::StageScoped;
-        session.release_completed(true, true, true).unwrap();
+        assert!(
+            session.native.state().unwrap().te.is_some()
+                && session.native.state().unwrap().dit.is_some()
+        );
+        let retained = residency.statistics().reserved_bytes;
+        assert!(retained > 1 << 30);
+        session
+            .scheduled(|state| {
+                state.options.residency = ResidencyPolicy::StageScoped;
+                state.release_completed(true, true, true)
+            })
+            .unwrap();
+        assert!(residency.statistics().reserved_bytes < retained);
         for cancel in [true, false] {
             let result = session.denoise(
                 &ids,
@@ -579,8 +829,13 @@ mod tests {
                 &[],
                 Some(&mut |_, _, _| cancel),
             );
-            assert!(session.te.is_none() && session.dit.is_none());
-            assert!(session.vvae.is_none() && session.avae.is_none());
+            let state = session.native.state().unwrap();
+            assert!(state.te.is_none() && state.dit.is_none());
+            assert!(state.vvae.is_none() && state.avae.is_none());
+            assert!(
+                residency.statistics().reserved_bytes < 256 << 20,
+                "only the bounded native staging cache may survive a completed stage"
+            );
             if cancel {
                 assert!(matches!(result, Err(crate::Error::Cancelled)));
             } else {
@@ -595,6 +850,8 @@ mod tests {
                 );
             }
         }
+        drop(session);
+        assert_eq!(residency.statistics().reserved_bytes, 0);
     }
 
     #[test]
@@ -628,7 +885,12 @@ mod tests {
                 video: f32::MIN_POSITIVE,
             }),
         ] {
-            session.options.cache = policy;
+            session
+                .scheduled(|state| {
+                    state.options.cache = policy;
+                    Ok(())
+                })
+                .unwrap();
             let actual = session
                 .denoise(&ids, &p, Noise::default(), &[], &[], None)
                 .unwrap();
@@ -643,7 +905,12 @@ mod tests {
         }
         // The legacy scalar maps to the hardened policy. Its old digest intentionally
         // no longer applies: evaluation one and consecutive suffix skips are forbidden.
-        session.options.cache = CachePolicy::Off;
+        session
+            .scheduled(|state| {
+                state.options.cache = CachePolicy::Off;
+                Ok(())
+            })
+            .unwrap();
         let cached = session
             .denoise(
                 &ids,

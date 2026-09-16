@@ -1449,7 +1449,7 @@ impl Dit {
                     cb.partials.slice(0, groups * 8),
                     crate::vvae::as_bytes_mut(&mut ps),
                 )?;
-                for pair in ps.chunks_exact(2) {
+                for pair in ps.as_chunks::<2>().0 {
                     metrics[slot][0] += f64::from(pair[0]);
                     metrics[slot][1] += f64::from(pair[1]);
                 }

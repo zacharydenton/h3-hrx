@@ -151,6 +151,11 @@ versus 11 s in the timing table above; steady sampling remained 103.7 s per
 evaluation. `--residency retain` keeps models resident, as library sessions do by
 default. See the [measurement and latent checks](docs/benchmarks/20260915-optimization/implementation.md).
 
+For shared-budget applications, `--residency budgeted --memory-budget-mib N`
+keeps idle model units in an evictable cache while pinning active stages. Library
+callers use `ResidencyPolicy::Budgeted` and `Session::new_in`; see
+[runtime options](docs/runtime-options.md#shared-allocation-budgets).
+
 Each configuration has one complete trajectory, with cached checkpoints and
 sequential execution. Steady medians exclude the first evaluation. Equal seeds
 across engines do not produce identical initial noise or clips.

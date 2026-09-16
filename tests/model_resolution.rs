@@ -78,7 +78,12 @@ fn hub_offline_environment_prevents_requests_even_without_the_cli_flag() {
         );
         assert!(!output.status.success());
         assert!(requests.is_empty(), "{value}: {requests:?}");
-        assert!(String::from_utf8_lossy(&output.stderr).contains("not found"));
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            message.contains("not in the Hugging Face cache"),
+            "{message}"
+        );
+        assert!(message.contains("downloading is off"), "{message}");
     }
     let (_, requests) = run(
         env!("CARGO_BIN_EXE_h3-dev"),

@@ -49,6 +49,7 @@ enum Sampler {
 enum Residency {
     StageScoped,
     Retain,
+    Budgeted,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -129,9 +130,13 @@ struct Cli {
     #[arg(long)]
     offline: bool,
 
-    /// Release completed models between stages, or retain them for reuse
+    /// Release completed models, retain them, or cache idle units under a budget
     #[arg(long, value_enum, default_value = "stage-scoped")]
     residency: Residency,
+
+    /// Shared native allocation ceiling in MiB (required for budgeted residency)
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    memory_budget_mib: Option<u64>,
 
     /// Record modality-specific cache changes while running every block
     #[arg(long, hide = true)]
@@ -303,7 +308,24 @@ fn cache_policy(cli: &Cli) -> Result<h3_hrx::CachePolicy> {
     Ok(policy)
 }
 
+fn memory_budget_bytes(cli: &Cli) -> Result<Option<usize>> {
+    let Some(mib) = cli.memory_budget_mib else {
+        if cli.residency == Residency::Budgeted {
+            usage!("--residency budgeted requires --memory-budget-mib");
+        }
+        return Ok(None);
+    };
+    let Some(bytes) = usize::try_from(mib)
+        .ok()
+        .and_then(|n| n.checked_mul(1 << 20))
+    else {
+        usage!("--memory-budget-mib overflows the allocation address space");
+    };
+    Ok(Some(bytes))
+}
+
 fn parameters(cli: &Cli) -> Result<DenoiseParams> {
+    memory_budget_bytes(cli)?;
     let cache = cache_policy(cli)?;
     let mut params = DenoiseParams {
         width: cli.width.unwrap_or(864),
@@ -545,17 +567,26 @@ fn run(cli: Cli) -> Result<()> {
     let t0 = Instant::now();
     // Safety: the checkpoints are the files this command was pointed at, and it does not write to
     // them. A user who edits a checkpoint mid-run gets what the documentation says they get.
+    let residency_manager = memory_budget_bytes(&cli)?
+        .map(hrx::residency::ResidencyManager::new)
+        .transpose()?;
+    let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
+        memory_budget: residency_manager.as_ref().map(|manager| manager.budget()),
+        ..Default::default()
+    })?;
     let mut session = unsafe {
-        Session::new_with_options(
+        Session::new_in(
             config,
             h3_hrx::SessionOptions {
                 residency: match cli.residency {
                     Residency::StageScoped => h3_hrx::ResidencyPolicy::StageScoped,
                     Residency::Retain => h3_hrx::ResidencyPolicy::Retain,
+                    Residency::Budgeted => h3_hrx::ResidencyPolicy::Budgeted,
                 },
                 cache: cache_policy(&cli)?,
                 turbo: cli.preset.turbo(),
             },
+            &context,
         )
     }?;
     eprintln!(
@@ -675,7 +706,7 @@ fn run(cli: Cli) -> Result<()> {
     eprintln!();
     let (video, audio) = (latents.video, latents.audio);
     eprintln!("denoised in {:.1} s", t0.elapsed().as_secs_f64());
-    if let Some(report) = session.profile_report() {
+    if let Some(report) = session.profile_report()? {
         eprintln!("  denoise stages ({report})");
     }
 
@@ -715,7 +746,7 @@ fn run(cli: Cli) -> Result<()> {
     let mut samples = vec![0.0f32; 2 * shape.audio_t as usize * 800];
     session.decode_audio(&audio, shape.audio_t as usize, &mut samples)?;
     eprintln!("decoded in {:.1} s", t0.elapsed().as_secs_f64());
-    if let Some(report) = session.profile_report() {
+    if let Some(report) = session.profile_report()? {
         eprintln!("  decode stages ({report})");
     }
     // the weights are released before muxing, which is where the memory is wanted
@@ -782,6 +813,27 @@ mod tests {
         assert_eq!(c.out, PathBuf::from("h3_out.mp4"));
         assert!(matches!(c.residency, Residency::StageScoped));
         assert!(c.preset.turbo().is_none());
+    }
+
+    #[test]
+    fn budgeted_residency_requires_an_explicit_representable_ceiling() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap();
+        assert!(memory_budget_bytes(&parse(&["h3", "--residency", "budgeted"])).is_err());
+        assert!(Cli::try_parse_from(["h3", "--memory-budget-mib", "0"]).is_err());
+        assert!(memory_budget_bytes(&parse(&[
+            "h3",
+            "--memory-budget-mib",
+            "18446744073709551615"
+        ]))
+        .is_err());
+        let cli = parse(&[
+            "h3",
+            "--residency",
+            "budgeted",
+            "--memory-budget-mib",
+            "81920",
+        ]);
+        assert_eq!(memory_budget_bytes(&cli).unwrap(), Some(80 << 30));
     }
 
     #[test]

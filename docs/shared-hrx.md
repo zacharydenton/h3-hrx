@@ -5,16 +5,16 @@ binary rpath build scripts are removed. The model still exposes `Session` as its
 Rust API. It does not require Python, Torch,
 ROCm development headers or an LLVM build.
 
-The workspace uses `hrx-rs` 0.5 from crates.io, with the exact release pinned
+The workspace uses `hrx-rs` 0.6 from crates.io, with the exact release pinned
 in the workspace lockfile. It includes the coordinated GPU/NPU APIs, compiler
-cache fixes and keyed pending requests. H3 enables only `download` and `loom`;
-ordinary inference does not initialize an NPU.
+cache fixes and keyed pending requests. GPU, downloads and Loom are unconditional
+in HRX; H3 does not enable the optional `npu` feature.
 
 For local HRX development, put this in an ignored `.cargo/config.toml`:
 
 ```toml
 [patch.crates-io]
-hrx-rs = { path = "../hrx.rs" }
+hrx-rs = { path = "../hrx-rs" }
 ```
 
 Restore the pinned dependency before committing lockfiles. HRX's
@@ -28,6 +28,10 @@ tracks last use rather than creation. Nothing is evicted implicitly.
 
 The shared runtime supplies per-session streams, allocator-based allocation,
 checked buffer ranges, dynamic native loading, and prepared binding dispatch.
+The session uses `execution::NativeSession` for shared
+compute-lane admission, completion fencing and owner quarantine. H3 retains its
+native stream-bound recordings and borrowed host API; its four model units use
+shared budgeted residency. See [session lifecycle](runtime-options.md).
 `h3_hrx::compile` now selects model sources/exports and delegates compilation,
 SHA-256 identity, integrity checks and atomic publication to `hrx::loom`. It
 compiles for the architecture the stream's device reports, and asking for a kernel

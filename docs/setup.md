@@ -28,10 +28,10 @@ bundle the crate pins, verifies it file by file against the manifest compiled
 into the crate, and caches it under `$XDG_CACHE_HOME/hrx`.
 
 To provision it ahead of time, or on a machine that will not have the network
-later, install the crate's runner and unpack the release yourself:
+later, install the CLI and unpack the release yourself:
 
 ```sh
-cargo install --locked hrx-rs --version 0.5.0 --features runner
+cargo install --locked hrx-rs --version 0.6.0
 gh release download native-20260910-gpu-npu --repo zacharydenton/hrx-rs \
   --pattern hrx-linux-x86_64-gfx1151.tar.gz --dir build --clobber
 hrx prepare build/hrx-linux-x86_64-gfx1151.tar.gz
