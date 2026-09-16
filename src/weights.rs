@@ -6,9 +6,9 @@
 //!
 //! Recipes are declarative and resolved against the checkpoint when they are assembled, so a recipe
 //! table can be built and validated at open without reading a byte of tensor data.
-use crate::checkpoint::{Checkpoint, Entry};
+use crate::checkpoint::Checkpoint;
 use half::{bf16, f16};
-use safetensors::tensor::Dtype;
+use hrx::artifacts::safetensors::{DType as Dtype, Entry};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex};
 pub enum Error {
     #[error(transparent)]
     Checkpoint(#[from] crate::checkpoint::Error),
+    #[error(transparent)]
+    Artifact(#[from] hrx::Error),
     #[error("no recipe for tensor {0}")]
     NoRecipe(String),
     #[error("{0}")]
@@ -258,7 +260,8 @@ impl Weights {
                     let span = &all[from..from + segment.rows * row_bytes];
                     self.file.will_need(span);
                     for (i, chunk) in span.chunks(CHUNK).enumerate() {
-                        crate::dispatch::upload_at(stream, buffer, i * CHUNK, chunk)
+                        stream
+                            .upload_at(buffer, i * CHUNK, chunk)
                             .map_err(|e| Error::Device(e.to_string()))?;
                     }
                 } else {
@@ -281,26 +284,26 @@ impl Weights {
                             stage[dst..dst + row_bytes].copy_from_slice(&all[src..src + row_bytes]);
                             staged += 1;
                             if staged == per {
-                                crate::dispatch::upload_at(
-                                    stream,
-                                    buffer,
-                                    written * pitch_bytes,
-                                    &stage[..staged * pitch_bytes],
-                                )
-                                .map_err(|e| Error::Device(e.to_string()))?;
+                                stream
+                                    .upload_at(
+                                        buffer,
+                                        written * pitch_bytes,
+                                        &stage[..staged * pitch_bytes],
+                                    )
+                                    .map_err(|e| Error::Device(e.to_string()))?;
                                 written += staged;
                                 staged = 0;
                             }
                         }
                     }
                     if staged > 0 {
-                        crate::dispatch::upload_at(
-                            stream,
-                            buffer,
-                            written * pitch_bytes,
-                            &stage[..staged * pitch_bytes],
-                        )
-                        .map_err(|e| Error::Device(e.to_string()))?;
+                        stream
+                            .upload_at(
+                                buffer,
+                                written * pitch_bytes,
+                                &stage[..staged * pitch_bytes],
+                            )
+                            .map_err(|e| Error::Device(e.to_string()))?;
                         written += staged;
                     }
                     if written != *rows {
@@ -380,8 +383,8 @@ pub fn rows_of(ck: &Checkpoint, parts: &[&str], pitch_bytes: usize) -> Result<Re
     for (i, name) in parts.iter().enumerate() {
         let entry = ck.at(name)?;
         if i == 0 {
-            row_bytes = entry.row_bytes();
-        } else if entry.row_bytes() != row_bytes {
+            row_bytes = entry.row_bytes()?;
+        } else if entry.row_bytes()? != row_bytes {
             return layout("concatenated tensors differ in row width");
         }
         segments.push(Segment {
@@ -418,14 +421,14 @@ pub fn interleave16(
 ) -> Result<Recipe> {
     let a = ck.at(first.0)?;
     let b = ck.at(second.0)?;
-    if a.row_bytes() != b.row_bytes()
+    if a.row_bytes()? != b.row_bytes()?
         || !rows_each.is_multiple_of(16)
         || first.1 + rows_each > a.rows()
         || second.1 + rows_each > b.rows()
     {
         return layout("interleave: the halves do not fit");
     }
-    let row_bytes = a.row_bytes();
+    let row_bytes = a.row_bytes()?;
     let pitch_bytes = if pitch_bytes != 0 {
         pitch_bytes
     } else {
@@ -460,7 +463,7 @@ pub fn rows_padded(
     pitch_bytes: usize,
 ) -> Result<Recipe> {
     let entry = ck.at(name)?;
-    let row_bytes = entry.row_bytes();
+    let row_bytes = entry.row_bytes()?;
     let pitch = if pitch_bytes != 0 {
         pitch_bytes
     } else {
@@ -497,7 +500,7 @@ pub fn rows_permuted(
     pitch_bytes: usize,
 ) -> Result<Recipe> {
     let entry = ck.at(name)?;
-    let row_bytes = entry.row_bytes();
+    let row_bytes = entry.row_bytes()?;
     let pitch_bytes = if pitch_bytes != 0 {
         pitch_bytes
     } else {
@@ -530,7 +533,7 @@ pub fn widen_runs(ck: &Checkpoint, name: &str, runs: &[Run]) -> Result<Recipe> {
     widenable(entry, "widen_runs")?;
     let mut n = 0;
     for &(first, count) in runs {
-        if first + count > entry.elements() {
+        if first + count > entry.elements()? {
             return layout(format!("an element run past {name}"));
         }
         n += count;
@@ -579,7 +582,7 @@ pub fn regroup(
     if eb == 0 {
         return layout(format!("regroup on {:?}", entry.dtype));
     }
-    if entry.row_bytes() != groups * in_elems * eb || out_elems < in_elems {
+    if entry.row_bytes()? != groups * in_elems * eb || out_elems < in_elems {
         return layout("regroup: the row does not hold the groups");
     }
     let rows = entry.rows();
@@ -612,7 +615,7 @@ pub fn widen_f32(ck: &Checkpoint, parts: &[&str]) -> Result<Recipe> {
     for name in parts {
         let entry = ck.at(name)?;
         widenable(entry, "widen_f32")?;
-        n += entry.elements();
+        n += entry.elements()?;
     }
     let parts: Vec<String> = parts.iter().map(|s| (*s).to_string()).collect();
     Ok(Recipe::Built {
@@ -623,7 +626,7 @@ pub fn widen_f32(ck: &Checkpoint, parts: &[&str]) -> Result<Recipe> {
                 let entry = ck.at(name)?;
                 let eb = elem_bytes(entry.dtype);
                 let src = ck.bytes(entry);
-                for i in 0..entry.elements() {
+                for i in 0..entry.elements()? {
                     out.extend_from_slice(&widen_one(entry.dtype, &src[i * eb..])?.to_le_bytes());
                 }
             }
@@ -636,10 +639,10 @@ pub fn widen_f32(ck: &Checkpoint, parts: &[&str]) -> Result<Recipe> {
 pub fn widen_padded(ck: &Checkpoint, name: &str, n_out: usize) -> Result<Recipe> {
     let entry = ck.at(name)?;
     widenable(entry, "widen_padded")?;
-    if n_out < entry.elements() {
+    if n_out < entry.elements()? {
         return layout("widen_padded: shorter than the tensor");
     }
-    let (name, n) = (name.to_string(), entry.elements());
+    let (name, n) = (name.to_string(), entry.elements()?);
     Ok(Recipe::Built {
         bytes: n_out * 4,
         build: Box::new(move |ck| {
@@ -727,7 +730,7 @@ pub fn scales_interleave16(
 ) -> Result<Recipe> {
     for (name, _) in [first, second] {
         let entry = ck.at(name)?;
-        if entry.dtype != Dtype::F32 || entry.row_bytes() != 4 {
+        if entry.dtype != Dtype::F32 || entry.row_bytes()? != 4 {
             return layout("scales must be f32 [N, 1]");
         }
     }

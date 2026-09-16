@@ -63,9 +63,8 @@ fn inner() -> Fallible {
         let prepare = Prepare::build(&compiler, &mut stream, "plain", "f16", width, 0.0, 1, width)?;
         compiler.flush(&mut stream)?;
         let bytes = width * tokens as usize * 2;
-        let input = stream.allocate(bytes)?;
+        let input = stream.allocate_zeroed(bytes)?;
         let output = stream.allocate(bytes)?;
-        stream.fill(input.binding(), 0)?;
         stream.fill(output.binding(), 0x7f)?;
 
         // The same launches as a chain. Every node writes `output`, so every edge is real: this is
@@ -143,13 +142,10 @@ fn inner() -> Fallible {
         ];
         let kernel = compiler.get(&mut stream, "conv1d4_f32", "h3_conv1d4_f32", &cfg)?;
         compiler.flush(&mut stream)?;
-        let plane = stream.allocate(chan * len.div_ceil(256).max(1) * 256 * 4)?;
-        let out = stream.allocate(chan * len.div_ceil(256).max(1) * 256 * 4)?;
-        let weight = stream.allocate(chan * chan * kk * 4)?;
-        let bias = stream.allocate(chan * 4)?;
-        for b in [&plane, &out, &weight, &bias] {
-            stream.fill(b.binding(), 0)?;
-        }
+        let plane = stream.allocate_zeroed(chan * len.div_ceil(256).max(1) * 256 * 4)?;
+        let out = stream.allocate_zeroed(chan * len.div_ceil(256).max(1) * 256 * 4)?;
+        let weight = stream.allocate_zeroed(chan * chan * kk * 4)?;
+        let bias = stream.allocate_zeroed(chan * 4)?;
         let grid = [len.div_ceil(256) as u32, chan as u32, 1];
         let need = [plane.bytes(), weight.bytes(), bias.bytes(), out.bytes()];
         let views = [

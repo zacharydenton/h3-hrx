@@ -2,6 +2,7 @@
 //!
 //! Repository-relative filenames are passed directly to the Hub client, which owns
 //! snapshot paths, cache lookup, and downloads. No separate model directory is used.
+use hrx::artifacts::hf::{HubFile, Repository, Resolver as HubResolver};
 use std::path::PathBuf;
 
 pub const REPO_OWNER: &str = "Comfy-Org";
@@ -25,16 +26,6 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-
-/// Match Hugging Face's boolean environment convention.
-fn hub_offline() -> bool {
-    std::env::var("HF_HUB_OFFLINE").is_ok_and(|value| {
-        matches!(
-            value.to_ascii_uppercase().as_str(),
-            "1" | "ON" | "YES" | "TRUE"
-        )
-    })
-}
 
 /// Resolve Comfy-Org checkpoints through the shared Hugging Face Hub cache.
 pub struct Resolver {
@@ -82,38 +73,32 @@ impl Resolver {
 
     /// The path of one checkpoint, fetching it into the shared cache if it is not already cached.
     pub fn find(&self, relative: &str) -> Result<PathBuf> {
-        // Already in the shared cache? This never touches the network.
-        if let Ok(path) = self.hub(relative, true) {
+        let resolver = self.hub();
+        let file = HubFile::new(relative);
+        if let Ok(Some(path)) = resolver.local(&file) {
             return Ok(path);
         }
-        if !self.download || hub_offline() {
+        if !self.download {
             return Err(self.missing(relative));
         }
-        self.hub(relative, false)
+        resolver.resolve(&file).map_err(|source| Error::Hub {
+            name: relative.into(),
+            source: Box::new(source),
+        })
     }
 
     /// As [`Resolver::find`], but a file that is simply absent is not an error: the ref2va checkpoint
     /// is optional, and asking for it must not start a 21 GB download.
     pub fn find_local(&self, relative: &str) -> Option<PathBuf> {
-        self.hub(relative, true).ok()
+        self.hub().local(&HubFile::new(relative)).ok().flatten()
     }
 
-    fn hub(&self, relative: &str, cached_only: bool) -> Result<PathBuf> {
-        let client = hf_hub::HFClientSync::new().map_err(|e| Error::Hub {
-            name: relative.into(),
-            source: Box::new(e),
-        })?;
-        client
-            .model(self.owner.as_str(), self.repository.as_str())
-            .download_file()
-            .filename(relative)
-            .maybe_revision(self.revision.clone())
-            .local_files_only(cached_only)
-            .send()
-            .map_err(|e| Error::Hub {
-                name: relative.into(),
-                source: Box::new(e),
-            })
+    fn hub(&self) -> HubResolver {
+        let mut repository = Repository::new(&self.owner, &self.repository);
+        if let Some(revision) = &self.revision {
+            repository = repository.at(revision);
+        }
+        HubResolver::new(repository)
     }
 
     fn missing(&self, relative: &str) -> Error {

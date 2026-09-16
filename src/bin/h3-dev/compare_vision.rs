@@ -68,10 +68,12 @@ pub fn run(args: Vec<String>) {
         let original =
             std::fs::read_to_string(Path::new(&baseline).join(format!("{stem}.loom"))).unwrap();
         let mut request = hrx::loom::Specialization::new(&symbol);
-        request.config = [("k_size", k), ("n_size", n)]
-            .into_iter()
-            .map(|(key, value)| (format!("h3.{stem}.{key}"), value.to_string()))
-            .collect();
+        request.replace_config(
+            [("k_size", k), ("n_size", n)]
+                .into_iter()
+                .map(|(key, value)| (format!("h3.{stem}.{key}"), value.to_string()))
+                .collect(),
+        );
         let old = compiler.module(&original).compile(&request).unwrap();
         let new = compiler.module(&source).compile(&request).unwrap();
         let identical = old.bytes() == new.bytes();

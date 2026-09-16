@@ -47,10 +47,11 @@ impl Harness {
         let source = std::fs::read_to_string(path).unwrap();
         let symbol = format!("h3_{stem}");
         let mut request = hrx::loom::Specialization::new(&symbol);
-        request.config = cfg
-            .iter()
-            .map(|(key, value)| (format!("h3.{stem}.{key}"), value.clone()))
-            .collect();
+        request.replace_config(
+            cfg.iter()
+                .map(|(key, value)| (format!("h3.{stem}.{key}"), value.clone()))
+                .collect(),
+        );
         let path = self.compiler.module(&source).compile(&request).unwrap();
         let baseline = std::env::var_os("H3_KERNEL_BASELINE")
             .filter(|_| module != stem)
@@ -58,7 +59,7 @@ impl Harness {
                 let source = std::fs::read_to_string(Path::new(&dir).join(format!("{stem}.loom")))
                     .expect("baseline kernel source");
                 let mut old = hrx::loom::Specialization::new(&symbol);
-                old.config = request.config.clone();
+                old.replace_config(request.configuration().clone());
                 let old_path = self.compiler.module(&source).compile(&old).unwrap();
                 eprintln!(
                     "artifact {stem}: {}",

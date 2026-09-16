@@ -7,7 +7,7 @@
 use crate::checkpoint::Checkpoint;
 use crate::model::*;
 use crate::weights::{rows_of, widen_f32, Recipe, Result};
-use safetensors::tensor::Dtype;
+use hrx::artifacts::safetensors::DType as Dtype;
 use std::collections::BTreeMap;
 
 type Table = BTreeMap<String, Recipe>;

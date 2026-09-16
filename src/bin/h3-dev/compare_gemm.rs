@@ -111,7 +111,7 @@ pub fn run(args: Vec<String>) {
                         std::fs::read_to_string(baseline.join(format!("{stem}.loom"))).unwrap();
                     let new = std::fs::read_to_string(root.join(format!("{module}.loom"))).unwrap();
                     let mut request = hrx::loom::Specialization::new(&symbol);
-                    request.config = cfg;
+                    request.replace_config(cfg);
                     let old_path = compiler.module(&old).compile(&request).unwrap();
                     let new_path = compiler.module(&new).compile(&request).unwrap();
                     let identical = old_path.bytes() == new_path.bytes();

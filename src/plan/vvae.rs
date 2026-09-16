@@ -10,7 +10,7 @@ use crate::weights::{
     conv3d_taps, interleaved_runs, regroup, rows_of, rows_permuted, up, widen_f32, widen_padded,
     widen_runs, Recipe, Result, Run,
 };
-use safetensors::tensor::Dtype;
+use hrx::artifacts::safetensors::DType as Dtype;
 use std::collections::BTreeMap;
 
 type Table = BTreeMap<String, Recipe>;

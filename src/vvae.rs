@@ -158,10 +158,8 @@ impl VideoVae {
         )?;
         let t = stack.capacity();
 
-        let x = stream.allocate(t * VAE_HID * 4)?;
-        stream.fill(x.slice(0, t * VAE_HID * 4), 0)?;
-        let in16 = stream.allocate(t * VAE_KIN * 2)?;
-        stream.fill(in16.slice(0, t * VAE_KIN * 2), 0)?;
+        let x = stream.allocate_zeroed(t * VAE_HID * 4)?;
+        let in16 = stream.allocate_zeroed(t * VAE_KIN * 2)?;
         let cls = crate::dispatch::Classes::zeroed(stream, t)?;
 
         // the rotary table over this grid; the register and cls rows keep the identity rotation

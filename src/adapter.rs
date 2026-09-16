@@ -1,8 +1,8 @@
 //! Pinned Turbo checkpoint descriptions and strict CPU validation.
 //! This module inspects adapters; execution is not enabled by inspecting a checkpoint.
-use crate::checkpoint::{Checkpoint, Entry};
+use crate::checkpoint::Checkpoint;
 use crate::error::{invalid, Result};
-use safetensors::tensor::Dtype;
+use hrx::artifacts::safetensors::{DType as Dtype, Entry};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -122,8 +122,8 @@ fn validate_header(entries: &BTreeMap<String, Entry>) -> Result<Vec<LinearAdapte
             };
             if entry.dtype != dtype || entry.shape != shape {
                 return invalid(format!(
-                    "adapter {name}: expected {dtype:?} {shape:?}, got {}",
-                    entry.describe()
+                    "adapter {name}: expected {dtype:?} {shape:?}, got {:?} {:?}",
+                    entry.dtype, entry.shape
                 ));
             }
             expected.insert(name);

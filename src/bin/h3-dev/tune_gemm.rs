@@ -120,18 +120,20 @@ pub fn run(args: Vec<String>) {
             let mut kernels = Vec::new();
             for &group in &groups {
                 let mut req = hrx::loom::Specialization::new(format!("h3_{stem}"));
-                req.report = true;
-                req.config = [
-                    ("k_size", k),
-                    ("n_size", n),
-                    ("k_stride", stride),
-                    ("m_group", group as usize),
-                    ("classes", 4),
-                ]
-                .into_iter()
-                .filter(|(key, _)| *key != "classes" || mode == "_resid")
-                .map(|(key, value)| (format!("h3.{stem}.{key}"), value.to_string()))
-                .collect();
+                req.set_report(true);
+                req.replace_config(
+                    [
+                        ("k_size", k),
+                        ("n_size", n),
+                        ("k_stride", stride),
+                        ("m_group", group as usize),
+                        ("classes", 4),
+                    ]
+                    .into_iter()
+                    .filter(|(key, _)| *key != "classes" || mode == "_resid")
+                    .map(|(key, value)| (format!("h3.{stem}.{key}"), value.to_string()))
+                    .collect(),
+                );
                 let artifact = compiler.module(&source).compile(&req).unwrap();
                 println!("{{\"kind\":\"artifact\",\"op\":\"{op}\",\"m\":{m},\"group\":{group},\"sha256\":\"{}\",\"compiler\":\"{}\",\"report\":{}}}",
                     hrx::bundle::digest(artifact.bytes()), artifact.compiler_identity(), artifact.report().map_or("null".into(), ToString::to_string));

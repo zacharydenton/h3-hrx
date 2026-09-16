@@ -9,7 +9,7 @@ use crate::weights::{
     interleave16, regroup, rows_of, rows_padded, scales_interleave16, scales_rows, widen_f32,
     widen_padded, Recipe, Result,
 };
-use safetensors::tensor::Dtype;
+use hrx::artifacts::safetensors::DType as Dtype;
 use std::collections::BTreeMap;
 
 // The vision tower's own shapes.

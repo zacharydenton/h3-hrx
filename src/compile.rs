@@ -203,7 +203,7 @@ impl Compiler {
     }
     pub fn tag(&self, stem: &str, symbol: &str, cfg: &Cfg) -> Result<String> {
         let mut request = hrx::loom::Specialization::new(symbol);
-        request.config = config(stem, cfg)?;
+        request.replace_config(config(stem, cfg)?);
         let source = self.source(stem)?;
         Ok(self
             .kernels(None)?
@@ -247,7 +247,7 @@ impl Compiler {
                         .source(&key.stem)
                         .map_err(|e| hrx::Error::Message(e.to_string()))?;
                     let mut spec = hrx::loom::Specialization::new(&key.symbol);
-                    spec.config = key.config.iter().cloned().collect();
+                    spec.replace_config(key.config.iter().cloned().collect());
                     Ok((source, spec))
                 })
         }?;

@@ -3,10 +3,8 @@
 //! Nothing is read at open beyond the header: pages fault in when a tensor's bytes are first touched,
 //! and are released again once they are on the device. The dtype strings are the file's own, so a plan
 //! validates against what the checkpoint actually holds rather than against an expectation baked in here.
-use memmap2::Mmap;
-use safetensors::tensor::{Dtype, Metadata, SafeTensors};
+use hrx::artifacts::safetensors::{DType, Entry, FileView};
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -30,50 +28,15 @@ pub enum Error {
     #[error("{name} has an unsupported checkpoint dtype {dtype:?} in {path}")]
     Dtype {
         name: String,
-        dtype: Dtype,
+        dtype: DType,
         path: PathBuf,
     },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// One tensor's placement in the mapped data block.
-#[derive(Clone, Debug)]
-pub struct Entry {
-    pub dtype: Dtype,
-    pub shape: Vec<usize>,
-    /// Offset from the start of the data block, not the file.
-    pub offset: usize,
-    pub bytes: usize,
-}
-
-impl Entry {
-    /// A scalar counts as one row, so `row_bytes` is well defined for every tensor.
-    pub fn rows(&self) -> usize {
-        self.shape.first().copied().unwrap_or(1)
-    }
-    pub fn row_bytes(&self) -> usize {
-        self.bytes.checked_div(self.rows()).unwrap_or(self.bytes)
-    }
-    pub fn elements(&self) -> usize {
-        self.shape
-            .iter()
-            .product::<usize>()
-            .max(usize::from(self.shape.is_empty()))
-    }
-    /// `I8 [32, 8]`, as it appears in a mismatch message.
-    pub fn describe(&self) -> String {
-        format!("{:?} {:?}", self.dtype, self.shape)
-    }
-}
-
 pub struct Checkpoint {
-    path: PathBuf,
-    map: Mmap,
-    /// Where the data block starts in the file.
-    data: usize,
-    /// Ordered, because a lookup failure reports the lexicographically first offender.
-    entries: BTreeMap<String, Entry>,
+    file: FileView,
 }
 
 impl Checkpoint {
@@ -95,70 +58,33 @@ impl Checkpoint {
     /// same requirement in its own documentation, and is the safe entry point that relies on it.
     pub unsafe fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = File::open(&path).map_err(|source| Error::Open {
+        std::fs::File::open(&path).map_err(|source| Error::Open {
             path: path.clone(),
             source,
         })?;
-        // Safety: the caller's, and stated above.
-        let map = unsafe { Mmap::map(&file) }.map_err(|source| Error::Open {
+        let file = unsafe { FileView::map(&path) }.map_err(|error| Error::Header {
             path: path.clone(),
-            source,
+            message: error.to_string(),
         })?;
-
-        let (header, metadata): (usize, Metadata) =
-            SafeTensors::read_metadata(&map).map_err(|e| Error::Header {
-                path: path.clone(),
-                message: e.to_string(),
-            })?;
-        let data = 8 + header;
-        let data_bytes = map.len().checked_sub(data).ok_or_else(|| Error::Header {
-            path: path.clone(),
-            message: "header runs past the end of the file".into(),
-        })?;
-
-        let mut entries = BTreeMap::new();
-        for (name, info) in metadata.tensors() {
-            let (begin, end) = info.data_offsets;
-            if end < begin || end > data_bytes {
-                return Err(Error::Header {
-                    path: path.clone(),
-                    message: format!("tensor {name} spans past the data block"),
-                });
-            }
-            entries.insert(
-                name.clone(),
-                Entry {
-                    dtype: info.dtype,
-                    shape: info.shape.clone(),
-                    offset: begin,
-                    bytes: end - begin,
-                },
-            );
-        }
-        Ok(Self {
-            path,
-            map,
-            data,
-            entries,
-        })
+        Ok(Self { file })
     }
 
     pub fn entries(&self) -> &BTreeMap<String, Entry> {
-        &self.entries
+        self.file.entries()
     }
     pub fn has(&self, name: &str) -> bool {
-        self.entries.contains_key(name)
+        self.file.contains(name)
     }
 
     pub fn at(&self, name: &str) -> Result<&Entry> {
-        self.entries.get(name).ok_or_else(|| Error::Missing {
+        self.file.entries().get(name).ok_or_else(|| Error::Missing {
             name: name.to_string(),
-            path: self.path.clone(),
+            path: self.file.path().to_path_buf(),
         })
     }
 
     /// The checked lookup a plan uses. A `-1` dimension matches whatever the file has there.
-    pub fn at_checked(&self, name: &str, dtype: Dtype, shape: &[i64]) -> Result<&Entry> {
+    pub fn at_checked(&self, name: &str, dtype: DType, shape: &[i64]) -> Result<&Entry> {
         let entry = self.at(name)?;
         let shape_ok = entry.shape.len() == shape.len()
             && entry
@@ -169,9 +95,9 @@ impl Checkpoint {
         if entry.dtype != dtype || !shape_ok {
             return Err(Error::Mismatch {
                 name: name.to_string(),
-                found: entry.describe(),
+                found: format!("{:?} {:?}", entry.dtype, entry.shape),
                 expected: format!("{dtype:?} {shape:?}"),
-                path: self.path.clone(),
+                path: self.file.path().to_path_buf(),
             });
         }
         Ok(entry)
@@ -179,12 +105,14 @@ impl Checkpoint {
 
     /// A tensor's bytes, still in the mapping. Reading them faults their pages in.
     pub fn bytes(&self, entry: &Entry) -> &[u8] {
-        &self.map[self.data + entry.offset..self.data + entry.offset + entry.bytes]
+        self.file
+            .bytes(entry)
+            .expect("checkpoint entry belongs to this file")
     }
 
     /// Hint the kernel to read a range ahead of a sequential pass over it.
     pub fn will_need(&self, range: &[u8]) {
-        self.advise(range, libc::MADV_WILLNEED);
+        self.file.will_need_bytes(range);
     }
 
     /// Release a range's pages once its bytes are on the device. A tensor is read once, and tens of
@@ -197,70 +125,19 @@ impl Checkpoint {
             std::env::var_os("H3_KEEP_MAPPED").is_some_and(|v| !v.is_empty() && v != "0")
         });
         if !keep {
-            self.advise(range, libc::MADV_DONTNEED);
+            self.file.done_with_bytes(range);
         }
     }
-
-    /// The whole pages a range covers, so a partial page at either end is never advised away under a
-    /// neighbouring tensor's bytes: WILLNEED rounds outward, DONTNEED inward. Dropping a shared page
-    /// would cost the neighbour a re-read, not correctness, so the asymmetry is the safe direction.
-    ///
-    /// The range must lie inside this checkpoint's mapping, and anything else is ignored. Both
-    /// callers are safe functions taking a `&[u8]`, and `MADV_DONTNEED` on private anonymous memory
-    /// *zeroes* it — so without this check a caller could hand over an unrelated buffer and have it
-    /// silently erased. Every real call site slices `bytes()`, which is always inside.
-    fn advise(&self, range: &[u8], how: i32) {
-        if range.is_empty() {
-            return;
-        }
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        let Some((begin, end)) = advise_pages(
-            (self.map.as_ptr() as usize, self.map.len()),
-            (range.as_ptr() as usize, range.len()),
-            page,
-            how == libc::MADV_WILLNEED,
-        ) else {
-            return;
-        };
-        unsafe { libc::madvise(begin as *mut libc::c_void, end - begin, how) };
-    }
-}
-
-/// The page range to advise, or `None` when there is nothing to do.
-///
-/// Split out so it can be tested with plain integers: the interesting cases are a range outside the
-/// mapping and one that runs past its end, and *constructing* a slice for either of those would
-/// itself be undefined behaviour — a test that has to break the rules to reach the check proves
-/// nothing about it.
-fn advise_pages(
-    map: (usize, usize),
-    range: (usize, usize),
-    page: usize,
-    outward: bool,
-) -> Option<(usize, usize)> {
-    let (map_start, map_len) = map;
-    let (first, len) = range;
-    let map_end = map_start.checked_add(map_len)?;
-    let last = first.checked_add(len)?;
-    if first < map_start || last > map_end {
-        return None;
-    }
-    let (begin, end) = if outward {
-        (first & !(page - 1), (last + page - 1) & !(page - 1))
-    } else {
-        ((first + page - 1) & !(page - 1), last & !(page - 1))
-    };
-    (end > begin).then_some((begin, end))
 }
 
 /// Bytes per element for the dtypes a ComfyUI checkpoint holds. `U8` includes its quantisation
 /// metadata blobs. Anything else is a checkpoint this build does not understand.
-pub fn dtype_bytes(name: &str, dtype: Dtype, path: &Path) -> Result<usize> {
+pub fn dtype_bytes(name: &str, dtype: DType, path: &Path) -> Result<usize> {
     match dtype {
-        Dtype::BOOL | Dtype::U8 | Dtype::I8 => Ok(1),
-        Dtype::U16 | Dtype::I16 | Dtype::F16 | Dtype::BF16 => Ok(2),
-        Dtype::U32 | Dtype::I32 | Dtype::F32 => Ok(4),
-        Dtype::U64 | Dtype::I64 | Dtype::F64 => Ok(8),
+        DType::BOOL | DType::U8 | DType::I8 => Ok(1),
+        DType::U16 | DType::I16 | DType::F16 | DType::BF16 => Ok(2),
+        DType::U32 | DType::I32 | DType::F32 => Ok(4),
+        DType::U64 | DType::I64 | DType::F64 => Ok(8),
         other => Err(Error::Dtype {
             name: name.to_string(),
             dtype: other,
@@ -272,6 +149,8 @@ pub fn dtype_bytes(name: &str, dtype: Dtype, path: &Path) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hrx::artifacts::safetensors::DType as Dtype;
+    use std::fs::File;
     use std::io::Write;
 
     /// Writes a safetensors file: `(name, dtype, shape, bytes)` entries laid out in order.
@@ -328,7 +207,14 @@ mod tests {
         let gate = ck.at("gate").unwrap();
         assert_eq!(gate.dtype, Dtype::I8);
         assert_eq!(gate.shape, vec![2, 4]);
-        assert_eq!((gate.rows(), gate.row_bytes(), gate.elements()), (2, 4, 8));
+        assert_eq!(
+            (
+                gate.rows(),
+                gate.row_bytes().unwrap(),
+                gate.elements().unwrap()
+            ),
+            (2, 4, 8)
+        );
         assert_eq!(ck.bytes(gate), &(0..8u8).collect::<Vec<_>>()[..]);
         assert!(ck.has("scale") && !ck.has("nope"));
         // entries are ordered, so error reporting is deterministic
@@ -452,9 +338,12 @@ mod tests {
         );
         let ck = unsafe { Checkpoint::open(&path) }.unwrap();
         let scalar = ck.at("scalar").unwrap();
-        assert_eq!((scalar.elements(), scalar.rows(), scalar.bytes), (1, 1, 4));
+        assert_eq!(
+            (scalar.elements().unwrap(), scalar.rows(), scalar.bytes),
+            (1, 1, 4)
+        );
         let empty = ck.at("empty").unwrap();
-        assert_eq!((empty.elements(), empty.bytes), (0, 0));
+        assert_eq!((empty.elements().unwrap(), empty.bytes), (0, 0));
         assert!(ck.bytes(empty).is_empty());
     }
 
@@ -473,51 +362,6 @@ mod tests {
             assert_eq!(dtype_bytes("t", dtype, path).unwrap(), want, "{dtype:?}");
         }
         assert!(dtype_bytes("t", Dtype::F8_E5M2, path).is_err());
-    }
-
-    #[test]
-    fn a_range_outside_the_mapping_is_never_advised() {
-        // Integers, not slices: a range outside the mapping cannot be built as a reference without
-        // undefined behaviour, so the check is tested where it can be reached honestly.
-        const PAGE: usize = 4096;
-        let map = (0x1000_0000usize, 64 * PAGE);
-        // wholly inside is advised
-        assert!(advise_pages(map, (map.0, 8 * PAGE), PAGE, true).is_some());
-        // wholly outside, before and after
-        assert_eq!(advise_pages(map, (map.0 - PAGE, PAGE), PAGE, true), None);
-        assert_eq!(advise_pages(map, (map.0 + map.1, PAGE), PAGE, true), None);
-        // starting inside and running past the end
-        assert_eq!(advise_pages(map, (map.0, map.1 + 1), PAGE, true), None);
-        assert_eq!(advise_pages(map, (map.0 + PAGE, map.1), PAGE, false), None);
-        // and a length that would overflow the address space
-        assert_eq!(advise_pages(map, (map.0, usize::MAX), PAGE, true), None);
-        assert_eq!(
-            advise_pages((map.0, usize::MAX), (map.0, 1), PAGE, true),
-            None
-        );
-    }
-
-    #[test]
-    fn advised_pages_round_outward_to_read_and_inward_to_drop() {
-        const PAGE: usize = 4096;
-        let map = (0x1000_0000usize, 64 * PAGE);
-        // a range inside one page: reading takes the whole page, dropping takes none of it
-        let part = (map.0 + 100, 200);
-        assert_eq!(
-            advise_pages(map, part, PAGE, true),
-            Some((map.0, map.0 + PAGE))
-        );
-        assert_eq!(advise_pages(map, part, PAGE, false), None);
-        // two and a bit pages: reading rounds out to three, dropping in to the whole one between
-        let span = (map.0 + PAGE - 8, 2 * PAGE + 16);
-        assert_eq!(
-            advise_pages(map, span, PAGE, true),
-            Some((map.0, map.0 + 4 * PAGE))
-        );
-        assert_eq!(
-            advise_pages(map, span, PAGE, false),
-            Some((map.0 + PAGE, map.0 + 3 * PAGE))
-        );
     }
 
     #[test]

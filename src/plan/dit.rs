@@ -9,7 +9,7 @@ use crate::model::*;
 use crate::weights::{
     interleave16, rows_of, scales_interleave16, scales_rows, widen_f32, Recipe, Result,
 };
-use safetensors::tensor::Dtype;
+use hrx::artifacts::safetensors::DType as Dtype;
 use std::collections::BTreeMap;
 
 type Table = BTreeMap<String, Recipe>;

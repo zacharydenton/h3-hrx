@@ -5,7 +5,7 @@ binary rpath build scripts are removed. The model still exposes `Session` as its
 Rust API. It does not require Python, Torch,
 ROCm development headers or an LLVM build.
 
-The workspace uses `hrx-rs` 0.4 from crates.io, with the exact release pinned
+The workspace uses `hrx-rs` 0.5 from crates.io, with the exact release pinned
 in the workspace lockfile. It includes the coordinated GPU/NPU APIs, compiler
 cache fixes and keyed pending requests. H3 enables only `download` and `loom`;
 ordinary inference does not initialize an NPU.

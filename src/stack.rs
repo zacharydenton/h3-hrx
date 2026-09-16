@@ -98,8 +98,7 @@ impl Constants {
         let ones = stream.allocate(HID * 4)?;
         let row: Vec<u8> = (0..HID).flat_map(|_| 1.0f32.to_le_bytes()).collect();
         stream.upload(ones.binding(), &row)?;
-        let zeros = stream.allocate(2 * TE_FFN * 4)?;
-        stream.fill(zeros.slice(0, 2 * TE_FFN * 4), 0)?;
+        let zeros = stream.allocate_zeroed(2 * TE_FFN * 4)?;
         Ok(Self {
             ones: Arc::new(ones),
             zeros: Arc::new(zeros),
@@ -703,10 +702,8 @@ impl Stack {
             let qs = stream.allocate(t * d.heads * 4)?;
             let ks = stream.allocate(t * d.heads * 4)?;
             let kmean = stream.allocate(d.inner() * 4)?;
-            let zmean = stream.allocate(d.inner() * 4)?;
-            let vt = stream.allocate(d.inner() * t * 2)?;
-            stream.fill(zmean.slice(0, d.inner() * 4), 0)?;
-            stream.fill(vt.slice(0, d.inner() * t * 2), 0)?;
+            let zmean = stream.allocate_zeroed(d.inner() * 4)?;
+            let vt = stream.allocate_zeroed(d.inner() * t * 2)?;
             stream.fill(qi.slice(0, t * d.heads * code_bytes), 0)?;
             stream.fill(ki.slice(0, t * d.heads * code_bytes), 0)?;
             stream.fill(qs.slice(0, t * d.heads * 4), 0)?;

@@ -34,16 +34,12 @@ path = "src/bin/h3-dev/main.rs"
 doc = false
 
 [dependencies]
-hrx = { package = "hrx-rs", version = "0.4.1", default-features = false, features = ["download", "loom"] }
-memmap2 = "0.9"
-safetensors = "0.8"
+hrx = { package = "hrx-rs", version = "0.5.0", default-features = false, features = ["download", "loom"] }
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"
-libc = "0.2"
 thiserror = "2"
 # Use the Rust regex backend without a native regex dependency.
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
-hf-hub = { version = "1.0.0", default-features = false, features = ["blocking", "rustls-tls"] }
 # ChaCha rather than StdRng: rand does not promise StdRng's stream across major versions, and a seed
 # has to keep naming the same clip.
 rand = { version = "0.9", default-features = false, features = ["std"] }

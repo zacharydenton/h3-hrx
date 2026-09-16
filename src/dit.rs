@@ -144,8 +144,7 @@ impl Dit {
         self.seq = None;
         let t = seq_capacity(seq);
         let zeroed = |bytes: usize| -> Result<hrx::Buffer> {
-            let b = stream.allocate(bytes)?;
-            stream.fill(b.slice(0, bytes), 0)?;
+            let b = stream.allocate_zeroed(bytes)?;
             Ok(b)
         };
         self.seq = Some(Seq {
@@ -907,8 +906,8 @@ impl Dit {
             // has no place for — 2 for a reference's video, 3 for its audio — so only the generated
             // span goes up, and the head binds it from row zero.
             seq.tcls.write(stream, &lay.tclass[lr..lr + na + nv], 2)?;
-            crate::dispatch::upload_at(stream, &seq.cos, 0, crate::vvae::as_bytes(&cos))?;
-            crate::dispatch::upload_at(stream, &seq.sin, 0, crate::vvae::as_bytes(&sin))?;
+            stream.upload_at(&seq.cos, 0, crate::vvae::as_bytes(&cos))?;
+            stream.upload_at(&seq.sin, 0, crate::vvae::as_bytes(&sin))?;
         }
         Ok(lay)
     }
@@ -1056,7 +1055,7 @@ impl Dit {
             }
             if res {
                 let seq = self.seq.as_ref().expect("sized above");
-                crate::dispatch::upload_at(stream, &seq.in32, 0, crate::vvae::as_bytes(&arows))?;
+                stream.upload_at(&seq.in32, 0, crate::vvae::as_bytes(&arows))?;
             }
             let input = self
                 .euler
@@ -1066,7 +1065,7 @@ impl Dit {
             self.embed_f32(stream, prof, "audio in", lr, na, true, input)?;
             if res {
                 let seq = self.seq.as_ref().expect("sized above");
-                crate::dispatch::upload_at(stream, &seq.in32, 0, crate::vvae::as_bytes(&vrows))?;
+                stream.upload_at(&seq.in32, 0, crate::vvae::as_bytes(&vrows))?;
             }
             let input = self
                 .euler
@@ -1315,8 +1314,7 @@ impl Dit {
                     }
                 }
                 let seq = self.seq.as_ref().expect("sized above");
-                crate::dispatch::upload_at(
-                    stream,
+                stream.upload_at(
                     &seq.in32,
                     0,
                     crate::vvae::as_bytes(&in32[..sg.rows * AUDIO_CH]),
@@ -1335,8 +1333,7 @@ impl Dit {
                     seed,
                 );
                 let seq = self.seq.as_ref().expect("sized above");
-                crate::dispatch::upload_at(
-                    stream,
+                stream.upload_at(
                     &seq.in32,
                     0,
                     crate::vvae::as_bytes(&in32[..sg.rows * VIDEO_PATCH]),

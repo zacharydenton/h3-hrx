@@ -17,19 +17,19 @@ pub type Result<T> = std::result::Result<T, crate::compile::Error>;
 #[derive(Default)]
 pub struct Profile {
     pub on: bool,
-    pub micros: BTreeMap<String, f64>,
+    timings: hrx::benchmark::StageTimings,
 }
 
 impl Profile {
     pub fn from_env() -> Self {
         Self {
             on: std::env::var_os("H3_PROFILE").is_some_and(|v| !v.is_empty() && v != "0"),
-            micros: BTreeMap::new(),
+            timings: hrx::benchmark::StageTimings::new(),
         }
     }
 
     pub fn total_seconds(&self) -> f64 {
-        self.micros.values().sum::<f64>() * 1e-6
+        self.timings.totals_ms().values().sum::<f64>() * 1e-3
     }
 
     /// The stages worth naming, largest first: any taking more than `floor` of the total.
@@ -41,12 +41,13 @@ impl Profile {
         if total <= 0.0 {
             return String::new();
         }
-        let mut stages: Vec<(&String, &f64)> = self.micros.iter().collect();
+        let totals = self.timings.totals_ms();
+        let mut stages: Vec<(&String, &f64)> = totals.iter().collect();
         stages.sort_by(|a, b| b.1.total_cmp(a.1));
         let mut out = format!("{total:.1} s:");
         for (name, micros) in stages {
-            if *micros > floor * total * 1e6 {
-                out.push_str(&format!("  {name} {:.2}s", micros * 1e-6));
+            if *micros > floor * total * 1e3 {
+                out.push_str(&format!("  {name} {:.2}s", micros * 1e-3));
             }
         }
         out
@@ -54,7 +55,11 @@ impl Profile {
 
     /// Empties the counters, so the next phase is reported on its own.
     pub fn take(&mut self) -> BTreeMap<String, f64> {
-        std::mem::take(&mut self.micros)
+        self.timings
+            .take_totals_ms()
+            .into_iter()
+            .map(|(name, milliseconds)| (name, milliseconds * 1e3))
+            .collect()
     }
 }
 
@@ -85,25 +90,12 @@ pub(crate) unsafe fn launch(
             let started = Instant::now();
             unsafe { stream.dispatch(kernel, grid, block, &constants, bindings)? };
             stream.synchronize()?;
-            *p.micros.entry(stage.to_string()).or_insert(0.0) +=
-                started.elapsed().as_secs_f64() * 1e6;
+            p.timings
+                .push(stage, started.elapsed().as_secs_f64() * 1e3)?;
         }
         _ => unsafe { stream.dispatch(kernel, grid, block, &constants, bindings)? },
     }
     Ok(())
-}
-
-/// Upload into `dst` at a byte offset.
-///
-/// `Stream::upload` takes the view it writes, so an offset upload is an upload into a slice — this
-/// just names the length, which is the source's, rather than repeating it at every call.
-pub fn upload_at(
-    stream: &mut hrx::Stream,
-    dst: &hrx::Buffer,
-    offset: usize,
-    bytes: &[u8],
-) -> Result<()> {
-    Ok(stream.upload(dst.binding().slice(offset, bytes.len())?, bytes)?)
 }
 
 /// A launch whose bindings have been checked against the extents its kernel addresses.
@@ -336,8 +328,7 @@ impl Classes {
     /// `rows` of class zero, which is a row of every table.
     pub fn zeroed(stream: &mut hrx::Stream, rows: usize) -> Result<Self> {
         let bytes = rows.max(1) * 4;
-        let buf = stream.allocate(bytes)?;
-        stream.fill(buf.slice(0, bytes), 0)?;
+        let buf = stream.allocate_zeroed(bytes)?;
         Ok(Self {
             buf,
             capacity: rows,
@@ -358,7 +349,7 @@ impl Classes {
     ) -> Result<()> {
         self.written = 0;
         checkable(values, classes, self.capacity)?;
-        crate::dispatch::upload_at(stream, &self.buf, 0, bytemuck::cast_slice(values))?;
+        stream.upload_at(&self.buf, 0, bytemuck::cast_slice(values))?;
         self.written = values.len();
         self.bound = classes;
         Ok(())

@@ -258,8 +258,7 @@ impl AudioVae {
         path: impl AsRef<std::path::Path>,
     ) -> Result<Self> {
         let weights = unsafe { Weights::open(path, crate::plan::avae::plan) }?;
-        let zeros = stream.allocate(2048 * 4)?;
-        stream.fill(zeros.slice(0, 2048 * 4), 0)?;
+        let zeros = stream.allocate_zeroed(2048 * 4)?;
         Ok(Self {
             dec_mean: weights.host_f32("audio.latents_mean", AUDIO_CH)?,
             dec_std: weights.host_f32("audio.latents_std", AUDIO_CH)?,
@@ -386,7 +385,7 @@ impl AudioVae {
                 }
             }
             let d = self.dec.as_ref().expect("sized above");
-            crate::dispatch::upload_at(stream, &d.input, 0, crate::vvae::as_bytes(&input))?;
+            stream.upload_at(&d.input, 0, crate::vvae::as_bytes(&input))?;
 
             let held_1 = self
                 .weights
