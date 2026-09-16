@@ -73,6 +73,7 @@ struct Refiner {
 
 /// Resident DiT state and recordings, used only on the stream passed to `open`.
 pub struct Dit {
+    adapter: Option<crate::adapter::Adapter>,
     stream_id: usize,
     weights: Weights,
     constants: Constants,
@@ -97,6 +98,7 @@ impl Dit {
         path: impl AsRef<std::path::Path>,
     ) -> Result<Self> {
         Ok(Self {
+            adapter: None,
             stream_id: stream.id(),
             weights: unsafe { Weights::open(path, crate::plan::dit::plan) }?,
             constants: Constants::new(stream)?,
@@ -109,6 +111,14 @@ impl Dit {
             cache: None,
             euler: None,
         })
+    }
+
+    pub(crate) fn set_adapter(&mut self, adapter: crate::adapter::Adapter) {
+        assert!(
+            self.blocks.is_none() && self.refiner.is_none(),
+            "attach before preparing the DiT"
+        );
+        self.adapter = Some(adapter);
     }
 
     pub fn weights(&self) -> &Weights {
@@ -157,7 +167,7 @@ impl Dit {
             return Ok(());
         }
         self.refiner = None;
-        let stack = Stack::new(
+        let mut stack = Stack::new(
             c,
             stream,
             refiner_dims(),
@@ -169,6 +179,9 @@ impl Dit {
             self.constants.ones.clone(),
             "refiner",
         )?;
+        if let Some(adapter) = &self.adapter {
+            stack.attach_adapter(c, stream, adapter, true)?;
+        }
         // no rope: the identity rotation at every row
         let cos = stream.allocate(n * ROPE_HALF * 4)?;
         let sin = stream.allocate(n * ROPE_HALF * 4)?;
@@ -361,6 +374,7 @@ struct Blocks {
     final_out: Projection,
     /// the text rows, kept so they can be restored each step
     text_copy: hrx::Buffer,
+    prefix_rows: usize,
 }
 
 /// A projection and its resident operands, prepared outside the denoise loop.
@@ -665,13 +679,12 @@ impl Dit {
         stream: &mut hrx::Stream,
         c: &Compiler,
         tokens: usize,
+        prefix_rows: usize,
         qk_bits: usize,
     ) -> Result<()> {
-        if self
-            .blocks
-            .as_ref()
-            .is_some_and(|b| b.tokens == tokens && b.qk_bits == qk_bits)
-        {
+        if self.blocks.as_ref().is_some_and(|b| {
+            b.tokens == tokens && b.qk_bits == qk_bits && b.prefix_rows == prefix_rows
+        }) {
             return Ok(());
         }
         self.block_graph = None;
@@ -695,7 +708,7 @@ impl Dit {
             bf16: false,
         };
         let qk = d.attn_qk_bits;
-        let stack = Stack::new(
+        let mut stack = Stack::new(
             c,
             stream,
             d,
@@ -707,6 +720,9 @@ impl Dit {
             self.constants.ones.clone(),
             "dit",
         )?;
+        if let Some(adapter) = &self.adapter {
+            stack.attach_adapter(c, stream, adapter, false)?;
+        }
         self.blocks = Some(Blocks {
             stack,
             tokens,
@@ -717,7 +733,8 @@ impl Dit {
             audio_in: Projection::build(c, stream, &self.weights, "h3.audio_in", AUDIO_CH, HID)?,
             video_in: Projection::build(c, stream, &self.weights, "h3.video_in", VIDEO_PATCH, HID)?,
             final_out: Projection::build(c, stream, &self.weights, "h3.final.out", HID, FINAL_N)?,
-            text_copy: stream.allocate(seq_capacity(tokens) * HID * 4)?,
+            text_copy: stream.allocate(prefix_rows * HID * 4)?,
+            prefix_rows,
         });
         Ok(())
     }
@@ -781,8 +798,40 @@ impl Dit {
         noise: Noise<'_>,
         refs: &[Reference<'_>],
         kfs: &[Keyframe<'_>],
-        mut progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
+        progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
     ) -> Result<Latents> {
+        crate::cache::CachePolicy::Off
+            .validate(p.cache_threshold)
+            .map_err(|e| crate::Error::Invalid(e.into()))?;
+        let prepared = self.prepare_denoise(stream, c, prof, te, ids, p, refs, kfs)?;
+        self.sample_prepared(
+            stream,
+            c,
+            prof,
+            prepared,
+            p,
+            qk_bits,
+            noise,
+            refs,
+            kfs,
+            progress,
+            crate::cache::CachePolicy::Off,
+        )
+    }
+
+    /// Materialize conditioning before the sampling stack is loaded. No encoder views escape.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_denoise(
+        &mut self,
+        stream: &mut hrx::Stream,
+        c: &Compiler,
+        prof: &mut Profile,
+        te: &mut TextEncoder,
+        ids: &[i32],
+        p: &DenoiseParams,
+        refs: &[Reference<'_>],
+        kfs: &[Keyframe<'_>],
+    ) -> Result<crate::layout::Layout> {
         self.check_stream(stream)?;
         let sh = crate::layout::shape_for(p.height, p.width, p.frames)
             .ok_or_else(|| crate::error::Error::Invalid("no such shape".into()))?;
@@ -861,7 +910,38 @@ impl Dit {
             crate::dispatch::upload_at(stream, &seq.cos, 0, crate::vvae::as_bytes(&cos))?;
             crate::dispatch::upload_at(stream, &seq.sin, 0, crate::vvae::as_bytes(&sin))?;
         }
-        self.ensure_blocks(stream, c, s, qk_bits)?;
+        Ok(lay)
+    }
+
+    /// Run sampling with the already materialized conditioning in this DiT's sequence buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn sample_prepared(
+        &mut self,
+        stream: &mut hrx::Stream,
+        c: &Compiler,
+        prof: &mut Profile,
+        lay: crate::layout::Layout,
+        p: &DenoiseParams,
+        qk_bits: usize,
+        noise: Noise<'_>,
+        refs: &[Reference<'_>],
+        kfs: &[Keyframe<'_>],
+        mut progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
+        cache_policy: crate::cache::CachePolicy,
+    ) -> Result<Latents> {
+        self.check_stream(stream)?;
+        let sh = crate::layout::shape_for(p.height, p.width, p.frames)
+            .ok_or_else(|| crate::error::Error::Invalid("no such shape".into()))?;
+        let lr = lay.text_len + lay.ref_rows;
+        let (na, nv, s) = (lay.audio_rows, lay.video_rows, lay.seq_len);
+        self.ensure_blocks(stream, c, s, lr, qk_bits)?;
+        crate::trace::event("sampling_loaded", || {
+            format!(
+            ",\"text_rows\":{},\"reference_rows\":{},\"audio_rows\":{},\"video_rows\":{},\"total_rows\":{},\"sequence_capacity\":{},\"attention_capacity\":{},\"prefix_copy_bytes\":{},\"qk_bits\":{}",
+            lay.text_len, lay.ref_rows, na, nv, s, self.seq.as_ref().expect("sized").capacity,
+            self.blocks.as_ref().expect("loaded").stack.capacity(), lr * HID * 4, qk_bits,
+        )
+        });
 
         // the latents, as rows
         let generated = na + nv;
@@ -922,10 +1002,28 @@ impl Dit {
 
         let sv = crate::layout::Schedule::new(p.steps, shift_v);
         let sa = crate::layout::Schedule::new(p.steps, shift_a);
+        crate::trace::event("schedule", || {
+            use crate::cache::CachePolicy;
+            let (mode, thresholds) = match cache_policy {
+                CachePolicy::Off if p.cache_threshold > 0.0 => {
+                    ("conservative", vec![p.cache_threshold; 3])
+                }
+                CachePolicy::Off => ("off", vec![]),
+                CachePolicy::Observe => ("observe", vec![]),
+                CachePolicy::Conservative(t) => {
+                    ("conservative", vec![t.conditioning, t.audio, t.video])
+                }
+            };
+            format!(
+                ",\"evaluations\":{},\"video_sigmas\":{:?},\"audio_sigmas\":{:?},\"seed\":{},\"sampler\":\"{:?}\",\"cache_mode\":\"{mode}\",\"cache_thresholds\":{:?}",
+                sv.timesteps.len(), sv.sigmas, sa.sigmas, p.seed, p.sampler, thresholds,
+            )
+        });
         if sv.timesteps.len() != sa.timesteps.len() {
             return crate::error::other("the two schedules differ in length");
         }
-        let mut cache = crate::cache::StepCache::new(p.cache_threshold);
+        let mut cache = crate::cache::StepCache::configured(cache_policy, p.cache_threshold)
+            .map_err(|e| crate::Error::Invalid(e.into()))?;
         if cache.is_some() {
             self.ensure_cache(stream, c, s * HID)?;
         }
@@ -995,7 +1093,15 @@ impl Dit {
                 )?;
             }
 
-            self.run_blocks(stream, c, prof, s, step, cache.as_mut())?;
+            self.run_blocks(
+                stream,
+                c,
+                prof,
+                &lay,
+                step,
+                sv.timesteps.len(),
+                cache.as_mut(),
+            )?;
 
             // the final layer: the modulated norm on the generated rows, then the two f32 heads
             {
@@ -1258,15 +1364,18 @@ impl Dit {
     }
 
     /// The 50 blocks, either straight through or with the first-block cache deciding.
+    #[allow(clippy::too_many_arguments)]
     fn run_blocks(
         &mut self,
         stream: &mut hrx::Stream,
         c: &Compiler,
         prof: &mut Profile,
-        s: usize,
+        lay: &crate::layout::Layout,
         step: usize,
+        total: usize,
         cache: Option<&mut crate::cache::StepCache>,
     ) -> Result<()> {
+        let s = lay.seq_len;
         // The table is one field and the buffers another, so they are taken apart before the views
         // are made: a view borrows its allocation, and borrowing all of `self` to build them would
         // conflict with the mutable borrow the stack needs.
@@ -1311,36 +1420,65 @@ impl Dit {
         let n = s * HID;
         b.stack
             .forward(stream, prof, x, cls, cos, sin, &cond_fn, 0, Some(1))?;
-        let (mut d, mut m) = (0.0f64, 0.0f64);
+        let mut metrics = [[0.0f64; 2]; 3];
         if step > 0 {
-            let groups = crate::cache::groups(n);
-            checked(
-                stream,
-                &cb.metric,
-                Some(prof),
-                "cache metric",
-                [groups as u32, 1, 1],
-                [THREADS, 1, 1],
-                &[n as u32],
-                &[x, cb.prev.binding(), cb.partials.binding()],
-                &[n * 4, n * 4, groups * 8],
-            )?;
-            let mut ps = vec![0.0f32; groups * 2];
-            stream.read_blocking(
-                cb.partials.slice(0, groups * 8),
-                crate::vvae::as_bytes_mut(&mut ps),
-            )?;
-            for i in 0..groups {
-                d += f64::from(ps[2 * i]);
-                m += f64::from(ps[2 * i + 1]);
+            let mut row0 = 0;
+            for (slot, rows) in [lay.text_len + lay.ref_rows, lay.audio_rows, lay.video_rows]
+                .into_iter()
+                .enumerate()
+            {
+                let count = rows * HID;
+                if count == 0 {
+                    continue;
+                }
+                let groups = crate::cache::groups(count);
+                checked(
+                    stream,
+                    &cb.metric,
+                    Some(prof),
+                    "cache metric",
+                    [groups as u32, 1, 1],
+                    [THREADS, 1, 1],
+                    &[count as u32],
+                    &[
+                        seq.x.slice(row0 * HID * 4, count * 4),
+                        cb.prev.slice(row0 * HID * 4, count * 4),
+                        cb.partials.binding(),
+                    ],
+                    &[count * 4, count * 4, groups * 8],
+                )?;
+                let mut ps = vec![0.0f32; groups * 2];
+                stream.read_blocking(
+                    cb.partials.slice(0, groups * 8),
+                    crate::vvae::as_bytes_mut(&mut ps),
+                )?;
+                for pair in ps.chunks_exact(2) {
+                    metrics[slot][0] += f64::from(pair[0]);
+                    metrics[slot][1] += f64::from(pair[1]);
+                }
+                row0 += rows;
             }
         }
-        let change = cache.consider(step, d, m);
+        let change = cache.consider(step, total, metrics);
+        crate::trace::event("cache_decision", || {
+            let numbers = |xs: [f64; 3]| {
+                xs.map(|x| {
+                    if x.is_finite() {
+                        x.to_string()
+                    } else {
+                        "null".into()
+                    }
+                })
+                .join(",")
+            };
+            format!(",\"evaluation\":{},\"skipped\":{},\"relative_conditioning_audio_video\":[{}],\"accumulated_conditioning_audio_video\":[{}]",
+                step + 1, change.skip, numbers(change.relative), numbers(change.accumulated))
+        });
         // H3_CACHE_TRACE: the decision per step, as the C printed it. Without it the threshold is
         // impossible to choose — the useful range is narrow and depends on the prompt.
         if crate::stack::env_once("H3_CACHE_TRACE").is_some() {
             eprintln!(
-                "  step {}: block-0 change {:.4}, accumulated {:.4} -> {}",
+                "  step {}: block-0 change [conditioning,audio,video] {:?}, accumulated {:?} -> {}",
                 step + 1,
                 change.relative,
                 change.accumulated,
@@ -1426,6 +1564,7 @@ mod tests {
         // Safety: this test owns the file and leaves it unchanged while mapped.
         let weights = unsafe { Weights::open(file.path(), |_, _| Ok(())) }.unwrap();
         let mut dit = Dit {
+            adapter: None,
             stream_id: stream.id(),
             weights,
             constants: Constants::new(&mut stream).unwrap(),

@@ -33,8 +33,15 @@ respectively; this whole-machine view includes other applications and caching.
 h3's small PSS does not establish a smaller total footprint.
 
 The headless ComfyUI runner releases conditioning models before sampling and
-the DiT before decoding. h3 currently keeps its models in the session. Stage-aware
-loading and release is a clear memory improvement opportunity for the CLI.
+the DiT before decoding. The h3 run above retained models throughout the session.
+The CLI now defaults to stage-scoped ownership. A complete repeat of alien-fjord
+reduced peak GPU residency to **27.20 GiB (52% less)** and process PSS to
+**1.80 GiB**, with byte-identical video and audio latents. It took **38m02s**,
+including 116.3 seconds preparation, 2,085.9 seconds sampling (103.7-second steady
+median), and 78.8 seconds decoding. The historical timing above had much warmer
+startup. These changes establish a memory reduction, not an additional speedup.
+The [implementation report](benchmarks/20260915-optimization/implementation.md)
+includes stage peaks, raw telemetry, and latent digests.
 
 There is one complete trajectory per configuration, with cached checkpoints and
 sequential fresh processes. Steady medians exclude evaluation one. Equal seeds

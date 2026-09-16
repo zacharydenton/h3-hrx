@@ -1,0 +1,74 @@
+[
+  {
+    "rows": 17,
+    "classes": 4,
+    "refiner": false,
+    "preset": "Eight",
+    "rope": "identity",
+    "layer": 0,
+    "relative_l2": 0.013951721601188183,
+    "cosine": 0.9999034404754639,
+    "finite": true,
+    "intermediate_relative_l2": {
+      "qkv": 0.0001054995009326376,
+      "attention": 0.0006607571267522871,
+      "hidden": 0.01054310705512762
+    },
+    "passed": false,
+    "reference": "CPU FP32 matrix products with original tensor order, activation quantization and native low-rank rounding boundaries; global softmax permits online-softmax rounding differences."
+  },
+  {
+    "rows": 17,
+    "classes": 1,
+    "refiner": true,
+    "preset": "Eight",
+    "rope": "identity",
+    "layer": 0,
+    "relative_l2": 0.001968108117580414,
+    "cosine": 0.999998927116394,
+    "finite": true,
+    "intermediate_relative_l2": {
+      "qkv": 7.567105785710737e-05,
+      "attention": 0.0002652033872436732,
+      "hidden": 0.0013912577414885163
+    },
+    "passed": true,
+    "reference": "CPU FP32 matrix products with original tensor order, activation quantization and native low-rank rounding boundaries; global softmax permits online-softmax rounding differences."
+  },
+  {
+    "rows": 17,
+    "classes": 4,
+    "refiner": false,
+    "preset": "Four",
+    "rope": "identity",
+    "layer": 0,
+    "relative_l2": 0.01431285124272108,
+    "cosine": 0.9998981952667236,
+    "finite": true,
+    "intermediate_relative_l2": {
+      "qkv": 0.00010741510050138459,
+      "attention": 0.0007955231121741235,
+      "hidden": 0.011121260933578014
+    },
+    "passed": false,
+    "reference": "CPU FP32 matrix products with original tensor order, activation quantization and native low-rank rounding boundaries; global softmax permits online-softmax rounding differences."
+  },
+  {
+    "rows": 17,
+    "classes": 1,
+    "refiner": true,
+    "preset": "Four",
+    "rope": "identity",
+    "layer": 0,
+    "relative_l2": 0.001996465492993593,
+    "cosine": 0.9999992847442627,
+    "finite": true,
+    "intermediate_relative_l2": {
+      "qkv": 7.290870416909456e-05,
+      "attention": 0.00025998378987424076,
+      "hidden": 0.0013764220057055354
+    },
+    "passed": true,
+    "reference": "CPU FP32 matrix products with original tensor order, activation quantization and native low-rank rounding boundaries; global softmax permits online-softmax rounding differences."
+  }
+]

@@ -416,7 +416,7 @@ pub struct ClassRows<'a> {
 impl<'a> ClassRows<'a> {
     /// The binding, once the kernel's own table has been found wide enough for these values and long
     /// enough for its launch.
-    fn against(&self, stage: &str, tokens: usize, classes: usize) -> Result<View<'a>> {
+    pub(crate) fn against(&self, stage: &str, tokens: usize, classes: usize) -> Result<View<'a>> {
         if self.rows < tokens {
             return Err(crate::compile::Error::Io(format!(
                 "{stage}: {tokens} rows want a class each, {} given",
@@ -706,7 +706,7 @@ impl Gemm {
             k_stride: if k_stride != 0 { k_stride } else { k_size },
             classes,
             out_width,
-            out_bytes: if resid { 4 } else { 2 },
+            out_bytes: if resid || mode == "f32" { 4 } else { 2 },
         })
     }
 

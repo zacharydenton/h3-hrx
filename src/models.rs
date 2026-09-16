@@ -38,6 +38,8 @@ fn hub_offline() -> bool {
 
 /// Resolve Comfy-Org checkpoints through the shared Hugging Face Hub cache.
 pub struct Resolver {
+    owner: String,
+    repository: String,
     revision: Option<String>,
     /// When false, only files already on disk are used and the hub is never contacted.
     download: bool,
@@ -53,6 +55,8 @@ impl Resolver {
     /// Resolve through the standard Hugging Face cache, downloading missing files on demand.
     pub fn new() -> Self {
         Self {
+            owner: REPO_OWNER.into(),
+            repository: REPO_NAME.into(),
             revision: None,
             download: true,
         }
@@ -60,6 +64,13 @@ impl Resolver {
 
     pub fn revision(mut self, revision: Option<String>) -> Self {
         self.revision = revision;
+        self
+    }
+
+    /// Select another Hub model repository, using the same standard cache and offline policy.
+    pub fn repository(mut self, owner: &str, repository: &str) -> Self {
+        self.owner = owner.into();
+        self.repository = repository.into();
         self
     }
 
@@ -93,7 +104,7 @@ impl Resolver {
             source: Box::new(e),
         })?;
         client
-            .model(REPO_OWNER, REPO_NAME)
+            .model(self.owner.as_str(), self.repository.as_str())
             .download_file()
             .filename(relative)
             .maybe_revision(self.revision.clone())
@@ -106,7 +117,10 @@ impl Resolver {
     }
 
     fn missing(&self, relative: &str) -> Error {
-        let tried = format!("not in the Hugging Face cache for {REPO_OWNER}/{REPO_NAME}");
+        let tried = format!(
+            "not in the Hugging Face cache for {}/{}",
+            self.owner, self.repository
+        );
         Error::NotFound {
             name: relative.into(),
             tried,

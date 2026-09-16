@@ -1,0 +1,107 @@
+{
+  "method": "Static allocation formulas and Amdahl projections, not measured improvements. Profile shares come from a separate two-evaluation run with graph replay disabled. Fewer-call scenarios assume unchanged per-call cost and fixed overhead; adapter overhead, altered sampler, loading and quality are not modeled.",
+  "layouts": {
+    "alien_fjord": {
+      "text_rows": 338,
+      "reference_rows": 0,
+      "video_rows": 37296,
+      "audio_rows": 414,
+      "total_rows": 38048,
+      "sequence_capacity": 38176,
+      "stack_capacity": 38144,
+      "text_copy_allocated_gib": 0.764557,
+      "text_copy_prefix_only_gib": 0.006769,
+      "text_copy_excess_gib": 0.757788,
+      "split_qkv_gib": 1.527832,
+      "cache_three_residual_buffers_gib": 2.28598
+    },
+    "glass_leviathan": {
+      "text_rows": 1329,
+      "reference_rows": 1008,
+      "video_rows": 37296,
+      "audio_rows": 414,
+      "total_rows": 40047,
+      "sequence_capacity": 40224,
+      "stack_capacity": 40192,
+      "text_copy_allocated_gib": 0.805573,
+      "text_copy_prefix_only_gib": 0.046803,
+      "text_copy_excess_gib": 0.758769,
+      "split_qkv_gib": 1.609863,
+      "cache_three_residual_buffers_gib": 2.406083
+    }
+  },
+  "main_int8_linear_weights_gib": {
+    "text_encoder_excludes_scales_norms_vision_scratch": 22.918701,
+    "dit_excludes_scales_norms_refiner_conditioning_scratch": 17.976379
+  },
+  "baseline_seconds": 2158.908143793,
+  "fixed_non_sampling_seconds": 87.50814379299982,
+  "hypothetical_scenarios": {
+    "attention_latency_minus_20_percent": {
+      "seconds": 1916.634,
+      "minutes": 31.944,
+      "speedup_vs_baseline": 1.126,
+      "wall_time_saved_percent": 11.222
+    },
+    "all_four_gemm_latency_minus_20_percent": {
+      "seconds": 2015.556,
+      "minutes": 33.593,
+      "speedup_vs_baseline": 1.071,
+      "wall_time_saved_percent": 6.64
+    },
+    "attention_and_gemm_latency_minus_20_percent": {
+      "seconds": 1773.282,
+      "minutes": 29.555,
+      "speedup_vs_baseline": 1.217,
+      "wall_time_saved_percent": 17.862
+    },
+    "attention_twice_as_fast": {
+      "seconds": 1553.223,
+      "minutes": 25.887,
+      "speedup_vs_baseline": 1.39,
+      "wall_time_saved_percent": 28.055
+    },
+    "decode_twice_as_fast": {
+      "seconds": 2121.308,
+      "minutes": 35.355,
+      "speedup_vs_baseline": 1.018,
+      "wall_time_saved_percent": 1.742
+    },
+    "16_transformer_calls": {
+      "seconds": 1744.628,
+      "minutes": 29.077,
+      "speedup_vs_baseline": 1.237,
+      "wall_time_saved_percent": 19.189
+    },
+    "12_transformer_calls": {
+      "seconds": 1330.348,
+      "minutes": 22.172,
+      "speedup_vs_baseline": 1.623,
+      "wall_time_saved_percent": 38.379
+    },
+    "8_transformer_calls": {
+      "seconds": 916.068,
+      "minutes": 15.268,
+      "speedup_vs_baseline": 2.357,
+      "wall_time_saved_percent": 57.568
+    },
+    "4_transformer_calls": {
+      "seconds": 501.788,
+      "minutes": 8.363,
+      "speedup_vs_baseline": 4.302,
+      "wall_time_saved_percent": 76.757
+    },
+    "cache_skips_5_of_20_suffixes": {
+      "seconds": 1651.415,
+      "minutes": 27.524,
+      "speedup_vs_baseline": 1.307,
+      "wall_time_saved_percent": 23.507
+    },
+    "cache_skips_10_of_20_suffixes": {
+      "seconds": 1143.922,
+      "minutes": 19.065,
+      "speedup_vs_baseline": 1.887,
+      "wall_time_saved_percent": 47.014
+    }
+  }
+}

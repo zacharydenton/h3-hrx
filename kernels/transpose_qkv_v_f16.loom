@@ -1,0 +1,95 @@
+// Extract V directly from a fused [rows][3 * width] MHA QKV projection.
+// [rows][width] f16 -> [width][row_capacity] f16 through a 32x32 LDS tile: V^T for the attention
+// kernels, whose V tiles are [channel][key]. Columns past `rows` are left as they are (zero headroom).
+// Workgroups (ceil(rows / 32), width / 32) of 256 lanes; a lane moves a vector<4xf16> each way.
+amdgpu.target<gfx11-generic> @h3_transpose_qkv_v_f16_gfx11 {subgroup_size = 32}
+
+config.decl @h3.transpose_qkv_v_f16.width : %value: index where [range(%value, 32, 65536), mul(%value, 32)]
+
+config.decl @h3.transpose_qkv_v_f16.row_capacity : %value: index where [range(%value, 32, 1048576), mul(%value, 32)]
+
+kernel.def target(@h3_transpose_qkv_v_f16_gfx11) export("h3_transpose_qkv_v_f16") @h3_transpose_qkv_v_f16(%rows: index) {
+  %c1 = index.constant 1 : index
+  %c31 = index.constant 31 : index
+  %c32 = index.constant 32 : index
+  %c256 = index.constant 256 : index
+  %width = config.get @h3.transpose_qkv_v_f16.width : index
+  %rounded = index.add %rows, %c31 : index
+  %row_tiles = index.div %rounded, %c32 : index
+  %col_tiles = index.div %width, %c32 : index
+  kernel.launch.config workgroups(%row_tiles, %col_tiles, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%rows: index, %x: buffer, %out: buffer) {
+  %width = config.get @h3.transpose_qkv_v_f16.width : index
+  %cap = config.get @h3.transpose_qkv_v_f16.row_capacity : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c28 = index.constant 28 : index
+  %c32 = index.constant 32 : index
+  %c0_offset = index.constant 0 : offset
+  %lds_bytes = index.constant 2304 : offset
+  %zero_h = scalar.constant 0.0 : f16
+  %zero4 = vector.splat %zero_h : vector<4xf16>
+  %rows_b = index.assume %rows [range(%rows, 1, 1048576), le(%rows, %cap)] : index
+  %rt = kernel.workgroup.id<x> : index
+  %ct = kernel.workgroup.id<y> : index
+  %lane = kernel.workitem.id<x> : index
+  %row0 = index.mul %rt, %c32 : index
+  %col0a = index.mul %ct, %c32 : index
+  %col_limit = index.sub %width, %c32 : index
+  %col0 = index.assume %col0a [le(%col0a, %col_limit), mul(%col0a, 32)] : index
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %o_global = buffer.assume.memory_space<global> %out : buffer
+  %stride = index.mul %width, %c3 : index
+  %voff = index.mul %width, %c2 : index
+  %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%rows_b]x[%stride]xf16>
+  %o_view = buffer.view %o_global[%c0_offset] : buffer -> view<[%width]x[%cap]xf16>
+  %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
+  %tile = buffer.view %lds[%c0_offset] : buffer -> view<32x36xf16>
+  // load: lane -> row lane/8, columns (lane%8)*4 .. +4 of the tile
+  %lr = index.div %lane, %c8 : index
+  %lc0 = index.rem %lane, %c8 : index
+  %lc = index.mul %lc0, %c4 : index
+  %lcb = index.assume %lc [le(%lc, %c28), mul(%lc, 4)] : index
+  %grow = index.add %row0, %lr : index
+  %in_rows = index.cmp ult, %grow, %rows_b : index
+  scf.if %in_rows {
+    %grow_b = index.assume %grow [lt(%grow, %rows_b)] : index
+    %gcol = index.add %col0, %lcb : index
+    %gcol_limit = index.sub %width, %c4 : index
+    %gcolb = index.assume %gcol [le(%gcol, %gcol_limit), mul(%gcol, 4)] : index
+    %vcol0 = index.add %voff, %gcolb : index
+    %vlimit = index.sub %stride, %c4 : index
+    %vcol = index.assume %vcol0 [le(%vcol0, %vlimit), mul(%vcol0, 4)] : index
+    %v = vector.load %x_view[%grow_b, %vcol] : view<[%rows_b]x[%stride]xf16> -> vector<4xf16>
+    vector.store %v, %tile[%lr, %lcb] : vector<4xf16>, view<32x36xf16>
+  } else {
+    vector.store %zero4, %tile[%lr, %lcb] : vector<4xf16>, view<32x36xf16>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  // store: lane -> tile column lane/8 (an output row), tile rows (lane%8)*4 .. +4 (output columns)
+  %tc = index.div %lane, %c8 : index
+  %tr = index.mul %lc0, %c4 : index
+  %trb = index.assume %tr [le(%tr, %c28), mul(%tr, 4)] : index
+  %e0 = view.load %tile[%trb, %tc] : view<32x36xf16> -> f16
+  %tr1 = index.add %trb, %c1 : index
+  %tr2 = index.add %trb, %c2 : index
+  %tr3 = index.add %trb, %c3 : index
+  %e1 = view.load %tile[%tr1, %tc] : view<32x36xf16> -> f16
+  %e2 = view.load %tile[%tr2, %tc] : view<32x36xf16> -> f16
+  %e3 = view.load %tile[%tr3, %tc] : view<32x36xf16> -> f16
+  %ov = vector.from_elements %e0, %e1, %e2, %e3 : vector<4xf16>
+  %orow = index.add %col0, %tc : index
+  %orow_b = index.assume %orow [lt(%orow, %width)] : index
+  %ocol = index.add %row0, %trb : index
+  %ocol_limit = index.sub %cap, %c4 : index
+  %in_cols = index.cmp ule, %ocol, %ocol_limit : index
+  scf.if %in_cols {
+    %ocol_b = index.assume %ocol [le(%ocol, %ocol_limit), mul(%ocol, 4)] : index
+    vector.store %ov, %o_view[%orow_b, %ocol_b] : vector<4xf16>, view<[%width]x[%cap]xf16>
+  }
+  kernel.return
+}

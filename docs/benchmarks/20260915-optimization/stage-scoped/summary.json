@@ -1,0 +1,22 @@
+{
+  "case": "alien_fjord",
+  "shape": [
+    1344,
+    768,
+    124
+  ],
+  "evaluations": 20,
+  "seed": 1618,
+  "wall_seconds": 2282.056504737,
+  "preparation_seconds": 116.3,
+  "sampling_seconds": 2085.9,
+  "steady_median_seconds": 103.70000000000005,
+  "decode_seconds": 78.8,
+  "peak_drm_resident_gib": 27.203754425048828,
+  "peak_process_pss_gib": 1.8031463623046875,
+  "available_memory_drop_gib": 37.555362701416016,
+  "minimum_available_gib": 33.97616958618164,
+  "gpu_peak_reduction_fraction": 0.5196089427511335,
+  "baseline_video_and_audio_byte_identical": true,
+  "note": "Fresh process, existing caches. Preparation cache state differs from historical baseline. System memory includes external applications; UMA views overlap."
+}

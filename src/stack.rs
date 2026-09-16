@@ -12,6 +12,9 @@ use crate::weights::Weights;
 use hrx::View;
 use std::sync::{Arc, OnceLock};
 
+#[path = "stack_adapter.rs"]
+mod adapter;
+
 pub type Result<T> = std::result::Result<T, crate::compile::Error>;
 
 fn err<T>(message: impl Into<String>) -> Result<T> {
@@ -151,6 +154,7 @@ pub fn env_once(name: &'static str) -> Option<&'static str> {
 }
 
 pub struct Stack {
+    adapter: Option<adapter::AdapterRuntime>,
     d: StackDims,
     tokens: usize,
     capacity: usize,
@@ -159,6 +163,7 @@ pub struct Stack {
     waves: usize,
     calls: usize,
     direct_attn: bool,
+    fused_operands: bool,
     /// the row stride of `attn`, which is the inner width padded to the GEMM's pitch when the out
     /// projection reads it directly
     attn_width: usize,
@@ -191,7 +196,7 @@ pub struct Stack {
     /// their own allocations.
     qkv_split: Option<(hrx::Buffer, hrx::Buffer, hrx::Buffer)>,
     attn: hrx::Buffer,
-    gu: hrx::Buffer,
+    gu: Option<hrx::Buffer>,
     /// The integer QK^T operands, when the attention runs on them.
     int_qk: Option<IntQk>,
 }
@@ -460,7 +465,18 @@ impl Stack {
             0,
         )?;
 
-        let rope = if fused_qkv {
+        // Keep the numerical experiment opt-in until production-shape parity and
+        // timing qualify it. Smoothing still uses the separate K reduction path.
+        let fused_operands = env_once("H3_FUSED_OPERANDS") == Some("1")
+            && !d.attn_i4
+            && d.attn_qk_bits == 8
+            && waves == 8
+            && !d.causal
+            && d.head_dim == 128
+            && d.rope_dim == 96
+            && d.heads == d.kv_heads
+            && env_once("H3_KSMOOTH") != Some("1");
+        let rope = if fused_qkv || fused_operands {
             None
         } else {
             let stem = if d.head_dim == 64 {
@@ -493,6 +509,8 @@ impl Stack {
         let qk_head_major = !d.attn_i4 && d.attn_qk_bits == 8 && waves == 8;
         let pqk = if d.attn_i4 {
             "prepare_qk_i4"
+        } else if fused_operands {
+            "prepare_qk_rope_i8hm"
         } else if qk_head_major {
             "prepare_qk_i8hm"
         } else {
@@ -511,12 +529,18 @@ impl Stack {
                 &vec![("h3.colmean_f32.width".into(), d.inner().to_string())],
             )?);
             let mut cfg: Cfg = vec![
-                (format!("{pq}row_stride"), d.inner().to_string()),
+                (
+                    format!("{pq}row_stride"),
+                    if fused_operands { d.qkv() } else { d.inner() }.to_string(),
+                ),
                 (format!("{pq}head_offset"), "0".into()),
                 (format!("{pq}heads"), d.heads.to_string()),
             ];
             if qk_head_major {
                 cfg.push((format!("{pq}token_capacity"), capacity.to_string()));
+            }
+            if fused_operands {
+                cfg.push((format!("{pq}eps"), num(f64::from(d.eps))));
             }
             cfg.push((
                 format!("{pq}extra_scale"),
@@ -526,14 +550,25 @@ impl Stack {
             // the K operand differs only in its head offset
             let last = cfg.len() - 1;
             cfg[last].1 = "1".into();
+            if fused_operands {
+                cfg[1].1 = d.inner().to_string();
+            }
             prep_k = Some(c.get(stream, pqk, &format!("h3_{pqk}"), &cfg)?);
+            let transpose_stem = if fused_operands {
+                "transpose_qkv_v_f16"
+            } else {
+                "transpose_f16"
+            };
             transpose = Some(c.get(
                 stream,
-                "transpose_f16",
-                "h3_transpose_f16",
+                transpose_stem,
+                &format!("h3_{transpose_stem}"),
                 &vec![
-                    ("h3.transpose_f16.width".into(), d.inner().to_string()),
-                    ("h3.transpose_f16.row_capacity".into(), capacity.to_string()),
+                    (format!("h3.{transpose_stem}.width"), d.inner().to_string()),
+                    (
+                        format!("h3.{transpose_stem}.row_capacity"),
+                        capacity.to_string(),
+                    ),
                 ],
             )?);
         }
@@ -630,7 +665,7 @@ impl Stack {
         let a_q = stream.allocate(t * widest * if quant { 1 } else { 2 })?;
         let a_s = stream.allocate(t * 4)?;
         let fused = stream.allocate(t * d.qkv() * 2)?;
-        let qkv_split = if fused_qkv {
+        let qkv_split = if fused_qkv || fused_operands {
             None // q, k and v are views into `fused`
         } else {
             Some((
@@ -645,7 +680,14 @@ impl Stack {
             d.inner()
         };
         let attn = stream.allocate(t * attn_width * 2)?;
-        let gu = stream.allocate(t * if direct_down { pitch(d.ffn) } else { d.ffn } * 2)?;
+        let gu_bytes = t * if direct_down { pitch(d.ffn) } else { d.ffn } * 2;
+        // QKV is dead after the attention join. Gate/up starts only after the
+        // output projection and second normalization, so it can reuse that storage.
+        let gu = if env_once("H3_REUSE_SCRATCH") == Some("1") && gu_bytes <= t * d.qkv() * 2 {
+            None
+        } else {
+            Some(stream.allocate(gu_bytes)?)
+        };
         stream.fill(fused.slice(0, t * d.qkv() * 2), 0)?;
         stream.fill(attn.slice(0, t * attn_width * 2), 0)?;
         if let Some((q, k, v)) = &qkv_split {
@@ -688,6 +730,7 @@ impl Stack {
         c.flush(stream)?;
 
         Ok(Self {
+            adapter: None,
             d,
             tokens,
             capacity,
@@ -696,6 +739,7 @@ impl Stack {
             waves,
             calls: 0,
             direct_attn,
+            fused_operands,
             attn_width,
             a_stride: widest * if quant { 1 } else { 2 },
             direct_down,
@@ -728,6 +772,20 @@ impl Stack {
     pub fn capacity(&self) -> usize {
         self.capacity
     }
+
+    /// Attach validated low-rank weights before recording or running this stack.
+    pub(crate) fn attach_adapter(
+        &mut self,
+        c: &Compiler,
+        stream: &mut hrx::Stream,
+        adapter: &crate::adapter::Adapter,
+        refiner: bool,
+    ) -> Result<()> {
+        self.adapter = Some(adapter::AdapterRuntime::build(
+            c, stream, self, adapter, refiner,
+        )?);
+        Ok(())
+    }
     pub fn tokens(&self) -> usize {
         self.tokens
     }
@@ -738,8 +796,21 @@ impl Stack {
         &self.blocks[i]
     }
 
+    fn gu_view(&self) -> View<'_> {
+        self.gu
+            .as_ref()
+            .map_or_else(|| self.fused.binding(), hrx::Buffer::binding)
+    }
+
     /// Q, K and V, whether they are their own allocations or views into the fused one.
     fn qkv_views(&self) -> (View<'_>, View<'_>, View<'_>) {
+        if self.fused_operands {
+            return (
+                self.fused.binding(),
+                self.fused.binding(),
+                self.fused.binding(),
+            );
+        }
         match &self.qkv_split {
             Some((q, k, v)) => (q.binding(), k.binding(), v.binding()),
             None => {
@@ -940,40 +1011,62 @@ impl Stack {
             } else {
                 let b = &self.blocks[i];
                 let scales = b.qkv_s.as_ref().map(|s| (s.binding(), self.a_s.binding()));
-                self.gemm_qkv.as_ref().expect("built when not fused").emit(
-                    sink,
-                    Some(prof),
-                    "gemm qkv",
-                    t,
-                    self.a_q.binding(),
-                    b.qkv_q.binding(),
-                    scales,
-                    self.fused.binding(),
-                    None,
-                    b.qkv_b.as_ref().map(|x| x.binding()),
-                )?;
-                emit(
-                    sink,
-                    self.rope.as_ref().expect("built when not fused"),
-                    Some(prof),
-                    "qk norm + rope",
-                    [t, 1, 1],
-                    [THREADS, 1, 1],
-                    &[t],
-                    &[self.fused.binding(), qnorm, knorm, cos, sin, q, k, v],
-                    &[
-                        rows * self.d.qkv() * 2,
-                        self.d.head_dim * 4,
-                        self.d.head_dim * 4,
-                        rows * (self.d.rope_dim / 2) * 4,
-                        rows * (self.d.rope_dim / 2) * 4,
-                        rows * self.d.inner() * 2,
-                        rows * self.d.kv_inner() * 2,
-                        rows * self.d.kv_inner() * 2,
-                    ],
-                )?;
+                if let Some(adapter) = &self.adapter {
+                    adapter.emit(
+                        sink,
+                        prof,
+                        0,
+                        i,
+                        t,
+                        x,
+                        Some((norm1, lc.table_msa, cls)),
+                        self.a_q.binding(),
+                        b.qkv_q.binding(),
+                        scales,
+                        self.fused.binding(),
+                        None,
+                    )?;
+                } else {
+                    self.gemm_qkv.as_ref().expect("built when not fused").emit(
+                        sink,
+                        Some(prof),
+                        "gemm qkv",
+                        t,
+                        self.a_q.binding(),
+                        b.qkv_q.binding(),
+                        scales,
+                        self.fused.binding(),
+                        None,
+                        b.qkv_b.as_ref().map(|x| x.binding()),
+                    )?;
+                }
+                if !self.fused_operands {
+                    emit(
+                        sink,
+                        self.rope.as_ref().expect("built when not fused"),
+                        Some(prof),
+                        "qk norm + rope",
+                        [t, 1, 1],
+                        [THREADS, 1, 1],
+                        &[t],
+                        &[self.fused.binding(), qnorm, knorm, cos, sin, q, k, v],
+                        &[
+                            rows * self.d.qkv() * 2,
+                            self.d.head_dim * 4,
+                            self.d.head_dim * 4,
+                            rows * (self.d.rope_dim / 2) * 4,
+                            rows * (self.d.rope_dim / 2) * 4,
+                            rows * self.d.inner() * 2,
+                            rows * self.d.kv_inner() * 2,
+                            rows * self.d.kv_inner() * 2,
+                        ],
+                    )?;
+                }
             }
 
+            if self.fused_operands {
+                self.prepare_fused_operands(sink, prof, t, qnorm, knorm, cos, sin)?;
+            }
             self.attend(sink, prof, t, q, k, v)?;
 
             let attn_operand = if self.direct_attn {
@@ -997,18 +1090,35 @@ impl Stack {
             {
                 let b = &self.blocks[i];
                 let scales = b.out_s.as_ref().map(|s| (s.binding(), self.a_s.binding()));
-                self.gemm_out.emit(
-                    sink,
-                    Some(prof),
-                    "gemm out + residual",
-                    t,
-                    attn_operand,
-                    b.out_q.binding(),
-                    scales,
-                    x,
-                    Some((lc.gate_msa, cls)),
-                    b.out_b.as_ref().map(|x| x.binding()),
-                )?;
+                if let Some(adapter) = &self.adapter {
+                    adapter.emit(
+                        sink,
+                        prof,
+                        1,
+                        i,
+                        t,
+                        self.attn.binding(),
+                        None,
+                        attn_operand,
+                        b.out_q.binding(),
+                        scales,
+                        x,
+                        Some((lc.gate_msa, cls)),
+                    )?;
+                } else {
+                    self.gemm_out.emit(
+                        sink,
+                        Some(prof),
+                        "gemm out + residual",
+                        t,
+                        attn_operand,
+                        b.out_q.binding(),
+                        scales,
+                        x,
+                        Some((lc.gate_msa, cls)),
+                        b.out_b.as_ref().map(|x| x.binding()),
+                    )?;
+                }
             }
 
             self.prep_norm.emit(
@@ -1024,21 +1134,38 @@ impl Stack {
             {
                 let b = &self.blocks[i];
                 let scales = b.gu_s.as_ref().map(|s| (s.binding(), self.a_s.binding()));
-                self.gemm_gu.emit(
-                    sink,
-                    Some(prof),
-                    "gemm ff + swiglu",
-                    t,
-                    self.a_q.binding(),
-                    b.gu_q.binding(),
-                    scales,
-                    self.gu.binding(),
-                    None,
-                    b.gu_b.as_ref().map(|x| x.binding()),
-                )?;
+                if let Some(adapter) = &self.adapter {
+                    adapter.emit(
+                        sink,
+                        prof,
+                        2,
+                        i,
+                        t,
+                        x,
+                        Some((norm2, lc.table_mlp, cls)),
+                        self.a_q.binding(),
+                        b.gu_q.binding(),
+                        scales,
+                        self.gu_view(),
+                        None,
+                    )?;
+                } else {
+                    self.gemm_gu.emit(
+                        sink,
+                        Some(prof),
+                        "gemm ff + swiglu",
+                        t,
+                        self.a_q.binding(),
+                        b.gu_q.binding(),
+                        scales,
+                        self.gu_view(),
+                        None,
+                        b.gu_b.as_ref().map(|x| x.binding()),
+                    )?;
+                }
             }
             let down_operand = if self.direct_down {
-                self.gu.binding()
+                self.gu_view()
             } else {
                 self.prep_down
                     .as_ref()
@@ -1048,7 +1175,7 @@ impl Stack {
                         Some(prof),
                         "prepare down input",
                         t,
-                        self.gu.binding(),
+                        self.gu_view(),
                         None,
                         self.a_q.binding(),
                         Some(self.a_s.binding()),
@@ -1058,18 +1185,35 @@ impl Stack {
             {
                 let b = &self.blocks[i];
                 let scales = b.down_s.as_ref().map(|s| (s.binding(), self.a_s.binding()));
-                self.gemm_down.emit(
-                    sink,
-                    Some(prof),
-                    "gemm down + residual",
-                    t,
-                    down_operand,
-                    b.down_q.binding(),
-                    scales,
-                    x,
-                    Some((lc.gate_mlp, cls)),
-                    b.down_b.as_ref().map(|x| x.binding()),
-                )?;
+                if let Some(adapter) = &self.adapter {
+                    adapter.emit(
+                        sink,
+                        prof,
+                        3,
+                        i,
+                        t,
+                        self.gu_view(),
+                        None,
+                        down_operand,
+                        b.down_q.binding(),
+                        scales,
+                        x,
+                        Some((lc.gate_mlp, cls)),
+                    )?;
+                } else {
+                    self.gemm_down.emit(
+                        sink,
+                        Some(prof),
+                        "gemm down + residual",
+                        t,
+                        down_operand,
+                        b.down_q.binding(),
+                        scales,
+                        x,
+                        Some((lc.gate_mlp, cls)),
+                        b.down_b.as_ref().map(|x| x.binding()),
+                    )?;
+                }
             }
             if dumping {
                 if let Sink::Stream(stream) = &mut *sink {
@@ -1077,6 +1221,80 @@ impl Stack {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Each branch reads the fused projection and writes a disjoint attention
+    /// operand. The join precedes attention and all later scratch reuse.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_fused_operands<'g>(
+        &'g self,
+        sink: &mut Sink<'_, 'g>,
+        prof: &mut Profile,
+        t: u32,
+        qnorm: View<'g>,
+        knorm: View<'g>,
+        cos: View<'g>,
+        sin: View<'g>,
+    ) -> Result<()> {
+        let iq = self
+            .int_qk
+            .as_ref()
+            .expect("fused operands require INT8 attention");
+        let rows = t as usize;
+        let before = sink.head();
+        let mut ends = [Default::default(); 3];
+        for (i, kernel, weight, codes, scales) in [
+            (
+                0,
+                self.prep_q.as_ref().unwrap(),
+                qnorm,
+                iq.qi.binding(),
+                iq.qs.binding(),
+            ),
+            (
+                1,
+                self.prep_k.as_ref().unwrap(),
+                knorm,
+                iq.ki.binding(),
+                iq.ks.binding(),
+            ),
+        ] {
+            sink.resume(before);
+            emit(
+                sink,
+                kernel,
+                Some(prof),
+                "fused attention operands",
+                [t, 1, 1],
+                [THREADS, 1, 1],
+                &[t],
+                &[self.fused.binding(), weight, cos, sin, codes, scales],
+                &[
+                    rows * self.d.qkv() * 2,
+                    128 * 4,
+                    rows * 48 * 4,
+                    rows * 48 * 4,
+                    self.capacity * self.d.inner(),
+                    self.capacity * self.d.heads * 4,
+                ],
+            )?;
+            ends[i] = sink.head();
+        }
+        sink.resume(before);
+        emit(
+            sink,
+            self.transpose.as_ref().unwrap(),
+            Some(prof),
+            "fused V transpose",
+            [t.div_ceil(32), (self.d.inner() / 32) as u32, 1],
+            [THREADS, 1, 1],
+            &[t],
+            &[self.fused.binding(), iq.vt.binding()],
+            &[rows * self.d.qkv() * 2, self.d.inner() * self.capacity * 2],
+        )?;
+        ends[2] = sink.head();
+        sink.after_branches(ends)?;
         Ok(())
     }
 
@@ -1125,90 +1343,92 @@ impl Stack {
             );
         };
 
-        // K mean smoothing: off by default, having measured worse.
-        let smooth = env_once("H3_KSMOOTH") == Some("1");
-        if smooth {
+        let codes = if self.d.attn_i4 { 64 } else { 128 };
+        if !self.fused_operands {
+            // K mean smoothing: off by default, having measured worse.
+            let smooth = env_once("H3_KSMOOTH") == Some("1");
+            if smooth {
+                emit(
+                    sink,
+                    self.colmean.as_ref().expect("built with integer QK"),
+                    Some(prof),
+                    "attention operands",
+                    [(self.d.inner() / 256) as u32, 1, 1],
+                    [THREADS, 1, 1],
+                    &[t],
+                    &[k, int_qk.kmean.binding()],
+                    &[rows * self.d.inner() * 2, self.d.inner() * 4],
+                )?;
+            }
+            // integer QK^T is MHA with head 128 only, so q and k share the inner width; a code is 64
+            // bytes per head in int4 and 128 in int8
+            // `prepare` writes the `t` rows of the call; the attention that follows indexes its whole
+            // capacity, so the two differ and both appear below
+            let operand = [
+                rows * self.d.inner() * 2,
+                self.d.inner() * 4,
+                rows * self.d.heads * codes,
+                rows * self.d.heads * 4,
+            ];
+            // The only three launches in a block that may overlap. They read `q`, `k` and `v`, share
+            // `zmean` read-only, and write six allocations no other two of them touch, so each waits for
+            // what came before rather than for its neighbours.
+            let before = sink.head();
+            let mut ends = [Default::default(); 3];
             emit(
                 sink,
-                self.colmean.as_ref().expect("built with integer QK"),
+                self.prep_q.as_ref().expect("built with integer QK"),
                 Some(prof),
                 "attention operands",
-                [(self.d.inner() / 256) as u32, 1, 1],
+                [t, 1, 1],
                 [THREADS, 1, 1],
                 &[t],
-                &[k, int_qk.kmean.binding()],
-                &[rows * self.d.inner() * 2, self.d.inner() * 4],
+                &[
+                    q,
+                    int_qk.zmean.binding(),
+                    int_qk.qi.binding(),
+                    int_qk.qs.binding(),
+                ],
+                &operand,
             )?;
+            ends[0] = sink.head();
+            sink.resume(before);
+            emit(
+                sink,
+                self.prep_k.as_ref().expect("built with integer QK"),
+                Some(prof),
+                "attention operands",
+                [t, 1, 1],
+                [THREADS, 1, 1],
+                &[t],
+                &[
+                    k,
+                    if smooth {
+                        int_qk.kmean.binding()
+                    } else {
+                        int_qk.zmean.binding()
+                    },
+                    int_qk.ki.binding(),
+                    int_qk.ks.binding(),
+                ],
+                &operand,
+            )?;
+            ends[1] = sink.head();
+            sink.resume(before);
+            emit(
+                sink,
+                self.transpose.as_ref().expect("built with integer QK"),
+                Some(prof),
+                "attention operands",
+                [t.div_ceil(32), (self.d.inner() / 32) as u32, 1],
+                [THREADS, 1, 1],
+                &[t],
+                &[v, int_qk.vt.binding()],
+                &[rows * self.d.inner() * 2, self.d.inner() * cap * 2],
+            )?;
+            ends[2] = sink.head();
+            sink.after_branches(ends)?;
         }
-        // integer QK^T is MHA with head 128 only, so q and k share the inner width; a code is 64
-        // bytes per head in int4 and 128 in int8
-        let codes = if self.d.attn_i4 { 64 } else { 128 };
-        // `prepare` writes the `t` rows of the call; the attention that follows indexes its whole
-        // capacity, so the two differ and both appear below
-        let operand = [
-            rows * self.d.inner() * 2,
-            self.d.inner() * 4,
-            rows * self.d.heads * codes,
-            rows * self.d.heads * 4,
-        ];
-        // The only three launches in a block that may overlap. They read `q`, `k` and `v`, share
-        // `zmean` read-only, and write six allocations no other two of them touch, so each waits for
-        // what came before rather than for its neighbours.
-        let before = sink.head();
-        let mut ends = [Default::default(); 3];
-        emit(
-            sink,
-            self.prep_q.as_ref().expect("built with integer QK"),
-            Some(prof),
-            "attention operands",
-            [t, 1, 1],
-            [THREADS, 1, 1],
-            &[t],
-            &[
-                q,
-                int_qk.zmean.binding(),
-                int_qk.qi.binding(),
-                int_qk.qs.binding(),
-            ],
-            &operand,
-        )?;
-        ends[0] = sink.head();
-        sink.resume(before);
-        emit(
-            sink,
-            self.prep_k.as_ref().expect("built with integer QK"),
-            Some(prof),
-            "attention operands",
-            [t, 1, 1],
-            [THREADS, 1, 1],
-            &[t],
-            &[
-                k,
-                if smooth {
-                    int_qk.kmean.binding()
-                } else {
-                    int_qk.zmean.binding()
-                },
-                int_qk.ki.binding(),
-                int_qk.ks.binding(),
-            ],
-            &operand,
-        )?;
-        ends[1] = sink.head();
-        sink.resume(before);
-        emit(
-            sink,
-            self.transpose.as_ref().expect("built with integer QK"),
-            Some(prof),
-            "attention operands",
-            [t.div_ceil(32), (self.d.inner() / 32) as u32, 1],
-            [THREADS, 1, 1],
-            &[t],
-            &[v, int_qk.vt.binding()],
-            &[rows * self.d.inner() * 2, self.d.inner() * cap * 2],
-        )?;
-        ends[2] = sink.head();
-        sink.after_branches(ends)?;
         emit(
             sink,
             &self.attention,

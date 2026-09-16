@@ -119,6 +119,120 @@ template.def<@h3.gemm_bf16_finish> @h3.gemm_bf16_finish_plain(%epilogue: index, 
   template.return
 }
 
+template.def<@h3.gemm_bf16_finish> @h3.gemm_bf16_finish_plain_f32(%epilogue: index, %m_bounded: index, %n_size: index, %cfg_classes: index, %has_bias: i1, %lds: buffer, %c: buffer, %bias: buffer, %gate: buffer, %cls: buffer, %base_m: index, %base_n: index, %wave_row: index, %wave_col: index, %lane: index, %wave_result_offset: offset, %acc00: vector<8xf32>, %acc01: vector<8xf32>, %acc02: vector<8xf32>, %acc03: vector<8xf32>, %acc10: vector<8xf32>, %acc11: vector<8xf32>, %acc12: vector<8xf32>, %acc13: vector<8xf32>, %acc20: vector<8xf32>, %acc21: vector<8xf32>, %acc22: vector<8xf32>, %acc23: vector<8xf32>, %acc30: vector<8xf32>, %acc31: vector<8xf32>, %acc32: vector<8xf32>, %acc33: vector<8xf32>) where [eq(%epilogue, 4)] {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %cf1 = index.constant 1 : index
+  %cf2 = index.constant 2 : index
+  %cf3 = index.constant 3 : index
+  %cf4 = index.constant 4 : index
+  %cf5 = index.constant 5 : index
+  %cf6 = index.constant 6 : index
+  %cf7 = index.constant 7 : index
+  %cf8 = index.constant 8 : index
+  %cf9 = index.constant 9 : index
+  %cf10 = index.constant 10 : index
+  %cf11 = index.constant 11 : index
+  %cf12 = index.constant 12 : index
+  %cf13 = index.constant 13 : index
+  %cf14 = index.constant 14 : index
+  %cf15 = index.constant 15 : index
+  %c0_offset = index.constant 0 : offset
+  %m = index.constant 16 : index
+  %n = index.constant 16 : index
+  %c_global = buffer.assume.memory_space<global> %c : buffer
+  %bias_global = buffer.assume.memory_space<global> %bias : buffer
+  %bias_view = buffer.view %bias_global[%c0_offset] : buffer -> view<[%n_size]xf32>
+  %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_bounded]x[%n_size]xf32>
+  %result_view = buffer.view %lds[%wave_result_offset] : buffer -> view<16x16xf32>
+  // Publish through LDS. Each lane takes two vector4 slices of each staged 16x16 tile.
+  %publish_row0 = index.div %lane, %c4 : index
+  %publish_col_group = index.rem %lane, %c4 : index
+  %publish_col = index.mul %publish_col_group, %c4 : index
+  %publish_col_half = index.mul %publish_col_group, %c2 : index
+  %one_f32 = scalar.constant 1.0 : f32
+  %zero_f32 = scalar.constant 0.0 : f32
+  %one4 = vector.splat %one_f32 : vector<4xf32>
+  %zero4 = vector.splat %zero_f32 : vector<4xf32>
+  %f16_max = scalar.constant 65472.0 : f32
+  %f16_min = scalar.constant -65472.0 : f32
+  %f16_max4 = vector.splat %f16_max : vector<4xf32>
+  %f16_min4 = vector.splat %f16_min : vector<4xf32>
+  %up_stage_offset = index.constant 1024 : offset
+  %wave_up_offset = index.add %wave_result_offset, %up_stage_offset : offset
+  %up_view = buffer.view %lds[%wave_up_offset] : buffer -> view<16x16xf32>
+  scf.for %step = [%c0 to %c16 step %c1] {
+    %fi = index.div %step, %c4 : index
+    %fj = index.rem %step, %c4 : index
+    %g_is1 = index.cmp eq, %step, %cf1 : index
+    %g_p1 = scf.select %g_is1, %acc01, %acc00 : vector<8xf32>
+    %g_is2 = index.cmp eq, %step, %cf2 : index
+    %g_p2 = scf.select %g_is2, %acc02, %g_p1 : vector<8xf32>
+    %g_is3 = index.cmp eq, %step, %cf3 : index
+    %g_p3 = scf.select %g_is3, %acc03, %g_p2 : vector<8xf32>
+    %g_is4 = index.cmp eq, %step, %cf4 : index
+    %g_p4 = scf.select %g_is4, %acc10, %g_p3 : vector<8xf32>
+    %g_is5 = index.cmp eq, %step, %cf5 : index
+    %g_p5 = scf.select %g_is5, %acc11, %g_p4 : vector<8xf32>
+    %g_is6 = index.cmp eq, %step, %cf6 : index
+    %g_p6 = scf.select %g_is6, %acc12, %g_p5 : vector<8xf32>
+    %g_is7 = index.cmp eq, %step, %cf7 : index
+    %g_p7 = scf.select %g_is7, %acc13, %g_p6 : vector<8xf32>
+    %g_is8 = index.cmp eq, %step, %cf8 : index
+    %g_p8 = scf.select %g_is8, %acc20, %g_p7 : vector<8xf32>
+    %g_is9 = index.cmp eq, %step, %cf9 : index
+    %g_p9 = scf.select %g_is9, %acc21, %g_p8 : vector<8xf32>
+    %g_is10 = index.cmp eq, %step, %cf10 : index
+    %g_p10 = scf.select %g_is10, %acc22, %g_p9 : vector<8xf32>
+    %g_is11 = index.cmp eq, %step, %cf11 : index
+    %g_p11 = scf.select %g_is11, %acc23, %g_p10 : vector<8xf32>
+    %g_is12 = index.cmp eq, %step, %cf12 : index
+    %g_p12 = scf.select %g_is12, %acc30, %g_p11 : vector<8xf32>
+    %g_is13 = index.cmp eq, %step, %cf13 : index
+    %g_p13 = scf.select %g_is13, %acc31, %g_p12 : vector<8xf32>
+    %g_is14 = index.cmp eq, %step, %cf14 : index
+    %g_p14 = scf.select %g_is14, %acc32, %g_p13 : vector<8xf32>
+    %g_is15 = index.cmp eq, %step, %cf15 : index
+    %g_p15 = scf.select %g_is15, %acc33, %g_p14 : vector<8xf32>
+    vector.fragment.store<result> %g_p15, %result_view[%c0, %c0] shape [%m, %n] : vector<8xf32>, view<16x16xf32>
+    kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+    %frag_row_offset = index.mul %fi, %c16 : index
+    %frag_col_offset = index.mul %fj, %c16 : index
+    %tile_col = index.add %wave_col, %frag_col_offset : index
+    %out_col_local = index.add %tile_col, %publish_col : index
+    %out_col = index.add %base_n, %out_col_local : index
+    scf.for %half = [%c0 to %c2 step %c1] {
+      %row_offset = index.mul %half, %c8 : index
+      %publish_row = index.add %publish_row0, %row_offset : index
+      %values = vector.load %result_view[%publish_row, %publish_col] : view<16x16xf32> -> vector<4xf32>
+      %values_f32 = vector.addf %values, %zero4 : vector<4xf32>
+      %scaled0 = vector.addf %values_f32, %zero4 : vector<4xf32>
+      %row_in_wave = index.add %frag_row_offset, %publish_row : index
+      %row_local = index.add %wave_row, %row_in_wave : index
+      %out_row = index.add %base_m, %row_local : index
+      %writes = index.cmp ult, %out_row, %m_bounded : index
+      scf.if %writes {
+        %bounded = index.assume %out_row [lt(%out_row, %m_bounded)] : index
+        %scaled1 = vector.addf %scaled0, %zero4 : vector<4xf32>
+        %bias_values = scf.if %has_bias -> (vector<4xf32>) {
+          %loaded_bias = vector.load %bias_view[%out_col] : view<[%n_size]xf32> -> vector<4xf32>
+          scf.yield %loaded_bias : vector<4xf32>
+        } else {
+          scf.yield %zero4 : vector<4xf32>
+        }
+        %scaled = vector.addf %scaled1, %bias_values : vector<4xf32>
+        vector.store %scaled, %c_view[%bounded, %out_col] : vector<4xf32>, view<[%m_bounded]x[%n_size]xf32>
+      }
+    }
+    kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+  }
+  template.return
+}
+
 template.def<@h3.gemm_bf16_finish> @h3.gemm_bf16_finish_residual(%epilogue: index, %m_bounded: index, %n_size: index, %cfg_classes: index, %has_bias: i1, %lds: buffer, %c: buffer, %bias: buffer, %gate: buffer, %cls: buffer, %base_m: index, %base_n: index, %wave_row: index, %wave_col: index, %lane: index, %wave_result_offset: offset, %acc00: vector<8xf32>, %acc01: vector<8xf32>, %acc02: vector<8xf32>, %acc03: vector<8xf32>, %acc10: vector<8xf32>, %acc11: vector<8xf32>, %acc12: vector<8xf32>, %acc13: vector<8xf32>, %acc20: vector<8xf32>, %acc21: vector<8xf32>, %acc22: vector<8xf32>, %acc23: vector<8xf32>, %acc30: vector<8xf32>, %acc31: vector<8xf32>, %acc32: vector<8xf32>, %acc33: vector<8xf32>) where [eq(%epilogue, 1)] {
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -813,6 +927,45 @@ kernel.def target(@h3_gemm_bf16_256_gfx11) export("h3_gemm_bf16_256") @h3_gemm_b
   %has_bias = scalar.constant false : i1
   %cfg_classes = index.constant 1 : index
   %epilogue = index.constant 0 : index
+  template.apply<@h3.gemm_bf16>(%m_size, %a, %w, %c, %c, %c, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %cfg_classes, %has_bias, %epilogue) : (index, buffer, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, i1, index)
+  kernel.return
+}
+
+amdgpu.target<gfx11-generic> @h3_gemm_bf16_f32_256_gfx11 {subgroup_size = 32}
+
+config.decl @h3.gemm_bf16_f32_256.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+
+config.decl @h3.gemm_bf16_f32_256.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+
+config.decl @h3.gemm_bf16_f32_256.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+
+config.decl @h3.gemm_bf16_f32_256.m_group : %value: index where [range(%value, 1, 4)]
+
+kernel.def target(@h3_gemm_bf16_f32_256_gfx11) export("h3_gemm_bf16_f32_256") @h3_gemm_bf16_f32_256(%m_size: index) {
+  %c1 = index.constant 1 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c128 = index.constant 128 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %n_size0 = config.get @h3.gemm_bf16_f32_256.n_size : index
+  %m_rounded = index.add %m_size, %c255 : index
+  %m_tiles = index.div %m_rounded, %c256 : index
+  %m_group = config.get @h3.gemm_bf16_f32_256.m_group : index
+  %m_group_less = index.sub %m_group, %c1 : index
+  %m_tiles3 = index.add %m_tiles, %m_group_less : index
+  %m_groups = index.div %m_tiles3, %m_group : index
+  %m_tiles_padded = index.mul %m_groups, %m_group : index
+  %n_tiles = index.div %n_size0, %c128 : index
+  kernel.launch.config workgroups(%n_tiles, %m_tiles_padded, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%m_size: index, %a: buffer, %w: buffer, %c: buffer) {
+  %cfg_k_size = config.get @h3.gemm_bf16_f32_256.k_size : index
+  %cfg_n_size = config.get @h3.gemm_bf16_f32_256.n_size : index
+  %cfg_k_stride = config.get @h3.gemm_bf16_f32_256.k_stride : index
+  %cfg_m_group = config.get @h3.gemm_bf16_f32_256.m_group : index
+  %has_bias = scalar.constant false : i1
+  %cfg_classes = index.constant 1 : index
+  %epilogue = index.constant 4 : index
   template.apply<@h3.gemm_bf16>(%m_size, %a, %w, %c, %c, %c, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %cfg_classes, %has_bias, %epilogue) : (index, buffer, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, i1, index)
   kernel.return
 }

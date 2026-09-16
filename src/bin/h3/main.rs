@@ -45,6 +45,31 @@ enum Sampler {
     Euler,
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum Residency {
+    StageScoped,
+    Retain,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum Preset {
+    Base,
+    #[value(name = "turbo-768p-4")]
+    TurboFour,
+    #[value(name = "turbo-768p-8")]
+    TurboEight,
+}
+
+impl Preset {
+    fn turbo(self) -> Option<h3_hrx::adapter::TurboPreset> {
+        match self {
+            Self::Base => None,
+            Self::TurboFour => Some(h3_hrx::adapter::TurboPreset::Four),
+            Self::TurboEight => Some(h3_hrx::adapter::TurboPreset::Eight),
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "h3",
@@ -56,6 +81,10 @@ struct Cli {
     /// Reference files, by extension: images become `<Picture i>`, audio becomes `<Audio j>`
     #[arg(value_name = "FILE")]
     files: Vec<PathBuf>,
+
+    /// Generation preset (Turbo is experimental until qualification completes)
+    #[arg(long, value_enum, default_value = "base", hide = true)]
+    preset: Preset,
 
     /// The prompt (otherwise read from stdin)
     #[arg(short = 'p', value_name = "TEXT", allow_hyphen_values = true)]
@@ -69,18 +98,21 @@ struct Cli {
     #[arg(long, default_value = "h3_out.mp4", value_name = "CLIP")]
     out: PathBuf,
 
-    #[arg(long, default_value_t = 124, value_parser = clap::value_parser!(i32).range(1..=1 << 20))]
-    frames: i32,
+    /// Frame count (base default: 124)
+    #[arg(long, value_parser = clap::value_parser!(i32).range(1..=1 << 20))]
+    frames: Option<i32>,
 
-    /// Sigma grid points; one fewer than this many model evaluations
-    #[arg(long, default_value_t = 31, value_parser = clap::value_parser!(i32).range(2..=1000))]
-    steps: i32,
+    /// Sigma grid points; one fewer model evaluations (base default: 31)
+    #[arg(long, value_parser = clap::value_parser!(i32).range(2..=1000))]
+    steps: Option<i32>,
 
-    #[arg(long, default_value_t = 864, value_parser = clap::value_parser!(i32).range(32..=8192))]
-    width: i32,
+    /// Output width (base default: 864)
+    #[arg(long, value_parser = clap::value_parser!(i32).range(32..=8192))]
+    width: Option<i32>,
 
-    #[arg(long, default_value_t = 480, value_parser = clap::value_parser!(i32).range(32..=8192))]
-    height: i32,
+    /// Output height (base default: 480)
+    #[arg(long, value_parser = clap::value_parser!(i32).range(32..=8192))]
+    height: Option<i32>,
 
     #[arg(long, default_value_t = 0)]
     seed: u64,
@@ -89,12 +121,25 @@ struct Cli {
     #[arg(long, value_enum, default_value = "i8")]
     attn: Attn,
 
-    #[arg(long, value_enum, default_value = "res_multistep")]
-    sampler: Sampler,
+    /// Sampler (base default: res_multistep)
+    #[arg(long, value_enum)]
+    sampler: Option<Sampler>,
 
     /// Use only checkpoints already on disk; never download
     #[arg(long)]
     offline: bool,
+
+    /// Release completed models between stages, or retain them for reuse
+    #[arg(long, value_enum, default_value = "stage-scoped")]
+    residency: Residency,
+
+    /// Record modality-specific cache changes while running every block
+    #[arg(long, hide = true)]
+    cache_observe: bool,
+
+    /// Experimental conditioning/audio/video cache thresholds; requires quality calibration
+    #[arg(long, hide = true, num_args = 3, conflicts_with = "cache_observe")]
+    cache_thresholds: Vec<f32>,
 
     #[arg(long, value_name = "FILE")]
     dit: Option<PathBuf>,
@@ -240,7 +285,65 @@ macro_rules! usage {
     ($($arg:tt)*) => { return Err(UsageError(format!($($arg)*)).into()) };
 }
 
+fn cache_policy(cli: &Cli) -> Result<h3_hrx::CachePolicy> {
+    use h3_hrx::{CachePolicy, CacheThresholds};
+    let policy = match cli.cache_thresholds.as_slice() {
+        [] if cli.cache_observe => CachePolicy::Observe,
+        [] => CachePolicy::Off,
+        &[conditioning, audio, video] => CachePolicy::Conservative(CacheThresholds {
+            conditioning,
+            audio,
+            video,
+        }),
+        _ => usage!("pass three cache thresholds: conditioning audio video"),
+    };
+    if let Err(message) = policy.validate(0.0) {
+        usage!("{message}");
+    }
+    Ok(policy)
+}
+
+fn parameters(cli: &Cli) -> Result<DenoiseParams> {
+    let cache = cache_policy(cli)?;
+    let mut params = DenoiseParams {
+        width: cli.width.unwrap_or(864),
+        height: cli.height.unwrap_or(480),
+        frames: cli.frames.unwrap_or(124),
+        steps: cli.steps.unwrap_or(31) as usize,
+        seed: cli.seed,
+        sampler: match cli.sampler.unwrap_or(Sampler::ResMultistep) {
+            Sampler::Euler => Sampler16::Euler,
+            Sampler::ResMultistep => Sampler16::ResMultistep,
+        },
+        ..DenoiseParams::default()
+    };
+    if let Some(preset) = cli.preset.turbo() {
+        for (name, given, expected) in [
+            ("width", cli.width, 1344),
+            ("height", cli.height, 768),
+            ("frames", cli.frames, 124),
+            ("steps", cli.steps, preset.evaluations() as i32 + 1),
+        ] {
+            if given.is_some_and(|v| v != expected) {
+                usage!("Turbo requires --{name} {expected}");
+            }
+        }
+        if cli.sampler.is_some_and(|s| s != Sampler::Euler)
+            || cli.dit.is_some()
+            || !cli.files.is_empty()
+            || cli.audio_only
+            || cli.attn != Attn::I8
+            || cache != h3_hrx::CachePolicy::Off
+        {
+            usage!("Turbo requires Euler, the default i8 base, cache off, and text or --first-frame conditioning");
+        }
+        preset.configure(&mut params);
+    }
+    Ok(params)
+}
+
 fn run(cli: Cli) -> Result<()> {
+    let params = parameters(&cli)?;
     let (mut image_files, mut audio_files) = (Vec::new(), Vec::new());
     for f in &cli.files {
         let e = lower_ext(f);
@@ -265,7 +368,7 @@ fn run(cli: Cli) -> Result<()> {
         usage!("no prompt (give -p \"...\" or pipe it on stdin)");
     }
 
-    if cli.height % 32 != 0 || cli.width % 32 != 0 {
+    if params.height % 32 != 0 || params.width % 32 != 0 {
         usage!("--width and --height must be multiples of 32");
     }
     if cli.audio_only && cli.still.is_some() {
@@ -330,18 +433,6 @@ fn run(cli: Cli) -> Result<()> {
         usage!("{} not found (README, Weights; --dit)", dit.display());
     }
 
-    let params = DenoiseParams {
-        height: cli.height,
-        width: cli.width,
-        frames: cli.frames,
-        steps: cli.steps as usize,
-        seed: cli.seed,
-        sampler: match cli.sampler {
-            Sampler::Euler => Sampler16::Euler,
-            Sampler::ResMultistep => Sampler16::ResMultistep,
-        },
-        ..DenoiseParams::default()
-    };
     let shape = Session::shape_for(params.height, params.width, params.frames)
         .ok_or_else(|| UsageError("no such shape".into()))?;
 
@@ -434,7 +525,11 @@ fn run(cli: Cli) -> Result<()> {
         .unwrap_or_default();
     let loom_library = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
     let config = Config {
-        dit: Some(dit.clone()),
+        dit: if cli.preset.turbo().is_some() {
+            None
+        } else {
+            Some(dit.clone())
+        },
         te: Some(te),
         video_vae: Some(video_vae),
         audio_vae: Some(audio_vae),
@@ -450,7 +545,19 @@ fn run(cli: Cli) -> Result<()> {
     let t0 = Instant::now();
     // Safety: the checkpoints are the files this command was pointed at, and it does not write to
     // them. A user who edits a checkpoint mid-run gets what the documentation says they get.
-    let mut session = unsafe { Session::new(config) }?;
+    let mut session = unsafe {
+        Session::new_with_options(
+            config,
+            h3_hrx::SessionOptions {
+                residency: match cli.residency {
+                    Residency::StageScoped => h3_hrx::ResidencyPolicy::StageScoped,
+                    Residency::Retain => h3_hrx::ResidencyPolicy::Retain,
+                },
+                cache: cache_policy(&cli)?,
+                turbo: cli.preset.turbo(),
+            },
+        )
+    }?;
     eprintln!(
         "session in {:.1} s ({}, {} attention)",
         t0.elapsed().as_secs_f64(),
@@ -461,6 +568,13 @@ fn run(cli: Cli) -> Result<()> {
             Attn::I4 => "i4",
         }
     );
+
+    if let Some(preset) = cli.preset.turbo() {
+        eprintln!(
+            "experimental Turbo: {} Euler evaluations, video/audio shifts 6/3",
+            preset.evaluations()
+        );
+    }
 
     // encoders: latents for the keyframe and the references, encoded before the run so a bad input
     // fails early. Each reference borrows its own latents, which live until the denoise returns.
@@ -540,8 +654,13 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     let t0 = Instant::now();
+    let trace = std::env::var_os("H3_STAGE_TRACE").is_some_and(|v| !v.is_empty() && v != "0");
     let mut show = |step: usize, steps: usize, seconds: f64| {
-        eprint!("\r  step {step}/{steps}  {seconds:5.1} s");
+        if trace {
+            eprintln!("  step {step}/{steps}  {seconds:5.1} s");
+        } else {
+            eprint!("\r  step {step}/{steps}  {seconds:5.1} s");
+        }
         let _ = std::io::Write::flush(&mut std::io::stderr());
         false // true would cancel
     };
@@ -654,12 +773,93 @@ mod tests {
     #[test]
     fn defaults_match_the_documented_ones() {
         let c = Cli::try_parse_from(["h3"]).unwrap();
+        let p = parameters(&c).unwrap();
         assert_eq!(
-            (c.frames, c.steps, c.width, c.height, c.seed),
+            (p.frames, p.steps, p.width, p.height, p.seed),
             (124, 31, 864, 480, 0)
         );
-        assert!(matches!(c.attn, Attn::I8) && matches!(c.sampler, Sampler::ResMultistep));
+        assert!(matches!(c.attn, Attn::I8) && matches!(p.sampler, Sampler16::ResMultistep));
         assert_eq!(c.out, PathBuf::from("h3_out.mp4"));
+        assert!(matches!(c.residency, Residency::StageScoped));
+        assert!(c.preset.turbo().is_none());
+    }
+
+    #[test]
+    fn cache_thresholds_are_complete_positive_and_finite() {
+        for values in [
+            ["0", "0.1", "0.1"],
+            ["0.1", "NaN", "0.1"],
+            ["0.1", "0.1", "inf"],
+        ] {
+            let cli =
+                Cli::try_parse_from(["h3", "--cache-thresholds", values[0], values[1], values[2]])
+                    .unwrap();
+            assert!(parameters(&cli).is_err());
+        }
+        assert!(Cli::try_parse_from(["h3", "--cache-thresholds", "0.1", "0.1"]).is_err());
+        assert!(Cli::try_parse_from([
+            "h3",
+            "--cache-observe",
+            "--cache-thresholds",
+            "0.1",
+            "0.1",
+            "0.1"
+        ])
+        .is_err());
+        let cli = Cli::try_parse_from(["h3", "--cache-thresholds", "0.1", "0.2", "0.3"]).unwrap();
+        assert_eq!(
+            cache_policy(&cli).unwrap(),
+            h3_hrx::CachePolicy::Conservative(h3_hrx::CacheThresholds {
+                conditioning: 0.1,
+                audio: 0.2,
+                video: 0.3
+            })
+        );
+    }
+
+    #[test]
+    fn turbo_selects_all_trained_parameters_together() {
+        for (name, evaluations) in [("turbo-768p-4", 4), ("turbo-768p-8", 8)] {
+            let cli = Cli::try_parse_from(["h3", "--preset", name]).unwrap();
+            let p = parameters(&cli).unwrap();
+            assert_eq!((p.width, p.height, p.frames), (1344, 768, 124));
+            assert_eq!(p.steps, evaluations + 1);
+            assert_eq!(p.sampler, Sampler16::Euler);
+            assert_eq!((p.video_shift, p.audio_shift), (6.0, 3.0));
+        }
+    }
+
+    #[test]
+    fn turbo_conflicts_fail_before_model_resolution() {
+        for extra in [
+            vec!["--steps", "4"],
+            vec!["--width", "864"],
+            vec!["--sampler", "res_multistep"],
+            vec!["--dit", "custom.safetensors"],
+            vec!["ref.jpg"],
+            vec!["--audio-only"],
+            vec!["--cache-observe"],
+            vec!["--cache-thresholds", "0.1", "0.1", "0.1"],
+            vec!["--attn", "i4"],
+        ] {
+            let mut args = vec!["h3", "--preset", "turbo-768p-4"];
+            args.extend(extra);
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(parameters(&cli).is_err());
+        }
+        let cli = Cli::try_parse_from([
+            "h3",
+            "--preset",
+            "turbo-768p-4",
+            "--steps",
+            "5",
+            "--sampler",
+            "euler",
+            "--first-frame",
+            "alien.png",
+        ])
+        .unwrap();
+        assert!(parameters(&cli).is_ok());
     }
 
     #[test]
@@ -685,13 +885,13 @@ mod tests {
             Cli::try_parse_from(["h3", "--height", "480"])
                 .unwrap()
                 .height,
-            480
+            Some(480)
         );
         assert_eq!(
             Cli::try_parse_from(["h3", "--frames", "124"])
                 .unwrap()
                 .frames,
-            124
+            Some(124)
         );
     }
 
@@ -707,20 +907,20 @@ mod tests {
             Cli::try_parse_from(["h3", "--sampler", "euler"])
                 .unwrap()
                 .sampler,
-            Sampler::Euler
+            Some(Sampler::Euler)
         ));
         // the documented spelling is the underscore one; the kebab spelling is accepted as an alias
         assert!(matches!(
             Cli::try_parse_from(["h3", "--sampler", "res_multistep"])
                 .unwrap()
                 .sampler,
-            Sampler::ResMultistep
+            Some(Sampler::ResMultistep)
         ));
         assert!(matches!(
             Cli::try_parse_from(["h3", "--sampler", "res-multistep"])
                 .unwrap()
                 .sampler,
-            Sampler::ResMultistep
+            Some(Sampler::ResMultistep)
         ));
     }
 

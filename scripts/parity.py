@@ -3,7 +3,7 @@
 
 The host subprocess adapter, prompt presentation, reference implementation, and checks
 are in this file. It is deliberately not part of `scripts/test.sh`: it needs the checkpoints, a GPU,
-and for the gate a directory of dumps produced inside the ComfyUI container by `scripts/comfy_dump.py`.
+and for the gate a directory of dumps produced by a native ComfyUI checkout using `scripts/comfy_dump.py`.
 Run it before a release, not on every change.
 
     python3 scripts/parity.py gate [--require]   the release gate: this host vs ComfyUI's own run

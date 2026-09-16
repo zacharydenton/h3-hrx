@@ -6,13 +6,16 @@ mod audio_vae;
 mod compare_decode;
 mod compare_gemm;
 mod compare_vision;
+mod compile_probes;
 mod decode_video;
 mod denoise_cases;
 mod dispatch_cost;
 mod encode_video;
+mod inspect_adapter;
 mod parity_dump;
 mod resolve;
 mod text_in;
+mod tune_gemm;
 mod two_sessions;
 mod verify_gemm;
 mod verify_send;
@@ -31,14 +34,17 @@ fn main() {
         "audio-vae" => audio_vae::run(args),
         "compare-decode" => compare_decode::run(args),
         "compare-gemm" => compare_gemm::run(args),
+        "compile-probes" => compile_probes::run(args),
         "compare-vision" => compare_vision::run(args),
         "decode-video" => decode_video::run(args),
         "denoise-cases" => denoise_cases::run(args),
         "dispatch-cost" => dispatch_cost::run(args),
         "encode-video" => encode_video::run(args),
+        "inspect-adapter" => inspect_adapter::run(args),
         "parity-dump" => parity_dump::run(args),
         "resolve" => resolve::run(args),
         "text-in" => text_in::run(args),
+        "tune-gemm" => tune_gemm::run(args),
         "two-sessions" => two_sessions::run(args),
         "verify-gemm" => verify_gemm::run(args),
         "verify-send" => verify_send::run(args),
@@ -51,14 +57,17 @@ fn main() {
                 "audio-vae",
                 "compare-decode",
                 "compare-gemm",
+                "compile-probes",
                 "compare-vision",
                 "decode-video",
                 "denoise-cases",
                 "dispatch-cost",
                 "encode-video",
+                "inspect-adapter",
                 "parity-dump",
                 "resolve",
                 "text-in",
+                "tune-gemm",
                 "two-sessions",
                 "verify-gemm",
                 "verify-send",

@@ -31,6 +31,7 @@
 //! library has already validated, or shrink the file under reads that are in flight. Point a session
 //! at files you control.
 
+pub mod adapter;
 pub mod avae;
 pub mod checkpoint;
 pub mod compile;
@@ -58,12 +59,14 @@ mod sampler;
 pub mod session;
 mod tiles;
 pub mod tokenizer;
+mod trace;
 
+pub use cache::{CachePolicy, CacheThresholds};
 pub use dit::{
     Attention, DenoiseParams, Keyframe, LatentGrid, Latents, Noise, Presented, Reference, Sampler,
 };
 pub use error::{Error, Result};
 pub use layout::{shape_for, Shape};
-pub use session::{Config, Session};
+pub use session::{Config, ResidencyPolicy, Session, SessionOptions};
 pub use tokenizer::Tokenizer;
 pub use vvae::Clip;

@@ -237,7 +237,8 @@ fn audio_conversions_are_byte_stable_at_the_boundaries() {
     }
 }
 
-/// Both samplers, a cached trajectory, and the two frame counts that pack differently.
+/// Both samplers and the two frame counts that pack differently.
+/// Cache policies are compared against the uncached trajectory in the session tests.
 ///
 /// The middle pair differs only in the sampler, and four steps is the shortest trajectory where
 /// that shows: at two steps `ResMultistep` has no history to use and produces exactly what Euler
@@ -247,7 +248,7 @@ fn audio_conversions_are_byte_stable_at_the_boundaries() {
 /// most of the cost, and every case after the first reuses them.
 #[test]
 #[ignore = "requires gfx1151, provisioned HRX and the DiT and text encoder checkpoints"]
-fn denoising_is_byte_stable_across_samplers_and_the_step_cache() {
+fn denoising_is_byte_stable_across_samplers() {
     /// name, canvas, frames, steps, sampler, cache threshold, and the digests of the two latents.
     type Case = (
         &'static str,
@@ -304,17 +305,6 @@ fn denoising_is_byte_stable_across_samplers_and_the_step_cache() {
             0.0,
             "c7732f32ab26d080e9ddf07f5c87565a8362cdbdbfd5ac092a710a1aab24538d",
             "9f4a72b17467dae97c14e3e00827cb7cd6d92e5ca3aaf72bcffc717042cf10f8",
-        ),
-        (
-            "step-cache",
-            256,
-            256,
-            22,
-            6,
-            Sampler::ResMultistep,
-            0.15,
-            "b91dc015f89185f972c0e4152a2558ca6e350ce1c79487680351de45c6a7c0c1",
-            "333e54b3354e7643637e0f0275864334f1d72c7bcb52bb68d4e0ec36db9db39b",
         ),
     ];
     let ids = Tokenizer::new()

@@ -1,0 +1,31 @@
+{
+  "started_utc": "2026-09-15T04:27:34.782035+00:00",
+  "command": [
+    "bash",
+    "build/optimization-20260915/validate-native-rest.sh"
+  ],
+  "stdin": null,
+  "wall_seconds": 444.5030873249998,
+  "exit_code": 0,
+  "aborted_for_memory_pressure": false,
+  "minimum_starting_available_gib": 58.0,
+  "abort_available_gib": 12.0,
+  "max_rss_kib": 1507008,
+  "memory_sampling_interval_seconds": 5,
+  "baseline_system_memory_bytes": {
+    "MemTotal": 134145695744,
+    "MemAvailable": 79028174848,
+    "MemFree": 33343156224,
+    "Cached": 56402452480,
+    "SwapTotal": 67074256896,
+    "SwapFree": 50690711552,
+    "Dirty": 854925312
+  },
+  "sampled_peak_process_rss_bytes": 1557454848,
+  "sampled_peak_process_pss_bytes": 1540315136,
+  "sampled_peak_drm_resident_bytes": 46913470464,
+  "sampled_peak_drm_allocated_bytes": 46913482752,
+  "minimum_system_available_bytes": 33492819968,
+  "maximum_system_swap_used_bytes": 28441935872,
+  "memory_note": "Sampled process PSS and DRM memory are separate views and must not be summed. 5-second sampling may miss brief peaks. System counters include other applications."
+}

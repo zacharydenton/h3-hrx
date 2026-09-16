@@ -1,0 +1,28 @@
+124 frames at 1344x768: 37x48x84 latents, 207 audio latents; 338 prompt tokens (0 keyframe, 0 reference images, 0 reference audio)
+session in 0.1 s (minimax_h3_fl2va_pruned_int8_convrot.safetensors, i8 attention)
+experimental Turbo: 4 Euler evaluations, video/audio shifts 6/3
+H3_STAGE {"stage":"conditioning_start","elapsed_seconds":0.00000014,"unix_seconds":1789446935.3377132}
+H3_STAGE {"stage":"checkpoint","elapsed_seconds":0.005684463,"unix_seconds":1789446935.3433974,"model":"dit","path":"/home/zach/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/snapshots/a98869194787969724c7425d95d0ed73ce9202af/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors","resolved_path":"/home/zach/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/blobs/e889202c41dafb67b10d67b97f0d8541508036a6090af23425a5c2615d03c47a","file_bytes":20970379616}
+H3_STAGE {"stage":"checkpoint","elapsed_seconds":0.021222533,"unix_seconds":1789446935.3589354,"model":"adapter","path":"/home/zach/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/snapshots/a98869194787969724c7425d95d0ed73ce9202af/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors","resolved_path":"/home/zach/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/blobs/c396a9a06f58399e9df9754b18299818d84a2ddd371724ba48fe4a41221437dc","file_bytes":1956192992}
+H3_STAGE {"stage":"checkpoint","elapsed_seconds":0.038906985,"unix_seconds":1789446935.3766203,"model":"te","path":"/home/zach/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/snapshots/a98869194787969724c7425d95d0ed73ce9202af/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors","resolved_path":"/home/zach/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/blobs/bc2ced0fbea64757fa9acddccfc0b3f4819d1dcf1da6c124d690d368be283923","file_bytes":27141342152}
+H3_STAGE {"stage":"conditioning_ready","elapsed_seconds":48.416139634,"unix_seconds":1789446983.753853}
+H3_STAGE {"stage":"encoder_released","elapsed_seconds":48.497908048,"unix_seconds":1789446983.8356214,"released":true}
+H3_STAGE {"stage":"sampling_loaded","elapsed_seconds":80.850310449,"unix_seconds":1789447016.1880248,"text_rows":338,"reference_rows":0,"audio_rows":414,"video_rows":37296,"total_rows":38048,"sequence_capacity":38176,"attention_capacity":38144,"prefix_copy_bytes":7268352,"qk_bits":8}
+H3_STAGE {"stage":"schedule","elapsed_seconds":80.872185786,"unix_seconds":1789447016.209899,"evaluations":4,"video_sigmas":[1.0, 0.94736844, 0.85714287, 0.6666667, 0.0],"audio_sigmas":[1.0, 0.9, 0.75, 0.5, 0.0],"seed":1618,"sampler":"Euler","cache_mode":"off","cache_thresholds":[]}
+  step 1/4  109.1 s
+  step 2/4  221.3 s
+  step 3/4  335.3 s
+  step 4/4  448.8 s
+H3_STAGE {"stage":"denoise_finished","elapsed_seconds":529.83371855,"unix_seconds":1789447465.171432,"success":true,"dit_released":true}
+
+denoised in 529.8 s
+wrote build/optimization-20260915/alien-turbo4.video.f32 and build/optimization-20260915/alien-turbo4.audio.f32
+H3_STAGE {"stage":"video_decode_start","elapsed_seconds":529.836565202,"unix_seconds":1789447465.1742783}
+H3_STAGE {"stage":"checkpoint","elapsed_seconds":529.836574212,"unix_seconds":1789447465.174287,"model":"video_vae","path":"/home/zach/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/snapshots/a98869194787969724c7425d95d0ed73ce9202af/vae/minimax_h3_video_vae_fp16.safetensors","resolved_path":"/home/zach/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/blobs/7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522","file_bytes":5207808496}
+H3_STAGE {"stage":"video_decode_finished","elapsed_seconds":603.546117687,"unix_seconds":1789447538.8838313,"success":true}
+H3_STAGE {"stage":"audio_decode_start","elapsed_seconds":603.546280703,"unix_seconds":1789447538.8839936}
+H3_STAGE {"stage":"checkpoint","elapsed_seconds":603.546290113,"unix_seconds":1789447538.884003,"model":"audio_vae","path":"/home/zach/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/snapshots/a98869194787969724c7425d95d0ed73ce9202af/vae/minimax_h3_audio_vae_fp32.safetensors","resolved_path":"/home/zach/.cache/huggingface/hub/models--Comfy-Org--MiniMax-H3/blobs/8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48","file_bytes":605254808}
+H3_STAGE {"stage":"audio_decode_finished","elapsed_seconds":604.680740994,"unix_seconds":1789447540.0184546,"success":true}
+decoded in 74.8 s
+wrote build/optimization-20260915/alien-turbo4.mp4 (124 frames, 1344x768, 5.17 s) and build/optimization-20260915/alien-turbo4.wav
+build/optimization-20260915/alien-turbo4.mp4

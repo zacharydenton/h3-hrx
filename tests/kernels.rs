@@ -1785,3 +1785,281 @@ fn recorded_branches_feed_their_consumer_on_every_replay() {
         assert_eq!(actual, source);
     }
 }
+
+#[test]
+#[ignore = "requires gfx1151 and provisioned Loom"]
+fn adapter_finish_adds_before_activation_and_preserves_f32_residuals() {
+    let mut h = Harness::new();
+    let (rows, width) = (3usize, 128usize);
+    for mode in 0..3 {
+        let input_width = if mode == 1 { width * 2 } else { width };
+        let base: Vec<f32> = (0..rows * input_width)
+            .map(|i| ((i % 17) as f32 - 8.0) / 8.0)
+            .collect();
+        let delta: Vec<f16> = (0..rows * input_width)
+            .map(|i| f16::from_f32(((i % 7) as f32 - 3.0) / 16.0))
+            .collect();
+        let gates: Vec<f32> = (0..2 * width)
+            .map(|i| if i < width { 0.5 } else { -0.25 })
+            .collect();
+        let cls = vec![0i32, 1, 0];
+        let initial = vec![100000.0f32; rows * width];
+        let data = vec![
+            bytes(&base),
+            bytes(&delta),
+            if mode == 2 {
+                bytes(&initial)
+            } else {
+                vec![0; rows * width * 2]
+            },
+            bytes(&gates),
+            bytes(&cls),
+        ];
+        let out = h.run(
+            "adapter_finish",
+            &[
+                ("width", width.to_string()),
+                ("mode", mode.to_string()),
+                ("classes", "2".into()),
+            ],
+            [(rows * width).div_ceil(256) as u32, 1, 1],
+            256,
+            &[rows as u64],
+            &data,
+        );
+        for row in 0..rows {
+            for col in 0..width {
+                let ic = if mode == 1 {
+                    (col / 16) * 32 + col % 16
+                } else {
+                    col
+                };
+                let index = row * input_width + ic;
+                let mut expected = base[index] + delta[index].to_f32();
+                if mode == 1 {
+                    let up = base[index + 16] + delta[index + 16].to_f32();
+                    expected = expected * (1.0 / (1.0 + (-expected).exp())) * up;
+                }
+                let i = row * width + col;
+                let actual = if mode == 2 {
+                    expected = initial[i] + expected * gates[cls[row] as usize * width + col];
+                    f32::from_le_bytes(out[2][i * 4..i * 4 + 4].try_into().unwrap())
+                } else {
+                    expected = f16::from_f32(expected).to_f32();
+                    f16::from_le_bytes(out[2][i * 2..i * 2 + 2].try_into().unwrap()).to_f32()
+                };
+                assert!(
+                    (actual - expected).abs() <= if mode == 2 { 0.008 } else { 0.002 },
+                    "mode {mode} row {row} col {col}: {actual} != {expected}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires gfx1151 and provisioned Loom"]
+fn adapter_f32_gemms_preserve_values_above_f16_range() {
+    let mut h = Harness::new();
+    let (rows, k, n, stride) = (17usize, 128usize, 128usize, 192usize);
+    for integer in [true, false] {
+        let input = if integer {
+            vec![32u8; rows * stride]
+        } else {
+            bytes(&vec![bf16::from_f32(32.0); rows * stride])
+        };
+        let weight = if integer {
+            vec![32u8; n * stride]
+        } else {
+            bytes(&vec![bf16::from_f32(32.0); n * stride])
+        };
+        let mut data = vec![input, weight];
+        if integer {
+            data.extend([bytes(&vec![1.0f32; n]), bytes(&vec![1.0f32; rows])]);
+        }
+        data.push(vec![0; rows * n * 4]);
+        let stem = if integer {
+            "gemm_i8_f32_256"
+        } else {
+            "gemm_bf16_f32_256"
+        };
+        let module = if integer {
+            "gemm_packed_256"
+        } else {
+            "gemm_bf16_family"
+        };
+        let out = h.run_module(
+            module,
+            stem,
+            &[
+                ("k_size", k.to_string()),
+                ("n_size", n.to_string()),
+                ("k_stride", stride.to_string()),
+                ("m_group", "1".into()),
+            ],
+            [1, 1, 1],
+            256,
+            &[rows as u64],
+            &data,
+        );
+        for value in floats(out.last().unwrap()) {
+            assert_eq!(value, 131072.0, "{stem}");
+        }
+    }
+}
+
+/// Fusion must preserve the FP16 boundary after RoPE, every INT8 code/scale,
+/// and transposed V including padded rows. The separate kernels have CPU oracles above.
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn fused_qkv_operands_are_byte_identical_to_separate_preparation() {
+    let mut h = Harness::new();
+    for (tokens, heads) in [(3usize, 2usize), (129, 56)] {
+        let width = heads * 128;
+        let capacity = tokens.div_ceil(256) * 256;
+        let fused: Vec<_> = values(tokens * width * 3, 0.7)
+            .into_iter()
+            .map(f16::from_f32)
+            .collect();
+        let qw: Vec<_> = values(128, 0.1).into_iter().map(|x| 1.0 + x).collect();
+        let kw: Vec<_> = qw.iter().map(|x| x + 0.05).collect();
+        let angles = values(tokens * 48, 3.0);
+        let cos: Vec<_> = angles.iter().map(|x| x.cos()).collect();
+        let sin: Vec<_> = angles.iter().map(|x| x.sin()).collect();
+        let mut config = cfg(&[
+            ("row_stride", width * 3),
+            ("heads", heads),
+            ("kv_heads", heads),
+            ("k_offset", width),
+        ]);
+        config.push(("eps", "1e-5".into()));
+        let split = h.run(
+            "rope_qknorm_f16",
+            &config,
+            [tokens as u32, 1, 1],
+            256,
+            &[tokens as u64],
+            &[
+                bytes(&fused),
+                bytes(&qw),
+                bytes(&kw),
+                bytes(&cos),
+                bytes(&sin),
+                vec![0; tokens * width * 2],
+                vec![0; tokens * width * 2],
+                vec![0; tokens * width * 2],
+            ],
+        );
+        for (i, weight, extra) in [(0, &qw, 1.0 / 128f64.sqrt() / 128.0), (1, &kw, 1.0)] {
+            let mut config = cfg(&[
+                ("row_stride", width),
+                ("heads", heads),
+                ("head_offset", 0),
+                ("token_capacity", capacity),
+            ]);
+            config.push(("extra_scale", format!("{extra:.17e}")));
+            let old = h.run(
+                "prepare_qk_i8hm",
+                &config,
+                [tokens as u32, 1, 1],
+                256,
+                &[tokens as u64],
+                &[
+                    split[5 + i].clone(),
+                    vec![0; width * 4],
+                    vec![0; capacity * width],
+                    vec![0; capacity * heads * 4],
+                ],
+            );
+            config[0].1 = (width * 3).to_string();
+            config[2].1 = (i * width).to_string();
+            config.push(("eps", "1e-5".into()));
+            let new = h.run(
+                "prepare_qk_rope_i8hm",
+                &config,
+                [tokens as u32, 1, 1],
+                256,
+                &[tokens as u64],
+                &[
+                    bytes(&fused),
+                    bytes(weight),
+                    bytes(&cos),
+                    bytes(&sin),
+                    vec![0; capacity * width],
+                    vec![0; capacity * heads * 4],
+                ],
+            );
+            assert!(old[2] == new[4], "codes differ: tokens={tokens} head={i}");
+            assert!(old[3] == new[5], "scales differ: tokens={tokens} head={i}");
+        }
+        let config = cfg(&[("width", width), ("row_capacity", capacity)]);
+        let old = h.run(
+            "transpose_f16",
+            &config,
+            [tokens.div_ceil(32) as u32, (width / 32) as u32, 1],
+            256,
+            &[tokens as u64],
+            &[split[7].clone(), vec![0; capacity * width * 2]],
+        );
+        let new = h.run(
+            "transpose_qkv_v_f16",
+            &config,
+            [tokens.div_ceil(32) as u32, (width / 32) as u32, 1],
+            256,
+            &[tokens as u64],
+            &[bytes(&fused), vec![0; capacity * width * 2]],
+        );
+        assert!(old[1] == new[1], "V transpose differs: tokens={tokens}");
+    }
+}
+
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX; probes the historical compiler workaround"]
+fn subgroup_shuffle_preparation_matches_lds_repeatedly() {
+    let mut h = Harness::new();
+    let (tokens, heads, capacity) = (257usize, 17usize, 512usize);
+    let width = heads * 128;
+    let x: Vec<_> = values(tokens * width, 0.7)
+        .into_iter()
+        .map(f16::from_f32)
+        .collect();
+    let mut config = cfg(&[
+        ("row_stride", width),
+        ("head_offset", 0),
+        ("heads", heads),
+        ("token_capacity", capacity),
+    ]);
+    config.push(("extra_scale", "0.0006905339660024879".into()));
+    let inputs = [
+        bytes(&x),
+        bytes(&values(width, 0.1)),
+        vec![0; capacity * width],
+        vec![0; capacity * heads * 4],
+    ];
+    let expected = h.run(
+        "prepare_qk_i8hm",
+        &config,
+        [tokens as u32, 1, 1],
+        256,
+        &[tokens as u64],
+        &inputs,
+    );
+    for iteration in 0..64 {
+        let actual = h.run(
+            "prepare_qk_i8hm_shuffle",
+            &config,
+            [tokens as u32, 1, 1],
+            256,
+            &[tokens as u64],
+            &inputs,
+        );
+        assert!(
+            actual[2] == expected[2],
+            "shuffle codes differ at repetition {iteration}"
+        );
+        assert!(
+            actual[3] == expected[3],
+            "shuffle scales differ at repetition {iteration}"
+        );
+    }
+}

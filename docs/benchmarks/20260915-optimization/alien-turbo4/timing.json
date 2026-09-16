@@ -1,0 +1,39 @@
+{
+  "started_utc": "2026-09-15T04:35:35.037173+00:00",
+  "command": [
+    "target/release/h3",
+    "--offline",
+    "--preset",
+    "turbo-768p-4",
+    "--seed",
+    "1618",
+    "--out",
+    "build/optimization-20260915/alien-turbo4.mp4",
+    "--latents",
+    "build/optimization-20260915/alien-turbo4"
+  ],
+  "stdin": "/home/zach/code/h3-hrx/docs/prompts/alien_fjord.txt",
+  "wall_seconds": 605.6981977879987,
+  "exit_code": 0,
+  "aborted_for_memory_pressure": false,
+  "minimum_starting_available_gib": 58.0,
+  "abort_available_gib": 12.0,
+  "max_rss_kib": 1928144,
+  "memory_sampling_interval_seconds": 1.0,
+  "baseline_system_memory_bytes": {
+    "MemTotal": 134145695744,
+    "MemAvailable": 82496163840,
+    "MemFree": 38725177344,
+    "Cached": 45913530368,
+    "SwapTotal": 67074256896,
+    "SwapFree": 38843867136,
+    "Dirty": 8724480
+  },
+  "sampled_peak_process_rss_bytes": 1980346368,
+  "sampled_peak_process_pss_bytes": 1971745792,
+  "sampled_peak_drm_resident_bytes": 41029898240,
+  "sampled_peak_drm_allocated_bytes": 41029910528,
+  "minimum_system_available_bytes": 38760013824,
+  "maximum_system_swap_used_bytes": 28944125952,
+  "memory_note": "Sampled process PSS and DRM memory are separate views and must not be summed. 1-second sampling may miss brief peaks. System counters include other applications."
+}

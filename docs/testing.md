@@ -1,24 +1,38 @@
 # Native test coverage
 
-Three tiers, each needing more of the machine than the last:
+Choose checks for the hardware and cached checkpoints available:
 
 | | needs | runs |
 | --- | --- | --- |
 | `scripts/test.sh --cpu` | nothing | formatting, Clippy, the unit tests |
 | `scripts/test.sh --gpu` | gfx1151 and a provisioned HRX | the above, plus `tests/kernels.rs` and the resident Euler and conditioning tests |
-| `scripts/test.sh --full` | the checkpoints as well | the above, plus `tests/differentials.rs`, about three minutes |
+| `scripts/test.sh --full` | the base checkpoints as well | the above, plus session lifecycle/cache tests and `tests/differentials.rs` |
+| `scripts/test.sh --adapters` | the DiT and both pinned Turbo adapters | the GPU tier plus real low-rank projection and adapted eager/graph block tests |
 
 The native tests compile through `hrx::loom::Compiler`, upload owned buffers,
 dispatch through `hrx::Stream`, and read results back through HRX staging. They
 are ignored by default; explicitly running them requires working hardware and
 the provisioned native bundle. No Python or Torch dependency is involved.
 
+For the optional independent Turbo block reference, export fixtures with
+`H3_ADAPTER_BLOCK_FIXTURE=build/adapter-blocks scripts/test.sh --adapters`, then
+run `scripts/adapter_block_reference.py build/adapter-blocks` using the native
+Comfy checkout's Python environment. That diagnostic uses Torch on the CPU and
+the original checkpoint tensor order. It checks QKV, attention, the complete
+block, and the remaining projections with identical attention input; it is
+separate from installing or running h3. See the
+[qualification results](benchmarks/20260915-optimization/implementation.md).
+
+The standard-library benchmark parser and cache calibration checks run with
+`python scripts/test_optimization_benchmark.py`.
+
 ## Whole-pipeline digests
 
-`tests/differentials.rs` runs thirty-one cases — seven video decodes across every tiling the
-decoder chooses, fourteen audio conversions at its padding boundaries, and five denoising
-trajectories over both samplers and the step cache — and compares a SHA-256 of each result against a
-constant in the file.
+`tests/differentials.rs` covers video decodes across the decoder's tilings,
+audio conversions at their padding boundaries, and four uncached denoising
+trajectories over both samplers. It compares each result's SHA-256 against a
+constant in the file. Cache tests separately require observation/forced-full
+execution to preserve both latent streams, and check an eligible actual skip.
 
 These are the checks that catch what types cannot: a recorded graph missing an edge, a stage moved
 to another stream, a path that resolves to the wrong tree. Inputs are generated from a seed by a
@@ -102,8 +116,8 @@ They reuse the standard Hugging Face cache and do not download missing
 checkpoints during validation.
 
 Whole-model parity lives in `scripts/parity.py`, outside this suite and outside
-`scripts/test.sh`: it needs the checkpoints, a device and dumps produced inside the
-ComfyUI container by `scripts/comfy_dump.py`, and it takes about eleven minutes.
+`scripts/test.sh`: it needs the checkpoints, a device and dumps produced by a native
+ComfyUI checkout using `scripts/comfy_dump.py`, and it takes about eleven minutes.
 Run `python3 scripts/parity.py gate --require` before a release. This suite
 establishes the numerical cases above; that script establishes full-model parity.
 

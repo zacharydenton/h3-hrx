@@ -197,8 +197,12 @@ weights and executed no generation. Those client IDs remain in the raw telemetry
 ## Attention diagnostics
 
 A representative 768p attention microbenchmark uses identical BF16 QKV tensors
-of shape `[1, 56, 37754, 128]`. This token count comes from the earlier glacier
-prompt; the alien-fjord prompt has 87 more text tokens. It times PyTorch flash
+of shape `[1, 56, 37754, 128]`. This is a nearby representative sequence length;
+the complete alien-fjord run has 38,048 rows: 37,296 video, 414 audio (two
+207-latent streams), and 338 text. The microbenchmark therefore has 294 fewer
+rows (0.77%). An earlier description omitted the second audio stream when
+relating the microbenchmark shape to the prompts. The raw timings and complete
+render results are unchanged. It times PyTorch flash
 SDPA with the model's head-strided inputs and with contiguous inputs, including
 the cost of all three copies in the latter.
 

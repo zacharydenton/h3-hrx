@@ -1,0 +1,38 @@
+{
+  "preset": "turbo-768p-4",
+  "case": "alien_fjord",
+  "evaluations": 4,
+  "seed": 1618,
+  "shape": [
+    1344,
+    768,
+    124
+  ],
+  "wall_seconds": 605.6981977879987,
+  "preparation_seconds": 80.850310449,
+  "sampling_seconds": 448.8,
+  "evaluation_seconds": [
+    109.1,
+    112.20000000000002,
+    114.0,
+    113.5
+  ],
+  "decode_seconds": 74.84417579199999,
+  "peak_drm_resident_gib": 38.21207046508789,
+  "peak_process_pss_gib": 1.8363313674926758,
+  "available_memory_drop_gib": 40.73246383666992,
+  "minimum_available_gib": 36.09807586669922,
+  "audio": {
+    "sample_rate": 32000,
+    "channels": 2,
+    "duration_seconds": 5.175,
+    "peak_absolute": 0.21661376953125,
+    "rms": 0.04286640536577672,
+    "near_full_scale_samples": 0
+  },
+  "validation": {
+    "full_decode": "FFmpeg -xerror passed for both streams",
+    "visual_review": "16 sampled frames preserve the creature identity, lighting, and composition, with visible membrane and filament motion; no abrupt identity change in inspected samples. This is not a claim of equal quality to twenty-evaluation base.",
+    "auditory_review": "Not performed; waveform and container checks only."
+  }
+}

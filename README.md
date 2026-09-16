@@ -138,14 +138,18 @@ use INT8 linear kernels for these checkpoints; attention implementations differ.
 
 | Configuration | Sampled peak GPU residency | Sampled peak process PSS |
 | --- | ---: | ---: |
-| h3-hrx | 56.63 GiB | 2.70 GiB |
+| h3-hrx · current stage-scoped CLI | **27.20 GiB** | **1.80 GiB** |
+| h3-hrx · historical retained-model run | 56.63 GiB | 2.70 GiB |
 | ComfyUI · default attention | 26.64 GiB | 26.45 GiB |
 | ComfyUI · Kitchen attention | 26.64 GiB | 26.06 GiB |
 
 These peaks cover complete pipelines. GPU residency and PSS overlap on unified
-memory and **must not be added**. h3 retains its models across stages; the ComfyUI
-runner unloads them between conditioning, sampling, and decoding. Reducing h3's
-peak memory is a concrete improvement opportunity.
+memory and **must not be added**. Releasing completed models between conditioning,
+sampling, and decoding reduced h3's GPU peak by **52%**, with byte-identical video
+and audio latents. The new run took 38 min 02 s, including 116 s of preparation
+versus 11 s in the timing table above; steady sampling remained 103.7 s per
+evaluation. `--residency retain` keeps models resident, as library sessions do by
+default. See the [measurement and latent checks](docs/benchmarks/20260915-optimization/implementation.md).
 
 Each configuration has one complete trajectory, with cached checkpoints and
 sequential execution. Steady medians exclude the first evaluation. Equal seeds
@@ -176,6 +180,7 @@ CPU checks require no GPU, native runtime, or model weights. Hardware and
 checkpoint tests are documented in [test coverage](docs/testing.md).
 
 - [Contributing](CONTRIBUTING.md) — development, tests, and bug reports.
+- [Runtime options](docs/runtime-options.md) — model residency and acceleration qualification.
 - [Shared HRX integration](docs/shared-hrx.md) — compilation, caching, runtime, and graphs.
 - [Research archive](docs/archive/README.md) — historical kernel experiments and measurements.
 - [Release checklist](docs/releasing.md) — packaging and validation gates.

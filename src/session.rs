@@ -12,6 +12,25 @@ use crate::layout::{shape_for, Shape};
 use crate::te::TextEncoder;
 use crate::vvae::{Clip, VideoVae};
 
+/// How long a session keeps completed models on the device.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResidencyPolicy {
+    /// Keep weights for subsequent requests.
+    #[default]
+    Retain,
+    /// Release completed stages before loading the next model.
+    StageScoped,
+}
+
+/// Optional session behavior. Existing callers retain weights by default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SessionOptions {
+    pub residency: ResidencyPolicy,
+    pub cache: crate::cache::CachePolicy,
+    /// Experimental native Turbo path; requires its matching parameters and qualification.
+    pub turbo: Option<crate::adapter::TurboPreset>,
+}
+
 /// Where the four checkpoints live, and how kernels are built.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -65,6 +84,7 @@ pub struct Session {
     stream: hrx::Stream,
     compiler: Compiler,
     config: Config,
+    options: SessionOptions,
     prof: Profile,
     dit: Option<Dit>,
     te: Option<TextEncoder>,
@@ -90,6 +110,16 @@ impl Session {
     /// function is `unsafe` rather than documentation asking nicely. Point a session at files you
     /// control.
     pub unsafe fn new(config: Config) -> Result<Self> {
+        // Safety: forwarded unchanged from this constructor's contract.
+        unsafe { Self::new_with_options(config, SessionOptions::default()) }
+    }
+
+    /// Opens a session with explicit model residency behavior.
+    ///
+    /// # Safety
+    /// The checkpoint immutability requirements of [`Session::new`] apply for the
+    /// entire session, including files temporarily released and reopened later.
+    pub unsafe fn new_with_options(config: Config, options: SessionOptions) -> Result<Self> {
         // An empty `kernel_sources` selects the sources embedded in this package. Compiled
         // artifacts go wherever HRX keeps them, which is one cache per user for every consumer.
         let compiler = Compiler::new(config.loom_library.clone(), config.kernel_sources.clone());
@@ -97,12 +127,37 @@ impl Session {
             stream: hrx::Stream::open()?,
             compiler,
             config,
+            options,
             prof: Profile::from_env(),
             dit: None,
             te: None,
             vvae: None,
             avae: None,
         })
+    }
+
+    /// The lifetime policy selected when this session was opened.
+    pub fn residency(&self) -> ResidencyPolicy {
+        self.options.residency
+    }
+
+    /// Fence before dropping model owners and the graph executions they contain.
+    fn release_completed(&mut self, encoder: bool, dit: bool, vaes: bool) -> Result<()> {
+        if self.options.residency == ResidencyPolicy::Retain {
+            return Ok(());
+        }
+        self.stream.synchronize()?;
+        if encoder {
+            self.te = None;
+        }
+        if dit {
+            self.dit = None;
+        }
+        if vaes {
+            self.vvae = None;
+            self.avae = None;
+        }
+        Ok(())
     }
 
     /// The stage timings gathered since the last call, and a reset.
@@ -132,8 +187,21 @@ impl Session {
     fn dit(&mut self) -> Result<&mut Dit> {
         if self.dit.is_none() {
             let path = checkpoint_path(&self.config.dit, crate::models::DIT_FL2VA)?;
+            crate::trace::checkpoint("dit", &path);
             // Safety: the caller's, taken at Session::new.
-            self.dit = Some(unsafe { Dit::open(&mut self.stream, &path) }?);
+            let adapter = if let Some(preset) = self.options.turbo {
+                let adapter_path = preset.resolve(false)?;
+                crate::trace::checkpoint("adapter", &adapter_path);
+                // Safety: session constructor also requires adapter cache files to remain immutable.
+                Some(unsafe { crate::adapter::Adapter::open(&adapter_path) }?)
+            } else {
+                None
+            };
+            let mut dit = unsafe { Dit::open(&mut self.stream, &path) }?;
+            if let Some(adapter) = adapter {
+                dit.set_adapter(adapter);
+            }
+            self.dit = Some(dit);
         }
         Ok(self.dit.as_mut().expect("opened above"))
     }
@@ -141,6 +209,7 @@ impl Session {
     fn te(&mut self) -> Result<&mut TextEncoder> {
         if self.te.is_none() {
             let path = checkpoint_path(&self.config.te, crate::models::TE)?;
+            crate::trace::checkpoint("te", &path);
             // Safety: the caller's, taken at Session::new.
             self.te = Some(unsafe { TextEncoder::open(&mut self.stream, &path) }?);
         }
@@ -150,6 +219,7 @@ impl Session {
     fn vvae(&mut self) -> Result<&mut VideoVae> {
         if self.vvae.is_none() {
             let path = checkpoint_path(&self.config.video_vae, crate::models::VIDEO_VAE)?;
+            crate::trace::checkpoint("video_vae", &path);
             // Safety: the caller's, taken at Session::new.
             self.vvae = Some(unsafe { VideoVae::open(&mut self.stream, &path) }?);
         }
@@ -159,6 +229,7 @@ impl Session {
     fn avae(&mut self) -> Result<&mut AudioVae> {
         if self.avae.is_none() {
             let path = checkpoint_path(&self.config.audio_vae, crate::models::AUDIO_VAE)?;
+            crate::trace::checkpoint("audio_vae", &path);
             // Safety: the caller's, taken at Session::new.
             self.avae = Some(unsafe { AudioVae::open(&mut self.stream, &path) }?);
         }
@@ -235,10 +306,45 @@ impl Session {
         let _ = sh;
         // the attention width is the session's, set once at creation: the stack is built for it
         let qk_bits = self.config.attention.bits();
-        let (stream, c, prof, dit, te) = self.prompt_pair()?;
-        dit.denoise(
-            stream, c, prof, te, ids, p, qk_bits, noise, refs, kfs, progress,
-        )
+        let cache_policy = self.options.cache;
+        self.release_completed(false, false, true)?;
+        crate::trace::event("conditioning_start", String::new);
+        let result = (|| {
+            let (stream, c, prof, dit, te) = self.prompt_pair()?;
+            let prepared = dit.prepare_denoise(stream, c, prof, te, ids, p, refs, kfs)?;
+            crate::trace::event("conditioning_ready", String::new);
+            self.release_completed(true, false, false)?;
+            crate::trace::event("encoder_released", || {
+                format!(",\"released\":{}", self.te.is_none())
+            });
+            self.dit
+                .as_mut()
+                .expect("conditioning prepared")
+                .sample_prepared(
+                    &mut self.stream,
+                    &self.compiler,
+                    &mut self.prof,
+                    prepared,
+                    p,
+                    qk_bits,
+                    noise,
+                    refs,
+                    kfs,
+                    progress,
+                    cache_policy,
+                )
+        })();
+        // Cleanup also runs after cancellation or a failed preparation. A failed fence
+        // retains owners so in-flight work cannot observe freed allocations.
+        self.release_completed(true, true, false)?;
+        crate::trace::event("denoise_finished", || {
+            format!(
+                ",\"success\":{},\"dit_released\":{}",
+                result.is_ok(),
+                self.dit.is_none()
+            )
+        });
+        result
     }
 
     /// Every cheap property of a request, checked before anything expensive happens.
@@ -253,6 +359,37 @@ impl Session {
         refs: &[Reference<'_>],
         kfs: &[Keyframe<'_>],
     ) -> Result<Shape> {
+        self.options
+            .cache
+            .validate(p.cache_threshold)
+            .map_err(|e| crate::Error::Invalid(e.into()))?;
+        if let Some(preset) = self.options.turbo {
+            if (p.width, p.height, p.frames) != (1344, 768, 124)
+                || !refs.is_empty()
+                || kfs.len() > 1
+                || kfs.iter().any(|k| k.frame_index != 0 || k.audio.is_some())
+            {
+                return invalid(
+                    "768p Turbo supports 1344x768, 124 frames, and at most one first-frame image",
+                );
+            }
+            if p.steps != preset.evaluations() + 1
+                || p.sampler != crate::Sampler::Euler
+                || p.video_shift != 6.0
+                || p.audio_shift != 3.0
+            {
+                return invalid("Turbo requires its trained evaluation count, Euler, and video/audio shifts 6/3");
+            }
+            if self.config.dit.is_some()
+                || self.config.attention != crate::Attention::I8
+                || p.cache_threshold > 0.0
+                || self.options.cache != crate::CachePolicy::Off
+            {
+                return invalid(
+                    "Turbo requires the default quantized base, i8 attention, and cache off",
+                );
+            }
+        }
         if ids.is_empty() {
             return invalid("ids must hold at least one token");
         }
@@ -323,6 +460,8 @@ impl Session {
     ///
     /// `latents` and `out` must not overlap.
     pub fn decode_video(&mut self, shape: &Shape, latents: &[f32], out: &mut [u8]) -> Result<()> {
+        self.release_completed(true, true, false)?;
+        crate::trace::event("video_decode_start", String::new);
         self.vvae()?;
         let Self {
             stream,
@@ -331,9 +470,15 @@ impl Session {
             vvae,
             ..
         } = self;
-        vvae.as_mut()
+        let result = vvae
+            .as_mut()
             .expect("opened")
-            .decode_video(stream, compiler, prof, shape, latents, out)
+            .decode_video(stream, compiler, prof, shape, latents, out);
+        self.release_completed(false, false, true)?;
+        crate::trace::event("video_decode_finished", || {
+            format!(",\"success\":{}", result.is_ok())
+        });
+        result
     }
 
     pub fn encode_video(&mut self, clip: Clip<'_>) -> Result<(Vec<f32>, usize)> {
@@ -356,6 +501,8 @@ impl Session {
         audio_t: usize,
         samples: &mut [f32],
     ) -> Result<()> {
+        self.release_completed(true, true, false)?;
+        crate::trace::event("audio_decode_start", String::new);
         self.avae()?;
         let Self {
             stream,
@@ -364,9 +511,15 @@ impl Session {
             avae,
             ..
         } = self;
-        avae.as_mut()
+        let result = avae
+            .as_mut()
             .expect("opened")
-            .decode(stream, compiler, prof, latents, audio_t, samples)
+            .decode(stream, compiler, prof, latents, audio_t, samples);
+        self.release_completed(false, false, true)?;
+        crate::trace::event("audio_decode_finished", || {
+            format!(",\"success\":{}", result.is_ok())
+        });
+        result
     }
 
     pub fn encode_audio(&mut self, samples: &[f32], n: usize) -> Result<(Vec<f32>, usize)> {
@@ -387,6 +540,133 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_sessions_retain_models_by_default() {
+        assert_eq!(SessionOptions::default().residency, ResidencyPolicy::Retain);
+    }
+
+    #[test]
+    #[ignore = "requires an idle gfx1151 and the DiT/text encoder checkpoints"]
+    fn stage_scoped_denoise_releases_models_and_recovers_after_cancellation() {
+        let ids = crate::Tokenizer::new()
+            .unwrap()
+            .encode("a red fox in snow")
+            .unwrap();
+        let p = DenoiseParams {
+            height: 256,
+            width: 256,
+            frames: 5,
+            steps: 2,
+            sampler: crate::Sampler::Euler,
+            seed: 7,
+            ..DenoiseParams::default()
+        };
+        // Safety: the fixture never modifies checkpoint files.
+        let mut session = unsafe { Session::new(Config::default()) }.unwrap();
+        let expected = session
+            .denoise(&ids, &p, Noise::default(), &[], &[], None)
+            .unwrap();
+        assert!(session.te.is_some() && session.dit.is_some());
+        session.options.residency = ResidencyPolicy::StageScoped;
+        session.release_completed(true, true, true).unwrap();
+        for cancel in [true, false] {
+            let result = session.denoise(
+                &ids,
+                &p,
+                Noise::default(),
+                &[],
+                &[],
+                Some(&mut |_, _, _| cancel),
+            );
+            assert!(session.te.is_none() && session.dit.is_none());
+            assert!(session.vvae.is_none() && session.avae.is_none());
+            if cancel {
+                assert!(matches!(result, Err(crate::Error::Cancelled)));
+            } else {
+                let actual = result.unwrap();
+                assert_eq!(
+                    crate::vvae::as_bytes(&actual.video),
+                    crate::vvae::as_bytes(&expected.video)
+                );
+                assert_eq!(
+                    crate::vvae::as_bytes(&actual.audio),
+                    crate::vvae::as_bytes(&expected.audio)
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an idle gfx1151 and the DiT/text encoder checkpoints"]
+    fn observing_and_forcing_full_cache_evaluations_preserve_the_trajectory() {
+        use crate::{CachePolicy, CacheThresholds};
+        let ids = crate::Tokenizer::new()
+            .unwrap()
+            .encode("a fox running through snow")
+            .unwrap();
+        let p = DenoiseParams {
+            height: 256,
+            width: 256,
+            frames: 22,
+            steps: 6,
+            seed: 7,
+            ..DenoiseParams::default()
+        };
+        // Safety: the fixture never modifies checkpoint files.
+        let mut session = unsafe { Session::new(Config::default()) }.unwrap();
+        let expected = session
+            .denoise(&ids, &p, Noise::default(), &[], &[], None)
+            .unwrap();
+        // Five evaluations include one eligible interior skip. A very small threshold
+        // forces its suffix to run, exercising the split graph and metric reductions.
+        for policy in [
+            CachePolicy::Observe,
+            CachePolicy::Conservative(CacheThresholds {
+                conditioning: f32::MIN_POSITIVE,
+                audio: f32::MIN_POSITIVE,
+                video: f32::MIN_POSITIVE,
+            }),
+        ] {
+            session.options.cache = policy;
+            let actual = session
+                .denoise(&ids, &p, Noise::default(), &[], &[], None)
+                .unwrap();
+            assert_eq!(
+                crate::vvae::as_bytes(&actual.video),
+                crate::vvae::as_bytes(&expected.video)
+            );
+            assert_eq!(
+                crate::vvae::as_bytes(&actual.audio),
+                crate::vvae::as_bytes(&expected.audio)
+            );
+        }
+        // The legacy scalar maps to the hardened policy. Its old digest intentionally
+        // no longer applies: evaluation one and consecutive suffix skips are forbidden.
+        session.options.cache = CachePolicy::Off;
+        let cached = session
+            .denoise(
+                &ids,
+                &DenoiseParams {
+                    cache_threshold: f32::MAX,
+                    ..p
+                },
+                Noise::default(),
+                &[],
+                &[],
+                None,
+            )
+            .unwrap();
+        assert!(cached
+            .video
+            .iter()
+            .chain(&cached.audio)
+            .all(|v| v.is_finite()));
+        assert_ne!(
+            crate::vvae::as_bytes(&cached.video),
+            crate::vvae::as_bytes(&expected.video)
+        );
+    }
 
     #[test]
     fn default_checkpoints_reuse_the_standard_hub_cache() {

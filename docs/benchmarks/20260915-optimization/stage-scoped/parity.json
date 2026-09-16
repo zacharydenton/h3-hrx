@@ -1,0 +1,14 @@
+{
+  "video": {
+    "byte_identical": true,
+    "bytes": 14321664,
+    "sha256": "32902d7154d371f549769552507916103071d3edb61711b20cc468a1665015a4",
+    "baseline_sha256": "32902d7154d371f549769552507916103071d3edb61711b20cc468a1665015a4"
+  },
+  "audio": {
+    "byte_identical": true,
+    "bytes": 52992,
+    "sha256": "7cb8581a3706334bf317ac2bc82af4a9c24ffbe501c1d46e98536c0760c7e85e",
+    "baseline_sha256": "7cb8581a3706334bf317ac2bc82af4a9c24ffbe501c1d46e98536c0760c7e85e"
+  }
+}

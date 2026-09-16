@@ -24,6 +24,7 @@ ap.add_argument("--comfy-args", nargs=argparse.REMAINDER, default=[], help="Comf
 ap.add_argument("--attention-backend", choices=["default", "pytorch-contiguous", "comfy-kitchen-int8"], default="default", help="DiT attention only; kitchen matches ComfyUI's Model Attention Backend node")
 ap.add_argument("--profile-sampling", action="store_true", help="record an intrusive torch profile; use a separate diagnostic run")
 ap.add_argument("--save-latents", action="store_true", help="also save initial noise and final video/audio latents with MP4 output")
+ap.add_argument("--preset", choices=["base", "turbo-768p-4", "turbo-768p-8"], default="base")
 ap.add_argument("--model", default="minimax_h3_fl2va_pruned_int8_convrot.safetensors")
 ap.add_argument("--width", type=int, default=864); ap.add_argument("--height", type=int, default=480); ap.add_argument("--length", type=int, default=22)
 ap.add_argument("--steps", type=int, default=20); ap.add_argument("--seed", type=int, default=7)
@@ -33,6 +34,22 @@ ap.add_argument("--prompt-file", type=Path, help="read the structured prompt fro
 ap.add_argument("--prompt", default="A red fox trotting through a snowy forest at dawn, cinematic")
 ap.add_argument("--first-frame", default=None); ap.add_argument("--dump-blocks", default="", help="comma-separated block indices whose output rows to save at the first evaluation (plus the refined text and the embedded rows)"); ap.add_argument("--dump-steps", action="store_true", help="save the noise and, per evaluation, the sampler state x_k and denoised d_k (video part)"); ap.add_argument("--out", type=Path, default=Path("build/comfy_clip"))
 a = ap.parse_args()
+adapter_path = None
+if a.preset != "base":
+    evaluations = 4 if a.preset == "turbo-768p-4" else 8
+    for flag, field, value in [("--steps", "steps", evaluations), ("--sampler", "sampler", "euler"),
+                               ("--width", "width", 1344), ("--height", "height", 768), ("--length", "length", 124)]:
+        if any(v == flag or v.startswith(flag + "=") for v in sys.argv[1:]) and getattr(a, field) != value: ap.error(f"{a.preset} requires {flag} {value}")
+        setattr(a, field, value)
+    if a.model != "minimax_h3_fl2va_pruned_int8_convrot.safetensors" or a.scheduler != "simple":
+        ap.error("Turbo comparison requires the standard quantized FL2VA base and simple schedule")
+    from huggingface_hub import hf_hub_download
+    if evaluations == 4:
+        source = ("Comfy-Org/MiniMax-H3", "a98869194787969724c7425d95d0ed73ce9202af", "loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors")
+    else:
+        source = ("lightx2v/Minimax-h3-Turbo", "3ec17a324ced54151364f24f8b5fb6bf7e26414f", "minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors")
+    adapter_path = hf_hub_download(repo_id=source[0], revision=source[1], filename=source[2], local_files_only=True)
+
 if a.prompt_file is not None: a.prompt = a.prompt_file.read_text(encoding="utf-8").strip()
 if a.video_out is not None:
     # Fail before loading models if this environment cannot produce the requested output.
@@ -70,6 +87,7 @@ metrics = {
     "comfy_args": a.comfy_args,
     "attention_backend": a.attention_backend,
     "profile_sampling": a.profile_sampling,
+    "preset": a.preset, "adapter_path": adapter_path,
     "save_latents": a.save_latents,
     "default_attention_implementation": get_attention_function("optimized").__name__,
     "comfy_kitchen_backends": comfy.quant_ops.ck.list_backends(),
@@ -112,12 +130,42 @@ with torch.inference_mode():
     load_start = stamp()
     clip = None; comfy.model_management.unload_all_models(); comfy.model_management.soft_empty_cache()
     model = comfy.sd.load_diffusion_model(str(model_path(f"diffusion_models/{a.model}")))
+    if adapter_path is not None:
+        lora = comfy.utils.load_torch_file(adapter_path, safe_load=True)
+        model, _ = comfy.sd.load_lora_for_models(model, None, lora, 1.0, 0.0)
+        metrics["adapter_patch_count"] = len(model.patches)
+        if len(model.patches) != 208:
+            raise RuntimeError(f"Expected all 208 Turbo projections, got {len(model.patches)} patches")
+        model = H3.MiniMaxH3SigmaShift.execute(model, 6.0, 3.0).args[0]
+        del lora
+    sigmas = comfy.samplers.calculate_sigmas(model.get_model_object("model_sampling"), a.scheduler, a.steps).cpu().tolist()
+    metrics["video_sigmas"] = sigmas
+    if adapter_path is not None:
+        expected = [6 * (1-i/a.steps) / (1+5*(1-i/a.steps)) for i in range(a.steps+1)]
+        if len(sigmas) != a.steps+1 or any(abs(x-y) > 1e-6 for x,y in zip(sigmas, expected)):
+            raise RuntimeError(f"Unexpected Turbo sigma schedule: {sigmas}")
+        metrics["audio_sigmas"] = [3 * (1-i/a.steps) / (1+2*(1-i/a.steps)) for i in range(a.steps+1)]
+
     if a.attention_backend == "pytorch-contiguous":
         model.set_model_optimized_attention(contiguous_attention)
     elif a.attention_backend == "comfy-kitchen-int8":
         model.set_model_optimized_attention(get_attention_function("comfy_kitchen_int8"))
     metrics["dit_load_and_conditioning_unload_seconds"] = stamp() - load_start
     metrics["dit_inference_dtype"] = str(model.model.get_dtype_inference())
+    def linear_metadata():
+        result = {}
+        for stack, block in [("dit", model.model.diffusion_model.blocks[0]),
+                             ("refiner", model.model.diffusion_model.token_refiner.blocks[0])]:
+            for name in ("attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2"):
+                layer = block.get_submodule(name)
+                weight = layer.weight
+                result[stack + "." + name] = {
+                    "module": type(layer).__qualname__, "weight_type": type(weight).__qualname__,
+                    "dtype": str(weight.dtype), "layout": str(getattr(weight, "_layout_cls", None)),
+                    "weight_functions": len(getattr(layer, "weight_function", [])),
+                }
+        return result
+    metrics["linear_layers_before_sampling"] = linear_metadata()
     noise = comfy.sample.prepare_noise(latent["samples"], a.seed)
     marks = [stamp()]
     if a.dump_steps or a.save_latents:
@@ -146,6 +194,7 @@ with torch.inference_mode():
     with profiling as profiler:
         samples = comfy.sample.sample(model, noise, a.steps, 1.0, a.sampler, a.scheduler, positive, positive, latent["samples"], seed=a.seed, callback=cb, disable_pbar=True)
     metrics["sampling_seconds"] = stamp() - marks[0]; save_metrics()
+    metrics["linear_layers_after_sampling"] = linear_metadata()
     if profiler is not None:
         profiler.export_chrome_trace(str(a.out / "sampling-trace.json"))
         (a.out / "sampling-profile.txt").write_text(profiler.key_averages().table(sort_by="self_device_time_total", row_limit=50))

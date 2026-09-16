@@ -1,0 +1,105 @@
+// Experimental low-rank side branch. Add before SwiGLU or residual gating.
+// The base projection and residual stay f32; only the low-rank branch narrows to f16.
+amdgpu.target<gfx11-generic> @h3_adapter_finish_gfx11 {subgroup_size = 32}
+config.decl @h3.adapter_finish.width : %v: index where [range(%v, 128, 32768), mul(%v, 128)]
+config.decl @h3.adapter_finish.mode : %v: index where [range(%v, 0, 2)]
+config.decl @h3.adapter_finish.classes : %v: index where [range(%v, 1, 64)]
+
+kernel.def target(@h3_adapter_finish_gfx11) export("h3_adapter_finish") @h3_adapter_finish(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %width = config.get @h3.adapter_finish.width : index
+  %count = index.mul %tokens, %width : index
+  %rounded = index.add %count, %c255 : index
+  %groups = index.div %rounded, %c256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%tokens: index, %base: buffer, %delta: buffer, %out: buffer, %gate: buffer, %cls: buffer) {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c256 = index.constant 256 : index
+  %off0 = index.constant 0 : offset
+  %width0 = config.get @h3.adapter_finish.width : index
+  %width = index.assume %width0 [range(%width0, 128, 32768), mul(%width0, 128)] : index
+  %mode = config.get @h3.adapter_finish.mode : index
+  %classes0 = config.get @h3.adapter_finish.classes : index
+  %classes = index.assume %classes0 [range(%classes0, 1, 64)] : index
+  %rows = index.assume %tokens [range(%tokens, 1, 1048576)] : index
+  %is_glu = index.cmp eq, %mode, %c1 : index
+  %is_resid = index.cmp eq, %mode, %c2 : index
+  %two_width = index.mul %width, %c2 : index
+  %input_width = scf.select %is_glu, %two_width, %width : index
+  %count = index.mul %rows, %width : index
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %start = index.mul %wg, %c256 : index
+  %idx = index.add %start, %lane : index
+  %bg = buffer.assume.memory_space<global> %base : buffer
+  %dg = buffer.assume.memory_space<global> %delta : buffer
+  %og = buffer.assume.memory_space<global> %out : buffer
+  %gg = buffer.assume.memory_space<global> %gate : buffer
+  %cg = buffer.assume.memory_space<global> %cls : buffer
+  %bv = buffer.view %bg[%off0] : buffer -> view<[%rows]x[%input_width]xf32>
+  %dv = buffer.view %dg[%off0] : buffer -> view<[%rows]x[%input_width]xf16>
+  %out16 = buffer.view %og[%off0] : buffer -> view<[%rows]x[%width]xf16>
+  %out32 = buffer.view %og[%off0] : buffer -> view<[%rows]x[%width]xf32>
+  %gates = buffer.view %gg[%off0] : buffer -> view<[%classes]x[%width]xf32>
+  %clss = buffer.view %cg[%off0] : buffer -> view<[%rows]xi32>
+  %active = index.cmp ult, %idx, %count : index
+  scf.if %active {
+    %row0 = index.div %idx, %width : index
+    %col0 = index.rem %idx, %width : index
+    %row = index.assume %row0 [lt(%row0, %rows)] : index
+    %col = index.assume %col0 [lt(%col0, %width)] : index
+    %group = index.div %col, %c16 : index
+    %within = index.rem %col, %c16 : index
+    %group32 = index.mul %group, %c32 : index
+    %interleaved = index.add %group32, %within : index
+    %ic0 = scf.select %is_glu, %interleaved, %col : index
+    %ic = index.assume %ic0 [lt(%ic0, %input_width)] : index
+    %b = view.load %bv[%row, %ic] : view<[%rows]x[%input_width]xf32> -> f32
+    %d16 = view.load %dv[%row, %ic] : view<[%rows]x[%input_width]xf16> -> f16
+    %d = scalar.extf %d16 : f16 to f32
+    %sum = scalar.addf %b, %d : f32
+    %value = scf.if %is_glu -> (f32) {
+      %uc0 = index.add %ic, %c16 : index
+      %uc = index.assume %uc0 [lt(%uc0, %input_width)] : index
+      %ub = view.load %bv[%row, %uc] : view<[%rows]x[%input_width]xf32> -> f32
+      %ud16 = view.load %dv[%row, %uc] : view<[%rows]x[%input_width]xf16> -> f16
+      %ud = scalar.extf %ud16 : f16 to f32
+      %up = scalar.addf %ub, %ud : f32
+      %zero = scalar.constant 0.0 : f32
+      %one = scalar.constant 1.0 : f32
+      %negative = scalar.subf %zero, %sum : f32
+      %e = scalar.expf<afn> %negative : f32
+      %den = scalar.addf %one, %e : f32
+      %sigmoid = scalar.divf %one, %den : f32
+      %silu = scalar.mulf %sum, %sigmoid : f32
+      %product = scalar.mulf %silu, %up : f32
+      scf.yield %product : f32
+    } else {
+      scf.yield %sum : f32
+    }
+    scf.if %is_resid {
+      %class_i32 = view.load %clss[%row] : view<[%rows]xi32> -> i32
+      %class0 = index.cast %class_i32 : i32 to index
+      %class = index.assume %class0 [lt(%class0, %classes)] : index
+      %g = view.load %gates[%class, %col] : view<[%classes]x[%width]xf32> -> f32
+      %old = view.load %out32[%row, %col] : view<[%rows]x[%width]xf32> -> f32
+      %scaled = scalar.mulf %value, %g : f32
+      %updated = scalar.addf %old, %scaled : f32
+      view.store %updated, %out32[%row, %col] : f32, view<[%rows]x[%width]xf32>
+    } else {
+      %maximum = scalar.constant 65472.0 : f32
+      %minimum = scalar.constant -65472.0 : f32
+      %upper = scalar.minnumf %value, %maximum : f32
+      %bounded = scalar.maxnumf %upper, %minimum : f32
+      %narrow = scalar.fptrunc %bounded : f32 to f16
+      view.store %narrow, %out16[%row, %col] : f16, view<[%rows]x[%width]xf16>
+    }
+  }
+  kernel.return
+}
