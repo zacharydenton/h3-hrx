@@ -17,7 +17,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     })?;
     // SAFETY: the caller supplies an immutable local model snapshot.
-    let mut session = unsafe { Session::new_in(config, SessionOptions { residency: ResidencyPolicy::Budgeted, ..Default::default() }, &context) }?;
+    let mut session = unsafe {
+        Session::new_in(
+            config,
+            SessionOptions {
+                residency: ResidencyPolicy::Budgeted,
+                ..Default::default()
+            },
+            &context,
+        )
+    }?;
     let input: Vec<f32> = (0..6400).map(|i| ((i % 97) as f32 - 48.) / 97.).collect();
     let mut run = || -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         let (audio, t) = session.encode_audio(&input, 3200)?;

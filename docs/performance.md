@@ -4,6 +4,26 @@ The current comparison measures h3-hrx and ComfyUI on AMD Strix Halo (`gfx1151`)
 with 128 GB unified memory. Timings depend on sequence length, prompt, cache state,
 and competing CPU/GPU work on the APU.
 
+## September 22: audio command reuse
+
+HRX 0.8.4 reuses native commands on budgeted streams. The audio encoder now
+retains its scratch workspace, growing it when needed and reusing it for smaller
+shapes. In five alternating fresh-process pairs, the 3,200-sample stereo
+encode/decode benchmark improves from 430.811 ms to 298.476 ms (30.7%). Each
+process collects 11 warm samples; outputs match byte for byte. This restores
+performance near the historical HRX 0.7 result (~302 ms).
+
+Frozen audio digests pass across workspace growth and smaller-shape reuse. The
+full session fixture also passes cancellation/retry, four-unit eviction/reload,
+and zero charged residency at teardown. Scratch remains resident with the audio
+unit until it is evicted or dropped. The benchmark uses budgeted residency;
+stage-scoped sessions that unload the VAE between stages do not retain it.
+
+`examples/profile_audio.rs` separates encoder and decoder timings. Set
+`H3_PROFILE=1` for synchronized per-stage diagnostics; these intrusive timings
+are not comparable to `examples/bench_runtime.rs` warm session latency. Set
+`H3_PROFILE_BUDGET=0` only to diagnose an unbudgeted stream.
+
 ## September 14: complete native 768p comparison
 
 At 1344×768, 124 frames, and 20 evaluations, h3 completed video and audio output

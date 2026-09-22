@@ -230,6 +230,7 @@ pub struct AudioVae {
     /// the decoder's conv_post has no bias in the checkpoint, so it is handed zeros
     zeros: hrx::Buffer,
     dec: Option<DecBuffers>,
+    enc: Option<EncBuffers>,
     dec_mean: Vec<f32>,
     dec_std: Vec<f32>,
     enc_mean: Vec<f32>,
@@ -247,6 +248,27 @@ struct DecBuffers {
     /// the 2x buffer the anti-aliased activation passes through, hence twice the width
     tmp2: hrx::Buffer,
     input: hrx::Buffer,
+}
+
+/// Resident encoder scratch; stable bindings reuse native dispatch preparation.
+struct EncBuffers {
+    cap: usize,
+    x0: hrx::Buffer,
+    h: hrx::Buffer,
+    h2: hrx::Buffer,
+    y: hrx::Buffer,
+    y2: hrx::Buffer,
+    rows: hrx::Buffer,
+    n1: hrx::Buffer,
+    qkv: hrx::Buffer,
+    pattn: hrx::Buffer,
+    pool: hrx::Buffer,
+    xa: hrx::Buffer,
+    xb: hrx::Buffer,
+    xc: hrx::Buffer,
+    a0: hrx::Buffer,
+    a1: hrx::Buffer,
+    g: hrx::Buffer,
 }
 
 impl AudioVae {
@@ -267,6 +289,7 @@ impl AudioVae {
             weights,
             zeros,
             dec: None,
+            enc: None,
         })
     }
 
@@ -650,6 +673,37 @@ impl AudioVae {
         Ok(())
     }
 
+    fn ensure_enc(&mut self, stream: &mut hrx::Stream, lp: usize) -> Result<()> {
+        if self.enc.as_ref().is_some_and(|e| e.cap >= lp) {
+            return Ok(());
+        }
+        // An earlier failed invocation may still have queued work. Fence before
+        // evicting its backing and the stream's cached native commands.
+        stream.synchronize()?;
+        self.enc = None;
+        let t = lp / HOP;
+        self.enc = Some(EncBuffers {
+            cap: lp,
+            x0: stream.allocate((lp) * 4)?,
+            h: stream.allocate((64 * lp) * 4)?,
+            h2: stream.allocate((64 * lp) * 4)?,
+            y: stream.allocate((64 * lp) * 4)?,
+            y2: stream.allocate((64 * lp) * 4)?,
+            rows: stream.allocate((t * 2048) * 4)?,
+            n1: stream.allocate((t * 2048) * 4)?,
+            qkv: stream.allocate((t * 6144) * 4)?,
+            pattn: stream.allocate((8 * t * t) * 4)?,
+            pool: stream.allocate((t * AUDIO_CH) * 4)?,
+            xa: stream.allocate((t * AUDIO_CH) * 4)?,
+            xb: stream.allocate((t * AUDIO_CH) * 4)?,
+            xc: stream.allocate((t * AUDIO_CH) * 4)?,
+            a0: stream.allocate((t * 64) * 4)?,
+            a1: stream.allocate((t * 64) * 4)?,
+            g: stream.allocate((t * 64) * 4)?,
+        });
+        Ok(())
+    }
+
     /// Stereo samples `[2][n]` at 32 kHz to model-space latents `[2][32][audio_t]`.
     ///
     /// The sample count is padded up to a whole number of 800-sample frames; the tail is silence, not
@@ -664,24 +718,24 @@ impl AudioVae {
     ) -> Result<(Vec<f32>, usize)> {
         let lp = n.div_ceil(HOP) * HOP;
         let t = lp / HOP;
-        let plane = 64 * lp;
-
-        let x0 = stream.allocate(lp * 4)?;
-        let mut h = stream.allocate(plane * 4)?;
-        let mut h2 = stream.allocate(plane * 4)?;
-        let y = stream.allocate(plane * 4)?;
-        let y2 = stream.allocate(plane * 4)?;
-        let rows = stream.allocate(t * 2048 * 4)?;
-        let n1 = stream.allocate(t * 2048 * 4)?;
-        let qkv = stream.allocate(t * 6144 * 4)?;
-        let pattn = stream.allocate(8 * t * t * 4)?;
-        let pool = stream.allocate(t * AUDIO_CH * 4)?;
-        let xa = stream.allocate(t * AUDIO_CH * 4)?;
-        let xb = stream.allocate(t * AUDIO_CH * 4)?;
-        let xc = stream.allocate(t * AUDIO_CH * 4)?;
-        let a0 = stream.allocate(t * 64 * 4)?;
-        let a1 = stream.allocate(t * 64 * 4)?;
-        let g = stream.allocate(t * 64 * 4)?;
+        self.ensure_enc(stream, lp)?;
+        let workspace = self.enc.as_ref().expect("sized above");
+        let x0 = &workspace.x0;
+        let mut h = &workspace.h;
+        let mut h2 = &workspace.h2;
+        let y = &workspace.y;
+        let y2 = &workspace.y2;
+        let rows = &workspace.rows;
+        let n1 = &workspace.n1;
+        let qkv = &workspace.qkv;
+        let pattn = &workspace.pattn;
+        let pool = &workspace.pool;
+        let xa = &workspace.xa;
+        let xb = &workspace.xb;
+        let xc = &workspace.xc;
+        let a0 = &workspace.a0;
+        let a1 = &workspace.a1;
+        let g = &workspace.g;
 
         let mut out = vec![0.0f32; 2 * AUDIO_CH * t];
         let mut host = vec![0.0f32; lp];

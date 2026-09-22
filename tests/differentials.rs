@@ -223,7 +223,13 @@ fn audio_conversions_are_byte_stable_at_the_boundaries() {
             .expect("decode");
         check(digest_f32(&samples), want, &format!("decode {t}"));
     }
-    for &(n, want) in ENCODES {
+    // Grow the resident workspace, then reuse it for smaller padded shapes and
+    // changed inputs. Every replay still uses the original frozen digest.
+    for &(n, want) in ENCODES
+        .iter()
+        .chain(ENCODES[..4].iter().rev())
+        .chain(&ENCODES[..2])
+    {
         // scaled into the range a waveform occupies, since the encoder is not scale-free
         let samples: Vec<f32> = Normals(0x5a3f)
             .take(2 * n)
