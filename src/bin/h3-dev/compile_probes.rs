@@ -60,7 +60,7 @@ pub fn run(args: Vec<String>) {
     for (dir, stem, cfg, required) in requests {
         let source = std::fs::read_to_string(root.join(dir).join(format!("{stem}.loom"))).unwrap();
         let mut req = hrx::loom::Specialization::new(format!("h3_{stem}"));
-        req.set_report(true);
+        req.set_report(hrx::loom::ReportMode::Summary);
         req.replace_config(
             cfg.into_iter()
                 .map(|(k, v)| (format!("h3.{stem}.{k}"), v))
@@ -68,7 +68,7 @@ pub fn run(args: Vec<String>) {
         );
         match compiler.module(&source).compile(&req) {
             Ok(a) => println!("{{\"stem\":\"{stem}\",\"compiled\":true,\"sha256\":\"{}\",\"compiler\":\"{}\",\"report\":{}}}",
-                hrx::bundle::digest(a.bytes()), a.compiler_identity(), a.report().map_or("null".into(), ToString::to_string)),
+                hrx::bundle::digest(a.bytes()), a.compiler_identity(), a.report().map_or("null".into(), |report| report.json().to_string())),
             Err(e) => {
                 eprintln!("{stem}: {e}");
                 println!("{{\"stem\":\"{stem}\",\"compiled\":false,\"required\":{required}}}");

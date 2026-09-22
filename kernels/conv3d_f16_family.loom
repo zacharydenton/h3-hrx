@@ -172,7 +172,8 @@ template.def<@h3.shared_conv3d_f16_wmma_add> @h3_body_conv3d_f16_wmma_add(%m_siz
       %row_y0_first = index.add %row_t_first, %yi_first : index
       %row_yw_first = index.mul %row_y0_first, %cfg_width : index
       %in_row0_first = index.add %row_yw_first, %xi_first : index
-      %in_row_first = index.assume %in_row0_first [lt(%in_row0_first, %in_rows_total)] : index
+      // Guarded causal time and reflected spatial coordinates form a nonnegative row.
+      %in_row_first = index.assume %in_row0_first [range(%in_row0_first, 0, 2097151), lt(%in_row0_first, %in_rows_total)] : index
       %c_col_first = index.assume %c_first [le(%c_first, %c_limit), mul(%c_first, 8)] : index
       %v_first = vector.load %a_view[%in_row_first, %c_col_first] : view<[%in_rows_total]x[%cfg_cin_stride]xf16> -> vector<8xf16>
       scf.yield %v_first : vector<8xf16>
@@ -260,7 +261,7 @@ template.def<@h3.shared_conv3d_f16_wmma_add> @h3_body_conv3d_f16_wmma_add(%m_siz
         %row_y0_next = index.add %row_t_next, %yi_next : index
         %row_yw_next = index.mul %row_y0_next, %cfg_width : index
         %in_row0_next = index.add %row_yw_next, %xi_next : index
-        %in_row_next = index.assume %in_row0_next [lt(%in_row0_next, %in_rows_total)] : index
+        %in_row_next = index.assume %in_row0_next [range(%in_row0_next, 0, 2097151), lt(%in_row0_next, %in_rows_total)] : index
         %c_col_next = index.assume %c_next [le(%c_next, %c_limit), mul(%c_next, 8)] : index
         %v_next = vector.load %a_view[%in_row_next, %c_col_next] : view<[%in_rows_total]x[%cfg_cin_stride]xf16> -> vector<8xf16>
         scf.yield %v_next : vector<8xf16>

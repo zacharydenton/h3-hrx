@@ -166,7 +166,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(residency.statistics().reserved_bytes, 0);
     assert_eq!(residency.statistics().resources, 0);
     let trace = context.runtime().finish_trace().expect("trace started");
-    assert!(trace.events.len() >= 6);
+    // Encode/decode audio, encode video, denoise, and decode video: five stages.
+    assert!(trace.events.len() >= 5);
     assert!(trace
         .events
         .iter()

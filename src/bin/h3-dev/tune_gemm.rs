@@ -120,7 +120,7 @@ pub fn run(args: Vec<String>) {
             let mut kernels = Vec::new();
             for &group in &groups {
                 let mut req = hrx::loom::Specialization::new(format!("h3_{stem}"));
-                req.set_report(true);
+                req.set_report(hrx::loom::ReportMode::Summary);
                 req.replace_config(
                     [
                         ("k_size", k),
@@ -136,7 +136,7 @@ pub fn run(args: Vec<String>) {
                 );
                 let artifact = compiler.module(&source).compile(&req).unwrap();
                 println!("{{\"kind\":\"artifact\",\"op\":\"{op}\",\"m\":{m},\"group\":{group},\"sha256\":\"{}\",\"compiler\":\"{}\",\"report\":{}}}",
-                    hrx::bundle::digest(artifact.bytes()), artifact.compiler_identity(), artifact.report().map_or("null".into(), ToString::to_string));
+                    hrx::bundle::digest(artifact.bytes()), artifact.compiler_identity(), artifact.report().map_or("null".into(), |report| report.json().to_string()));
                 eprintln!(
                     "resources {op} M={m} group={group} {}",
                     artifact.path().display()
