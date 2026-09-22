@@ -34,7 +34,7 @@ path = "src/bin/h3-dev/main.rs"
 doc = false
 
 [dependencies]
-hrx = { package = "hrx-rs", version = "0.8.0" }
+hrx = { package = "hrx-rs", version = "0.8.2" }
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"
 thiserror = "2"

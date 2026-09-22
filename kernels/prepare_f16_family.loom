@@ -1,3 +1,55 @@
+// Preserve the eight-wave normalization tree used to qualify VAE checkpoints.
+// A different sum association can cross an f16 rounding boundary.
+template.decl @h3.prepare_sum_f16(%value: f32, %lanes: index) -> (f32)
+template.def<@h3.prepare_sum_f16> @h3_prepare_sum_f16(%value: f32, %lanes: index) -> (f32) {
+  %c0 = index.constant 0 : index
+  %c256 = index.constant 256 : index
+  %c0_offset = index.constant 0 : offset
+  %eight_waves = index.cmp eq, %lanes, %c256 : index
+  %total = scf.if %eight_waves -> (f32) {
+    %sum_bytes = index.constant 32 : offset
+    %sum_lds = buffer.alloca<workgroup> align(16) %sum_bytes : buffer
+    %sum_view = buffer.view %sum_lds[%c0_offset] : buffer -> view<8xf32>
+    %sum_wave = kernel.subgroup.id : index
+    %sum_lane = kernel.subgroup.lane.id : index
+    %sum_leader = index.cmp eq, %sum_lane, %c0 : index
+    %sum_partial = kernel.subgroup.reduce<addf> %value : f32
+    scf.if %sum_leader {
+      %sum_wave_b = index.assume %sum_wave [range(%sum_wave, 0, 7)] : index
+      view.store %sum_partial, %sum_view[%sum_wave_b] : f32, view<8xf32>
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+    %sum_i0 = index.constant 0 : index
+    %sum_p0 = view.load %sum_view[%sum_i0] : view<8xf32> -> f32
+    %sum_i1 = index.constant 1 : index
+    %sum_p1 = view.load %sum_view[%sum_i1] : view<8xf32> -> f32
+    %sum_i2 = index.constant 2 : index
+    %sum_p2 = view.load %sum_view[%sum_i2] : view<8xf32> -> f32
+    %sum_i3 = index.constant 3 : index
+    %sum_p3 = view.load %sum_view[%sum_i3] : view<8xf32> -> f32
+    %sum_i4 = index.constant 4 : index
+    %sum_p4 = view.load %sum_view[%sum_i4] : view<8xf32> -> f32
+    %sum_i5 = index.constant 5 : index
+    %sum_p5 = view.load %sum_view[%sum_i5] : view<8xf32> -> f32
+    %sum_i6 = index.constant 6 : index
+    %sum_p6 = view.load %sum_view[%sum_i6] : view<8xf32> -> f32
+    %sum_i7 = index.constant 7 : index
+    %sum_p7 = view.load %sum_view[%sum_i7] : view<8xf32> -> f32
+    %sum_pair0 = scalar.addf %sum_p0, %sum_p4 : f32
+    %sum_pair1 = scalar.addf %sum_p1, %sum_p5 : f32
+    %sum_pair2 = scalar.addf %sum_p2, %sum_p6 : f32
+    %sum_pair3 = scalar.addf %sum_p3, %sum_p7 : f32
+    %sum_even = scalar.addf %sum_pair0, %sum_pair2 : f32
+    %sum_odd = scalar.addf %sum_pair1, %sum_pair3 : f32
+    %ordered = scalar.addf %sum_even, %sum_odd : f32
+    scf.yield %ordered : f32
+  } else {
+    %native = kernel.workgroup.reduce<addf> %value : f32
+    scf.yield %native : f32
+  }
+  template.return %total : f32
+}
+
 // Shared f16 preparation finish: narrowing or Hadamard, scale and packing.
 // Views are reconstructed inside the template to preserve scalar shape specialization.
 template.decl @h3.prepare_finish_f16(%chunks_per_lane: index, %lanes: index, %lane: index, %width_last: index, %out_last: index, %lds: buffer, %width: index, %q_global: buffer, %tokens_b: index, %out_stride: index, %row: index)
@@ -238,7 +290,7 @@ kernel.def target(@h3_prepare_norm_f16_gfx11) export("h3_prepare_norm_f16") @h3_
     scf.yield %ss_next : vector<8xf32>
   }
   %ss = vector.reduce<addf> %ss_v, %zero : vector<8xf32>, f32
-  %total = kernel.workgroup.reduce<addf> %ss : f32
+  %total = template.apply<@h3.prepare_sum_f16>(%ss, %lanes) : (f32, index) -> (f32)
   %width_i = index.cast %width : index to i32
   %width_f = scalar.sitofp %width_i : i32 to f32
   %mean = scalar.divf %total, %width_f : f32
@@ -383,8 +435,8 @@ kernel.def target(@h3_prepare_lnorm_f16_gfx11) export("h3_prepare_lnorm_f16") @h
   }
   %ss = vector.reduce<addf> %ss_v, %zero : vector<8xf32>, f32
   %s1 = vector.reduce<addf> %s1_v, %zero : vector<8xf32>, f32
-  %total = kernel.workgroup.reduce<addf> %ss : f32
-  %total1 = kernel.workgroup.reduce<addf> %s1 : f32
+  %total = template.apply<@h3.prepare_sum_f16>(%ss, %lanes) : (f32, index) -> (f32)
+  %total1 = template.apply<@h3.prepare_sum_f16>(%s1, %lanes) : (f32, index) -> (f32)
   %width_i = index.cast %width : index to i32
   %width_f = scalar.sitofp %width_i : i32 to f32
   %ex2 = scalar.divf %total, %width_f : f32

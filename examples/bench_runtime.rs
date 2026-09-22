@@ -1,5 +1,5 @@
 //! Warm Session audio VAE roundtrip with cached production weights.
-use h3_hrx::{Config, Session, SessionOptions};
+use h3_hrx::{Config, ResidencyPolicy, Session, SessionOptions};
 use std::{path::Path, time::Instant};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
@@ -11,9 +11,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         audio_vae: Some(snapshot.join(h3_hrx::models::AUDIO_VAE)),
         ..Config::default()
     };
-    let context = hrx::inference::ModelContext::new(Default::default())?;
+    let residency = hrx::residency::ResidencyManager::new(64 << 30)?;
+    let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
+        memory_budget: Some(residency.budget()),
+        ..Default::default()
+    })?;
     // SAFETY: the caller supplies an immutable local model snapshot.
-    let mut session = unsafe { Session::new_in(config, SessionOptions::default(), &context) }?;
+    let mut session = unsafe { Session::new_in(config, SessionOptions { residency: ResidencyPolicy::Budgeted, ..Default::default() }, &context) }?;
     let input: Vec<f32> = (0..6400).map(|i| ((i % 97) as f32 - 48.) / 97.).collect();
     let mut run = || -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         let (audio, t) = session.encode_audio(&input, 3200)?;

@@ -26,6 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .open(&path)?
                 .write_all(bytes)?;
         } else if std::fs::read(&path)? != bytes {
+            std::fs::write(path.with_extension("actual"), bytes)?;
             return Err(format!("{} differs from the recorded session", path.display()).into());
         }
         eprintln!(
