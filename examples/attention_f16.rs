@@ -116,8 +116,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     stream.launch(&mut kernels[0].1)?;
     stream.read_blocking(output.binding(), &mut expected)?;
     let expected: Vec<_> = expected
-        .chunks_exact(2)
-        .map(|v| f16::from_bits(u16::from_le_bytes(v.try_into().unwrap())).to_f64())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|v| f16::from_bits(u16::from_le_bytes(*v)).to_f64())
         .collect();
     if !expected.iter().all(|v| v.is_finite()) {
         return Err("nonfinite baseline output".into());
@@ -129,8 +131,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut squared_error = 0.;
         let mut squared_reference = 0.;
         let mut max_error = 0f64;
-        for (bytes, reference) in bytes.chunks_exact(2).zip(&expected) {
-            let value = f16::from_bits(u16::from_le_bytes(bytes.try_into().unwrap())).to_f64();
+        for (bytes, reference) in bytes.as_chunks::<2>().0.iter().zip(&expected) {
+            let value = f16::from_bits(u16::from_le_bytes(*bytes)).to_f64();
             if !value.is_finite() {
                 return Err("nonfinite candidate output".into());
             }
