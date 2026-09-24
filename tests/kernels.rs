@@ -1018,96 +1018,128 @@ fn prepare_qk_int8_rotates_quantises_and_packs_the_attention_operands() {
 #[ignore = "requires gfx1151 and provisioned HRX"]
 fn int8_qk_attention_matches_the_attention_its_operands_define() {
     let mut h = Harness::new();
-    let (heads, d, waves) = (4usize, 128usize, 4usize);
-    let stride = heads * d;
-    for tokens in [23usize, 64] {
-        let block = 16 * waves;
-        let capacity = ((tokens + 16).div_ceil(32) * 32).max(tokens.div_ceil(block) * block);
-        let q: Vec<f16> = values(tokens * stride, 0.7)
-            .into_iter()
-            .map(f16::from_f32)
-            .collect();
-        let k: Vec<f16> = values(tokens * stride, 0.65)
-            .into_iter()
-            .map(f16::from_f32)
-            .collect();
-        let v: Vec<f16> = values(tokens * stride, 0.5)
-            .into_iter()
-            .map(f16::from_f32)
-            .collect();
-        // Q folds the softmax scale into its own; K is centred on its column mean, as the host does.
-        let extra = 1.0 / (d as f64).sqrt() / 128.0;
-        let mut kmean = vec![0f32; stride];
-        for (c, m) in kmean.iter_mut().enumerate() {
-            *m = (0..tokens).map(|t| k[t * stride + c].to_f32()).sum::<f32>() / tokens as f32;
-        }
-        let (qw, qs, qc) = prepared_qk(&q, &vec![0f32; stride], tokens, heads, d, extra);
-        let (kw, ks, kc) = prepared_qk(&k, &kmean, tokens, heads, d, 1.0);
+    let (heads, d) = (4usize, 128usize);
+    for head_major in [false, true] {
+        let waves = if head_major { 8 } else { 4 };
+        let stride = heads * d;
+        for tokens in [23usize, 64, 97, 129] {
+            let block = 16 * waves;
+            let capacity = ((tokens + 16).div_ceil(32) * 32).max(tokens.div_ceil(block) * block);
+            let q: Vec<f16> = values(tokens * stride, 0.7)
+                .into_iter()
+                .map(f16::from_f32)
+                .collect();
+            let k: Vec<f16> = values(tokens * stride, 0.65)
+                .into_iter()
+                .map(f16::from_f32)
+                .collect();
+            let v: Vec<f16> = values(tokens * stride, 0.5)
+                .into_iter()
+                .map(f16::from_f32)
+                .collect();
+            // Q folds the softmax scale into its own; K is centred on its column mean, as the host does.
+            let extra = 1.0 / (d as f64).sqrt() / 128.0;
+            let mut kmean = vec![0f32; stride];
+            for (c, m) in kmean.iter_mut().enumerate() {
+                *m = (0..tokens).map(|t| k[t * stride + c].to_f32()).sum::<f32>() / tokens as f32;
+            }
+            let (qw, qs, qc) = prepared_qk(&q, &vec![0f32; stride], tokens, heads, d, extra);
+            let (kw, ks, kc) = prepared_qk(&k, &kmean, tokens, heads, d, 1.0);
 
-        let mut want = vec![0f64; tokens * stride];
-        for row in 0..tokens {
-            for head in 0..heads {
-                let score = |key: usize| {
-                    (0..d)
-                        .map(|e| qc[row * stride + head * d + e] * kc[key * stride + head * d + e])
-                        .sum::<f64>()
-                        * f64::from(qs[row * heads + head])
-                        * f64::from(ks[key * heads + head])
-                };
-                let top = (0..tokens).map(score).fold(f64::MIN, f64::max);
-                let weights: Vec<f64> = (0..tokens).map(|j| (score(j) - top).exp()).collect();
-                let total: f64 = weights.iter().sum();
-                for (key, w) in weights.iter().enumerate() {
-                    for c in 0..d {
-                        want[row * stride + head * d + c] +=
-                            w / total * v[key * stride + head * d + c].to_f64();
+            let mut want = vec![0f64; tokens * stride];
+            for row in 0..tokens {
+                for head in 0..heads {
+                    let score = |key: usize| {
+                        (0..d)
+                            .map(|e| {
+                                qc[row * stride + head * d + e] * kc[key * stride + head * d + e]
+                            })
+                            .sum::<f64>()
+                            * f64::from(qs[row * heads + head])
+                            * f64::from(ks[key * heads + head])
+                    };
+                    let top = (0..tokens).map(score).fold(f64::MIN, f64::max);
+                    let weights: Vec<f64> = (0..tokens).map(|j| (score(j) - top).exp()).collect();
+                    let total: f64 = weights.iter().sum();
+                    for (key, w) in weights.iter().enumerate() {
+                        for c in 0..d {
+                            want[row * stride + head * d + c] +=
+                                w / total * v[key * stride + head * d + c].to_f64();
+                        }
                     }
                 }
             }
-        }
 
-        // The operands arrive padded to the capacity, and V transposed: [channels][capacity].
-        let pad_words = |w: &[i32]| {
-            let mut out = vec![0i32; capacity * heads * 32];
-            out[..w.len()].copy_from_slice(w);
-            out
-        };
-        let pad_scales = |s: &[f32]| {
-            let mut out = vec![0f32; capacity * heads];
-            out[..s.len()].copy_from_slice(s);
-            out
-        };
-        let mut vt = vec![f16::ZERO; stride * capacity];
-        for t in 0..tokens {
-            for c in 0..stride {
-                vt[c * capacity + t] = v[t * stride + c];
+            // The operands arrive padded to the capacity, and V transposed: [channels][capacity].
+            let pad_words = |w: &[i32]| {
+                let mut out = vec![0i32; capacity * heads * 32];
+                for t in 0..tokens {
+                    for head in 0..heads {
+                        let source = (t * heads + head) * 32;
+                        let destination = if head_major {
+                            (head * capacity + t) * 32
+                        } else {
+                            source
+                        };
+                        out[destination..destination + 32].copy_from_slice(&w[source..source + 32]);
+                    }
+                }
+                out
+            };
+            let pad_scales = |s: &[f32]| {
+                let mut out = vec![0f32; capacity * heads];
+                for t in 0..tokens {
+                    for head in 0..heads {
+                        let destination = if head_major {
+                            head * capacity + t
+                        } else {
+                            t * heads + head
+                        };
+                        out[destination] = s[t * heads + head];
+                    }
+                }
+                out
+            };
+            let mut vt = vec![f16::ZERO; stride * capacity];
+            for t in 0..tokens {
+                for c in 0..stride {
+                    vt[c * capacity + t] = v[t * stride + c];
+                }
             }
+            let mut config = cfg(&[
+                ("q_stride", stride),
+                ("kv_stride", stride),
+                ("tokens", tokens),
+                ("token_capacity", capacity),
+                ("out_stride", stride),
+            ]);
+            config.push(("scale", "1.0".into()));
+            let out = h.run_module(
+                if head_major {
+                    "attention_i8qkhm_mha8_k64_lds_f16_wmma"
+                } else {
+                    "attention_i8qk_family"
+                },
+                if head_major {
+                    "attention_i8qkhm_mha8_k64_lds_f16_wmma"
+                } else {
+                    "attention_i8qk_mha_lds_f16_wmma"
+                },
+                &config,
+                [tokens.div_ceil(block) as u32, heads as u32, 1],
+                32 * waves as u32,
+                &[tokens as u64, heads as u64],
+                &[
+                    bytes(&pad_words(&qw)),
+                    bytes(&pad_scales(&qs)),
+                    bytes(&pad_words(&kw)),
+                    bytes(&pad_scales(&ks)),
+                    bytes(&vt),
+                    vec![0; tokens * stride * 2],
+                ],
+            );
+            close(&halves(&out[5], false), &want, 2e-2, 2e-2);
         }
-        let mut config = cfg(&[
-            ("q_stride", stride),
-            ("kv_stride", stride),
-            ("tokens", tokens),
-            ("token_capacity", capacity),
-            ("out_stride", stride),
-        ]);
-        config.push(("scale", "1.0".into()));
-        let out = h.run_module(
-            "attention_i8qk_family",
-            "attention_i8qk_mha_lds_f16_wmma",
-            &config,
-            [tokens.div_ceil(block) as u32, heads as u32, 1],
-            32 * waves as u32,
-            &[tokens as u64, heads as u64],
-            &[
-                bytes(&pad_words(&qw)),
-                bytes(&pad_scales(&qs)),
-                bytes(&pad_words(&kw)),
-                bytes(&pad_scales(&ks)),
-                bytes(&vt),
-                vec![0; tokens * stride * 2],
-            ],
-        );
-        close(&halves(&out[5], false), &want, 2e-2, 2e-2);
     }
 }
 
@@ -2068,5 +2100,41 @@ fn subgroup_shuffle_preparation_matches_lds_repeatedly() {
             actual[3] == expected[3],
             "shuffle scales differ at repetition {iteration}"
         );
+    }
+}
+
+/// Reused projection scratch is not initially zero. Transposing across the
+/// complete capacity must overwrite every poisoned tail element with zero.
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn transposed_values_clear_reused_capacity() {
+    let mut h = Harness::new();
+    for tokens in [1usize, 31, 32, 33, 129, 4096, 4097] {
+        let width = 256;
+        let capacity = (tokens + 32).div_ceil(256) * 256;
+        let input: Vec<f16> = values(tokens * width, 0.7)
+            .into_iter()
+            .map(f16::from_f32)
+            .collect();
+        let actual = h.run(
+            "transpose_f16",
+            &cfg(&[("width", width), ("row_capacity", capacity)]),
+            [(capacity / 32) as u32, (width / 32) as u32, 1],
+            256,
+            &[tokens as u64],
+            &[bytes(&input), vec![0xff; capacity * width * 2]],
+        );
+        for (i, word) in actual[1].as_chunks::<2>().0.iter().enumerate() {
+            let (channel, row) = (i / capacity, i % capacity);
+            let expected = if row < tokens {
+                input[row * width + channel].to_le_bytes()
+            } else {
+                [0, 0]
+            };
+            assert_eq!(
+                *word, expected,
+                "tokens={tokens} row={row} channel={channel}"
+            );
+        }
     }
 }

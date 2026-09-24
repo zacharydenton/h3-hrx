@@ -207,7 +207,8 @@ struct IntQk {
     ks: hrx::Buffer,
     kmean: hrx::Buffer,
     zmean: hrx::Buffer,
-    vt: hrx::Buffer,
+    // None reuses the dead projection operand until attention completes.
+    vt: Option<hrx::Buffer>,
 }
 
 impl Stack {
@@ -703,7 +704,12 @@ impl Stack {
             let ks = stream.allocate(t * d.heads * 4)?;
             let kmean = stream.allocate(d.inner() * 4)?;
             let zmean = stream.allocate_zeroed(d.inner() * 4)?;
-            let vt = stream.allocate_zeroed(d.inner() * t * 2)?;
+            let vt_bytes = d.inner() * t * 2;
+            let vt = if qk_head_major && !fused_operands && vt_bytes <= a_q.bytes() {
+                None
+            } else {
+                Some(stream.allocate_zeroed(vt_bytes)?)
+            };
             stream.fill(qi.slice(0, t * d.heads * code_bytes), 0)?;
             stream.fill(ki.slice(0, t * d.heads * code_bytes), 0)?;
             stream.fill(qs.slice(0, t * d.heads * 4), 0)?;
@@ -797,6 +803,13 @@ impl Stack {
         self.gu
             .as_ref()
             .map_or_else(|| self.fused.binding(), hrx::Buffer::binding)
+    }
+
+    fn vt_view<'a>(&'a self, iq: &'a IntQk) -> View<'a> {
+        iq.vt.as_ref().map_or_else(
+            || self.a_q.slice(0, self.d.inner() * self.capacity * 2),
+            hrx::Buffer::binding,
+        )
     }
 
     /// Q, K and V, whether they are their own allocations or views into the fused one.
@@ -1287,7 +1300,7 @@ impl Stack {
             [t.div_ceil(32), (self.d.inner() / 32) as u32, 1],
             [THREADS, 1, 1],
             &[t],
-            &[self.fused.binding(), iq.vt.binding()],
+            &[self.fused.binding(), self.vt_view(iq)],
             &[rows * self.d.qkv() * 2, self.d.inner() * self.capacity * 2],
         )?;
         ends[2] = sink.head();
@@ -1417,10 +1430,20 @@ impl Stack {
                 self.transpose.as_ref().expect("built with integer QK"),
                 Some(prof),
                 "attention operands",
-                [t.div_ceil(32), (self.d.inner() / 32) as u32, 1],
+                [
+                    // Reused projection bytes can contain arbitrary half values.
+                    // Rewrite the entire V capacity so masked keys cannot see NaNs.
+                    if int_qk.vt.is_none() {
+                        (cap / 32) as u32
+                    } else {
+                        t.div_ceil(32)
+                    },
+                    (self.d.inner() / 32) as u32,
+                    1,
+                ],
                 [THREADS, 1, 1],
                 &[t],
-                &[v, int_qk.vt.binding()],
+                &[v, self.vt_view(int_qk)],
                 &[rows * self.d.inner() * 2, self.d.inner() * cap * 2],
             )?;
             ends[2] = sink.head();
@@ -1439,7 +1462,7 @@ impl Stack {
                 int_qk.qs.binding(),
                 int_qk.ki.binding(),
                 int_qk.ks.binding(),
-                int_qk.vt.binding(),
+                self.vt_view(int_qk),
                 self.attn.binding(),
             ],
             &[
