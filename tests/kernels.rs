@@ -804,6 +804,12 @@ fn attention_matches_scaled_dot_product_for_the_shipped_layouts() {
             false,
         ),
         ("attention_mha8_lds_f16_wmma", 128, 8, 4, 1, false),
+        // Gufo-style score tiles and reduced query residency must pass the same
+        // independent oracle and ragged-row cases as production schedules.
+        ("attention_mhat32_lds_f16_wmma", 128, 4, 4, 1, false),
+        ("attention_mha8t32_lds_f16_wmma", 128, 8, 4, 1, false),
+        ("attention_mha8h2t32_lds_f16_wmma", 128, 8, 4, 1, false),
+        ("attention_mha8h0t32_lds_f16_wmma", 128, 8, 4, 1, false),
         ("attention_mha64_lds_f16_wmma", 64, 4, 4, 1, false),
         ("attention_mha648_lds_f16_wmma", 64, 8, 4, 1, false),
         ("attention_mha64t32_lds_f16_wmma", 64, 4, 4, 1, false),
