@@ -192,7 +192,11 @@ fn conv4(
     out: View<'_>,
 ) -> Result<()> {
     let blocked = crate::plan::avae::packed_conv(cin, cout);
-    let stem = if blocked {
+    // Short padded windows benefit from branchless taps and operand lookahead.
+    let prefetched = blocked && cin.is_multiple_of(4) && (2..=11).contains(&ksize) && len <= 512;
+    let stem = if prefetched {
+        "conv1d_prefetch_f32"
+    } else if blocked {
         "conv1d_block_f32"
     } else {
         "conv1d4_f32"
@@ -213,7 +217,9 @@ fn conv4(
     let k = c.get(stream, stem, &format!("h3_{stem}"), &cfg)?;
     // Wide convolutions share inputs across eight output channels; narrow
     // convolutions retain four samples per lane and their original weight layout.
-    let (span, outputs) = if blocked {
+    let (span, outputs) = if prefetched {
+        (64, cout / 8)
+    } else if blocked {
         (128, cout / 8)
     } else {
         (256, cout)
