@@ -464,7 +464,13 @@ impl AudioVae {
                 let olen = (len - 1) * rate + k - 2 * pad;
                 {
                     let blocked = crate::plan::avae::packed_upsample(cout);
-                    let stem = if blocked {
+                    // Short sequences expose too few waves to hide each channel's
+                    // loads. Look ahead four channels without changing FMA order.
+                    let prefetch =
+                        blocked && chan.is_multiple_of(4) && k <= 2 * rate && olen <= 512;
+                    let stem = if prefetch {
+                        "convt1d_prefetch_f32"
+                    } else if blocked {
                         "convt1d_block_f32"
                     } else {
                         "convt1d_f32"

@@ -2247,3 +2247,88 @@ fn transposed_audio_convolution_matches_f64_with_holes_tails_and_guards() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn prefetched_audio_upsampling_preserves_fmas_edges_and_guards() {
+    let mut h = Harness::new();
+    for (ci, co, taps, stride, pad, n) in [
+        (4usize, 16usize, 9usize, 5usize, 2usize, 1usize),
+        (4, 16, 9, 5, 2, 2),
+        (8, 32, 9, 5, 2, 5),
+        (20, 32, 9, 5, 2, 13),
+        (64, 32, 9, 5, 2, 102),
+        (64, 32, 9, 5, 2, 103),
+        (4, 16, 4, 2, 1, 31),
+        (8, 32, 4, 2, 1, 32),
+        (20, 32, 4, 2, 1, 33),
+        (32, 16, 4, 2, 1, 256),
+        (4, 16, 3, 5, 0, 5),
+        (4, 16, 1, 1, 0, 7),
+        (1024, 512, 9, 5, 2, 1),
+    ] {
+        let olen = (n - 1) * stride + taps - 2 * pad;
+        let x = values(ci * n, 0.25);
+        let w = values(ci * co * taps, 0.03);
+        let bias = values(co, 0.01);
+        let mut want: Vec<f64> = bias
+            .iter()
+            .flat_map(|&b| std::iter::repeat_n(b as f64, olen))
+            .collect();
+        // Independent input-scatter oracle, rather than the kernel's phase lookup.
+        for i in 0..ci {
+            for input in 0..n {
+                for tap in 0..taps {
+                    let output = (input * stride + tap) as isize - pad as isize;
+                    if (0..olen as isize).contains(&output) {
+                        for o in 0..co {
+                            want[o * olen + output as usize] +=
+                                x[i * n + input] as f64 * w[(i * co + o) * taps + tap] as f64;
+                        }
+                    }
+                }
+            }
+        }
+        let mut packed = Vec::with_capacity(w.len());
+        for group in 0..co / 16 {
+            for i in 0..ci {
+                for tap in 0..taps {
+                    for o in 0..16 {
+                        packed.push(w[(i * co + group * 16 + o) * taps + tap]);
+                    }
+                }
+            }
+        }
+        let config = cfg(&[
+            ("cin", ci),
+            ("cout", co),
+            ("ksize", taps),
+            ("stride", stride),
+            ("pad", pad),
+            ("len_bound", olen.div_ceil(256) * 256),
+        ]);
+        let mut outputs = Vec::new();
+        for stem in ["convt1d_block_f32", "convt1d_prefetch_f32"] {
+            let out = h.run(
+                stem,
+                &config,
+                [olen.div_ceil(64) as u32, (co / 16) as u32, 1],
+                64,
+                &[n as u64, olen as u64],
+                &[
+                    bytes(&x),
+                    bytes(&packed),
+                    bytes(&bias),
+                    bytes(&vec![113f32; co * olen + 64]),
+                ],
+            );
+            assert_eq!(&out[3][co * olen * 4..], bytes(&[113f32; 64]));
+            close(&floats(&out[3][..co * olen * 4]), &want, 2e-6, 0.);
+            outputs.push(out[3].clone());
+        }
+        assert_eq!(
+            outputs[0], outputs[1],
+            "ci={ci}, co={co}, n={n}, taps={taps}"
+        );
+    }
+}
