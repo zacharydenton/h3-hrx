@@ -60,6 +60,7 @@ mod pixels;
 /// that is what the model was conditioned against; another resampler shifts the
 /// conditioning it sees. In the library rather than the CLI so that an
 /// application adapter scales its inputs the same way the CLI does.
+pub mod presentation;
 pub mod resize;
 mod rope;
 mod sampler;
@@ -74,6 +75,7 @@ pub use dit::{
 };
 pub use error::{Error, Result};
 pub use layout::{shape_for, Shape};
+pub use presentation::Presentation;
 pub use session::{Config, ResidencyPolicy, Session, SessionOptions};
 pub use tokenizer::Tokenizer;
 pub use vvae::Clip;

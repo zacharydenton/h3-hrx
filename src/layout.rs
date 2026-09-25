@@ -427,6 +427,34 @@ pub struct Shape {
     pub text_rows_max: i32,
 }
 
+impl Shape {
+    /// The canvas this shape decodes to.
+    pub fn size(&self) -> (i32, i32) {
+        (
+            self.lat_w * crate::presentation::LATENT_BLOCK,
+            self.lat_h * crate::presentation::LATENT_BLOCK,
+        )
+    }
+
+    /// Bytes of interleaved 8-bit RGB [`crate::Session::decode_video`] writes.
+    ///
+    /// A caller sizes its own buffer, and a buffer that is nearly right decodes
+    /// into a picture that is nearly right -- sheared, or short by a frame --
+    /// rather than failing, so the arithmetic belongs here.
+    pub fn video_bytes(&self) -> usize {
+        let (width, height) = self.size();
+        self.frames as usize * height as usize * width as usize * 3
+    }
+
+    /// Interleaved stereo samples [`crate::Session::decode_audio`] writes.
+    pub fn audio_samples(&self) -> usize {
+        2 * self.audio_t as usize * SAMPLES_PER_LATENT
+    }
+}
+
+/// Samples one audio latent decodes to, in each channel.
+const SAMPLES_PER_LATENT: usize = 800;
+
 /// The shapes a request produces, or `None` when the request is not one this model can serve.
 pub fn shape_for(height: i32, width: i32, frames: i32) -> Option<Shape> {
     if !valid_canvas(height, width) || !(1..=MAX_FRAMES).contains(&frames) {

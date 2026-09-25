@@ -15,8 +15,8 @@ mod media;
 use h3_hrx::resize;
 
 use h3_hrx::{
-    Attention as Attn16, Clip, Config, DenoiseParams, Keyframe, LatentGrid, Noise, Presented,
-    Reference, Sampler as Sampler16, Session, Tokenizer,
+    Attention as Attn16, Clip, Config, DenoiseParams, Keyframe, LatentGrid, Noise, Presentation,
+    Presented, Reference, Sampler as Sampler16, Session, Tokenizer,
 };
 
 use anyhow::{Context, Result};
@@ -24,9 +24,6 @@ use clap::{Parser, ValueEnum};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
-
-const VISION_START: i32 = 151652;
-const VISION_END: i32 = 151653;
 
 /// Usage errors follow clap (2); runtime failures exit 1.
 const EXIT_USAGE: u8 = 2;
@@ -477,12 +474,7 @@ fn run(cli: Cli) -> Result<()> {
     for path in &image_files {
         let (rgb, w, h) = media::decode_image(path)
             .with_context(|| format!("cannot decode {}", path.display()))?;
-        let scale = (f64::from(params.width) * f64::from(params.height)
-            / (f64::from(w) * f64::from(h)))
-        .sqrt()
-        .min(1.0);
-        let tw = 32.max(((f64::from(w) * scale / 32.0).round() as i32) * 32);
-        let th = 32.max(((f64::from(h) * scale / 32.0).round() as i32) * 32);
+        let (tw, th) = resize::fit(w, h, params.width, params.height);
         ref_images.push(Image {
             pixels: resize::pil_bilinear(&rgb, w, h, tw, th),
             w: tw,
@@ -500,37 +492,19 @@ fn run(cli: Cli) -> Result<()> {
     // the presentation: keyframe, then reference images ("<Picture i>: " + a vision span), then
     // "<Audio j>: ", then the prompt
     let tok = Tokenizer::new()?; // the vocabulary compiled into the crate (H3_TOKENIZER overrides it)
-    let mut ids: Vec<i32> = Vec::new();
-    let mut picture = 0;
-    let mut vision_span = |ids: &mut Vec<i32>, w: i32, h: i32| -> Result<()> {
-        picture += 1;
-        tok.encode_into(&format!("<Picture {picture}>: "), ids)?;
-        ids.push(VISION_START);
-        ids.extend(std::iter::repeat_n(
-            -1,
-            (h / 32) as usize * (w / 32) as usize,
-        ));
-        ids.push(VISION_END);
-        Ok(())
-    };
+    let mut presentation = Presentation::new(&tok);
     if let Some(k) = &keyframe {
-        vision_span(&mut ids, k.w, k.h)?;
+        presentation.picture(k.w, k.h)?;
     }
     for im in &ref_images {
-        vision_span(&mut ids, im.w, im.h)?;
+        presentation.picture(im.w, im.h)?;
     }
-    for j in 0..ref_audio.len() {
-        tok.encode_into(&format!("<Audio {}>: ", j + 1), &mut ids)?;
+    for _ in 0..ref_audio.len() {
+        presentation.audio()?;
     }
-    tok.encode_into(&prompt, &mut ids)
-        .context("cannot tokenize the prompt")?;
-    if ids.len() > shape.text_rows_max as usize {
-        usage!(
-            "the presentation is {} tokens; the model takes at most {}",
-            ids.len(),
-            shape.text_rows_max
-        );
-    }
+    let ids = presentation
+        .finish(&prompt, &shape)
+        .map_err(|e| UsageError(e.to_string()))?;
 
     eprintln!(
         "{} frames at {}x{}: {}x{}x{} latents, {} audio latents; {} prompt tokens ({} keyframe, {} reference images, {} reference audio){}",
@@ -744,7 +718,7 @@ fn run(cli: Cli) -> Result<()> {
     if !cli.audio_only {
         session.decode_video(&shape, &video, &mut frames)?;
     }
-    let mut samples = vec![0.0f32; 2 * shape.audio_t as usize * 800];
+    let mut samples = vec![0.0f32; shape.audio_samples()];
     session.decode_audio(&audio, shape.audio_t as usize, &mut samples)?;
     eprintln!("decoded in {:.1} s", t0.elapsed().as_secs_f64());
     if let Some(report) = session.profile_report()? {

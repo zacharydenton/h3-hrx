@@ -65,6 +65,26 @@ pub fn pil_bilinear(rgb: &[u8], sw: i32, sh: i32, dw: i32, dh: i32) -> Vec<f32> 
     out
 }
 
+/// The largest box with this aspect that fits a canvas' pixel count, on the
+/// 32-pixel grid a vision span divides by.
+///
+/// References are scaled to at most the canvas' area rather than to the canvas:
+/// a reference is conditioning and not a frame, and stretching one to the
+/// output's aspect would change what it shows.
+pub fn fit(width: i32, height: i32, canvas_width: i32, canvas_height: i32) -> (i32, i32) {
+    let block = crate::presentation::VISION_BLOCK;
+    let scale = (f64::from(canvas_width) * f64::from(canvas_height)
+        / (f64::from(width) * f64::from(height)))
+    .sqrt()
+    .min(1.0);
+
+    let round = |value: i32| {
+        block.max(((f64::from(value) * scale / f64::from(block)).round() as i32) * block)
+    };
+
+    (round(width), round(height))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
