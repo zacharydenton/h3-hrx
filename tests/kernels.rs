@@ -2356,6 +2356,8 @@ fn prefetched_audio_convolution_preserves_fmas_padding_and_residuals() {
         (32, 16, 11, 5, 25, 512),
         (32, 16, 11, 5, 25, 513),
         (512, 16, 11, 5, 25, 5),
+        (32, 32, 11, 5, 25, 1000),
+        (64, 64, 11, 5, 25, 2048),
     ] {
         let x = values(ci * n, 0.25);
         let w = values(co * ci * taps, 0.03);
@@ -2626,6 +2628,80 @@ fn audio_snake_fir_preserves_phases_padding_and_silence() {
             if amplitude == 0. {
                 assert!(got.iter().chain(&got_up).all(|&v| v == 0.));
             }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn narrow_audio_prefetch_preserves_padding_residuals_and_tails() {
+    let mut h = Harness::new();
+    for (ci, co, taps, dilation, pad, n) in [
+        (4usize, 1usize, 1usize, 1usize, 0usize, 1usize),
+        (4, 3, 2, 3, 0, 2),
+        (8, 8, 11, 5, 128, 2),
+        (8, 8, 3, 1, 1, 7),
+        (8, 16, 7, 3, 9, 63),
+        (12, 3, 11, 5, 25, 64),
+        (16, 16, 11, 5, 25, 65),
+        (16, 8, 7, 1, 3, 127),
+        (8, 8, 11, 3, 15, 128),
+        (8, 1, 7, 1, 3, 129),
+        (16, 16, 11, 5, 25, 255),
+        (16, 16, 11, 1, 5, 256),
+        (8, 8, 7, 5, 15, 257),
+        (16, 16, 11, 1, 5, 2000),
+        (8, 8, 11, 5, 25, 4000),
+    ] {
+        let x = values(ci * n, 0.25);
+        let w = values(co * ci * taps, 0.03);
+        let bias = values(co, 0.01);
+        for acc in [0usize, 1] {
+            let mut prev = values(co * n + 64, 0.02);
+            prev[co * n..].fill(113.);
+            let mut want = vec![0f64; co * n];
+            // Independent padded convolution over the original unpacked weights.
+            for o in 0..co {
+                for t in 0..n {
+                    let mut sum =
+                        bias[o] as f64 + if acc == 1 { prev[o * n + t] as f64 } else { 0. };
+                    for c in 0..ci {
+                        for tap in 0..taps {
+                            let j = t as isize + (tap * dilation) as isize - pad as isize;
+                            if (0..n as isize).contains(&j) {
+                                sum += w[(o * ci + c) * taps + tap] as f64
+                                    * x[c * n + j as usize] as f64;
+                            }
+                        }
+                    }
+                    want[o * n + t] = sum;
+                }
+            }
+            let config = cfg(&[
+                ("cin", ci),
+                ("cout", co),
+                ("ksize", taps),
+                ("dilation", dilation),
+                ("pad", pad),
+                ("accumulate", acc),
+                ("len_bound", n.div_ceil(256) * 256),
+            ]);
+            let mut outputs = Vec::new();
+            for (stem, span) in [("conv1d4_f32", 256), ("conv1d_narrow_f32", 64)] {
+                let out = h.run(
+                    stem,
+                    &config,
+                    [n.div_ceil(span) as u32, co as u32, 1],
+                    64,
+                    &[n as u64],
+                    &[bytes(&x), bytes(&w), bytes(&bias), bytes(&prev)],
+                );
+                assert_eq!(&out[3][co * n * 4..], bytes(&[113f32; 64]));
+                close(&floats(&out[3][..co * n * 4]), &want, 2e-6, 0.);
+                outputs.push(out[3].clone());
+            }
+            assert_eq!(outputs[0], outputs[1],
+                "ci={ci}, co={co}, n={n}, taps={taps}, dilation={dilation}, pad={pad}, residual={acc}");
         }
     }
 }
