@@ -2487,7 +2487,11 @@ fn channel_lanes_preserve_audio_convolution_fmas_and_edges() {
                 ("len_bound", n.div_ceil(256) * 256),
             ]);
             let mut outputs = Vec::new();
-            for (stem, span) in [("conv1d_prefetch_f32", 64), ("conv1d_lane_f32", 8)] {
+            let mut variants = vec![("conv1d_prefetch_f32", 64), ("conv1d_lane_f32", 8)];
+            if taps <= 3 {
+                variants.push(("conv1d_k3_f32", 8));
+            }
+            for (stem, span) in variants {
                 let out = h.run(
                     stem,
                     &config,
@@ -2500,8 +2504,10 @@ fn channel_lanes_preserve_audio_convolution_fmas_and_edges() {
                 close(&floats(&out[3][..co * n * 4]), &want, 2e-6, 0.);
                 outputs.push(out[3].clone());
             }
-            assert_eq!(outputs[0], outputs[1],
-                "ci={ci}, co={co}, n={n}, taps={taps}, dilation={dilation}, pad={pad}, residual={acc}");
+            for output in &outputs[1..] {
+                assert_eq!(&outputs[0], output,
+                    "ci={ci}, co={co}, n={n}, taps={taps}, dilation={dilation}, pad={pad}, residual={acc}");
+            }
         }
     }
 }

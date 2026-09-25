@@ -199,7 +199,9 @@ fn conv4(
     let channel_lanes = prefetched
         && cin.is_multiple_of(16)
         && (len <= 32 || (cin <= 256 && cout <= 256 && ksize <= 7 && len <= 128));
-    let stem = if channel_lanes {
+    let stem = if channel_lanes && ksize == 3 {
+        "conv1d_k3_f32"
+    } else if channel_lanes {
         "conv1d_lane_f32"
     } else if prefetched {
         "conv1d_prefetch_f32"
