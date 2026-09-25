@@ -3,9 +3,10 @@
 //! Before a prompt says what to do, the presentation says what is being looked
 //! at and listened to: each image as `<Picture n>: ` followed by a span of
 //! placeholder vision tokens the encoder fills in, each soundtrack as
-//! `<Audio n>: `, and then the prompt. The numbering is what a prompt refers
-//! back to, so the order things are announced in is meaning rather than
-//! presentation.
+//! `<Audio n>: `, each clip as `<Video n>: `, and then the prompt. The
+//! numbering is what a prompt refers back to, so the order things are
+//! announced in is meaning rather than presentation, and each kind is counted
+//! among its own.
 //!
 //! This is here rather than in a caller because all of it is the model's: the
 //! sentinels are fixed by the compiled vocabulary, the span is one token to a
@@ -51,6 +52,7 @@ pub struct Presentation<'a> {
     ids: Vec<i32>,
     pictures: usize,
     audios: usize,
+    videos: usize,
 }
 
 impl<'a> Presentation<'a> {
@@ -60,6 +62,7 @@ impl<'a> Presentation<'a> {
             ids: Vec::new(),
             pictures: 0,
             audios: 0,
+            videos: 0,
         }
     }
 
@@ -96,6 +99,26 @@ impl<'a> Presentation<'a> {
     pub fn audio(&mut self) -> Result<&mut Self> {
         self.audios += 1;
         let label = format!("<Audio {}>: ", self.audios);
+        self.tokenizer.encode_into(&label, &mut self.ids)?;
+        Ok(self)
+    }
+
+    /// Announce a clip as the next `<Video n>`.
+    ///
+    /// Like a soundtrack and unlike a picture, a clip carries no vision span:
+    /// [`crate::Reference::Video`] has no `presented` field, so its pixels
+    /// reach the model as conditioning rather than through the text encoder,
+    /// and this only names it.
+    ///
+    /// The label follows MiniMax's own rewrite guide, which lists `<Video N>`
+    /// beside `<Picture N>` and `<Audio N>` as the labels a full-reference
+    /// prompt refers back to. It has no other implementation to check against:
+    /// the CLI does not take video references, so unlike every other piece of
+    /// this format it is read from the documentation rather than from working
+    /// code.
+    pub fn video(&mut self) -> Result<&mut Self> {
+        self.videos += 1;
+        let label = format!("<Video {}>: ", self.videos);
         self.tokenizer.encode_into(&label, &mut self.ids)?;
         Ok(self)
     }
@@ -187,6 +210,29 @@ mod tests {
         tokenizer.encode_into("<Audio 1>: ", &mut expected).unwrap();
 
         assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn each_kind_is_numbered_among_its_own() {
+        let tokenizer = Tokenizer::new().expect("the compiled vocabulary");
+        let mut presentation = Presentation::new(&tokenizer);
+
+        presentation.picture(32, 32).unwrap();
+        presentation.audio().unwrap();
+        presentation.video().unwrap();
+        presentation.picture(32, 32).unwrap();
+        presentation.video().unwrap();
+
+        let ids = presentation.finish("", &shape()).expect("it fits");
+
+        // The second video is `<Video 2>` however many pictures were announced
+        // between it and the first: a prompt refers back by kind and number.
+        let mut expected = Vec::new();
+        tokenizer.encode_into("<Video 2>: ", &mut expected).unwrap();
+        assert!(
+            ids.windows(expected.len()).any(|w| w == expected),
+            "the second clip should be announced as <Video 2>"
+        );
     }
 
     #[test]
