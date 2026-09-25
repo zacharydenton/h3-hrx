@@ -194,7 +194,14 @@ fn conv4(
     let blocked = crate::plan::avae::packed_conv(cin, cout);
     // Short padded windows benefit from branchless taps and operand lookahead.
     let prefetched = blocked && cin.is_multiple_of(4) && (2..=11).contains(&ksize) && len <= 512;
-    let stem = if prefetched {
+    // Share the packed channel group across lanes when time lanes would be idle.
+    // Wider/longer convolutions benefit more from sharing each input in registers.
+    let channel_lanes = prefetched
+        && cin.is_multiple_of(16)
+        && (len <= 32 || (cin <= 256 && cout <= 256 && ksize <= 7 && len <= 128));
+    let stem = if channel_lanes {
+        "conv1d_lane_f32"
+    } else if prefetched {
         "conv1d_prefetch_f32"
     } else if blocked {
         "conv1d_block_f32"
@@ -217,7 +224,9 @@ fn conv4(
     let k = c.get(stream, stem, &format!("h3_{stem}"), &cfg)?;
     // Wide convolutions share inputs across eight output channels; narrow
     // convolutions retain four samples per lane and their original weight layout.
-    let (span, outputs) = if prefetched {
+    let (span, outputs) = if channel_lanes {
+        (8, cout / 8)
+    } else if prefetched {
         (64, cout / 8)
     } else if blocked {
         (128, cout / 8)
