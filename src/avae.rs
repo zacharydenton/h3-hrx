@@ -285,8 +285,6 @@ struct DecBuffers {
     hj: hrx::Buffer,
     r: hrx::Buffer,
     r2: hrx::Buffer,
-    /// the 2x buffer the anti-aliased activation passes through, hence twice the width
-    tmp2: hrx::Buffer,
     input: hrx::Buffer,
 }
 
@@ -345,50 +343,33 @@ impl AudioVae {
         x: View<'_>,
         alpha: View<'_>,
         beta: View<'_>,
-        tmp2: View<'_>,
         out: View<'_>,
     ) -> Result<()> {
-        let (nu, nd) = ("h3.up2_snake_f32.", "h3.down2_f32.");
-        let up_cfg: Cfg = vec![
-            (format!("{nu}channels"), channels.to_string()),
-            (format!("{nu}len_bound"), round256(len).to_string()),
+        let ns = "h3.snake_fused_f32.";
+        let cfg: Cfg = vec![
+            (format!("{ns}channels"), channels.to_string()),
+            (format!("{ns}len_bound"), round256(len).to_string()),
         ];
-        let down_cfg: Cfg = vec![
-            (format!("{nd}channels"), channels.to_string()),
-            (format!("{nd}len_bound"), round256(2 * len).to_string()),
-        ];
-        let up = c.get(stream, "up2_snake_f32", "h3_up2_snake_f32", &up_cfg)?;
-        let down = c.get(stream, "down2_f32", "h3_down2_f32", &down_cfg)?;
+        let kernel = c.get(stream, "snake_fused_f32", "h3_snake_fused_f32", &cfg)?;
         let fir = self.weights.at(stream, "audio.fir", 12 * 4)?;
-        // upsampling doubles the span, so `tmp2` carries `2 * len` samples per channel; the FIR is
-        // the same twelve taps both ways
+        // The complete anti-aliased activation keeps its rounded upsampled
+        // values in a workgroup tile, including the downsample's replicated halo.
         checked(
             stream,
-            &up,
+            &kernel,
             Some(prof),
-            "audio snake up",
-            [(2 * len).div_ceil(256) as u32, channels as u32, 1],
-            [THREADS, 1, 1],
+            "audio snake",
+            [len.div_ceil(64) as u32, channels as u32, 1],
+            [64, 1, 1],
             &[len as u32],
-            &[x, fir.binding(), alpha, beta, tmp2],
+            &[x, fir.binding(), alpha, beta, out],
             &[
                 channels * len * 4,
                 12 * 4,
                 channels * 4,
                 channels * 4,
-                channels * 2 * len * 4,
+                channels * len * 4,
             ],
-        )?;
-        checked(
-            stream,
-            &down,
-            Some(prof),
-            "audio snake down",
-            [len.div_ceil(256) as u32, channels as u32, 1],
-            [THREADS, 1, 1],
-            &[(2 * len) as u32],
-            &[tmp2, fir.binding(), out],
-            &[channels * 2 * len * 4, 12 * 4, channels * len * 4],
         )?;
         Ok(())
     }
@@ -407,7 +388,6 @@ impl AudioVae {
             hj: stream.allocate(cap * 4)?,
             r: stream.allocate(cap * 4)?,
             r2: stream.allocate(cap * 4)?,
-            tmp2: stream.allocate(cap * 8)?,
             input: stream.allocate(AUDIO_CH * t * 4 + 4096)?,
         });
         Ok(())
@@ -565,12 +545,7 @@ impl AudioVae {
                         let act1 = format!("audio.res.{r}.act.{}.", 2 * dl);
                         let act2 = format!("audio.res.{r}.act.{}.", 2 * dl + 1);
                         let d = self.dec.as_ref().expect("sized above");
-                        let (hj, rb, r2b, tmp2) = (
-                            d.hj.binding(),
-                            d.r.binding(),
-                            d.r2.binding(),
-                            d.tmp2.binding(),
-                        );
+                        let (hj, rb, r2b) = (d.hj.binding(), d.r.binding(), d.r2.binding());
                         // held for the call: a view borrows the allocation it names
                         let (a1, b1) = (
                             self.weights.at(stream, &format!("{act1}alpha"), chan * 4)?,
@@ -585,7 +560,6 @@ impl AudioVae {
                             hj,
                             a1.binding(),
                             b1.binding(),
-                            tmp2,
                             rb,
                         )?;
                         let held_0 = self.weights.at(
@@ -624,7 +598,6 @@ impl AudioVae {
                             r2b,
                             a2.binding(),
                             b2.binding(),
-                            tmp2,
                             rb,
                         )?;
                         // the accumulating form closes the skip in place
@@ -680,12 +653,7 @@ impl AudioVae {
             }
 
             let d = self.dec.as_ref().expect("sized above");
-            let (hb, rb, r2b, tmp2) = (
-                d.h.binding(),
-                d.r.binding(),
-                d.r2.binding(),
-                d.tmp2.binding(),
-            );
+            let (hb, rb, r2b) = (d.h.binding(), d.r.binding(), d.r2.binding());
             let (pa, pb) = (
                 self.weights.at(stream, "audio.post.alpha", chan * 4)?,
                 self.weights.at(stream, "audio.post.beta", chan * 4)?,
@@ -699,7 +667,6 @@ impl AudioVae {
                 hb,
                 pa.binding(),
                 pb.binding(),
-                tmp2,
                 rb,
             )?;
             let held_1 = self.weights.at(stream, "audio.conv_post.w", chan * 7 * 4)?;

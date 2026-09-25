@@ -2544,6 +2544,9 @@ fn audio_snake_fir_preserves_phases_padding_and_silence() {
         (3, 31),
         (3, 32),
         (3, 33),
+        (3, 63),
+        (3, 64),
+        (3, 65),
         (3, 125),
         (3, 127),
         (3, 128),
@@ -2625,6 +2628,31 @@ fn audio_snake_fir_preserves_phases_padding_and_silence() {
             let got = floats(&down[2][..channels * n * 4]);
             close(&got, &want_down, 3e-5, 0.);
             close(&got, &want_complete, 3e-5, 0.);
+            let fused = h.run(
+                "snake_fused_f32",
+                &cfg(&[("channels", channels), ("len_bound", n.div_ceil(256) * 256)]),
+                [n.div_ceil(64) as u32, channels as u32, 1],
+                64,
+                &[n as u64],
+                &[
+                    bytes(&x),
+                    bytes(&fir),
+                    bytes(&alpha),
+                    bytes(&beta),
+                    bytes(&vec![113f32; channels * n + 64]),
+                ],
+            );
+            assert_eq!(&fused[4][channels * n * 4..], bytes(&[113f32; 64]));
+            close(
+                &floats(&fused[4][..channels * n * 4]),
+                &want_complete,
+                3e-5,
+                0.,
+            );
+            assert_eq!(
+                fused[4], down[2],
+                "channels={channels}, len={n}, amplitude={amplitude}"
+            );
             if amplitude == 0. {
                 assert!(got.iter().chain(&got_up).all(|&v| v == 0.));
             }
