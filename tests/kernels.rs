@@ -2505,3 +2505,121 @@ fn channel_lanes_preserve_audio_convolution_fmas_and_edges() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn audio_snake_fir_preserves_phases_padding_and_silence() {
+    let mut h = Harness::new();
+    // FP32 Kaiser-sinc coefficients used by the audio decoder.
+    let fir: [f32; 12] = [
+        0.0020289647,
+        0.009389466,
+        -0.025543459,
+        -0.057657383,
+        0.12857258,
+        0.4432098,
+        0.4432098,
+        0.12857258,
+        -0.057657383,
+        -0.025543459,
+        0.009389466,
+        0.0020289647,
+    ];
+    for (channels, n) in [
+        (1usize, 1usize),
+        (3, 2),
+        (3, 3),
+        (3, 7),
+        (3, 8),
+        (3, 9),
+        (512, 25),
+        (3, 31),
+        (3, 32),
+        (3, 33),
+        (3, 125),
+        (3, 127),
+        (3, 128),
+        (3, 129),
+        (3, 255),
+        (3, 256),
+        (3, 257),
+        (8, 1035),
+    ] {
+        let alpha: Vec<f32> = (0..channels).map(|c| [0.173, 1., 5.62][c % 3]).collect();
+        let beta: Vec<f32> = (0..channels).map(|c| [0.293, 1., 5.62][c % 3]).collect();
+        for amplitude in [0., 0.0005, 0.25, 2.] {
+            let x = values(channels * n, amplitude);
+            let mut want_up = vec![0f64; channels * 2 * n];
+            // Independent original transposed-convolution definition: visit all
+            // twelve taps, including the zero-insertion and padded-domain tests.
+            for c in 0..channels {
+                for m in 0..2 * n {
+                    let mut u = 0.;
+                    for (k, &weight) in fir.iter().enumerate() {
+                        let raw = m as isize + 15 - k as isize;
+                        if raw >= 0 && raw % 2 == 0 && raw / 2 < (n + 10) as isize {
+                            let src = (raw / 2 - 5).clamp(0, n as isize - 1) as usize;
+                            u += 2. * weight as f64 * x[c * n + src] as f64;
+                        }
+                    }
+                    want_up[c * 2 * n + m] =
+                        u + (alpha[c] as f64 * u).sin().powi(2) / beta[c] as f64;
+                }
+            }
+            let up = h.run(
+                "up2_snake_f32",
+                &cfg(&[("channels", channels), ("len_bound", n.div_ceil(256) * 256)]),
+                [(2 * n).div_ceil(256) as u32, channels as u32, 1],
+                256,
+                &[n as u64],
+                &[
+                    bytes(&x),
+                    bytes(&fir),
+                    bytes(&alpha),
+                    bytes(&beta),
+                    bytes(&vec![113f32; channels * 2 * n + 64]),
+                ],
+            );
+            assert_eq!(&up[4][channels * 2 * n * 4..], bytes(&[113f32; 64]));
+            close(&floats(&up[4][..channels * 2 * n * 4]), &want_up, 3e-5, 0.);
+            // Downsample receives an exactly sized input allocation, including
+            // the final channel's right edge; no oversized scratch hides reads.
+            let up_input = up[4][..channels * 2 * n * 4].to_vec();
+            let got_up = floats(&up_input);
+            let mut want_down = vec![0f64; channels * n];
+            let mut want_complete = want_down.clone();
+            for c in 0..channels {
+                for t in 0..n {
+                    for (k, &weight) in fir.iter().enumerate() {
+                        let src = (2 * t as isize + k as isize - 5).clamp(0, (2 * n - 1) as isize)
+                            as usize;
+                        want_down[c * n + t] += weight as f64 * got_up[c * 2 * n + src];
+                        want_complete[c * n + t] += weight as f64 * want_up[c * 2 * n + src];
+                    }
+                }
+            }
+            let down = h.run(
+                "down2_f32",
+                &cfg(&[
+                    ("channels", channels),
+                    ("len_bound", (2 * n).div_ceil(256) * 256),
+                ]),
+                [n.div_ceil(256) as u32, channels as u32, 1],
+                256,
+                &[(2 * n) as u64],
+                &[
+                    up_input,
+                    bytes(&fir),
+                    bytes(&vec![113f32; channels * n + 64]),
+                ],
+            );
+            assert_eq!(&down[2][channels * n * 4..], bytes(&[113f32; 64]));
+            let got = floats(&down[2][..channels * n * 4]);
+            close(&got, &want_down, 3e-5, 0.);
+            close(&got, &want_complete, 3e-5, 0.);
+            if amplitude == 0. {
+                assert!(got.iter().chain(&got_up).all(|&v| v == 0.));
+            }
+        }
+    }
+}

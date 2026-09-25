@@ -25,7 +25,6 @@ kernel.def target(@h3_up2_snake_f32_gfx11) export("h3_up2_snake_f32") @h3_up2_sn
   %c1 = index.constant 1 : index
   %c2 = index.constant 2 : index
   %c5 = index.constant 5 : index
-  %c10 = index.constant 10 : index
   %c12 = index.constant 12 : index
   %c15 = index.constant 15 : index
   %c256 = index.constant 256 : index
@@ -35,7 +34,6 @@ kernel.def target(@h3_up2_snake_f32_gfx11) export("h3_up2_snake_f32") @h3_up2_sn
   %len_b = index.assume %len [range(%len, 1, 4194304), le(%len, %len_bound)] : index
   %olen = index.mul %len_b, %c2 : index
   %len_last = index.sub %len_b, %c1 : index
-  %padded = index.add %len_b, %c10 : index
   %wg = kernel.workgroup.id<x> : index
   %c_0 = kernel.workgroup.id<y> : index
   %ch = index.assume %c_0 [lt(%c_0, %channels)] : index
@@ -56,33 +54,96 @@ kernel.def target(@h3_up2_snake_f32_gfx11) export("h3_up2_snake_f32") @h3_up2_sn
   scf.if %active {
     %mm = index.assume %m [lt(%m, %olen)] : index
     %t_plus = index.add %mm, %c15 : index
-    %acc = scf.for %k = [%c0 to %c12 step %c1](%acc_k = %zero : f32) -> (f32) {
-      %kk = index.assume %k [lt(%k, %c12)] : index
-      %ge = index.cmp uge, %t_plus, %kk : index
-      %t = index.sub %t_plus, %kk : index
-      %rem = index.rem %t, %c2 : index
-      %aligned = index.cmp eq, %rem, %c0 : index
-      %j = index.div %t, %c2 : index
-      %inside = index.cmp ult, %j, %padded : index
-      %v0 = scalar.andi %ge, %aligned : i1
-      %valid = scalar.andi %v0, %inside : i1
-      %next = scf.if %valid -> (f32) {
-        // replicate padding of 5: source clamp(j - 5, 0, len - 1)
-        %low = index.cmp ult, %j, %c5 : index
-        %j5 = index.sub %j, %c5 : index
-        %src0 = scf.select %low, %c0, %j5 : index
-        %high = index.cmp ugt, %src0, %len_last : index
-        %src1 = scf.select %high, %len_last, %src0 : index
-        %src = index.assume %src1 [range(%src1, 0, 4194304), lt(%src1, %len_b)] : index
-        %fv = view.load %f_view[%kk] : view<12xf32> -> f32
-        %xv = view.load %x_view[%ch, %src] : view<[%channels]x[%len_b]xf32> -> f32
-        %fma = scalar.fmaf %fv, %xv, %acc_k : f32
-        scf.yield %fma : f32
-      } else {
-        scf.yield %acc_k : f32
-      }
-      scf.yield %next : f32
-    }
+    // Only taps with k == (m + 15) mod 2 contribute. For active m,
+    // m + 15 - k >= 4 and j < len + 10, so the other old tap predicates
+    // are always true. Load these six taps ahead, then preserve their
+    // ascending FP32 FMA order and the final factor-of-two rounding.
+    %phase = index.rem %t_plus, %c2 : index
+    %first = index.div %t_plus, %c2 : index
+    %r0 = index.constant 0 : index
+    %tapstep0 = index.constant 0 : index
+    %tapraw0 = index.add %phase, %tapstep0 : index
+    %tap0 = index.assume %tapraw0 [lt(%tapraw0, %c12)] : index
+    %j0 = index.sub %first, %r0 : index
+    %low0 = index.cmp ult, %j0, %c5 : index
+    %j5_0 = index.sub %j0, %c5 : index
+    %src0_0 = scf.select %low0, %c0, %j5_0 : index
+    %high0 = index.cmp ugt, %src0_0, %len_last : index
+    %src1_0 = scf.select %high0, %len_last, %src0_0 : index
+    %src0 = index.assume %src1_0 [range(%src1_0, 0, 4194304), lt(%src1_0, %len_b)] : index
+    %fv0 = view.load %f_view[%tap0] : view<12xf32> -> f32
+    %xv0 = view.load %x_view[%ch, %src0] : view<[%channels]x[%len_b]xf32> -> f32
+    %r1 = index.constant 1 : index
+    %tapstep1 = index.constant 2 : index
+    %tapraw1 = index.add %phase, %tapstep1 : index
+    %tap1 = index.assume %tapraw1 [lt(%tapraw1, %c12)] : index
+    %j1 = index.sub %first, %r1 : index
+    %low1 = index.cmp ult, %j1, %c5 : index
+    %j5_1 = index.sub %j1, %c5 : index
+    %src0_1 = scf.select %low1, %c0, %j5_1 : index
+    %high1 = index.cmp ugt, %src0_1, %len_last : index
+    %src1_1 = scf.select %high1, %len_last, %src0_1 : index
+    %src1 = index.assume %src1_1 [range(%src1_1, 0, 4194304), lt(%src1_1, %len_b)] : index
+    %fv1 = view.load %f_view[%tap1] : view<12xf32> -> f32
+    %xv1 = view.load %x_view[%ch, %src1] : view<[%channels]x[%len_b]xf32> -> f32
+    %r2 = index.constant 2 : index
+    %tapstep2 = index.constant 4 : index
+    %tapraw2 = index.add %phase, %tapstep2 : index
+    %tap2 = index.assume %tapraw2 [lt(%tapraw2, %c12)] : index
+    %j2 = index.sub %first, %r2 : index
+    %low2 = index.cmp ult, %j2, %c5 : index
+    %j5_2 = index.sub %j2, %c5 : index
+    %src0_2 = scf.select %low2, %c0, %j5_2 : index
+    %high2 = index.cmp ugt, %src0_2, %len_last : index
+    %src1_2 = scf.select %high2, %len_last, %src0_2 : index
+    %src2 = index.assume %src1_2 [range(%src1_2, 0, 4194304), lt(%src1_2, %len_b)] : index
+    %fv2 = view.load %f_view[%tap2] : view<12xf32> -> f32
+    %xv2 = view.load %x_view[%ch, %src2] : view<[%channels]x[%len_b]xf32> -> f32
+    %r3 = index.constant 3 : index
+    %tapstep3 = index.constant 6 : index
+    %tapraw3 = index.add %phase, %tapstep3 : index
+    %tap3 = index.assume %tapraw3 [lt(%tapraw3, %c12)] : index
+    %j3 = index.sub %first, %r3 : index
+    %low3 = index.cmp ult, %j3, %c5 : index
+    %j5_3 = index.sub %j3, %c5 : index
+    %src0_3 = scf.select %low3, %c0, %j5_3 : index
+    %high3 = index.cmp ugt, %src0_3, %len_last : index
+    %src1_3 = scf.select %high3, %len_last, %src0_3 : index
+    %src3 = index.assume %src1_3 [range(%src1_3, 0, 4194304), lt(%src1_3, %len_b)] : index
+    %fv3 = view.load %f_view[%tap3] : view<12xf32> -> f32
+    %xv3 = view.load %x_view[%ch, %src3] : view<[%channels]x[%len_b]xf32> -> f32
+    %r4 = index.constant 4 : index
+    %tapstep4 = index.constant 8 : index
+    %tapraw4 = index.add %phase, %tapstep4 : index
+    %tap4 = index.assume %tapraw4 [lt(%tapraw4, %c12)] : index
+    %j4 = index.sub %first, %r4 : index
+    %low4 = index.cmp ult, %j4, %c5 : index
+    %j5_4 = index.sub %j4, %c5 : index
+    %src0_4 = scf.select %low4, %c0, %j5_4 : index
+    %high4 = index.cmp ugt, %src0_4, %len_last : index
+    %src1_4 = scf.select %high4, %len_last, %src0_4 : index
+    %src4 = index.assume %src1_4 [range(%src1_4, 0, 4194304), lt(%src1_4, %len_b)] : index
+    %fv4 = view.load %f_view[%tap4] : view<12xf32> -> f32
+    %xv4 = view.load %x_view[%ch, %src4] : view<[%channels]x[%len_b]xf32> -> f32
+    %r5 = index.constant 5 : index
+    %tapstep5 = index.constant 10 : index
+    %tapraw5 = index.add %phase, %tapstep5 : index
+    %tap5 = index.assume %tapraw5 [lt(%tapraw5, %c12)] : index
+    %j5 = index.sub %first, %r5 : index
+    %low5 = index.cmp ult, %j5, %c5 : index
+    %j5_5 = index.sub %j5, %c5 : index
+    %src0_5 = scf.select %low5, %c0, %j5_5 : index
+    %high5 = index.cmp ugt, %src0_5, %len_last : index
+    %src1_5 = scf.select %high5, %len_last, %src0_5 : index
+    %src5 = index.assume %src1_5 [range(%src1_5, 0, 4194304), lt(%src1_5, %len_b)] : index
+    %fv5 = view.load %f_view[%tap5] : view<12xf32> -> f32
+    %xv5 = view.load %x_view[%ch, %src5] : view<[%channels]x[%len_b]xf32> -> f32
+    %acc0 = scalar.fmaf %fv0, %xv0, %zero : f32
+    %acc1 = scalar.fmaf %fv1, %xv1, %acc0 : f32
+    %acc2 = scalar.fmaf %fv2, %xv2, %acc1 : f32
+    %acc3 = scalar.fmaf %fv3, %xv3, %acc2 : f32
+    %acc4 = scalar.fmaf %fv4, %xv4, %acc3 : f32
+    %acc = scalar.fmaf %fv5, %xv5, %acc4 : f32
     %u = scalar.mulf %acc, %two : f32
     %al = view.load %a_view[%ch] : view<[%channels]xf32> -> f32
     %be = view.load %b_view[%ch] : view<[%channels]xf32> -> f32
