@@ -52,13 +52,14 @@ pub fn plan(ck: &Checkpoint, out: &mut Table) -> Result<()> {
     for (i, upk) in UPK.iter().enumerate() {
         let cout = c / 2;
         // a transposed conv: [Cin][Cout][k], so the bias is Cout wide, not the first dimension
-        flat(
+        upsample(
             ck,
             out,
             &format!("audio.ups.{i}"),
             &format!("decoder.ups.{i}.0"),
-            &[c as i64, cout as i64, *upk as i64],
-            Some(cout),
+            c,
+            cout,
+            *upk,
         )?;
         for (j, resk) in RESK.iter().enumerate() {
             let r = i * 3 + j;
@@ -168,6 +169,64 @@ fn decoder_conv(
                         ck.bytes(ck.at(&weight)?),
                         cout,
                         cin * kernel,
+                    ))
+                }),
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Keep the transposed-convolution plan and dispatch on the same packed layout.
+pub(crate) fn packed_upsample(cout: usize) -> bool {
+    cout >= 32 && cout.is_multiple_of(16)
+}
+
+fn pack_upsample_weights(bytes: &[u8], cin: usize, cout: usize, kernel: usize) -> Vec<u8> {
+    let mut packed = vec![0; bytes.len()];
+    for group in 0..cout / 16 {
+        for input in 0..cin {
+            for tap in 0..kernel {
+                for channel in 0..16 {
+                    let src = ((input * cout + group * 16 + channel) * kernel + tap) * 4;
+                    let dst = (((group * cin + input) * kernel + tap) * 16 + channel) * 4;
+                    packed[dst..dst + 4].copy_from_slice(&bytes[src..src + 4]);
+                }
+            }
+        }
+    }
+    packed
+}
+
+fn upsample(
+    ck: &Checkpoint,
+    out: &mut Table,
+    name: &str,
+    src: &str,
+    cin: usize,
+    cout: usize,
+    kernel: usize,
+) -> Result<()> {
+    flat(
+        ck,
+        out,
+        name,
+        src,
+        &[cin as i64, cout as i64, kernel as i64],
+        Some(cout),
+    )?;
+    if packed_upsample(cout) {
+        let weight = format!("{src}.weight");
+        out.insert(
+            format!("{name}.w"),
+            Recipe::Built {
+                bytes: ck.at(&weight)?.bytes,
+                build: Box::new(move |ck| {
+                    Ok(pack_upsample_weights(
+                        ck.bytes(ck.at(&weight)?),
+                        cin,
+                        cout,
+                        kernel,
                     ))
                 }),
             },
@@ -398,7 +457,7 @@ fn encoder(ck: &Checkpoint, out: &mut Table) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::pack_conv_weights;
+    use super::{pack_conv_weights, pack_upsample_weights};
 
     #[test]
     fn convolution_packing_preserves_bits_and_output_groups() {
@@ -415,6 +474,25 @@ mod tests {
             .iter()
             .map(|v| u32::from_le_bytes(*v))
             .collect();
+        assert_eq!(actual, expected.map(|i| 0x7fc0_0000 + i));
+    }
+    #[test]
+    fn upsample_packing_preserves_bits_across_input_channels() {
+        let input: Vec<u8> = (0..64u32)
+            .flat_map(|i| (0x7fc0_0000 + i).to_le_bytes())
+            .collect();
+        let packed = pack_upsample_weights(&input, 2, 16, 2);
+        let actual: Vec<u32> = packed
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| u32::from_le_bytes(*v))
+            .collect();
+        let expected = [
+            0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 1, 3, 5, 7, 9, 11, 13, 15,
+            17, 19, 21, 23, 25, 27, 29, 31, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58,
+            60, 62, 33, 35, 37, 39, 41, 43, 45, 47, 49, 51, 53, 55, 57, 59, 61, 63,
+        ];
         assert_eq!(actual, expected.map(|i| 0x7fc0_0000 + i));
     }
 }

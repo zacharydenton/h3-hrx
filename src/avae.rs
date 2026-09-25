@@ -463,7 +463,13 @@ impl AudioVae {
                 let pad = (k - rate) / 2;
                 let olen = (len - 1) * rate + k - 2 * pad;
                 {
-                    let ns = "h3.convt1d_f32.";
+                    let blocked = crate::plan::avae::packed_upsample(cout);
+                    let stem = if blocked {
+                        "convt1d_block_f32"
+                    } else {
+                        "convt1d_f32"
+                    };
+                    let ns = format!("h3.{stem}.");
                     let cfg: Cfg = vec![
                         (format!("{ns}cin"), chan.to_string()),
                         (format!("{ns}cout"), cout.to_string()),
@@ -472,7 +478,12 @@ impl AudioVae {
                         (format!("{ns}pad"), pad.to_string()),
                         (format!("{ns}len_bound"), round256(olen).to_string()),
                     ];
-                    let kt = c.get(stream, "convt1d_f32", "h3_convt1d_f32", &cfg)?;
+                    let kt = c.get(stream, stem, &format!("h3_{stem}"), &cfg)?;
+                    let (threads, outputs) = if blocked {
+                        (64, cout / 16)
+                    } else {
+                        (THREADS, cout)
+                    };
                     let d = self.dec.as_ref().expect("sized above");
                     let held_1 = self.weights.at(
                         stream,
@@ -487,8 +498,8 @@ impl AudioVae {
                         &kt,
                         Some(prof),
                         "audio upsample",
-                        [olen.div_ceil(256) as u32, cout as u32, 1],
-                        [THREADS, 1, 1],
+                        [olen.div_ceil(threads as usize) as u32, outputs as u32, 1],
+                        [threads, 1, 1],
                         &[len as u32, olen as u32],
                         &[
                             d.h.binding(),

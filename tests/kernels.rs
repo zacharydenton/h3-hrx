@@ -2159,3 +2159,91 @@ fn transposed_values_clear_reused_capacity() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn transposed_audio_convolution_matches_f64_with_holes_tails_and_guards() {
+    let mut h = Harness::new();
+    for n in [1usize, 2, 5, 25, 63, 64, 65, 127, 128, 129] {
+        for (taps, stride, pad) in [(9, 5, 2), (4, 2, 1), (3, 5, 0), (5, 2, 2), (1, 1, 0)] {
+            for co in [5usize, 32] {
+                let ci = 3;
+                let olen = (n - 1) * stride + taps - 2 * pad;
+                let x = values(ci * n, 0.25);
+                let w = values(ci * co * taps, 0.03);
+                let bias = values(co, 0.01);
+                let mut want: Vec<f64> = bias
+                    .iter()
+                    .flat_map(|&b| std::iter::repeat_n(b as f64, olen))
+                    .collect();
+                // Independent scatter formula: each input contributes through
+                // each tap, instead of selecting taps from an output phase.
+                for i in 0..ci {
+                    for input in 0..n {
+                        for tap in 0..taps {
+                            let output = (input * stride + tap) as isize - pad as isize;
+                            if (0..olen as isize).contains(&output) {
+                                for o in 0..co {
+                                    want[o * olen + output as usize] += x[i * n + input] as f64
+                                        * w[(i * co + o) * taps + tap] as f64;
+                                }
+                            }
+                        }
+                    }
+                }
+                let config = cfg(&[
+                    ("cin", ci),
+                    ("cout", co),
+                    ("ksize", taps),
+                    ("stride", stride),
+                    ("pad", pad),
+                    ("len_bound", olen.div_ceil(256) * 256),
+                ]);
+                let mut kernels = vec![("convt1d_f32", 256)];
+                if co == 32 {
+                    kernels.push(("convt1d_block_f32", 64));
+                }
+                let mut outputs = Vec::new();
+                for (stem, threads) in kernels {
+                    let blocked = stem == "convt1d_block_f32";
+                    let mut weights = w.clone();
+                    if blocked {
+                        weights.clear();
+                        for group in 0..co / 16 {
+                            for i in 0..ci {
+                                for tap in 0..taps {
+                                    for o in 0..16 {
+                                        weights.push(w[(i * co + group * 16 + o) * taps + tap]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let out = h.run(
+                        stem,
+                        &config,
+                        [
+                            olen.div_ceil(threads as usize) as u32,
+                            (if blocked { co / 16 } else { co }) as u32,
+                            1,
+                        ],
+                        threads,
+                        &[n as u64, olen as u64],
+                        &[
+                            bytes(&x),
+                            bytes(&weights),
+                            bytes(&bias),
+                            bytes(&vec![113f32; co * olen + 64]),
+                        ],
+                    );
+                    assert_eq!(&out[3][co * olen * 4..], bytes(&[113f32; 64]));
+                    close(&floats(&out[3][..co * olen * 4]), &want, 2e-6, 0.);
+                    outputs.push(out[3].clone());
+                }
+                if outputs.len() == 2 {
+                    assert_eq!(outputs[0], outputs[1], "transposed convolution at n={n}, kernel={taps}, stride={stride}, pad={pad}");
+                }
+            }
+        }
+    }
+}

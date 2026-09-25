@@ -1,0 +1,217 @@
+// Sixteen output channels share each input sample; weights are [Cout/16][Cin*kernel][16].
+// Visit only the output phase's contributing taps, retaining ascending channel/tap FP32 FMAs.
+amdgpu.target<gfx11-generic> @h3_convt1d_block_f32_gfx11 {subgroup_size = 32}
+
+config.decl @h3.convt1d_block_f32.cin : %value: index where [range(%value, 1, 4096)]
+
+config.decl @h3.convt1d_block_f32.cout : %value: index where [range(%value, 16, 4096), mul(%value, 16)]
+
+config.decl @h3.convt1d_block_f32.ksize : %value: index where [range(%value, 1, 64)]
+
+config.decl @h3.convt1d_block_f32.stride : %value: index where [range(%value, 1, 64)]
+
+config.decl @h3.convt1d_block_f32.pad : %value: index where [range(%value, 0, 1024)]
+
+config.decl @h3.convt1d_block_f32.len_bound : %value: index where [range(%value, 256, 4194304), mul(%value, 256)]
+
+kernel.def target(@h3_convt1d_block_f32_gfx11) export("h3_convt1d_block_f32") @h3_convt1d_block_f32(%len: index, %olen: index) {
+  %one = index.constant 1 : index
+  %span = index.constant 64 : index
+  %last = index.constant 63 : index
+  %threads = index.constant 64 : index
+  %otile = index.constant 16 : index
+  %cout = config.get @h3.convt1d_block_f32.cout : index
+  %rounded = index.add %olen, %last : index
+  %gx = index.div %rounded, %span : index
+  %gy = index.div %cout, %otile : index
+  kernel.launch.config workgroups(%gx, %gy, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%len: index, %olen: index, %x: buffer, %w: buffer, %b: buffer, %out: buffer) {
+  %cin = config.get @h3.convt1d_block_f32.cin : index
+  %cout = config.get @h3.convt1d_block_f32.cout : index
+  %ksize = config.get @h3.convt1d_block_f32.ksize : index
+  %stride = config.get @h3.convt1d_block_f32.stride : index
+  %pad = config.get @h3.convt1d_block_f32.pad : index
+  %len_bound = config.get @h3.convt1d_block_f32.len_bound : index
+  %z = index.constant 0 : index
+  %one = index.constant 1 : index
+  %offset = index.constant 0 : offset
+  %span = index.constant 64 : index
+  %otile = index.constant 16 : index
+  %length = index.assume %len [range(%len, 1, 4194304), le(%len, %len_bound)] : index
+  %outlen = index.assume %olen [range(%olen, 1, 4194304), le(%olen, %len_bound)] : index
+  %gxb = index.div %len_bound, %span : index
+  %gyb = index.div %cout, %otile : index
+  %gx0 = kernel.workgroup.id<x> : index
+  %gy0 = kernel.workgroup.id<y> : index
+  %gx = index.assume %gx0 [lt(%gx0, %gxb)] : index
+  %gy = index.assume %gy0 [lt(%gy0, %gyb)] : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %gx, %span : index
+  %n = index.add %base, %lane : index
+  %obase = index.mul %gy, %otile : index
+  %taps = index.mul %cin, %ksize : index
+  %xg = buffer.assume.memory_space<global> %x : buffer
+  %wg = buffer.assume.memory_space<global> %w : buffer
+  %bg = buffer.assume.memory_space<global> %b : buffer
+  %yg = buffer.assume.memory_space<global> %out : buffer
+  %xv = buffer.view %xg[%offset] : buffer -> view<[%cin]x[%length]xf32>
+  %wv = buffer.view %wg[%offset] : buffer -> view<[%gyb]x[%taps]x16xf32>
+  %bv = buffer.view %bg[%offset] : buffer -> view<[%cout]xf32>
+  %yv = buffer.view %yg[%offset] : buffer -> view<[%cout]x[%outlen]xf32>
+  %slast = index.sub %stride, %one : index
+  %kround = index.add %ksize, %slast : index
+  %kblocks = index.div %kround, %stride : index
+  %oc0 = index.constant 0 : index
+  %or0 = index.add %obase, %oc0 : index
+  %o0 = index.assume %or0 [lt(%or0, %cout)] : index
+  %bias0 = view.load %bv[%o0] : view<[%cout]xf32> -> f32
+  %oc1 = index.constant 1 : index
+  %or1 = index.add %obase, %oc1 : index
+  %o1 = index.assume %or1 [lt(%or1, %cout)] : index
+  %bias1 = view.load %bv[%o1] : view<[%cout]xf32> -> f32
+  %oc2 = index.constant 2 : index
+  %or2 = index.add %obase, %oc2 : index
+  %o2 = index.assume %or2 [lt(%or2, %cout)] : index
+  %bias2 = view.load %bv[%o2] : view<[%cout]xf32> -> f32
+  %oc3 = index.constant 3 : index
+  %or3 = index.add %obase, %oc3 : index
+  %o3 = index.assume %or3 [lt(%or3, %cout)] : index
+  %bias3 = view.load %bv[%o3] : view<[%cout]xf32> -> f32
+  %oc4 = index.constant 4 : index
+  %or4 = index.add %obase, %oc4 : index
+  %o4 = index.assume %or4 [lt(%or4, %cout)] : index
+  %bias4 = view.load %bv[%o4] : view<[%cout]xf32> -> f32
+  %oc5 = index.constant 5 : index
+  %or5 = index.add %obase, %oc5 : index
+  %o5 = index.assume %or5 [lt(%or5, %cout)] : index
+  %bias5 = view.load %bv[%o5] : view<[%cout]xf32> -> f32
+  %oc6 = index.constant 6 : index
+  %or6 = index.add %obase, %oc6 : index
+  %o6 = index.assume %or6 [lt(%or6, %cout)] : index
+  %bias6 = view.load %bv[%o6] : view<[%cout]xf32> -> f32
+  %oc7 = index.constant 7 : index
+  %or7 = index.add %obase, %oc7 : index
+  %o7 = index.assume %or7 [lt(%or7, %cout)] : index
+  %bias7 = view.load %bv[%o7] : view<[%cout]xf32> -> f32
+  %oc8 = index.constant 8 : index
+  %or8 = index.add %obase, %oc8 : index
+  %o8 = index.assume %or8 [lt(%or8, %cout)] : index
+  %bias8 = view.load %bv[%o8] : view<[%cout]xf32> -> f32
+  %oc9 = index.constant 9 : index
+  %or9 = index.add %obase, %oc9 : index
+  %o9 = index.assume %or9 [lt(%or9, %cout)] : index
+  %bias9 = view.load %bv[%o9] : view<[%cout]xf32> -> f32
+  %oc10 = index.constant 10 : index
+  %or10 = index.add %obase, %oc10 : index
+  %o10 = index.assume %or10 [lt(%or10, %cout)] : index
+  %bias10 = view.load %bv[%o10] : view<[%cout]xf32> -> f32
+  %oc11 = index.constant 11 : index
+  %or11 = index.add %obase, %oc11 : index
+  %o11 = index.assume %or11 [lt(%or11, %cout)] : index
+  %bias11 = view.load %bv[%o11] : view<[%cout]xf32> -> f32
+  %oc12 = index.constant 12 : index
+  %or12 = index.add %obase, %oc12 : index
+  %o12 = index.assume %or12 [lt(%or12, %cout)] : index
+  %bias12 = view.load %bv[%o12] : view<[%cout]xf32> -> f32
+  %oc13 = index.constant 13 : index
+  %or13 = index.add %obase, %oc13 : index
+  %o13 = index.assume %or13 [lt(%or13, %cout)] : index
+  %bias13 = view.load %bv[%o13] : view<[%cout]xf32> -> f32
+  %oc14 = index.constant 14 : index
+  %or14 = index.add %obase, %oc14 : index
+  %o14 = index.assume %or14 [lt(%or14, %cout)] : index
+  %bias14 = view.load %bv[%o14] : view<[%cout]xf32> -> f32
+  %oc15 = index.constant 15 : index
+  %or15 = index.add %obase, %oc15 : index
+  %o15 = index.assume %or15 [lt(%or15, %cout)] : index
+  %bias15 = view.load %bv[%o15] : view<[%cout]xf32> -> f32
+  %tc0 = index.constant 0 : index
+  %n0 = index.add %n, %tc0 : index
+  %active0 = index.cmp ult, %n0, %outlen : index
+  %plus0 = index.add %n0, %pad : index
+  %phase0 = index.rem %plus0, %stride : index
+  %source0 = index.div %plus0, %stride : index
+  %acc0_0, %acc1_0, %acc2_0, %acc3_0, %acc4_0, %acc5_0, %acc6_0, %acc7_0, %acc8_0, %acc9_0, %acc10_0, %acc11_0, %acc12_0, %acc13_0, %acc14_0, %acc15_0 = scf.for %ic = [%z to %cin step %one](%ai0_0 = %bias0 : f32, %ai1_0 = %bias1 : f32, %ai2_0 = %bias2 : f32, %ai3_0 = %bias3 : f32, %ai4_0 = %bias4 : f32, %ai5_0 = %bias5 : f32, %ai6_0 = %bias6 : f32, %ai7_0 = %bias7 : f32, %ai8_0 = %bias8 : f32, %ai9_0 = %bias9 : f32, %ai10_0 = %bias10 : f32, %ai11_0 = %bias11 : f32, %ai12_0 = %bias12 : f32, %ai13_0 = %bias13 : f32, %ai14_0 = %bias14 : f32, %ai15_0 = %bias15 : f32) -> (f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32) {
+    %ii = index.assume %ic [lt(%ic, %cin)] : index
+    %row = index.mul %ii, %ksize : index
+    %ak0_0, %ak1_0, %ak2_0, %ak3_0, %ak4_0, %ak5_0, %ak6_0, %ak7_0, %ak8_0, %ak9_0, %ak10_0, %ak11_0, %ak12_0, %ak13_0, %ak14_0, %ak15_0 = scf.for %kb = [%z to %kblocks step %one](%ki0_0 = %ai0_0 : f32, %ki1_0 = %ai1_0 : f32, %ki2_0 = %ai2_0 : f32, %ki3_0 = %ai3_0 : f32, %ki4_0 = %ai4_0 : f32, %ki5_0 = %ai5_0 : f32, %ki6_0 = %ai6_0 : f32, %ki7_0 = %ai7_0 : f32, %ki8_0 = %ai8_0 : f32, %ki9_0 = %ai9_0 : f32, %ki10_0 = %ai10_0 : f32, %ki11_0 = %ai11_0 : f32, %ki12_0 = %ai12_0 : f32, %ki13_0 = %ai13_0 : f32, %ki14_0 = %ai14_0 : f32, %ki15_0 = %ai15_0 : f32) -> (f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32) unroll {
+      %shift = index.mul %kb, %stride : index
+      %kraw0 = index.add %shift, %phase0 : index
+      %tap_live0 = index.cmp ult, %kraw0, %ksize : index
+      %left0 = index.cmp uge, %source0, %kb : index
+      %nraw0 = index.sub %source0, %kb : index
+      %right0 = index.cmp ult, %nraw0, %length : index
+      %bounds0 = scalar.andi %left0, %right0 : i1
+      %live0 = scalar.andi %active0, %tap_live0 : i1
+      %valid0 = scalar.andi %bounds0, %live0 : i1
+      %next0_0, %next1_0, %next2_0, %next3_0, %next4_0, %next5_0, %next6_0, %next7_0, %next8_0, %next9_0, %next10_0, %next11_0, %next12_0, %next13_0, %next14_0, %next15_0 = scf.if %valid0 -> (f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32) {
+        %kk = index.assume %kraw0 [lt(%kraw0, %ksize)] : index
+        %tap0 = index.add %row, %kk : index
+        %tap = index.assume %tap0 [lt(%tap0, %taps)] : index
+        %src = index.assume %nraw0 [range(%nraw0, 0, 4194304), lt(%nraw0, %length)] : index
+        %input = view.load %xv[%ii, %src] : view<[%cin]x[%length]xf32> -> f32
+        %weightvec0 = vector.load %wv[%gy, %tap, %oc0] : view<[%gyb]x[%taps]x16xf32> -> vector<4xf32>
+        %weight0 = vector.extract %weightvec0[0] : vector<4xf32> -> f32
+        %weight1 = vector.extract %weightvec0[1] : vector<4xf32> -> f32
+        %weight2 = vector.extract %weightvec0[2] : vector<4xf32> -> f32
+        %weight3 = vector.extract %weightvec0[3] : vector<4xf32> -> f32
+        %weightvec4 = vector.load %wv[%gy, %tap, %oc4] : view<[%gyb]x[%taps]x16xf32> -> vector<4xf32>
+        %weight4 = vector.extract %weightvec4[0] : vector<4xf32> -> f32
+        %weight5 = vector.extract %weightvec4[1] : vector<4xf32> -> f32
+        %weight6 = vector.extract %weightvec4[2] : vector<4xf32> -> f32
+        %weight7 = vector.extract %weightvec4[3] : vector<4xf32> -> f32
+        %weightvec8 = vector.load %wv[%gy, %tap, %oc8] : view<[%gyb]x[%taps]x16xf32> -> vector<4xf32>
+        %weight8 = vector.extract %weightvec8[0] : vector<4xf32> -> f32
+        %weight9 = vector.extract %weightvec8[1] : vector<4xf32> -> f32
+        %weight10 = vector.extract %weightvec8[2] : vector<4xf32> -> f32
+        %weight11 = vector.extract %weightvec8[3] : vector<4xf32> -> f32
+        %weightvec12 = vector.load %wv[%gy, %tap, %oc12] : view<[%gyb]x[%taps]x16xf32> -> vector<4xf32>
+        %weight12 = vector.extract %weightvec12[0] : vector<4xf32> -> f32
+        %weight13 = vector.extract %weightvec12[1] : vector<4xf32> -> f32
+        %weight14 = vector.extract %weightvec12[2] : vector<4xf32> -> f32
+        %weight15 = vector.extract %weightvec12[3] : vector<4xf32> -> f32
+        %fma0 = scalar.fmaf %weight0, %input, %ki0_0 : f32
+        %fma1 = scalar.fmaf %weight1, %input, %ki1_0 : f32
+        %fma2 = scalar.fmaf %weight2, %input, %ki2_0 : f32
+        %fma3 = scalar.fmaf %weight3, %input, %ki3_0 : f32
+        %fma4 = scalar.fmaf %weight4, %input, %ki4_0 : f32
+        %fma5 = scalar.fmaf %weight5, %input, %ki5_0 : f32
+        %fma6 = scalar.fmaf %weight6, %input, %ki6_0 : f32
+        %fma7 = scalar.fmaf %weight7, %input, %ki7_0 : f32
+        %fma8 = scalar.fmaf %weight8, %input, %ki8_0 : f32
+        %fma9 = scalar.fmaf %weight9, %input, %ki9_0 : f32
+        %fma10 = scalar.fmaf %weight10, %input, %ki10_0 : f32
+        %fma11 = scalar.fmaf %weight11, %input, %ki11_0 : f32
+        %fma12 = scalar.fmaf %weight12, %input, %ki12_0 : f32
+        %fma13 = scalar.fmaf %weight13, %input, %ki13_0 : f32
+        %fma14 = scalar.fmaf %weight14, %input, %ki14_0 : f32
+        %fma15 = scalar.fmaf %weight15, %input, %ki15_0 : f32
+        scf.yield %fma0, %fma1, %fma2, %fma3, %fma4, %fma5, %fma6, %fma7, %fma8, %fma9, %fma10, %fma11, %fma12, %fma13, %fma14, %fma15 : f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32
+      } else {
+        scf.yield %ki0_0, %ki1_0, %ki2_0, %ki3_0, %ki4_0, %ki5_0, %ki6_0, %ki7_0, %ki8_0, %ki9_0, %ki10_0, %ki11_0, %ki12_0, %ki13_0, %ki14_0, %ki15_0 : f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32
+      }
+      scf.yield %next0_0, %next1_0, %next2_0, %next3_0, %next4_0, %next5_0, %next6_0, %next7_0, %next8_0, %next9_0, %next10_0, %next11_0, %next12_0, %next13_0, %next14_0, %next15_0 : f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32
+    }
+    scf.yield %ak0_0, %ak1_0, %ak2_0, %ak3_0, %ak4_0, %ak5_0, %ak6_0, %ak7_0, %ak8_0, %ak9_0, %ak10_0, %ak11_0, %ak12_0, %ak13_0, %ak14_0, %ak15_0 : f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32
+  }
+  scf.if %active0 {
+    %nn = index.assume %n0 [lt(%n0, %outlen)] : index
+    view.store %acc0_0, %yv[%o0, %nn] : f32, view<[%cout]x[%outlen]xf32>
+    view.store %acc1_0, %yv[%o1, %nn] : f32, view<[%cout]x[%outlen]xf32>
+    view.store %acc2_0, %yv[%o2, %nn] : f32, view<[%cout]x[%outlen]xf32>
+    view.store %acc3_0, %yv[%o3, %nn] : f32, view<[%cout]x[%outlen]xf32>
+    view.store %acc4_0, %yv[%o4, %nn] : f32, view<[%cout]x[%outlen]xf32>
+    view.store %acc5_0, %yv[%o5, %nn] : f32, view<[%cout]x[%outlen]xf32>
+    view.store %acc6_0, %yv[%o6, %nn] : f32, view<[%cout]x[%outlen]xf32>
+    view.store %acc7_0, %yv[%o7, %nn] : f32, view<[%cout]x[%outlen]xf32>
+    view.store %acc8_0, %yv[%o8, %nn] : f32, view<[%cout]x[%outlen]xf32>
+    view.store %acc9_0, %yv[%o9, %nn] : f32, view<[%cout]x[%outlen]xf32>
+    view.store %acc10_0, %yv[%o10, %nn] : f32, view<[%cout]x[%outlen]xf32>
+    view.store %acc11_0, %yv[%o11, %nn] : f32, view<[%cout]x[%outlen]xf32>
+    view.store %acc12_0, %yv[%o12, %nn] : f32, view<[%cout]x[%outlen]xf32>
+    view.store %acc13_0, %yv[%o13, %nn] : f32, view<[%cout]x[%outlen]xf32>
+    view.store %acc14_0, %yv[%o14, %nn] : f32, view<[%cout]x[%outlen]xf32>
+    view.store %acc15_0, %yv[%o15, %nn] : f32, view<[%cout]x[%outlen]xf32>
+  }
+  kernel.return
+}

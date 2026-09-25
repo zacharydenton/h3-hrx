@@ -1,4 +1,5 @@
 // ConvTranspose1d: out[o][m] = b[o] + sum_{i,k: m + pad - k = n*stride, 0 <= n < len} w[i][o][k] * x[i][n]
+// Only visit contributing taps, in ascending order within each input channel.
 // f32, channel-major; out has olen = (len - 1) * stride + ksize - 2 * pad samples. One lane per output sample.
 amdgpu.target<gfx11-generic> @h3_convt1d_f32_gfx11 {subgroup_size = 32}
 
@@ -56,21 +57,25 @@ kernel.def target(@h3_convt1d_f32_gfx11) export("h3_convt1d_f32") @h3_convt1d_f3
     %bias = view.load %b_view[%o] : view<[%cout]xf32> -> f32
     %t_plus = index.add %mm, %pad : index
     %orow = index.mul %o, %ksize : index
+    %phase = index.rem %t_plus, %stride : index
+    %source_base = index.div %t_plus, %stride : index
+    %stride_less = index.sub %stride, %c1 : index
+    %ksize_rounded = index.add %ksize, %stride_less : index
+    %kblocks = index.div %ksize_rounded, %stride : index
     %acc = scf.for %i = [%c0 to %cin step %c1](%acc_i = %bias : f32) -> (f32) {
       %ii = index.assume %i [lt(%i, %cin)] : index
-      %acc_k = scf.for %k = [%c0 to %ksize step %c1](%acc_kk = %acc_i : f32) -> (f32) {
-        %kk = index.assume %k [lt(%k, %ksize)] : index
+      %acc_k = scf.for %kb = [%c0 to %kblocks step %c1](%acc_kk = %acc_i : f32) -> (f32) unroll {
+        %k_offset = index.mul %kb, %stride : index
+        %k_raw = index.add %k_offset, %phase : index
+        %tap_live = index.cmp ult, %k_raw, %ksize : index
+        %safe_k = scf.select %tap_live, %k_raw, %c0 : index
+        %kk = index.assume %safe_k [lt(%safe_k, %ksize)] : index
         %tap0 = index.add %orow, %kk : index
         %tap = index.assume %tap0 [lt(%tap0, %wrow)] : index
-        %ge = index.cmp uge, %t_plus, %kk : index
-        %t_raw = index.sub %t_plus, %kk : index
-        %t0 = scf.select %ge, %t_raw, %c0 : index
-        %t = index.assume %t0 [range(%t0, 0, 4194304)] : index
-        %rem = index.rem %t, %stride : index
-        %aligned = index.cmp eq, %rem, %c0 : index
-        %n_raw = index.div %t, %stride : index
+        %ge = index.cmp uge, %source_base, %kb : index
+        %n_raw = index.sub %source_base, %kb : index
         %lt = index.cmp ult, %n_raw, %len_b : index
-        %v0 = scalar.andi %ge, %aligned : i1
+        %v0 = scalar.andi %ge, %tap_live : i1
         %valid = scalar.andi %v0, %lt : i1
         %next = scf.if %valid -> (f32) {
           %n = index.assume %n_raw [range(%n_raw, 0, 4194304), lt(%n_raw, %len_b)] : index
