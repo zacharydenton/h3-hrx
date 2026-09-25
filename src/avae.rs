@@ -175,8 +175,8 @@ fn transpose(
     Ok(())
 }
 
-/// A non-strided, dilated 1-D convolution, four samples per lane. The `accumulate` form adds into its
-/// output instead of overwriting, which is how a residual block's second convolution closes the skip.
+/// A non-strided, dilated 1-D convolution over channel-major FP32 activations. The `accumulate` form
+/// adds into its output, which is how a residual block's second convolution closes the skip.
 #[allow(clippy::too_many_arguments)]
 fn conv4(
     c: &Compiler,
@@ -191,7 +191,13 @@ fn conv4(
     b: View<'_>,
     out: View<'_>,
 ) -> Result<()> {
-    let ns = "h3.conv1d4_f32.";
+    let blocked = crate::plan::avae::packed_conv(cin, cout);
+    let stem = if blocked {
+        "conv1d_block_f32"
+    } else {
+        "conv1d4_f32"
+    };
+    let ns = format!("h3.{stem}.");
     let cfg: Cfg = vec![
         (format!("{ns}cin"), cin.to_string()),
         (format!("{ns}cout"), cout.to_string()),
@@ -204,14 +210,20 @@ fn conv4(
         ),
         (format!("{ns}len_bound"), round256(len).to_string()),
     ];
-    let k = c.get(stream, "conv1d4_f32", "h3_conv1d4_f32", &cfg)?;
-    // Four independent samples per lane retain the original 256-sample workgroup span.
+    let k = c.get(stream, stem, &format!("h3_{stem}"), &cfg)?;
+    // Wide convolutions share inputs across eight output channels; narrow
+    // convolutions retain four samples per lane and their original weight layout.
+    let (span, outputs) = if blocked {
+        (128, cout / 8)
+    } else {
+        (256, cout)
+    };
     checked(
         stream,
         &k,
         Some(prof),
         stage,
-        [len.div_ceil(256) as u32, cout as u32, 1],
+        [len.div_ceil(span) as u32, outputs as u32, 1],
         [64, 1, 1],
         &[len as u32],
         &[x, w, b, out],

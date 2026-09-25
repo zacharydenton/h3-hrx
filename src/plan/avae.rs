@@ -32,21 +32,19 @@ pub fn plan(ck: &Checkpoint, out: &mut Table) -> Result<()> {
         widen_f32(ck, &[&f32v("latents_std", AUDIO_CH)?])?,
     );
 
-    flat(
+    decoder_conv(
         ck,
         out,
         "audio.dec_in_proj",
         "dec_in_proj",
         &[2048, AUDIO_CH as i64, 1],
-        None,
     )?;
-    flat(
+    decoder_conv(
         ck,
         out,
         "audio.conv_pre",
         "decoder.conv_pre",
         &[1024, 2048, 7],
-        None,
     )?;
 
     // The decoder's rates {5,5,2,2,2,2,2} halve the channels, which the loop tracks.
@@ -66,21 +64,19 @@ pub fn plan(ck: &Checkpoint, out: &mut Table) -> Result<()> {
             let r = i * 3 + j;
             let src = format!("decoder.resblocks.{r}");
             for d in 0..3 {
-                flat(
+                decoder_conv(
                     ck,
                     out,
                     &format!("audio.res.{r}.c1.{d}"),
                     &format!("{src}.convs1.{d}"),
                     &[cout as i64, cout as i64, *resk as i64],
-                    None,
                 )?;
-                flat(
+                decoder_conv(
                     ck,
                     out,
                     &format!("audio.res.{r}.c2.{d}"),
                     &format!("{src}.convs2.{d}"),
                     &[cout as i64, cout as i64, *resk as i64],
-                    None,
                 )?;
             }
             for act in 0..6 {
@@ -129,6 +125,55 @@ pub fn plan(ck: &Checkpoint, out: &mut Table) -> Result<()> {
     )?;
 
     encoder(ck, out)
+}
+
+/// Shared by the decoder's weight plan and dispatch: the layout must agree.
+pub(crate) fn packed_conv(cin: usize, cout: usize) -> bool {
+    cin >= 32 && cout >= 32 && cout.is_multiple_of(8)
+}
+
+fn pack_conv_weights(bytes: &[u8], outputs: usize, reduction: usize) -> Vec<u8> {
+    let mut packed = vec![0; bytes.len()];
+    for group in 0..outputs / 8 {
+        for tap in 0..reduction {
+            for channel in 0..8 {
+                let src = ((group * 8 + channel) * reduction + tap) * 4;
+                let dst = ((group * reduction + tap) * 8 + channel) * 4;
+                packed[dst..dst + 4].copy_from_slice(&bytes[src..src + 4]);
+            }
+        }
+    }
+    packed
+}
+
+/// Replace the flat recipe, retaining one device copy and every FP32 bit.
+fn decoder_conv(
+    ck: &Checkpoint,
+    out: &mut Table,
+    name: &str,
+    src: &str,
+    shape: &[i64],
+) -> Result<()> {
+    flat(ck, out, name, src, shape, None)?;
+    let (cout, cin, kernel) = (shape[0] as usize, shape[1] as usize, shape[2] as usize);
+    if packed_conv(cin, cout) {
+        let weight = format!("{src}.weight");
+        let bytes = ck.at(&weight)?.bytes;
+        out.insert(
+            format!("{name}.w"),
+            Recipe::Built {
+                bytes,
+                build: Box::new(move |ck| {
+                    Ok(pack_conv_weights(
+                        ck.bytes(ck.at(&weight)?),
+                        cout,
+                        cin * kernel,
+                    ))
+                }),
+            },
+        );
+    }
+    Ok(())
 }
 
 /// `[Cout][Cin][k]` (or a transposed conv's `[Cin][Cout][k]`) as the kernels' flat `[Cout][Cin * k]`
@@ -349,4 +394,27 @@ fn encoder(ck: &Checkpoint, out: &mut Table) -> Result<()> {
     out.insert("aenc.latents_mean".into(), widen_f32(ck, &[mean])?);
     out.insert("aenc.latents_std".into(), widen_f32(ck, &[std])?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pack_conv_weights;
+
+    #[test]
+    fn convolution_packing_preserves_bits_and_output_groups() {
+        let bits: Vec<u32> = (0..32).map(|i| 0x7fc0_0000 + i).collect();
+        let input: Vec<u8> = bits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let packed = pack_conv_weights(&input, 16, 2);
+        let expected = [
+            0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15, 16, 18, 20, 22, 24, 26, 28, 30,
+            17, 19, 21, 23, 25, 27, 29, 31,
+        ];
+        let actual: Vec<u32> = packed
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| u32::from_le_bytes(*v))
+            .collect();
+        assert_eq!(actual, expected.map(|i| 0x7fc0_0000 + i));
+    }
 }

@@ -314,57 +314,78 @@ fn attention_preserves_the_upper_tile_softmax_maximum() {
 fn audio_convolution_matches_f64_with_padding_residuals_and_guards() {
     let mut h = Harness::new();
     for n in [1usize, 63, 64, 65, 127, 128, 129, 255, 256, 257, 769] {
-        for acc in [0usize, 1] {
-            let (ci, co, taps, dilation, pad) = (3, 5, 11, 5, 25);
-            let x = values(ci * n, 0.25);
-            let w = values(co * ci * taps, 0.03);
-            let bias = values(co, 0.01);
-            let mut prev = values(co * n + 64, 0.02);
-            prev[co * n..].fill(113.);
-            let mut want = vec![0f64; co * n];
-            for o in 0..co {
-                for t in 0..n {
-                    let mut sum =
-                        bias[o] as f64 + if acc == 1 { prev[o * n + t] as f64 } else { 0. };
-                    for c in 0..ci {
-                        for tap in 0..taps {
-                            let j = t as isize + (tap * dilation) as isize - pad as isize;
-                            if (0..n as isize).contains(&j) {
-                                sum += w[(o * ci + c) * taps + tap] as f64
-                                    * x[c * n + j as usize] as f64;
+        for co in [5usize, 16] {
+            for acc in [0usize, 1] {
+                let (ci, taps, dilation, pad) = (3, 11, 5, 25);
+                let x = values(ci * n, 0.25);
+                let w = values(co * ci * taps, 0.03);
+                let bias = values(co, 0.01);
+                let mut prev = values(co * n + 64, 0.02);
+                prev[co * n..].fill(113.);
+                let mut want = vec![0f64; co * n];
+                for o in 0..co {
+                    for t in 0..n {
+                        let mut sum =
+                            bias[o] as f64 + if acc == 1 { prev[o * n + t] as f64 } else { 0. };
+                        for c in 0..ci {
+                            for tap in 0..taps {
+                                let j = t as isize + (tap * dilation) as isize - pad as isize;
+                                if (0..n as isize).contains(&j) {
+                                    sum += w[(o * ci + c) * taps + tap] as f64
+                                        * x[c * n + j as usize] as f64;
+                                }
+                            }
+                        }
+                        want[o * n + t] = sum;
+                    }
+                }
+                let config = cfg(&[
+                    ("cin", ci),
+                    ("cout", co),
+                    ("ksize", taps),
+                    ("dilation", dilation),
+                    ("pad", pad),
+                    ("accumulate", acc),
+                    ("len_bound", n.div_ceil(256) * 256),
+                ]);
+                let mut outputs = Vec::new();
+                let mut kernels = vec![("conv1d_f32", 256), ("conv1d4_f32", 64)];
+                if co == 16 {
+                    kernels.push(("conv1d_block_f32", 64));
+                }
+                for (stem, threads) in kernels {
+                    let blocked = stem == "conv1d_block_f32";
+                    let mut weights = w.clone();
+                    if blocked {
+                        weights.clear();
+                        for group in 0..co / 8 {
+                            for tap in 0..ci * taps {
+                                for channel in 0..8 {
+                                    weights.push(w[(group * 8 + channel) * ci * taps + tap]);
+                                }
                             }
                         }
                     }
-                    want[o * n + t] = sum;
+                    let (span, grid_outputs) = if blocked { (128, co / 8) } else { (256, co) };
+                    let out = h.run(
+                        stem,
+                        &config,
+                        [n.div_ceil(span) as u32, grid_outputs as u32, 1],
+                        threads,
+                        &[n as u64],
+                        &[bytes(&x), bytes(&weights), bytes(&bias), bytes(&prev)],
+                    );
+                    assert_eq!(&out[3][co * n * 4..], bytes(&[113f32; 64]));
+                    close(&floats(&out[3][..co * n * 4]), &want, 2e-6, 0.);
+                    outputs.push(out[3].clone());
+                }
+                for output in &outputs[1..] {
+                    assert_eq!(
+                        &outputs[0], output,
+                        "convolution accumulation order at n={n}, channels={co}, residual={acc}"
+                    );
                 }
             }
-            let config = cfg(&[
-                ("cin", ci),
-                ("cout", co),
-                ("ksize", taps),
-                ("dilation", dilation),
-                ("pad", pad),
-                ("accumulate", acc),
-                ("len_bound", n.div_ceil(256) * 256),
-            ]);
-            let mut outputs = Vec::new();
-            for (stem, threads) in [("conv1d_f32", 256), ("conv1d4_f32", 64)] {
-                let out = h.run(
-                    stem,
-                    &config,
-                    [n.div_ceil(256) as u32, co as u32, 1],
-                    threads,
-                    &[n as u64],
-                    &[bytes(&x), bytes(&w), bytes(&bias), bytes(&prev)],
-                );
-                assert_eq!(&out[3][co * n * 4..], bytes(&[113f32; 64]));
-                close(&floats(&out[3][..co * n * 4]), &want, 2e-6, 0.);
-                outputs.push(out[3].clone());
-            }
-            assert_eq!(
-                outputs[0], outputs[1],
-                "convolution accumulation order at n={n}, residual={acc}"
-            );
         }
     }
 }
