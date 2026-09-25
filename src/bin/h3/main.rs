@@ -11,7 +11,8 @@
 //!
 //! The CLI owns a Rust `Session`; application adapters call that same API.
 mod media;
-mod resize;
+
+use h3_hrx::resize;
 
 use h3_hrx::{
     Attention as Attn16, Clip, Config, DenoiseParams, Keyframe, LatentGrid, Noise, Presented,

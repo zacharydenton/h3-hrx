@@ -54,6 +54,13 @@ pub mod error;
 pub mod models;
 mod noise;
 mod pixels;
+/// The reference resampler.
+///
+/// Reference and keyframe images are scaled with PIL's bilinear filter because
+/// that is what the model was conditioned against; another resampler shifts the
+/// conditioning it sees. In the library rather than the CLI so that an
+/// application adapter scales its inputs the same way the CLI does.
+pub mod resize;
 mod rope;
 mod sampler;
 pub mod session;
