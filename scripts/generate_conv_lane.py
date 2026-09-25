@@ -9,8 +9,8 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[1]
 
-def generate():
-    L, U = 8, 16
+def generate(prefetch_channels=16):
+    L, U = 8, prefetch_channels
     O=8//L;span=64//L
     original = (ROOT / 'kernels/conv1d_prefetch_f32.loom').read_text()
     if hashlib.sha256(original.encode()).hexdigest() != '391576429420c87d4d997a706a69cfb3c7e67a44cb8258c59d9d02c524961095':

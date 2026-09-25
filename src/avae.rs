@@ -206,8 +206,17 @@ fn conv4(
     let channel_lanes = prefetched
         && cin.is_multiple_of(16)
         && (len <= 32 || (cin <= 256 && cout <= 256 && ksize <= 7 && len <= 128));
+    // Uniform tap guards expose independent loads without changing the dot.
+    // The wider entry projection needs fewer time samples to retain the gain.
+    // Undilated residuals lose the benefit before the dilated short-window limit.
+    let seven_tap = channel_lanes
+        && ksize == 7
+        && ((cin == 2048 && cout == 1024 && dil == 1 && pad == 3 && len <= 8)
+            || (cin == 512 && cout == 512 && (len <= 25 || dil >= 3)));
     let stem = if narrow {
         "conv1d_narrow_f32"
+    } else if seven_tap {
+        "conv1d_k7_f32"
     } else if channel_lanes && ksize == 3 {
         "conv1d_k3_f32"
     } else if channel_lanes {

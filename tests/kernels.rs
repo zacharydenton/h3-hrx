@@ -2428,6 +2428,13 @@ fn channel_lanes_preserve_audio_convolution_fmas_and_edges() {
         (16usize, 8usize, 11usize, 5usize, 25usize, 1usize),
         (16, 16, 11, 5, 25, 2),
         (32, 32, 11, 5, 25, 5),
+        (16, 16, 7, 1, 3, 1),
+        (16, 16, 7, 3, 9, 2),
+        (32, 16, 7, 5, 15, 5),
+        (32, 16, 7, 1, 3, 25),
+        (32, 16, 7, 5, 15, 31),
+        (32, 16, 7, 3, 9, 32),
+        (32, 16, 7, 3, 9, 33),
         (48, 16, 7, 3, 9, 7),
         (48, 16, 7, 3, 9, 8),
         (48, 16, 7, 3, 9, 9),
@@ -2492,6 +2499,9 @@ fn channel_lanes_preserve_audio_convolution_fmas_and_edges() {
             let mut variants = vec![("conv1d_prefetch_f32", 64), ("conv1d_lane_f32", 8)];
             if taps <= 3 {
                 variants.push(("conv1d_k3_f32", 8));
+            }
+            if taps == 7 {
+                variants.push(("conv1d_k7_f32", 8));
             }
             for (stem, span) in variants {
                 let out = h.run(
@@ -2730,6 +2740,83 @@ fn narrow_audio_prefetch_preserves_padding_residuals_and_tails() {
             }
             assert_eq!(outputs[0], outputs[1],
                 "ci={ci}, co={co}, n={n}, taps={taps}, dilation={dilation}, pad={pad}, residual={acc}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn seven_tap_audio_convolution_preserves_ordered_fp32_dots() {
+    let mut h = Harness::new();
+    for (ci, co, n, dilation) in [
+        (2048usize, 16usize, 1usize, 1usize),
+        (2048, 16, 2, 1),
+        (2048, 1024, 5, 1),
+        (2048, 16, 8, 1),
+        (512, 16, 5, 1),
+        (512, 16, 25, 3),
+        (512, 16, 32, 5),
+    ] {
+        let taps = 7;
+        let pad = 3 * dilation;
+        let x = values(ci * n, 0.25);
+        let w = values(co * ci * taps, 0.03);
+        let bias = values(co, 0.01);
+        let mut packed = Vec::with_capacity(w.len());
+        for group in 0..co / 8 {
+            for i in 0..ci * taps {
+                for o in 0..8 {
+                    packed.push(w[(group * 8 + o) * ci * taps + i]);
+                }
+            }
+        }
+        for acc in [0usize, 1] {
+            let mut prev = values(co * n + 64, 0.02);
+            prev[co * n..].fill(113.);
+            let mut want = vec![0f32; co * n];
+            // Scalar oracle for the original ordered FP32 contract, with no
+            // packing, channel chunks or workgroup tap pruning. This is exact
+            // accumulation-order coverage; FP64/model accuracy is a separate gate.
+            for o in 0..co {
+                for t in 0..n {
+                    let mut sum = (if acc == 1 { prev[o * n + t] } else { 0. }) + bias[o];
+                    for i in 0..ci {
+                        for k in 0..taps {
+                            let j = t as isize + (k * dilation) as isize - pad as isize;
+                            if (0..n as isize).contains(&j) {
+                                sum =
+                                    w[(o * ci + i) * taps + k].mul_add(x[i * n + j as usize], sum);
+                            }
+                        }
+                    }
+                    want[o * n + t] = sum;
+                }
+            }
+            let config = cfg(&[
+                ("cin", ci),
+                ("cout", co),
+                ("ksize", taps),
+                ("dilation", dilation),
+                ("pad", pad),
+                ("accumulate", acc),
+                ("len_bound", n.div_ceil(256) * 256),
+            ]);
+            for stem in ["conv1d_lane_f32", "conv1d_k7_f32"] {
+                let out = h.run(
+                    stem,
+                    &config,
+                    [n.div_ceil(8) as u32, (co / 8) as u32, 1],
+                    64,
+                    &[n as u64],
+                    &[bytes(&x), bytes(&packed), bytes(&bias), bytes(&prev)],
+                );
+                assert_eq!(&out[3][co * n * 4..], bytes(&[113f32; 64]));
+                assert_eq!(
+                    &out[3][..co * n * 4],
+                    bytes(&want),
+                    "{stem} ci={ci} co={co} n={n} d={dilation} acc={acc}"
+                );
+            }
         }
     }
 }
