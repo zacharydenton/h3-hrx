@@ -61,6 +61,7 @@ mod pixels;
 /// conditioning it sees. In the library rather than the CLI so that an
 /// application adapter scales its inputs the same way the CLI does.
 pub mod presentation;
+pub mod refmod;
 pub mod resize;
 mod rope;
 mod sampler;

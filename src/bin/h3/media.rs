@@ -100,13 +100,23 @@ pub fn decode_image(path: &Path) -> Result<(Vec<u8>, i32, i32)> {
 
 /// Any audio file as planar stereo `[2][n]` at 32 kHz; mono is duplicated and other rates resampled.
 pub fn decode_audio(path: &Path) -> Result<(Vec<f32>, i32)> {
+    decode_audio_inner(path, None)
+}
+
+/// Bound decoding before allocating audio samples for refmod creation.
+pub fn decode_audio_limited(path: &Path, seconds: f32) -> Result<(Vec<f32>, i32)> {
+    decode_audio_inner(path, Some(seconds))
+}
+
+fn decode_audio_inner(path: &Path, seconds: Option<f32>) -> Result<(Vec<f32>, i32)> {
     let p = path.to_str().context("path is not valid UTF-8")?;
-    let raw = capture(
-        "ffmpeg",
-        &[
-            "-v", "error", "-i", p, "-vn", "-f", "f32le", "-ac", "2", "-ar", "32000", "-",
-        ],
-    )?;
+    let duration = seconds.map(|s| s.to_string());
+    let mut args = vec!["-v", "error", "-i", p];
+    if let Some(s) = &duration {
+        args.extend(["-t", s.as_str()]);
+    }
+    args.extend(["-vn", "-f", "f32le", "-ac", "2", "-ar", "32000", "-"]);
+    let raw = capture("ffmpeg", &args)?;
     if raw.len() < 8 {
         bail!("{p}: no audio samples");
     }

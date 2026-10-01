@@ -22,6 +22,7 @@ fi
 if [ "$full" = 1 ]; then
   cargo test --locked --lib --release session::tests:: -- --ignored --test-threads=1
   cargo test --locked --test differentials --release -- --ignored --test-threads=1
+  cargo test --locked --test refmod --release -- --ignored --test-threads=1
 fi
 if [ "$adapters" = 1 ]; then
   cargo test --locked --lib --release stack::adapter::tests:: -- --ignored --test-threads=1

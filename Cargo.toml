@@ -38,6 +38,9 @@ hrx = { package = "hrx-rs", version = "0.8.7" }
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"
 thiserror = "2"
+safetensors = "0.8"
+serde_json = "1"
+tempfile = "3"
 # Use the Rust regex backend without a native regex dependency.
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 # ChaCha rather than StdRng: rand does not promise StdRng's stream across major versions, and a seed
@@ -49,9 +52,7 @@ anyhow = { version = "1", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 
 [dev-dependencies]
-serde_json = "1"
 libm = "0.2"
-tempfile = "3"
 
 [profile.release]
 opt-level = 2

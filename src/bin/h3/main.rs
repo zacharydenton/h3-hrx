@@ -11,6 +11,7 @@
 //!
 //! The CLI owns a Rust `Session`; application adapters call that same API.
 mod media;
+mod refmods;
 
 use h3_hrx::resize;
 
@@ -77,6 +78,24 @@ impl Preset {
     disable_help_subcommand = true
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Pre-encoded v4 reference or v5 visual/audio bundle (repeatable)
+    #[arg(long = "refmod", value_name = "FILE")]
+    refmods: Vec<PathBuf>,
+    /// Visual strength for a one-based refmod slot: INDEX=VALUE (0..1)
+    #[arg(long, value_name = "INDEX=VALUE")]
+    refmod_visual_strength: Vec<String>,
+    /// Audio strength for a one-based refmod slot: INDEX=VALUE (0..1)
+    #[arg(long, value_name = "INDEX=VALUE")]
+    refmod_audio_strength: Vec<String>,
+    /// Reference repetitions for a one-based slot: INDEX=COUNT
+    #[arg(long, value_name = "INDEX=COUNT")]
+    refmod_copies: Vec<String>,
+    /// Limit effective refmod tokens after modality filtering and copies
+    #[arg(long)]
+    refmod_max_total_tokens: Option<usize>,
     /// Reference files, by extension: images become `<Picture i>`, audio becomes `<Audio j>`
     #[arg(value_name = "FILE")]
     files: Vec<PathBuf>,
@@ -179,6 +198,15 @@ struct Cli {
     /// Use the base checkpoint for reference files instead of ref2va
     #[arg(long)]
     base_weights: bool,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Create or inspect portable encoded references
+    Refmod {
+        #[command(subcommand)]
+        command: refmods::Command,
+    },
 }
 
 fn lower_ext(path: &Path) -> String {
@@ -363,7 +391,15 @@ fn parameters(cli: &Cli) -> Result<DenoiseParams> {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    if let Some(Command::Refmod { command }) = cli.command {
+        return refmods::run(command);
+    }
     let params = parameters(&cli)?;
+    let prepared_refmods = refmods::prepare(&cli)?;
+    let active_refmods = prepared_refmods.iter().any(|r| r.token_count() > 0);
+    if active_refmods && cli.preset.turbo().is_some() {
+        usage!("Turbo does not support active refmods");
+    }
     let (mut image_files, mut audio_files) = (Vec::new(), Vec::new());
     for f in &cli.files {
         let e = lower_ext(f);
@@ -430,7 +466,7 @@ fn run(cli: Cli) -> Result<()> {
     // Reuse the standard Hub cache before downloading missing checkpoints.
     // --offline stops at what is already on disk instead of downloading.
     let resolver = h3_hrx::models::Resolver::new().offline(cli.offline);
-    let want_refs = !image_files.is_empty() || !audio_files.is_empty();
+    let want_refs = !image_files.is_empty() || !audio_files.is_empty() || active_refmods;
     let ref2va = want_refs && !cli.base_weights;
     let resolve = |explicit: &Option<PathBuf>, relative: &str| -> Result<PathBuf> {
         match explicit {
@@ -447,8 +483,19 @@ fn run(cli: Cli) -> Result<()> {
         },
     )?;
     let te = resolve(&cli.te, h3_hrx::models::TE)?;
-    let video_vae = resolve(&cli.video_vae, h3_hrx::models::VIDEO_VAE)?;
-    let audio_vae = resolve(&cli.audio_vae, h3_hrx::models::AUDIO_VAE)?;
+    let video_vae = if cli.first_frame.is_some()
+        || !image_files.is_empty()
+        || (!cli.no_decode && !cli.audio_only)
+    {
+        Some(resolve(&cli.video_vae, h3_hrx::models::VIDEO_VAE)?)
+    } else {
+        cli.video_vae.clone()
+    };
+    let audio_vae = if !audio_files.is_empty() || !cli.no_decode {
+        Some(resolve(&cli.audio_vae, h3_hrx::models::AUDIO_VAE)?)
+    } else {
+        cli.audio_vae.clone()
+    };
     if !dit.exists() {
         usage!("{} not found (README, Weights; --dit)", dit.display());
     }
@@ -528,8 +575,8 @@ fn run(cli: Cli) -> Result<()> {
             Some(dit.clone())
         },
         te: Some(te),
-        video_vae: Some(video_vae),
-        audio_vae: Some(audio_vae),
+        video_vae,
+        audio_vae,
         kernel_sources: sources,
         loom_library,
         attention: match cli.attn {
@@ -657,6 +704,9 @@ fn run(cli: Cli) -> Result<()> {
             latents: z,
             frames: *t,
         });
+    }
+    for prepared in &prepared_refmods {
+        refs.extend(prepared.references());
     }
 
     let t0 = Instant::now();

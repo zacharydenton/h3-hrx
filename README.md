@@ -38,6 +38,7 @@ generated locally with h3 in **39m58s**. [First frame and reproduction](docs/sho
 - **Text to video with sound:** generate an MP4 and a separate WAV from a structured prompt.
 - **Image to video:** animate a first frame or condition generation on reference images.
 - **Audio references:** guide generation with voices and sounds alongside image references.
+- **Reusable RefMods:** create encoded image references with optional bundled audio, or load ComfyUI v4/v5 files. See [RefMods](docs/refmods.md).
 - **Audio and stills:** use the CLI's audio-only and single-frame output modes.
 - **Embed inference:** use the Rust `Session` API or the example Rustler adapter for Elixir.
 
