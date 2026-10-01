@@ -334,6 +334,42 @@ fn creation_round_trip_matches_direct_encodes() {
     for (a, b) in mods.members().iter().zip(loaded.members()) {
         assert_eq!(a.values(), b.values());
     }
+    // A single non-square source must keep its entire frame when /32 rounding
+    // changes the target aspect ratio.
+    let pixels = (0..49 * 64 * 3)
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>();
+    let single = session
+        .create_refmod(
+            &[ImageInput {
+                pixels: &pixels,
+                width: 49,
+                height: 64,
+            }],
+            None,
+            &options,
+        )
+        .unwrap();
+    let normalized = h3_hrx::resize::pil_bilinear(&pixels, 49, 64, 64, 64);
+    let (direct, _) = session
+        .encode_video(Clip {
+            pixels: &normalized,
+            frames: 1,
+            height: 64,
+            width: 64,
+        })
+        .unwrap();
+    assert_eq!(
+        single.members()[0].values(),
+        direct
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        single.members()[0].metadata()["h3_hrx_preprocessing"]["crop"],
+        "disabled"
+    );
 }
 
 #[test]
@@ -471,4 +507,53 @@ fn standalone_audio_round_trips_without_visual_members() {
     assert_eq!(loaded.metadata()["_format_version"], 4);
     assert_eq!(loaded.members().len(), 1);
     assert_eq!(loaded.members()[0].values(), bundle.members()[1].values());
+}
+
+#[test]
+#[ignore = "requires gfx1151 and the cached audio VAE checkpoint"]
+fn audio_creation_preserves_channels_across_chunks_and_truncation() {
+    use h3_hrx::refmod::{AudioInput, CreateOptions};
+    use h3_hrx::{Config, Session};
+    let resolver = h3_hrx::models::Resolver::new().offline(true);
+    let config = Config {
+        audio_vae: Some(resolver.find(h3_hrx::models::AUDIO_VAE).unwrap()),
+        video_vae: Some("/absent/video_vae".into()),
+        dit: Some("/absent/dit".into()),
+        te: Some("/absent/te".into()),
+        ..Config::default()
+    };
+    // Safety: the test never writes checkpoints.
+    let mut session = unsafe { Session::new(config) }.unwrap();
+    let n = 320800;
+    let samples = (0..2 * n)
+        .map(|i| ((i % n) as f32 * 0.0123).sin() * if i < n { 0.1 } else { 0.2 })
+        .collect::<Vec<_>>();
+    let input = AudioInput {
+        samples: &samples,
+        samples_per_channel: n,
+    };
+    let options = CreateOptions::default();
+    let full = session.create_refmod(&[], Some(input), &options).unwrap();
+    assert_eq!(full.members()[0].shape(), &[1, 32, 2, 401]);
+    let mut tail = samples[320000..n].to_vec();
+    tail.extend_from_slice(&samples[n + 320000..]);
+    let (expected, frames) = session.encode_audio(&tail, 800).unwrap();
+    assert_eq!(frames, 1);
+    for (channel, &value) in expected.iter().enumerate() {
+        assert_eq!(full.members()[0].values()[channel * 401 + 400], value);
+    }
+    let mut options = CreateOptions {
+        audio_max_tokens: 801,
+        ..options
+    };
+    assert!(session.create_refmod(&[], Some(input), &options).is_err());
+    options.truncate_audio = true;
+    let truncated = session.create_refmod(&[], Some(input), &options).unwrap();
+    assert_eq!(truncated.members()[0].shape(), &[1, 32, 2, 400]);
+    for channel in 0..64 {
+        assert_eq!(
+            &truncated.members()[0].values()[channel * 400..(channel + 1) * 400],
+            &full.members()[0].values()[channel * 401..channel * 401 + 400]
+        );
+    }
 }

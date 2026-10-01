@@ -295,6 +295,70 @@ pub fn prepare(cli: &Cli) -> Result<Vec<PreparedRefMod>> {
 mod tests {
     use super::*;
     use clap::Parser;
+    fn fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/refmod/combined.safetensors")
+    }
+
+    #[test]
+    fn combined_slots_respect_modality_controls_copies_and_total_budget() {
+        let path = fixture();
+        let cli = Cli::try_parse_from([
+            "h3",
+            "--refmod",
+            path.to_str().unwrap(),
+            "--refmod",
+            path.to_str().unwrap(),
+            "--refmod-audio-strength",
+            "1=0",
+            "--refmod-visual-strength",
+            "2=0",
+            "--refmod-copies",
+            "1=2",
+            "--refmod-max-total-tokens",
+            "74",
+        ])
+        .unwrap();
+        let prepared = prepare(&cli).unwrap();
+        assert_eq!(prepared[0].token_count(), 36);
+        assert_eq!(prepared[1].token_count(), 38);
+        assert!(matches!(
+            prepared[0].references()[0],
+            h3_hrx::Reference::Video { .. }
+        ));
+        assert!(matches!(
+            prepared[1].references()[0],
+            h3_hrx::Reference::Audio { .. }
+        ));
+        assert_eq!(prepared[0].references().len(), 2);
+        let mut too_small = cli;
+        too_small.refmod_max_total_tokens = Some(73);
+        assert!(prepare(&too_small).is_err());
+    }
+
+    #[test]
+    fn disabled_mods_cost_zero_and_active_mods_reject_turbo_before_models() {
+        let path = fixture();
+        let mut cli = Cli::try_parse_from([
+            "h3",
+            "--refmod",
+            path.to_str().unwrap(),
+            "--preset",
+            "turbo-768p-4",
+            "--refmod-visual-strength",
+            "1=0",
+            "--refmod-audio-strength",
+            "1=0",
+        ])
+        .unwrap();
+        assert_eq!(prepare(&cli).unwrap()[0].token_count(), 0);
+        assert!(super::super::parameters(&cli).is_ok());
+        cli.refmod_visual_strength.clear();
+        let error = super::super::run(cli).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Turbo does not support active refmods"));
+    }
+
     #[test]
     fn commands_and_existing_generation_parse() {
         assert!(Cli::try_parse_from([

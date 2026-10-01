@@ -23,8 +23,9 @@ h3 refmod inspect character-with-voice.safetensors
 Directories are scanned nonrecursively in lexical order; explicit image files
 retain argument order. Images use the existing CLI's supported image formats.
 The first image determines the canvas. Its short edge is capped at 1024 pixels,
-with dimensions rounded to multiples of 32; subsequent images are center-cropped
-to the same aspect ratio. Native bilinear resampling differs from the upstream
+with dimensions rounded to multiples of 32. A single image is resized without
+cropping; a stack is center-cropped to the shared canvas aspect ratio.
+Native bilinear resampling differs from the upstream
 extractor's Lanczos resampling, so independently encoded files need not be
 byte-identical. Preprocessing settings are recorded in metadata.
 

@@ -119,7 +119,7 @@ impl Session {
             let (w, h) = options.canvas(first.width, first.height)?;
             let mut frames = Vec::new();
             for image in images {
-                let pixels = preprocess(*image, w, h);
+                let pixels = preprocess(*image, w, h, images.len() > 1);
                 let (z, t) = self.encode_video(Clip {
                     pixels: &pixels,
                     frames: 1,
@@ -153,7 +153,7 @@ impl Session {
             member.metadata["source"] = json!(if images.len() == 1 { "image" } else { "stack" });
             member.metadata["source_shape"] = json!(format!("{}x{}x{}", images.len(), lh, lw));
             member.metadata["pool"] = json!(format!("full-res {w}x{h}px"));
-            member.metadata["h3_hrx_preprocessing"] = json!({"filter":"bilinear","crop":"center","resolution":options.resolution,
+            member.metadata["h3_hrx_preprocessing"] = json!({"filter":"bilinear","crop":if images.len() > 1 {"center"} else {"disabled"},"resolution":options.resolution,
                 "source_images":images.len(),"selected_indices":selected});
             members.push(member);
         }
@@ -205,8 +205,11 @@ fn audio_samples(n: usize, options: &CreateOptions) -> usize {
             .max(1.0) as usize,
     )
 }
-fn preprocess(image: ImageInput<'_>, w: i32, h: i32) -> Vec<f32> {
+fn preprocess(image: ImageInput<'_>, w: i32, h: i32, crop: bool) -> Vec<f32> {
     let (sw, sh) = (image.width, image.height);
+    if !crop {
+        return crate::resize::pil_bilinear(image.pixels, sw, sh, w, h);
+    }
     let ratio = f64::from(w) / f64::from(h);
     let (cw, ch) = if f64::from(sw) / f64::from(sh) > ratio {
         ((f64::from(sh) * ratio).round().max(1.0) as i32, sh)
@@ -224,6 +227,18 @@ fn preprocess(image: ImageInput<'_>, w: i32, h: i32) -> Vec<f32> {
 fn select_frames(frames: &[Vec<f32>], cost: usize, budget: usize) -> Result<Vec<usize>> {
     if cost == 0 || cost > budget {
         return invalid("refmod: one frame exceeds token budget");
+    }
+    let elements = cost
+        .checked_mul(96)
+        .ok_or_else(|| err("frame size overflows"))?;
+    if frames.is_empty()
+        || frames
+            .iter()
+            .any(|z| z.len() != elements || z.iter().any(|v| !v.is_finite()))
+    {
+        return invalid(
+            "refmod: invalid encoded image frame; expected finite, equally sized latents",
+        );
     }
     if frames.len() <= budget / cost {
         return Ok((0..frames.len()).collect());
@@ -269,10 +284,40 @@ fn stack_frames(frames: &[Vec<f32>], indices: &[usize], plane: usize) -> Vec<f32
 mod tests {
     use super::*;
     #[test]
+    fn a_single_image_keeps_edges_when_canvas_rounding_changes_aspect() {
+        let mut pixels = vec![0; 49 * 64 * 3];
+        pixels[..49 * 3].fill(255);
+        pixels[49 * 63 * 3..].fill(255);
+        let image = ImageInput {
+            pixels: &pixels,
+            width: 49,
+            height: 64,
+        };
+        let (w, h) = CreateOptions::default().canvas(49, 64).unwrap();
+        assert_eq!((w, h), (64, 64));
+        let single = preprocess(image, w, h, false);
+        assert!(single[..64 * 3].iter().all(|&v| v == 1.0));
+        assert!(single[64 * 63 * 3..].iter().all(|&v| v == 1.0));
+        let stacked = preprocess(image, w, h, true);
+        assert!(stacked.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn token_fitting_never_hides_invalid_encoded_frames() {
+        let good = vec![1.0; 96];
+        for bad in [vec![f32::NAN; 96], vec![f32::INFINITY; 96], vec![0.0; 95]] {
+            for budget in [1, 2] {
+                assert!(select_frames(&[good.clone(), bad.clone()], 1, budget).is_err());
+            }
+        }
+        assert!(select_frames(&[], 1, 1).is_err());
+    }
+
+    #[test]
     fn temporal_selection_preserves_space_and_rounds_ties_even() {
         let frames = (0..6).map(|i| vec![i as f32; 96]).collect::<Vec<_>>();
         assert_eq!(select_frames(&frames, 1, 3).unwrap(), vec![0, 2, 5]);
-        let frames = vec![vec![1.0; 96]; 8];
+        let frames = vec![vec![1.0; 384]; 8];
         assert_eq!(select_frames(&frames, 4, 8).unwrap(), vec![0]);
         assert!(select_frames(&frames, 4, 3).is_err());
     }
