@@ -12,7 +12,7 @@ struct Projection {
     output: usize,
     result_width: usize,
     mode: usize,
-    weights: Vec<(hrx::Buffer, hrx::Buffer)>,
+    weights: Vec<Option<(hrx::Buffer, hrx::Buffer)>>,
 }
 
 pub(super) struct AdapterRuntime {
@@ -25,44 +25,59 @@ pub(super) struct AdapterRuntime {
     classes: usize,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn matrix(
+fn matrices(
     stream: &mut hrx::Stream,
     adapter: &crate::adapter::Adapter,
-    name: &str,
-    rows: usize,
-    cols: usize,
-    padded_rows: usize,
-    padded_cols: usize,
-    scale: f32,
-    interleave: bool,
-) -> Result<hrx::Buffer> {
-    let entry = adapter
-        .checkpoint()
-        .at(name)
-        .map_err(|e| crate::compile::Error::Io(e.to_string()))?;
-    let source = adapter.checkpoint().bytes(entry);
-    let mut bytes = vec![0u8; padded_rows * padded_cols * 2];
-    for row in 0..rows {
-        let src_row = if interleave {
-            (row / 32) * 16 + row % 16 + if row % 32 >= 16 { rows / 2 } else { 0 }
-        } else {
-            row
-        };
-        for col in 0..cols {
-            let at = (src_row * cols + col) * 2;
-            let value = half::bf16::from_le_bytes([source[at], source[at + 1]]).to_f32() * scale;
-            if !value.is_finite() {
-                return err(format!("non-finite adapter weight in {name}"));
+    specs: &[&crate::adapter::LinearAdapter],
+    rank_width: usize,
+) -> Result<(hrx::Buffer, hrx::Buffer)> {
+    let first = specs[0];
+    let ip = gemm_pitch(first.input, 16);
+    let rp = gemm_pitch(rank_width, 16);
+    let mut a = vec![0u8; rank_width * ip * 2];
+    let mut b = vec![0u8; first.output * rp * 2];
+    let mut rank_offset = 0;
+    for spec in specs {
+        let file = adapter.source(spec);
+        for (suffix, rows, cols, scale) in [
+            ("lora_A.weight", spec.rank, spec.input, 1.0),
+            ("lora_B.weight", spec.output, spec.rank, spec.scale),
+        ] {
+            let entry = file
+                .at(&format!("{}.{suffix}", spec.prefix))
+                .map_err(|e| crate::compile::Error::Io(e.to_string()))?;
+            let source = file.bytes(entry);
+            for row in 0..rows {
+                let src_row = if suffix == "lora_B.weight" && spec.gate_up {
+                    (row / 32) * 16 + row % 16 + if row % 32 >= 16 { rows / 2 } else { 0 }
+                } else {
+                    row
+                };
+                for col in 0..cols {
+                    let value = crate::adapter::float_at(entry.dtype, source, src_row * cols + col)
+                        .map_err(|e| crate::compile::Error::Io(e.to_string()))?
+                        * scale;
+                    let value = half::bf16::from_f32(value);
+                    if !value.is_finite() {
+                        return err("non-finite scaled LoRA weight");
+                    }
+                    let (dest, offset) = if suffix == "lora_A.weight" {
+                        (&mut a, ((rank_offset + row) * ip + col) * 2)
+                    } else {
+                        (&mut b, (row * rp + rank_offset + col) * 2)
+                    };
+                    dest[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+                }
             }
-            let target = (row * padded_cols + col) * 2;
-            bytes[target..target + 2].copy_from_slice(&half::bf16::from_f32(value).to_le_bytes());
+            file.done_with(source);
         }
+        rank_offset += spec.rank;
     }
-    let out = stream.allocate(bytes.len())?;
-    stream.upload(out.binding(), &bytes)?;
-    adapter.checkpoint().done_with(source);
-    Ok(out)
+    let a_buf = stream.allocate(a.len())?;
+    stream.upload(a_buf.binding(), &a)?;
+    let b_buf = stream.allocate(b.len())?;
+    stream.upload(b_buf.binding(), &b)?;
+    Ok((a_buf, b_buf))
 }
 
 impl AdapterRuntime {
@@ -75,66 +90,57 @@ impl AdapterRuntime {
     ) -> Result<Self> {
         let d = &stack.d;
         if d.hidden != HID || d.heads != HEADS || d.ffn != FFN || d.bias || !d.gate_first {
-            return err("Turbo adapters require the unbiased H3 DiT/refiner stack");
+            return err("LoRA adapters require the unbiased H3 DiT/refiner stack");
         }
         let elem = if d.wbits == 8 {
             "i8"
         } else if d.bf16 {
             "bf16"
         } else {
-            return err("unsupported Turbo base weight precision");
+            return err("unsupported LoRA base weight precision");
         };
         let mut projections = Vec::new();
-        for (op, input, output, mode, rank) in [
-            ("attn.qkv_proj", HID, QKV, 0, 384usize),
-            ("attn.out_proj", INNER, HID, 2, 128),
-            ("mlp.fc1", HID, 2 * FFN, 1, 128),
-            ("mlp.fc2", FFN, HID, 2, 128),
+        let mut max_rank_width = 256;
+        for (op, input, output, mode) in [
+            ("attn.qkv_proj", HID, QKV, 0),
+            ("attn.out_proj", INNER, HID, 2),
+            ("mlp.fc1", HID, 2 * FFN, 1),
+            ("mlp.fc2", FFN, HID, 2),
         ] {
+            let group = if refiner {
+                "token_refiner.blocks"
+            } else {
+                "blocks"
+            };
+            let specs = (0..stack.layers)
+                .map(|layer| {
+                    let prefix = format!("diffusion_model.{group}.{layer}.{op}");
+                    adapter
+                        .projections
+                        .iter()
+                        .filter(|s| s.prefix == prefix)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let rank = specs
+                .iter()
+                .map(|layer| layer.iter().map(|s| s.rank).sum::<usize>())
+                .max()
+                .unwrap_or(0)
+                .max(1);
             // Prepare works on multiples of 256; padding the rank adds exact zero terms.
             let rank_width = rank.div_ceil(256) * 256;
+            max_rank_width = max_rank_width.max(rank_width);
             let ip = gemm_pitch(input, 16);
             let rp = gemm_pitch(rank_width, 16);
             let result_width = if mode == 1 { output / 2 } else { output };
             let mut weights = Vec::new();
-            for layer in 0..stack.layers {
-                let group = if refiner {
-                    "token_refiner.blocks"
+            for layer in &specs {
+                weights.push(if layer.is_empty() {
+                    None
                 } else {
-                    "blocks"
-                };
-                let prefix = format!("diffusion_model.{group}.{layer}.{op}");
-                let spec = adapter
-                    .projections
-                    .iter()
-                    .find(|s| s.prefix == prefix)
-                    .ok_or_else(|| {
-                        crate::compile::Error::Io(format!("adapter missing {prefix}"))
-                    })?;
-                weights.push((
-                    matrix(
-                        stream,
-                        adapter,
-                        &format!("{prefix}.lora_A.weight"),
-                        rank,
-                        input,
-                        rank_width,
-                        ip,
-                        1.0,
-                        false,
-                    )?,
-                    matrix(
-                        stream,
-                        adapter,
-                        &format!("{prefix}.lora_B.weight"),
-                        output,
-                        rank,
-                        output,
-                        rp,
-                        spec.scale,
-                        mode == 1,
-                    )?,
-                ));
+                    Some(matrices(stream, adapter, layer, rank_width)?)
+                });
             }
             let finish = c.get(
                 stream,
@@ -224,14 +230,18 @@ impl AdapterRuntime {
             } else {
                 Some(stream.allocate(cap * gemm_pitch(FFN, 16) * 2)?)
             },
-            rank: stream.allocate(cap * 512 * 2)?,
-            rank_operand: stream.allocate(cap * gemm_pitch(512, 16) * 2)?,
+            rank: stream.allocate(cap * max_rank_width * 2)?,
+            rank_operand: stream.allocate(cap * gemm_pitch(max_rank_width, 16) * 2)?,
             base: stream.allocate(cap * 2 * FFN * 4)?,
             delta: stream.allocate(cap * 2 * FFN * 2)?,
             classes: d.classes,
         };
         c.flush(stream)?;
         Ok(result)
+    }
+
+    pub(super) fn has(&self, projection: usize, layer: usize) -> bool {
+        self.projections[projection].weights[layer].is_some()
     }
 
     fn input_view(&self) -> View<'_> {
@@ -255,7 +265,7 @@ impl AdapterRuntime {
         residual: Option<(View<'g>, ClassRows<'g>)>,
     ) -> Result<()> {
         let p = &self.projections[projection];
-        let (a, b) = &p.weights[layer];
+        let (a, b) = p.weights[layer].as_ref().expect("active projection");
         let (base_stage, rank_stage, up_stage) = match projection {
             0 => ("gemm qkv f32", "adapter rank qkv", "adapter up qkv"),
             1 => ("gemm out f32", "adapter rank out", "adapter up out"),
@@ -356,6 +366,57 @@ mod tests {
     use super::*;
     use half::{bf16, f16};
 
+    fn adapter_cases() -> Vec<(&'static str, crate::adapter::Adapter)> {
+        let mut cases = Vec::new();
+        for (name, preset) in [
+            ("Four", crate::adapter::TurboPreset::Four),
+            ("Eight", crate::adapter::TurboPreset::Eight),
+        ] {
+            let path = preset.resolve(true).unwrap();
+            // Safety: cached test artifacts remain immutable.
+            cases.push((
+                name,
+                unsafe { crate::adapter::Adapter::open(&path) }.unwrap(),
+            ));
+        }
+        let path = crate::models::Resolver::new()
+            .repository("pablodawson", "MiniMax-H3-360-Orbit-LoRA")
+            .revision(Some("5ddbc2dbbe95edbbdaf5017c3e934b1d01791697".into()))
+            .offline(true)
+            .find("minimax_h3_flf2v_lora_v1.safetensors")
+            .unwrap();
+        // Safety: cached test artifacts remain immutable.
+        let orbit = unsafe {
+            crate::adapter::Adapter::open_loras(&[crate::adapter::Lora::new(&path, 1.0)])
+        }
+        .unwrap()
+        .unwrap();
+        assert_eq!(orbit.projections.len(), 208);
+        assert!(orbit
+            .projections
+            .iter()
+            .all(|s| s.rank == 16 && s.scale == 1.0));
+        cases.push(("Orbit", orbit));
+        // Overlapping, signed branches on just one projection in each stack.
+        // The remaining projections must continue through their base kernels.
+        let mut mixed = unsafe {
+            crate::adapter::Adapter::open_loras(&[
+                crate::adapter::Lora::new(&path, 0.5),
+                crate::adapter::Lora::new(
+                    crate::adapter::TurboPreset::Four.resolve(true).unwrap(),
+                    -0.125,
+                ),
+            ])
+        }
+        .unwrap()
+        .unwrap();
+        mixed
+            .projections
+            .retain(|s| s.prefix.ends_with(".0.mlp.fc1"));
+        cases.push(("MixedPartialOrbit", mixed));
+        cases
+    }
+
     fn read(stream: &mut hrx::Stream, buffer: &hrx::Buffer, bytes: usize) -> Vec<u8> {
         read_view(stream, buffer.binding(), bytes)
     }
@@ -383,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires idle gfx1151, base checkpoint and both cached Turbo adapters"]
+    #[ignore = "requires idle gfx1151, base checkpoint and cached Turbo and Orbit adapters"]
     fn real_adapted_stacks_match_eager_and_recorded_execution() {
         assert!(
             std::env::var_os("H3_ADAPTER_BLOCK_FIXTURE").is_none()
@@ -400,12 +461,7 @@ mod tests {
         let weights = unsafe { Weights::open(path, crate::plan::dit::plan) }.unwrap();
         let constants = Constants::new(&mut stream).unwrap();
         let rows = 17;
-        for preset in [
-            crate::adapter::TurboPreset::Four,
-            crate::adapter::TurboPreset::Eight,
-        ] {
-            let path = preset.resolve(true).unwrap();
-            let checkpoint = unsafe { crate::adapter::Adapter::open(&path) }.unwrap();
+        for (preset, checkpoint) in adapter_cases() {
             for refiner in [false, true] {
                 let classes = if refiner { 1 } else { 4 };
                 let dims = StackDims {
@@ -545,17 +601,17 @@ mod tests {
                     let actual = read(&mut stream, &x, rows * HID * 4);
                     assert!(
                         actual == expected,
-                        "{preset:?} refiner={refiner} replay={iteration}"
+                        "{preset} refiner={refiner} replay={iteration}"
                     );
                     assert!(actual
                         .as_chunks::<4>()
                         .0
                         .iter()
                         .all(|v| f32::from_le_bytes(*v).is_finite()));
-                    if iteration == 0 {
+                    if iteration == 0 && preset != "MixedPartialOrbit" {
                         if let Some(dir) = std::env::var_os("H3_ADAPTER_BLOCK_FIXTURE") {
                             let dir = std::path::PathBuf::from(dir).join(format!(
-                                "{preset:?}-{}",
+                                "{preset}-{}",
                                 if refiner { "refiner" } else { "dit" }
                             ));
                             std::fs::create_dir_all(&dir).unwrap();
@@ -587,7 +643,7 @@ mod tests {
                                 read(&mut stream, &gate, classes * HID * 4),
                             )
                             .unwrap();
-                            std::fs::write(dir.join("fixture.json"), format!("{{\"rows\":{rows},\"classes\":{classes},\"refiner\":{refiner},\"preset\":\"{preset:?}\",\"rope\":\"identity\",\"layer\":0}}\n")).unwrap();
+                            std::fs::write(dir.join("fixture.json"), format!("{{\"rows\":{rows},\"classes\":{classes},\"refiner\":{refiner},\"preset\":\"{preset}\",\"rope\":\"identity\",\"layer\":0}}\n")).unwrap();
                         }
                     }
                 }
@@ -596,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires idle gfx1151, base checkpoint and both cached Turbo adapters"]
+    #[ignore = "requires idle gfx1151, base checkpoint and cached Turbo and Orbit adapters"]
     fn real_low_rank_branches_match_independent_cpu_products() {
         let c = Compiler::new(None, std::path::PathBuf::new());
         let mut stream = hrx::Stream::open().unwrap();
@@ -610,12 +666,7 @@ mod tests {
         let rows = 3;
         let mut cls = crate::dispatch::Classes::zeroed(&mut stream, rows).unwrap();
         cls.write(&mut stream, &vec![0; rows], 1).unwrap();
-        for preset in [
-            crate::adapter::TurboPreset::Four,
-            crate::adapter::TurboPreset::Eight,
-        ] {
-            let path = preset.resolve(true).unwrap();
-            let checkpoint = unsafe { crate::adapter::Adapter::open(&path) }.unwrap();
+        for (preset, checkpoint) in adapter_cases() {
             for refiner in [false, true] {
                 let dims = StackDims {
                     hidden: HID,
@@ -664,6 +715,9 @@ mod tests {
                     (2, HID, "mlp.fc1"),
                     (3, FFN, "mlp.fc2"),
                 ] {
+                    if !adapter.has(op, 0) {
+                        continue;
+                    }
                     let p = &adapter.projections[op];
                     let original_values: Vec<f32> = (0..rows * input_width)
                         .map(|i| ((i * 17 % 127) as f32 - 63.0) / 64.0)
@@ -747,44 +801,43 @@ mod tests {
                         "blocks"
                     };
                     let prefix = format!("diffusion_model.{group}.0.{op_name}");
-                    let spec = checkpoint
+                    let specs: Vec<_> = checkpoint
                         .projections
                         .iter()
-                        .find(|s| s.prefix == prefix)
-                        .unwrap();
-                    let a_entry = checkpoint
-                        .checkpoint()
-                        .at(&format!("{prefix}.lora_A.weight"))
-                        .unwrap();
-                    let b_entry = checkpoint
-                        .checkpoint()
-                        .at(&format!("{prefix}.lora_B.weight"))
-                        .unwrap();
-                    let a = checkpoint.checkpoint().bytes(a_entry);
-                    let b = checkpoint.checkpoint().bytes(b_entry);
-                    let rank_width = spec.rank.div_ceil(256) * 256;
+                        .filter(|s| s.prefix == prefix)
+                        .collect();
+                    let rank: usize = specs.iter().map(|s| s.rank).sum();
+                    let rank_width = rank.div_ceil(256) * 256;
                     let rp = gemm_pitch(rank_width, 16);
                     let ranks = read(&mut stream, &adapter.rank_operand, rows * rp * 2);
-                    let mut expected_rank = vec![0.0; rows * spec.rank];
+                    let mut expected_rank = vec![0.0; rows * rank];
                     let mut actual_rank = expected_rank.clone();
-                    for row in 0..rows {
-                        for r in 0..spec.rank {
-                            let mut sum = 0.0f32;
-                            for k in 0..input_width {
-                                sum +=
-                                    bfloat(&input, row * ip + k) * bfloat(a, r * input_width + k);
+                    let mut offset = 0;
+                    for spec in &specs {
+                        let file = checkpoint.source(spec);
+                        let entry = file.at(&format!("{prefix}.lora_A.weight")).unwrap();
+                        let a = file.bytes(entry);
+                        for row in 0..rows {
+                            for r in 0..spec.rank {
+                                let mut sum = 0.0f32;
+                                for k in 0..input_width {
+                                    sum += bfloat(&input, row * ip + k)
+                                        * bfloat(a, r * input_width + k);
+                                }
+                                expected_rank[row * rank + offset + r] = bf16::from_f32(
+                                    f16::from_f32(sum.clamp(-65472.0, 65472.0)).to_f32(),
+                                )
+                                .to_f32();
+                                actual_rank[row * rank + offset + r] =
+                                    bfloat(&ranks, row * rp + offset + r);
                             }
-                            expected_rank[row * spec.rank + r] = bf16::from_f32(
-                                f16::from_f32(sum.clamp(-65472.0, 65472.0)).to_f32(),
-                            )
-                            .to_f32();
-                            actual_rank[row * spec.rank + r] = bfloat(&ranks, row * rp + r);
                         }
+                        offset += spec.rank;
                     }
                     close(
                         &actual_rank,
                         &expected_rank,
-                        &format!("{preset:?} {prefix} A"),
+                        &format!("{preset} {prefix} A"),
                     );
                     let delta = read(&mut stream, &adapter.delta, rows * p.output * 2);
                     let mut expected = vec![0.0; rows * p.output];
@@ -792,7 +845,7 @@ mod tests {
                     for row in 0..rows {
                         for column in 0..p.output {
                             // Original B keeps whole gate/up halves, unlike the GPU's packed rows.
-                            let original_column = if spec.gate_up {
+                            let original_column = if specs[0].gate_up {
                                 (column / 32) * 16
                                     + column % 16
                                     + if column % 32 >= 16 { p.output / 2 } else { 0 }
@@ -800,12 +853,19 @@ mod tests {
                                 column
                             };
                             let mut sum = 0.0f32;
-                            for r in 0..spec.rank {
-                                sum += bfloat(&ranks, row * rp + r)
-                                    * bf16::from_f32(
-                                        bfloat(b, original_column * spec.rank + r) * spec.scale,
-                                    )
-                                    .to_f32();
+                            let mut offset = 0;
+                            for spec in &specs {
+                                let file = checkpoint.source(spec);
+                                let entry = file.at(&format!("{prefix}.lora_B.weight")).unwrap();
+                                let b = file.bytes(entry);
+                                for r in 0..spec.rank {
+                                    sum += bfloat(&ranks, row * rp + offset + r)
+                                        * bf16::from_f32(
+                                            bfloat(b, original_column * spec.rank + r) * spec.scale,
+                                        )
+                                        .to_f32();
+                                }
+                                offset += spec.rank;
                             }
                             expected[row * p.output + column] =
                                 f16::from_f32(sum.clamp(-65472.0, 65472.0)).to_f32();
@@ -818,7 +878,7 @@ mod tests {
                             .to_f32();
                         }
                     }
-                    close(&actual, &expected, &format!("{preset:?} {prefix} B"));
+                    close(&actual, &expected, &format!("{preset} {prefix} B"));
                 }
                 stream.synchronize().unwrap();
             }

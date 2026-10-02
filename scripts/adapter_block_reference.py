@@ -1,4 +1,4 @@
-"""Independent CPU block oracle for native Turbo fixtures.
+"""Independent CPU block oracle for native Turbo and Orbit LoRA fixtures.
 
 First run the ignored real_adapted_stacks_match_eager_and_recorded_execution
 Rust test with H3_ADAPTER_BLOCK_FIXTURE=DIR, then this script with DIR. Uses the
@@ -18,6 +18,7 @@ from huggingface_hub import hf_hub_download
 torch.set_num_threads(4)
 HID, INNER, FFN = 5376, 7168, 14336
 PINS = {
+    'Orbit': ('pablodawson/MiniMax-H3-360-Orbit-LoRA', '5ddbc2dbbe95edbbdaf5017c3e934b1d01791697', 'minimax_h3_flf2v_lora_v1.safetensors'),
     'Four': ('Comfy-Org/MiniMax-H3', 'a98869194787969724c7425d95d0ed73ce9202af', 'loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors'),
     'Eight': ('lightx2v/Minimax-h3-Turbo', '3ec17a324ced54151364f24f8b5fb6bf7e26414f', 'minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors'),
 }
@@ -77,7 +78,7 @@ def evaluate(directory, native_attention=False):
             key = 'diffusion_model.' + prefix + name
             a = adapter.get_tensor(key + '.lora_A.weight').float()
             b = adapter.get_tensor(key + '.lora_B.weight').float()
-            scale = adapter.get_tensor(key + '.alpha').item() / a.shape[0]
+            scale = adapter.get_tensor(key + '.alpha').item() / a.shape[0] if key + '.alpha' in adapter.keys() else 1.0
             ranks = half(x.to(torch.bfloat16).float() @ a.T).to(torch.bfloat16).float()
             delta = half(ranks @ (b * scale).to(torch.bfloat16).float().T)
             w = tensor(name + '.weight')
@@ -127,8 +128,8 @@ def main():
     parser.add_argument('directory', type=Path)
     args = parser.parse_args()
     fixtures = sorted(args.directory.glob('*/fixture.json'))
-    if len(fixtures) != 4:
-        parser.error('expected all four DiT/refiner and four/eight-evaluation fixture combinations')
+    if {json.loads(p.read_text())['preset'] + str(json.loads(p.read_text())['refiner']) for p in fixtures} != {name + str(refiner) for name in PINS for refiner in (False, True)}:
+        parser.error('expected both DiT/refiner fixtures for Turbo Four, Eight, and Orbit')
     with torch.inference_mode():
         results = [evaluate(path.parent, native_attention) for path in fixtures for native_attention in (False, True)]
     print(json.dumps(results, indent=2))

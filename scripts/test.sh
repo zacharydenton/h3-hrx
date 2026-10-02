@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # CPU checks by default. --gpu adds the kernel regressions, which need gfx1151 and a provisioned
 # HRX but no checkpoints. --full adds the whole-pipeline digests, which need the checkpoints and
-# take several minutes. --adapters checks the optional cached Turbo adapters.
+# take several minutes. --adapters checks the cached Turbo adapters and Orbit LoRA.
 # H3_GRAPH=1 selects recorded graphs for the normal pipeline tests.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."

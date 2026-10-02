@@ -7,14 +7,14 @@ Choose checks for the hardware and cached checkpoints available:
 | `scripts/test.sh --cpu` | nothing | formatting, Clippy, the unit tests |
 | `scripts/test.sh --gpu` | gfx1151 and a provisioned HRX | the above, plus `tests/kernels.rs` and the resident Euler and conditioning tests |
 | `scripts/test.sh --full` | the base checkpoints as well | the above, plus session lifecycle/cache tests and `tests/differentials.rs` |
-| `scripts/test.sh --adapters` | the DiT and both pinned Turbo adapters | the GPU tier plus real low-rank projection and adapted eager/graph block tests |
+| `scripts/test.sh --adapters` | the DiT, both pinned Turbo adapters, and the [Orbit LoRA](loras.md) | the GPU tier plus real low-rank projection, partial/mixed adapter, and adapted eager/graph block tests |
 
 The native tests compile through `hrx::loom::Compiler`, upload owned buffers,
 dispatch through `hrx::Stream`, and read results back through HRX staging. They
 are ignored by default; explicitly running them requires working hardware and
 the provisioned native bundle. No Python or Torch dependency is involved.
 
-For the optional independent Turbo block reference, export fixtures with
+For the optional independent Turbo and Orbit block reference, export six fixtures with
 `H3_ADAPTER_BLOCK_FIXTURE=build/adapter-blocks scripts/test.sh --adapters`, then
 run `scripts/adapter_block_reference.py build/adapter-blocks` using the native
 Comfy checkout's Python environment. That diagnostic uses Torch on the CPU and

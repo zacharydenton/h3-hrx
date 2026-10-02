@@ -213,7 +213,7 @@ fn create(args: Create) -> Result<()> {
     Ok(())
 }
 
-fn indexed<T: std::str::FromStr>(
+pub(super) fn indexed<T: std::str::FromStr>(
     values: &[String],
     len: usize,
     name: &str,

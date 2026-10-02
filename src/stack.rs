@@ -784,6 +784,18 @@ impl Stack {
         adapter: &crate::adapter::Adapter,
         refiner: bool,
     ) -> Result<()> {
+        let group = if refiner {
+            "diffusion_model.token_refiner.blocks."
+        } else {
+            "diffusion_model.blocks."
+        };
+        if !adapter
+            .projections
+            .iter()
+            .any(|p| p.prefix.starts_with(group))
+        {
+            return Ok(());
+        }
         self.adapter = Some(adapter::AdapterRuntime::build(
             c, stream, self, adapter, refiner,
         )?);
@@ -1021,7 +1033,7 @@ impl Stack {
             } else {
                 let b = &self.blocks[i];
                 let scales = b.qkv_s.as_ref().map(|s| (s.binding(), self.a_s.binding()));
-                if let Some(adapter) = &self.adapter {
+                if let Some(adapter) = self.adapter.as_ref().filter(|a| a.has(0, i)) {
                     adapter.emit(
                         sink,
                         prof,
@@ -1100,7 +1112,7 @@ impl Stack {
             {
                 let b = &self.blocks[i];
                 let scales = b.out_s.as_ref().map(|s| (s.binding(), self.a_s.binding()));
-                if let Some(adapter) = &self.adapter {
+                if let Some(adapter) = self.adapter.as_ref().filter(|a| a.has(1, i)) {
                     adapter.emit(
                         sink,
                         prof,
@@ -1144,7 +1156,7 @@ impl Stack {
             {
                 let b = &self.blocks[i];
                 let scales = b.gu_s.as_ref().map(|s| (s.binding(), self.a_s.binding()));
-                if let Some(adapter) = &self.adapter {
+                if let Some(adapter) = self.adapter.as_ref().filter(|a| a.has(2, i)) {
                     adapter.emit(
                         sink,
                         prof,
@@ -1195,7 +1207,7 @@ impl Stack {
             {
                 let b = &self.blocks[i];
                 let scales = b.down_s.as_ref().map(|s| (s.binding(), self.a_s.binding()));
-                if let Some(adapter) = &self.adapter {
+                if let Some(adapter) = self.adapter.as_ref().filter(|a| a.has(3, i)) {
                     adapter.emit(
                         sink,
                         prof,

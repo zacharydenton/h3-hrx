@@ -44,6 +44,8 @@ pub struct Config {
     pub te: Option<std::path::PathBuf>,
     pub video_vae: Option<std::path::PathBuf>,
     pub audio_vae: Option<std::path::PathBuf>,
+    /// Weighted H3 LoRAs. Their files share the checkpoint immutability contract.
+    pub loras: Vec<crate::adapter::Lora>,
     /// Empty selects the sources embedded in this model package.
     pub kernel_sources: std::path::PathBuf,
     pub loom_library: Option<std::path::PathBuf>,
@@ -60,6 +62,7 @@ impl Default for Config {
             te: None,
             video_vae: None,
             audio_vae: None,
+            loras: Vec::new(),
             kernel_sources: std::path::PathBuf::new(),
             loom_library: None,
             attention: crate::dit::Attention::default(),
@@ -152,6 +155,12 @@ impl Session {
         options: SessionOptions,
         context: &hrx::inference::ModelContext,
     ) -> Result<Self> {
+        if config.loras.iter().any(|l| !l.strength.is_finite()) {
+            return invalid("LoRA strength must be finite");
+        }
+        if options.turbo.is_some() && config.loras.iter().any(|l| l.strength != 0.0) {
+            return invalid("custom LoRAs cannot be combined with Turbo presets");
+        }
         // SAFETY: checkpoint immutability is forwarded from the caller.
         let state = unsafe { State::new_in(config, options, context) }?;
         let attention = state.config.attention;
@@ -372,7 +381,13 @@ impl State {
                 // Safety: session constructor also requires adapter cache files to remain immutable.
                 Some(unsafe { crate::adapter::Adapter::open(&adapter_path) }?)
             } else {
-                None
+                // Safety: custom adapters share the session's immutable-file contract.
+                for lora in &self.config.loras {
+                    if lora.strength != 0.0 {
+                        crate::trace::checkpoint("lora", &lora.path);
+                    }
+                }
+                unsafe { crate::adapter::Adapter::open_loras(&self.config.loras) }?
             };
             let mut dit = unsafe { Dit::open(&mut self.stream, &path) }?;
             if let Some(adapter) = adapter {
@@ -1008,6 +1023,7 @@ mod tests {
 
     fn config(attention: crate::dit::Attention) -> Config {
         Config {
+            loras: Vec::new(),
             dit: None,
             te: None,
             video_vae: None,

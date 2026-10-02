@@ -112,6 +112,18 @@ struct Cli {
     #[arg(long, value_name = "IMG")]
     first_frame: Option<PathBuf>,
 
+    /// Last keyframe (use the first image again to request a loop)
+    #[arg(long, value_name = "IMG", requires = "first_frame")]
+    last_frame: Option<PathBuf>,
+
+    /// H3 LoRA checkpoint; repeat to combine adapters
+    #[arg(long = "lora", value_name = "FILE")]
+    loras: Vec<PathBuf>,
+
+    /// Signed strength for a one-based LoRA slot: INDEX=VALUE (default 1)
+    #[arg(long, value_name = "INDEX=VALUE")]
+    lora_strength: Vec<String>,
+
     /// Output clip; `<out>.wav` is kept next to it
     #[arg(long, default_value = "h3_out.mp4", value_name = "CLIP")]
     out: PathBuf,
@@ -379,6 +391,7 @@ fn parameters(cli: &Cli) -> Result<DenoiseParams> {
         if cli.sampler.is_some_and(|s| s != Sampler::Euler)
             || cli.dit.is_some()
             || !cli.files.is_empty()
+            || cli.last_frame.is_some()
             || cli.audio_only
             || cli.attn != Attn::I8
             || cache != h3_hrx::CachePolicy::Off
@@ -390,11 +403,38 @@ fn parameters(cli: &Cli) -> Result<DenoiseParams> {
     Ok(params)
 }
 
+fn lora_options(cli: &Cli) -> Result<Vec<h3_hrx::adapter::Lora>> {
+    let mut loras = cli
+        .loras
+        .iter()
+        .map(|p| h3_hrx::adapter::Lora::new(p, 1.0))
+        .collect::<Vec<_>>();
+    for (i, strength) in refmods::indexed::<f32>(&cli.lora_strength, loras.len(), "lora-strength")?
+    {
+        if !strength.is_finite() {
+            usage!("LoRA strength must be finite");
+        }
+        loras[i].strength = strength;
+    }
+    Ok(loras)
+}
+
 fn run(cli: Cli) -> Result<()> {
     if let Some(Command::Refmod { command }) = cli.command {
         return refmods::run(command);
     }
     let params = parameters(&cli)?;
+    let loras = lora_options(&cli)?;
+    if cli.preset.turbo().is_some() && loras.iter().any(|l| l.strength != 0.0) {
+        usage!("custom LoRAs cannot be combined with Turbo presets");
+    }
+    // Safety: as with model checkpoints, this CLI never changes adapter files.
+    if let Some(adapter) = unsafe { h3_hrx::adapter::Adapter::open_loras(&loras) }? {
+        eprintln!(
+            "LoRAs: {} active projection branches",
+            adapter.projections.len()
+        );
+    }
     let prepared_refmods = refmods::prepare(&cli)?;
     let active_refmods = prepared_refmods.iter().any(|r| r.token_count() > 0);
     if active_refmods && cli.preset.turbo().is_some() {
@@ -505,18 +545,24 @@ fn run(cli: Cli) -> Result<()> {
 
     // inputs first: they are cheap and they fail fast. The keyframe fills the canvas; references are
     // scaled to at most the canvas' pixel count on a 32-pixel grid.
-    let keyframe = match &cli.first_frame {
-        Some(ff) => {
-            let (rgb, w, h) = media::decode_image(ff)
-                .with_context(|| format!("cannot decode {}", ff.display()))?;
-            Some(Image {
-                pixels: resize::pil_bilinear(&rgb, w, h, params.width, params.height),
-                w: params.width,
-                h: params.height,
-            })
+    if cli.last_frame.is_some() && shape.frames <= 1 {
+        usage!("--last-frame requires more than one output frame");
+    }
+    let mut keyframe_images = Vec::new();
+    for (index, path) in [(0, &cli.first_frame), (shape.frames - 1, &cli.last_frame)] {
+        if let Some(path) = path {
+            let (rgb, w, h) = media::decode_image(path)
+                .with_context(|| format!("cannot decode {}", path.display()))?;
+            keyframe_images.push((
+                index,
+                Image {
+                    pixels: resize::pil_bilinear(&rgb, w, h, params.width, params.height),
+                    w: params.width,
+                    h: params.height,
+                },
+            ));
         }
-        None => None,
-    };
+    }
     let mut ref_images = Vec::new();
     for path in &image_files {
         let (rgb, w, h) = media::decode_image(path)
@@ -540,7 +586,7 @@ fn run(cli: Cli) -> Result<()> {
     // "<Audio j>: ", then the prompt
     let tok = Tokenizer::new()?; // the vocabulary compiled into the crate (H3_TOKENIZER overrides it)
     let mut presentation = Presentation::new(&tok);
-    if let Some(k) = &keyframe {
+    for (_, k) in &keyframe_images {
         presentation.picture(k.w, k.h)?;
     }
     for im in &ref_images {
@@ -556,7 +602,7 @@ fn run(cli: Cli) -> Result<()> {
     eprintln!(
         "{} frames at {}x{}: {}x{}x{} latents, {} audio latents; {} prompt tokens ({} keyframe, {} reference images, {} reference audio){}",
         shape.frames, params.width, params.height, shape.latent_t, shape.lat_h, shape.lat_w, shape.audio_t,
-        ids.len(), keyframe.is_some() as i32, ref_images.len(), ref_audio.len(),
+        ids.len(), keyframe_images.len(), ref_images.len(), ref_audio.len(),
         if ref2va { ", ref2va weights" } else { "" }
     );
 
@@ -577,6 +623,7 @@ fn run(cli: Cli) -> Result<()> {
         te: Some(te),
         video_vae,
         audio_vae,
+        loras,
         kernel_sources: sources,
         loom_library,
         attention: match cli.attn {
@@ -631,8 +678,9 @@ fn run(cli: Cli) -> Result<()> {
 
     // encoders: latents for the keyframe and the references, encoded before the run so a bad input
     // fails early. Each reference borrows its own latents, which live until the denoise returns.
-    let keyframe_latents = match &keyframe {
-        Some(k) => Some(
+    let mut keyframe_latents = Vec::new();
+    for (_, k) in &keyframe_images {
+        keyframe_latents.push(
             session
                 .encode_video(Clip {
                     pixels: &k.pixels,
@@ -642,9 +690,8 @@ fn run(cli: Cli) -> Result<()> {
                 })
                 .context("encode keyframe")?
                 .0,
-        ),
-        None => None,
-    };
+        );
+    }
     let mut image_latents = Vec::with_capacity(ref_images.len());
     for im in &ref_images {
         image_latents.push(
@@ -668,11 +715,11 @@ fn run(cli: Cli) -> Result<()> {
         );
     }
 
-    let keyframes: Vec<Keyframe<'_>> = keyframe
+    let keyframes: Vec<Keyframe<'_>> = keyframe_images
         .iter()
         .zip(keyframe_latents.iter())
-        .map(|(k, z)| Keyframe {
-            frame_index: 0,
+        .map(|((index, k), z)| Keyframe {
+            frame_index: *index,
             latents: z,
             presented: Some(Presented {
                 pixels: &k.pixels,
@@ -820,6 +867,43 @@ fn run(cli: Cli) -> Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn lora_strengths_and_last_keyframe_are_explicit() {
+        let cli = Cli::try_parse_from([
+            "h3",
+            "--first-frame",
+            "input.png",
+            "--last-frame",
+            "input.png",
+            "--lora",
+            "a.safetensors",
+            "--lora",
+            "b.safetensors",
+            "--lora-strength",
+            "2=-0.5",
+        ])
+        .unwrap();
+        let loras = lora_options(&cli).unwrap();
+        assert_eq!(loras[0].strength, 1.0);
+        assert_eq!(loras[1].strength, -0.5);
+        assert!(Cli::try_parse_from(["h3", "--last-frame", "input.png"]).is_err());
+        let cli = Cli::try_parse_from(["h3", "--lora", "a", "--lora-strength", "2=1"]).unwrap();
+        assert!(lora_options(&cli).is_err());
+        let cli = Cli::try_parse_from(["h3", "--lora", "a", "--lora-strength", "1=NaN"]).unwrap();
+        assert!(lora_options(&cli).is_err());
+        let cli = Cli::try_parse_from([
+            "h3",
+            "--preset",
+            "turbo-768p-4",
+            "--first-frame",
+            "a",
+            "--last-frame",
+            "a",
+        ])
+        .unwrap();
+        assert!(parameters(&cli).is_err());
+    }
 
     #[test]
     fn the_command_is_well_formed() {
