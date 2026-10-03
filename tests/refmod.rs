@@ -417,6 +417,10 @@ fn loaded_bundle_denoises_identically_to_direct_references() {
         ..Config::default()
     };
     let context = hrx::inference::ModelContext::new(Default::default()).unwrap();
+    let automatic_config = Config {
+        dit: None,
+        ..config.clone()
+    };
     // Safety: tests never mutate checkpoints.
     let mut session = unsafe {
         Session::new_in(
@@ -457,6 +461,38 @@ fn loaded_bundle_denoises_identically_to_direct_references() {
         .unwrap();
     assert_eq!(a.video, b.video);
     assert_eq!(a.audio, b.audio);
+    // The library default must choose the same Ref2VA checkpoint as the CLI.
+    // Consumers such as the Rustler app construct Config::default() once and
+    // supply RefMods only later, when they call denoise.
+    let mut automatic = unsafe {
+        Session::new_in(
+            automatic_config,
+            SessionOptions {
+                residency: ResidencyPolicy::StageScoped,
+                ..Default::default()
+            },
+            &context,
+        )
+    }
+    .unwrap();
+    let actual = automatic
+        .denoise(
+            &ids,
+            &params,
+            Noise::default(),
+            &prepared.references(),
+            &[],
+            None,
+        )
+        .unwrap();
+    assert!(
+        a.video == actual.video,
+        "automatic session used the wrong video model"
+    );
+    assert!(
+        a.audio == actual.audio,
+        "automatic session used the wrong audio model"
+    );
 }
 
 #[test]

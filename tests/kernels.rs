@@ -1164,6 +1164,108 @@ fn int8_qk_attention_matches_the_attention_its_operands_define() {
     }
 }
 
+/// RefMods can push the packed sequence into the head-major kernel at 4096
+/// tokens. Check long key loops, partial final tiles and both query-wave halves
+/// against scalar attention; the short cases above cover at most three key tiles.
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn head_major_int8_attention_handles_long_reference_sequences() {
+    use rand::{Rng, SeedableRng};
+    let mut h = Harness::new();
+    let (heads, d) = (3usize, 128usize);
+    let stride = heads * d;
+    for tokens in [4096usize, 4097, 8193] {
+        let capacity = (tokens + 16).div_ceil(256) * 256;
+        let mut rng = rand_chacha::ChaCha12Rng::seed_from_u64(tokens as u64);
+        let mut normal = || rng.sample::<f32, _>(rand_distr::StandardNormal);
+        let mut q = vec![0i8; heads * capacity * d];
+        let mut k = q.clone();
+        let mut qs = vec![0f32; heads * capacity];
+        let mut ks = qs.clone();
+        let mut vt = vec![f16::ZERO; stride * capacity];
+        for head in 0..heads {
+            for t in 0..tokens {
+                qs[head * capacity + t] = (1 + t % 7) as f32 / 512.;
+                ks[head * capacity + t] = (1 + t % 3) as f32 / 128.;
+                for c in 0..d {
+                    let i = (head * capacity + t) * d + c;
+                    q[i] = (normal() * 24.).round().clamp(-127., 127.) as i8;
+                    k[i] = (normal() * 24.).round().clamp(-127., 127.) as i8;
+                    vt[(head * d + c) * capacity + t] = f16::from_f32(normal() * 0.3);
+                }
+            }
+        }
+        // A strong match in the final key tile exercises rescaling earlier
+        // accumulators when the softmax maximum rises late.
+        for head in 0..heads {
+            let src = (head * capacity + 31) * d;
+            let dst = (head * capacity + tokens - 1) * d;
+            k[dst..dst + d].copy_from_slice(&q[src..src + d]);
+        }
+        let mut config = cfg(&[
+            ("q_stride", stride),
+            ("kv_stride", stride),
+            ("tokens", tokens),
+            ("token_capacity", capacity),
+            ("out_stride", stride),
+        ]);
+        config.push(("scale", "1.0".into()));
+        let mut previous = None;
+        for _ in 0..3 {
+            let out = h.run(
+                "attention_i8qkhm_mha8_k64_lds_f16_wmma",
+                &config,
+                [tokens.div_ceil(128) as u32, heads as u32, 1],
+                256,
+                &[tokens as u64, heads as u64],
+                &[
+                    bytes(&q),
+                    bytes(&qs),
+                    bytes(&k),
+                    bytes(&ks),
+                    bytes(&vt),
+                    vec![0xff; tokens * stride * 2],
+                ],
+            );
+            let got = halves(&out[5], false);
+            assert!(got.iter().all(|x| x.is_finite()), "tokens={tokens}");
+            if let Some(previous) = &previous {
+                assert!(previous == &out[5], "unstable attention at {tokens} tokens");
+            } else {
+                for row in [0, 15, 16, 31, 63, 64, 127, 128, 4095, tokens - 1] {
+                    for head in 0..heads {
+                        let score = |key| {
+                            let a = (head * capacity + row) * d;
+                            let b = (head * capacity + key) * d;
+                            let dot: i32 = (0..d)
+                                .map(|c| i32::from(q[a + c]) * i32::from(k[b + c]))
+                                .sum();
+                            f64::from(dot)
+                                * f64::from(qs[head * capacity + row])
+                                * f64::from(ks[head * capacity + key])
+                        };
+                        let top = (0..tokens).map(score).fold(f64::NEG_INFINITY, f64::max);
+                        let weights: Vec<_> = (0..tokens).map(|j| (score(j) - top).exp()).collect();
+                        let total: f64 = weights.iter().sum();
+                        let mut want = vec![0.; d];
+                        for (c, value) in want.iter_mut().enumerate() {
+                            *value = weights
+                                .iter()
+                                .enumerate()
+                                .map(|(j, w)| w * vt[(head * d + c) * capacity + j].to_f64())
+                                .sum::<f64>()
+                                / total;
+                        }
+                        let start = row * stride + head * d;
+                        close(&got[start..start + d], &want, 1e-3, 2e-3);
+                    }
+                }
+            }
+            previous = Some(out[5].clone());
+        }
+    }
+}
+
 /// The f16 and bf16 GEMM families: the video VAE decoder's operands and the refiner's, which the
 /// int4/int8 test above does not reach. Same three modes and the same epilogues, but the operands
 /// arrive as stored floats with no per-row scale, so the reference rounds through the stored width

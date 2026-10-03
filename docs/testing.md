@@ -59,6 +59,22 @@ The additional diffusers check could not run: the cached original VAE index is
 present but its weight shards are missing. Current ComfyUI supplies the independent
 oracle for this update; diffusers 0.40.0 still uses the old raw-neighbour compositor.
 
+The 2026-10-03 RefMod follow-up found a separate library checkpoint-selection
+bug: `Config::dit = None` always loaded FL2VA, while the CLI selected Ref2VA for
+reference requests. The GPU RefMod equivalence test now compares automatic
+selection with explicit Ref2VA, in addition to loaded versus direct references.
+It failed against the previous library implementation and now passes byte for
+byte for video and audio. A session lifecycle test
+checks switching in both directions under retaining, stage-scoped and budgeted
+residency, and verifies that an explicit checkpoint still wins.
+
+Additional same-latent ComfyUI comparisons covered 39 frames at 320×320 and
+56/73 frames at 64×96. RGB8 RMSE stayed below 0.19 with maximum error 3, without
+large error spikes at the 17-frame chunk boundaries. Stereo audio decodes at
+65/255/256/257 latent frames differed by less than 9e-7 per sample. These checks
+bound decoder differences; they do not establish that a particular reported
+flashing artifact has been reproduced.
+
 A failed assertion reports the actual and expected digests. Before updating an expected digest
 for an intentional numerical change, validate the new output independently with
 `scripts/parity.py` against diffusers, then edit the constant explicitly.
@@ -71,6 +87,9 @@ The GPU suite compares independent scalar CPU references against:
   the text encoder's causal `gqa8c` — against scaled dot-product attention in f64.
 - `prepare_qk_i8`: the Hadamard rotation, int8 quantisation, packing and scales that the int8
   attention consumes, and `attention_i8qk_mha` against the attention those operands define.
+- The head-major INT8 attention path at 4096, 4097 and 8193 tokens: sampled
+  outputs against scalar CPU attention, partial final tiles, finite outputs
+  throughout and identical results across three launches.
 - Scalar and four-output audio convolutions at eleven boundary lengths, with
   padding, dilation, residual accumulation and untouched output guards.
 - Float32 matrix multiplication past the former 32,768-row limit.
@@ -139,8 +158,8 @@ Run `python3 scripts/parity.py gate --require` before a release. This suite
 establishes the numerical cases above; that script establishes full-model parity.
 
 Still uncovered here, in rough order of how much they matter: the large-token int4 and
-head-major attention variants (`attention_i4qkl*`, `attention_i4qksl*`, `attention_i8qkhm_mha8_k64`,
-`attention_mha64hm32`) with their `prepare_qk_i4` and `prepare_qk_i8hm` operands;
+FP16 head-major attention variants (`attention_i4qkl*`, `attention_i4qksl*`,
+`attention_mha64hm32`), and an independent CPU oracle for `prepare_qk_i8hm`;
 the wide and fast decoder GEMMs; the fused decoder QKV GEMM; `norm_mod_f32`; and
 the smaller shape kernels (`layernorm_f32`, `layernorm_f16_f32`, `transpose_f16`,
 `transpose_f32`, `gn_stats_f16`, `prepare_plain16_i8`, `conv1d_s_f32`,

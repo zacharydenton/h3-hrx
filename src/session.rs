@@ -39,7 +39,9 @@ pub struct SessionOptions {
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Explicit checkpoint paths override automatic resolution through the Hugging Face cache.
-    /// `None` resolves the corresponding checkpoint on first use.
+    /// `None` selects Ref2VA for denoising with references and FL2VA otherwise
+    /// (including keyframes and standalone text refinement). Reused sessions
+    /// switch checkpoints when the request changes; an explicit path always wins.
     pub dit: Option<std::path::PathBuf>,
     pub te: Option<std::path::PathBuf>,
     pub video_vae: Option<std::path::PathBuf>,
@@ -100,11 +102,18 @@ struct State {
     config: Config,
     options: SessionOptions,
     prof: Profile,
-    dit: Option<Dit>,
+    dit: Option<LoadedDit>,
     te: Option<TextEncoder>,
     vvae: Option<VideoVae>,
     avae: Option<AudioVae>,
     units: Option<residency::Units>,
+}
+
+/// Keep checkpoint identity with the model when a budgeted unit is checked in
+/// or evicted. A session may alternate between reference and keyframe requests.
+struct LoadedDit {
+    path: std::path::PathBuf,
+    model: Dit,
 }
 
 impl Session {
@@ -367,12 +376,23 @@ impl State {
         (!report.is_empty()).then_some(report)
     }
 
-    fn dit(&mut self) -> Result<&mut Dit> {
+    fn dit(&mut self, references: bool) -> Result<&mut Dit> {
+        let relative = if references {
+            crate::models::DIT_REF2VA
+        } else {
+            crate::models::DIT_FL2VA
+        };
+        let path = checkpoint_path(&self.config.dit, relative)?;
         if let Some(units) = &mut self.units {
             units.dit.checkout(&mut self.dit)?;
         }
+        if self.dit.as_ref().is_some_and(|dit| dit.path != path) {
+            // The previous model's recorded graphs own its buffers. Fence before
+            // replacing it, even when residency otherwise retains model owners.
+            self.stream.synchronize()?;
+            self.dit = None;
+        }
         if self.dit.is_none() {
-            let path = checkpoint_path(&self.config.dit, crate::models::DIT_FL2VA)?;
             crate::trace::checkpoint("dit", &path);
             // Safety: the caller's, taken at Session::new.
             let adapter = if let Some(preset) = self.options.turbo {
@@ -393,9 +413,9 @@ impl State {
             if let Some(adapter) = adapter {
                 dit.set_adapter(adapter);
             }
-            self.dit = Some(dit);
+            self.dit = Some(LoadedDit { path, model: dit });
         }
-        Ok(self.dit.as_mut().expect("opened above"))
+        Ok(&mut self.dit.as_mut().expect("opened above").model)
     }
 
     fn te(&mut self) -> Result<&mut TextEncoder> {
@@ -440,6 +460,7 @@ impl State {
     /// Both checkpoints the prompt path needs, borrowed at once.
     fn prompt_pair(
         &mut self,
+        references: bool,
     ) -> Result<(
         &mut hrx::Stream,
         &Compiler,
@@ -447,7 +468,7 @@ impl State {
         &mut Dit,
         &mut TextEncoder,
     )> {
-        self.dit()?;
+        self.dit(references)?;
         self.te()?;
         let Self {
             stream,
@@ -461,7 +482,7 @@ impl State {
             stream,
             compiler,
             prof,
-            dit.as_mut().expect("opened"),
+            &mut dit.as_mut().expect("opened").model,
             te.as_mut().expect("opened"),
         ))
     }
@@ -486,7 +507,7 @@ impl State {
         }
         self.release_completed(false, false, true)?;
         let result = (|| {
-            let (stream, c, prof, dit, te) = self.prompt_pair()?;
+            let (stream, c, prof, dit, te) = self.prompt_pair(false)?;
             dit.text_in(stream, c, prof, te, ids, &[])?;
             dit.read_rows(stream, ids.len(), out)
         })();
@@ -516,7 +537,7 @@ impl State {
         self.release_completed(false, false, true)?;
         crate::trace::event("conditioning_start", String::new);
         let result = (|| {
-            let (stream, c, prof, dit, te) = self.prompt_pair()?;
+            let (stream, c, prof, dit, te) = self.prompt_pair(!refs.is_empty())?;
             let prepared = dit.prepare_denoise(stream, c, prof, te, ids, p, refs, kfs)?;
             crate::trace::event("conditioning_ready", String::new);
             self.release_completed(true, false, false)?;
@@ -526,6 +547,7 @@ impl State {
             self.dit
                 .as_mut()
                 .expect("conditioning prepared")
+                .model
                 .sample_prepared(
                     &mut self.stream,
                     &self.compiler,
@@ -762,6 +784,62 @@ mod tests {
     #[test]
     fn existing_sessions_retain_models_by_default() {
         assert_eq!(SessionOptions::default().residency, ResidencyPolicy::Retain);
+    }
+
+    #[test]
+    #[ignore = "requires gfx1151 and cached FL2VA/Ref2VA checkpoints"]
+    fn automatic_dit_selection_follows_requests_across_residency_policies() {
+        let resolver = crate::models::Resolver::new().offline(true);
+        let base = resolver.find(crate::models::DIT_FL2VA).unwrap();
+        let reference = resolver.find(crate::models::DIT_REF2VA).unwrap();
+        let manager = hrx::residency::ResidencyManager::new(80 << 30).unwrap();
+        let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
+            memory_budget: Some(manager.budget()),
+            ..Default::default()
+        })
+        .unwrap();
+        for residency in [
+            ResidencyPolicy::Retain,
+            ResidencyPolicy::StageScoped,
+            ResidencyPolicy::Budgeted,
+        ] {
+            for explicit in [None, Some(base.clone())] {
+                // Safety: cached checkpoints remain immutable throughout this test.
+                let mut session = unsafe {
+                    Session::new_in(
+                        Config {
+                            dit: explicit.clone(),
+                            ..Default::default()
+                        },
+                        SessionOptions {
+                            residency,
+                            ..Default::default()
+                        },
+                        &context,
+                    )
+                }
+                .unwrap();
+                for references in [false, true, true, false] {
+                    session
+                        .scheduled(|state| {
+                            state.dit(references)?;
+                            let expected = if references && explicit.is_none() {
+                                &reference
+                            } else {
+                                &base
+                            };
+                            assert_eq!(
+                                &state.dit.as_ref().unwrap().path,
+                                expected,
+                                "{residency:?}, references={references}, explicit={explicit:?}"
+                            );
+                            state.release_completed(false, true, false)
+                        })
+                        .unwrap();
+                }
+            }
+        }
+        assert_eq!(manager.statistics().resources, 0);
     }
 
     #[test]

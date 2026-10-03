@@ -89,6 +89,12 @@ AudioInput}`. `Session::create_refmod` accepts decoded RGB8 images and optional
 planar stereo samples; use a retaining session to reuse encoder weights.
 Filesystem decoding is a CLI concern.
 
+With `Config::dit = None`, `Session::denoise` selects Ref2VA whenever its reference
+list is nonempty. Without references it selects FL2VA, including keyframe-only
+requests. A reused session switches checkpoints as needed, including when models
+are held in the budgeted residency cache. An explicit `Config::dit` path overrides
+this selection. Standalone `Session::text_in` uses FL2VA by default.
+
 ```rust,no_run
 use h3_hrx::refmod::{ApplyOptions, RefMod};
 # fn main() -> h3_hrx::Result<()> {

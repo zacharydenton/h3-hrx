@@ -50,7 +50,7 @@ impl<T: Send + 'static> Drop for Unit<T> {
 }
 
 pub(super) struct Units {
-    pub dit: Unit<crate::dit::Dit>,
+    pub dit: Unit<super::LoadedDit>,
     pub te: Unit<crate::te::TextEncoder>,
     pub video: Unit<crate::vvae::VideoVae>,
     pub audio: Unit<crate::avae::AudioVae>,
