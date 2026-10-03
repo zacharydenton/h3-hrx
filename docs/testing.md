@@ -75,6 +75,24 @@ large error spikes at the 17-frame chunk boundaries. Stereo audio decodes at
 bound decoder differences; they do not establish that a particular reported
 flashing artifact has been reproduced.
 
+A longer synthetic RefMod comparison used two encoded images plus stereo audio,
+320×320×124 frames, seed 7, 20 ResMultistep evaluations and caching off. Its 4435
+packed tokens exercise the default INT8 head-major attention path. Both native
+runs used the corrected decoder; only checkpoint selection changed. ComfyUI
+`a7169322` used Ref2VA, identical starting noise and shared native Ref2VA text
+embeddings. Final latent cosine similarities against ComfyUI were:
+
+| Native checkpoint selection | Video | Audio |
+| --- | --- | --- |
+| Previous default, FL2VA | 0.991144 | 0.726789 |
+| Corrected automatic selection, Ref2VA | 0.999855 | 0.981867 |
+
+Every corrected video latent frame exceeded 0.99975 cosine similarity. Sampled
+frames and temporal-change diagnostics did not isolate the reported flashing
+blocks. This establishes close agreement for this synthetic case, not a
+reproduction of the original failure. Native FP16/INT8 versus ComfyUI BF16/PyTorch
+arithmetic and different reference-augmentation RNGs remain comparison limits.
+
 A failed assertion reports the actual and expected digests. Before updating an expected digest
 for an intentional numerical change, validate the new output independently with
 `scripts/parity.py` against diffusers, then edit the constant explicitly.
