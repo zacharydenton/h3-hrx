@@ -224,6 +224,36 @@ pub fn mux(out: &Path, wav: &Path, frames: &[u8], width: i32, height: i32) -> Re
     )
 }
 
+/// Decode an entire reference clip at H3's 24 fps; no implicit audio selection.
+pub fn decode_reference_video(
+    path: &Path,
+    width: i32,
+    height: i32,
+) -> Result<(Vec<f32>, usize, i32, i32)> {
+    let (w, h) = probe_size(path)?;
+    let (w, h) = h3_hrx::resize::fit(w, h, width, height);
+    let p = path.to_str().context("video path is not UTF-8")?;
+    let filter = format!("fps=24,scale={w}:{h}");
+    let raw = capture(
+        "ffmpeg",
+        &[
+            "-v", "error", "-i", p, "-an", "-vf", &filter, "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-",
+        ],
+    )?;
+    let stride = w as usize * h as usize * 3;
+    if raw.is_empty() || !raw.len().is_multiple_of(stride) {
+        bail!("invalid decoded reference video");
+    }
+    let frames = raw.len() / stride;
+    Ok((
+        raw.iter().map(|b| *b as f32 / 255.0).collect(),
+        frames,
+        w,
+        h,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

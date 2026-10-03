@@ -239,7 +239,89 @@ impl Session {
         progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
     ) -> Result<Latents> {
         self.validate(ids, p, noise, refs, kfs)?;
-        self.scheduled(|state| state.denoise(ids, p, noise, refs, kfs, progress))
+        self.scheduled(|state| state.denoise(ids, p, noise, refs, kfs, progress, None))
+    }
+
+    /// Denoise with an explicit, upstream-compatible text/vision presentation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_presented(
+        &mut self,
+        presentation: &crate::PreparedPresentation,
+        p: &DenoiseParams,
+        noise: Noise<'_>,
+        refs: &[Reference<'_>],
+        kfs: &[Keyframe<'_>],
+        progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
+    ) -> Result<Latents> {
+        let sh = self.validate(presentation.ids(), p, noise, refs, kfs)?;
+        if presentation.ids().len() > sh.text_rows_max as usize {
+            return invalid("presentation exceeds text budget");
+        }
+        self.scheduled(|state| {
+            state.denoise(
+                presentation.ids(),
+                p,
+                noise,
+                refs,
+                kfs,
+                progress,
+                Some(presentation.blocks()),
+            )
+        })
+    }
+
+    /// Reconstruct effective reference latents as interleaved RGB floats in [0,1],
+    /// returning pixels and frame count, without imposing the output canvas or duration.
+    pub fn decode_reference_visual(
+        &mut self,
+        grid: crate::LatentGrid,
+        latents: &[f32],
+    ) -> Result<(Vec<f32>, usize)> {
+        Reference::Video {
+            latents,
+            grid,
+            audio: None,
+        }
+        .check(0)?;
+        let frames = grid
+            .frames
+            .checked_mul(4)
+            .and_then(|n| n.checked_sub(3))
+            .and_then(|n| n.checked_sub(3 * ((grid.frames - 1) / 5)))
+            .ok_or_else(|| crate::Error::Invalid("reference frame count overflows".into()))?;
+        let cv = |n| {
+            i32::try_from(n)
+                .map_err(|_| crate::Error::Invalid("reference dimensions overflow".into()))
+        };
+        let sh = Shape {
+            frames: cv(frames)?,
+            latent_t: cv(grid.frames)?,
+            lat_h: cv(grid.height)?,
+            lat_w: cv(grid.width)?,
+            audio_t: 0,
+            text_rows_max: 4096,
+        };
+        let elements = frames
+            .checked_mul(grid.height)
+            .and_then(|n| n.checked_mul(grid.width))
+            .and_then(|n| n.checked_mul(16 * 16 * 3))
+            .ok_or_else(|| crate::Error::Invalid("reference pixel buffer overflows".into()))?;
+        let mut out = vec![0.0; elements];
+        self.scheduled(|state| {
+            state.release_completed(true, true, false)?;
+            state.vvae()?;
+            let result = state.vvae.as_mut().expect("opened").decode_video_pixels(
+                &mut state.stream,
+                &state.compiler,
+                &mut state.prof,
+                &sh,
+                latents,
+                &mut out,
+            );
+            state.release_completed(false, false, true)?;
+            result
+        })?;
+        Ok((out, frames))
     }
 
     /// Check request metadata without reserving a lane or loading models.
@@ -525,6 +607,7 @@ impl State {
         refs: &[Reference<'_>],
         kfs: &[Keyframe<'_>],
         progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
+        visuals: Option<&[crate::media_context::VisualBlock]>,
     ) -> Result<Latents> {
         // Everything cheap, before a checkpoint opens or a kernel compiles. This was written once,
         // lost in a refactor, and not missed — because the tests called the validators rather than
@@ -538,7 +621,7 @@ impl State {
         crate::trace::event("conditioning_start", String::new);
         let result = (|| {
             let (stream, c, prof, dit, te) = self.prompt_pair(!refs.is_empty())?;
-            let prepared = dit.prepare_denoise(stream, c, prof, te, ids, p, refs, kfs)?;
+            let prepared = dit.prepare_denoise(stream, c, prof, te, ids, p, refs, kfs, visuals)?;
             crate::trace::event("conditioning_ready", String::new);
             self.release_completed(true, false, false)?;
             crate::trace::event("encoder_released", || {

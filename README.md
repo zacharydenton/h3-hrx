@@ -35,6 +35,7 @@ generated locally with h3 in **39m58s**. [First frame and reproduction](docs/sho
 
 ## What you can do
 
+- **Optional prompt generation:** use a configurable multimodal chat endpoint to turn instructions and references into H3 prompts. See [setup and examples](docs/prompting.md#optional-prompt-generation).
 - **Text to video with sound:** generate an MP4 and a separate WAV from a structured prompt.
 - **Image to video:** animate a first frame or condition generation on reference images.
 - **Audio references:** guide generation with voices and sounds alongside image references.
@@ -116,7 +117,7 @@ h3 ref.jpg voice.wav --out referenced.mp4 < reference-prompt.txt
 
 Sizes must be multiples of 32; frame counts round up to `17n + 5`.
 The sampler defaults to `res_multistep` with the `simple` schedule and no
-classifier-free guidance. Video references are available through the Rust API.
+classifier-free guidance. Positional MP4/MOV/MKV/WebM video references are supported; `--video-audio INDEX` explicitly includes a video soundtrack.
 See [other modes](docs/tricks.md) for audio-only output and still images.
 
 ## Performance

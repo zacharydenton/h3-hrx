@@ -430,6 +430,37 @@ impl VideoVae {
         latents: &[f32],
         out: &mut [u8],
     ) -> Result<()> {
+        self.decode_video_with(stream, c, prof, shape, latents, &mut |index, value, ch| {
+            out[index] = crate::pixels::imagenet_denormalise(value, ch);
+        })
+    }
+
+    /// Reference reconstruction retains float pixels before vision preprocessing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_video_pixels(
+        &mut self,
+        stream: &mut hrx::Stream,
+        c: &Compiler,
+        prof: &mut Profile,
+        shape: &crate::layout::Shape,
+        latents: &[f32],
+        out: &mut [f32],
+    ) -> Result<()> {
+        self.decode_video_with(stream, c, prof, shape, latents, &mut |index, value, ch| {
+            out[index] = (value * IMAGENET_STD[ch] + IMAGENET_MEAN[ch]).clamp(0.0, 1.0);
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_video_with(
+        &mut self,
+        stream: &mut hrx::Stream,
+        c: &Compiler,
+        prof: &mut Profile,
+        shape: &crate::layout::Shape,
+        latents: &[f32],
+        write: &mut impl FnMut(usize, f32, usize),
+    ) -> Result<()> {
         let (t_len, h, w) = (
             shape.latent_t as usize,
             shape.lat_h as usize,
@@ -467,8 +498,7 @@ impl VideoVae {
                 for q in 0..plane {
                     for ch in 0..3 {
                         let v = chunk[(ch * src_ft + f) * plane + q];
-                        out[((*decoded + f) * plane + q) * 3 + ch] =
-                            crate::pixels::imagenet_denormalise(v, ch);
+                        write(((*decoded + f) * plane + q) * 3 + ch, v, ch);
                     }
                 }
             }

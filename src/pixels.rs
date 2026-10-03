@@ -48,6 +48,28 @@ pub fn imagenet_denormalise(v: f32, c: usize) -> u8 {
 /// `[gh/2][gw/2][2][2]` blocks of 16x16, each patch `[3][2][16][16]` with the image in both temporal
 /// slots — Qwen2-VL feeds a still image as a two-frame clip.
 pub fn vision_patches(pixels: &[f32], gh: usize, gw: usize, w: usize) -> Vec<f32> {
+    patches(pixels, pixels, gh, gw, w, CLIP_MEAN, CLIP_STD)
+}
+
+pub fn vision_pair_patches(
+    first: &[f32],
+    second: &[f32],
+    gh: usize,
+    gw: usize,
+    w: usize,
+) -> Vec<f32> {
+    patches(first, second, gh, gw, w, [0.5; 3], [0.5; 3])
+}
+
+fn patches(
+    first: &[f32],
+    second: &[f32],
+    gh: usize,
+    gw: usize,
+    w: usize,
+    mean: [f32; 3],
+    std: [f32; 3],
+) -> Vec<f32> {
     let n = gh * gw;
     let mut patches = vec![0.0f32; n * VISION_PATCH];
     for bh in 0..gh / 2 {
@@ -63,7 +85,8 @@ pub fn vision_patches(pixels: &[f32], gh: usize, gw: usize, w: usize) -> Vec<f32
                                     let y = (bh * 2 + ih) * 16 + py;
                                     let x = (bw * 2 + iw) * 16 + px;
                                     dst[((c * 2 + t) * 16 + py) * 16 + px] =
-                                        (pixels[(y * w + x) * 3 + c] - CLIP_MEAN[c]) / CLIP_STD[c];
+                                        ([first, second][t][(y * w + x) * 3 + c] - mean[c])
+                                            / std[c];
                                 }
                             }
                         }
@@ -78,6 +101,27 @@ pub fn vision_patches(pixels: &[f32], gh: usize, gw: usize, w: usize) -> Vec<f32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporal_patches_match_pinned_comfyui() {
+        let data = safetensors::SafeTensors::deserialize(include_bytes!(
+            "../tests/fixtures/presentation/video_pair.safetensors"
+        ))
+        .unwrap();
+        let floats = |name| {
+            data.tensor(name)
+                .unwrap()
+                .data()
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let frames = floats("frames");
+        let stride = 64 * 96 * 3;
+        let got = vision_pair_patches(&frames[..stride], &frames[stride..], 4, 6, 96);
+        let expected = floats("patches");
+        assert_eq!(got, expected);
+    }
 
     #[test]
     fn a_nan_becomes_zero_rather_than_clamping() {

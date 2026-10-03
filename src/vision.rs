@@ -74,6 +74,42 @@ pub fn embed(
     height: usize,
     width: usize,
 ) -> Result<Embedding> {
+    embed_frames(
+        stream, c, prof, weights, pixels, pixels, height, width, false,
+    )
+}
+
+/// Embed a real two-frame temporal patch, in upstream channel/time/space order.
+#[allow(clippy::too_many_arguments)]
+pub fn embed_pair(
+    stream: &mut hrx::Stream,
+    c: &Compiler,
+    prof: &mut Profile,
+    weights: &Weights,
+    first: &[f32],
+    second: &[f32],
+    height: usize,
+    width: usize,
+) -> Result<Embedding> {
+    embed_frames(stream, c, prof, weights, first, second, height, width, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn embed_frames(
+    stream: &mut hrx::Stream,
+    c: &Compiler,
+    prof: &mut Profile,
+    weights: &Weights,
+    first: &[f32],
+    second: &[f32],
+    height: usize,
+    width: usize,
+    video: bool,
+) -> Result<Embedding> {
+    let need = height.checked_mul(width).and_then(|n| n.checked_mul(3));
+    if need != Some(first.len()) || need != Some(second.len()) {
+        return invalid("vision frame buffer does not match its dimensions");
+    }
     if !height.is_multiple_of(32) || !width.is_multiple_of(32) || height < 32 || width < 32 {
         return invalid("vision images need height and width multiples of 32");
     }
@@ -84,7 +120,11 @@ pub fn embed(
     let cap = (n + 16).div_ceil(32) * 32;
 
     // patches in merge order, CLIP-normalised, straight into the patch projection
-    let patches = crate::pixels::vision_patches(pixels, gh, gw, width);
+    let patches = if video {
+        crate::pixels::vision_pair_patches(first, second, gh, gw, width)
+    } else {
+        crate::pixels::vision_patches(first, gh, gw, width)
+    };
     let pa = stream.allocate(patches.len() * 4)?;
     stream.upload(pa.binding(), crate::vvae::as_bytes(&patches))?;
     let x32 = stream.allocate(n * VHID * 4)?;

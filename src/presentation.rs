@@ -105,21 +105,35 @@ impl<'a> Presentation<'a> {
 
     /// Announce a clip as the next `<Video n>`.
     ///
-    /// Like a soundtrack and unlike a picture, a clip carries no vision span:
-    /// [`crate::Reference::Video`] has no `presented` field, so its pixels
-    /// reach the model as conditioning rather than through the text encoder,
-    /// and this only names it.
-    ///
-    /// The label follows MiniMax's own rewrite guide, which lists `<Video N>`
-    /// beside `<Picture N>` and `<Audio N>` as the labels a full-reference
-    /// prompt refers back to. It has no other implementation to check against:
-    /// the CLI does not take video references, so unlike every other piece of
-    /// this format it is read from the documentation rather than from working
-    /// code.
+    /// This legacy label-only operation can be followed by `video_block()` to append
+    /// timestamped temporal vision spans. Prefer `PreparedPresentation` for complete
+    /// video presentation and matching pixel buffers.
     pub fn video(&mut self) -> Result<&mut Self> {
         self.videos += 1;
         let label = format!("<Video {}>: ", self.videos);
         self.tokenizer.encode_into(&label, &mut self.ids)?;
+        Ok(self)
+    }
+
+    /// One timestamped pair of video frames, after `video()`.
+    pub fn video_block(&mut self, width: i32, height: i32, seconds: f64) -> Result<&mut Self> {
+        if width <= 0
+            || height <= 0
+            || width % 32 != 0
+            || height % 32 != 0
+            || !seconds.is_finite()
+            || seconds < 0.0
+        {
+            return Err(Error::Invalid("invalid video presentation block".into()));
+        }
+        self.tokenizer
+            .encode_into(&format!("<{seconds:.1} seconds>"), &mut self.ids)?;
+        self.ids.push(VISION_START);
+        self.ids.extend(std::iter::repeat_n(
+            -1,
+            (width / 32) as usize * (height / 32) as usize,
+        ));
+        self.ids.push(VISION_END);
         Ok(self)
     }
 

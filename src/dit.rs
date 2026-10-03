@@ -802,7 +802,7 @@ impl Dit {
         crate::cache::CachePolicy::Off
             .validate(p.cache_threshold)
             .map_err(|e| crate::Error::Invalid(e.into()))?;
-        let prepared = self.prepare_denoise(stream, c, prof, te, ids, p, refs, kfs)?;
+        let prepared = self.prepare_denoise(stream, c, prof, te, ids, p, refs, kfs, None)?;
         self.sample_prepared(
             stream,
             c,
@@ -830,6 +830,7 @@ impl Dit {
         p: &DenoiseParams,
         refs: &[Reference<'_>],
         kfs: &[Keyframe<'_>],
+        visuals: Option<&[crate::media_context::VisualBlock]>,
     ) -> Result<crate::layout::Layout> {
         self.check_stream(stream)?;
         let sh = crate::layout::shape_for(p.height, p.width, p.frames)
@@ -879,7 +880,11 @@ impl Dit {
         self.ensure_seq(stream, s)?;
 
         // the images this prompt presents, through the tower, in the order of the placeholder runs
-        let embeddings = self.vision_for(stream, c, prof, te, ids, refs, kfs)?;
+        let embeddings = if let Some(blocks) = visuals {
+            self.vision_blocks(stream, c, prof, te, ids, blocks)?
+        } else {
+            self.vision_for(stream, c, prof, te, ids, refs, kfs)?
+        };
         let spans: Vec<crate::te::Span<'_>> = embeddings
             .iter()
             .map(|(at, e)| crate::te::Span {
@@ -1209,6 +1214,59 @@ impl Dit {
 }
 
 impl Dit {
+    #[allow(clippy::too_many_arguments)]
+    fn vision_blocks(
+        &self,
+        stream: &mut hrx::Stream,
+        c: &Compiler,
+        prof: &mut Profile,
+        te: &TextEncoder,
+        ids: &[i32],
+        blocks: &[crate::media_context::VisualBlock],
+    ) -> Result<Vec<(VisionSpan, crate::vision::Embedding)>> {
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            if *id < 0 {
+                match runs.last_mut() {
+                    Some(r) if r.0 + r.1 == i => r.1 += 1,
+                    _ => runs.push((i, 1)),
+                }
+            }
+        }
+        if runs.len() != blocks.len() {
+            return invalid("visual blocks do not match presentation spans");
+        }
+        blocks
+            .iter()
+            .zip(runs)
+            .map(|(b, (start, count))| {
+                let (h, w) = (b.first.height, b.first.width);
+                if count != (h / 32) * (w / 32) {
+                    return invalid("visual block does not match token span");
+                }
+                let e = crate::vision::embed_pair(
+                    stream,
+                    c,
+                    prof,
+                    te.weights(),
+                    &b.first.pixels,
+                    &b.second.pixels,
+                    h,
+                    w,
+                )?;
+                Ok((
+                    VisionSpan {
+                        start,
+                        count,
+                        merged_h: h / 32,
+                        merged_w: w / 32,
+                    },
+                    e,
+                ))
+            })
+            .collect()
+    }
+
     /// The tower's output for every image this prompt presents, paired with the rows it fills.
     ///
     /// A run of negative ids is a placeholder for an image; the images are matched to those runs in

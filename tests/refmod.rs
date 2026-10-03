@@ -593,3 +593,159 @@ fn audio_creation_preserves_channels_across_chunks_and_truncation() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires gfx1151 and cached video/audio VAE checkpoints"]
+fn effective_refmod_reconstruction_accepts_image_stack_and_audio_grids() {
+    use h3_hrx::{Config, Session};
+    let resolver = h3_hrx::models::Resolver::new().offline(true);
+    let config = Config {
+        video_vae: Some(resolver.find(h3_hrx::models::VIDEO_VAE).unwrap()),
+        audio_vae: Some(resolver.find(h3_hrx::models::AUDIO_VAE).unwrap()),
+        dit: Some("/absent/dit".into()),
+        te: Some("/absent/te".into()),
+        ..Default::default()
+    };
+    // Safety: no checkpoint files are modified by this test.
+    let mut session = unsafe { Session::new(config) }.unwrap();
+    let mods = RefMod::load(fixture("combined.safetensors")).unwrap();
+    let prepared = mods
+        .prepare(ApplyOptions {
+            visual_strength: 0.35,
+            audio_strength: 0.35,
+            copies: 2,
+            ..Default::default()
+        })
+        .unwrap();
+    let members: Vec<_> = prepared.members().collect();
+    assert_eq!(members[0].values().as_ptr(), members[1].values().as_ptr());
+    for member in [members[0], members[2]] {
+        match member.reference() {
+            Reference::Video { latents, grid, .. } => {
+                let (rgb, frames) = session.decode_reference_visual(grid, latents).unwrap();
+                assert_eq!(frames, 9); // 3 latent frames, including upstream temporal trimming.
+                assert_eq!(rgb.len(), frames * grid.height * grid.width * 16 * 16 * 3);
+                assert!(rgb.iter().any(|&x| x != rgb[0]));
+            }
+            Reference::Audio { latents, frames } => {
+                let mut samples = vec![0.0; frames * 800 * 2];
+                session.decode_audio(latents, frames, &mut samples).unwrap();
+                assert!(samples.iter().all(|x| x.is_finite()));
+                assert!(samples.iter().any(|x| x.abs() > 1e-5));
+            }
+            _ => panic!("unexpected fixture"),
+        }
+    }
+    let grid = LatentGrid {
+        frames: 1,
+        height: 4,
+        width: 4,
+    };
+    let (rgb, frames) = session
+        .decode_reference_visual(grid, &vec![0.0; 24 * 4 * 4])
+        .unwrap();
+    assert_eq!(frames, 1);
+    assert_eq!(rgb.len(), 64 * 64 * 3);
+    let shape = h3_hrx::shape_for(64, 64, 5).unwrap();
+    let z = vec![0.0; 24 * 2 * 4 * 4];
+    let (rgb, frames) = session
+        .decode_reference_visual(
+            LatentGrid {
+                frames: 2,
+                height: 4,
+                width: 4,
+            },
+            &z,
+        )
+        .unwrap();
+    let mut original = vec![0; shape.video_bytes()];
+    session.decode_video(&shape, &z, &mut original).unwrap();
+    assert_eq!(frames, 5);
+    let bytes: Vec<u8> = rgb
+        .iter()
+        .map(|v| ((*v * 255.0) as f64 + 0.5).floor() as u8)
+        .collect();
+    assert_eq!(bytes, original);
+}
+
+#[test]
+#[ignore = "requires idle gfx1151 and cached ref2va/text encoder checkpoints"]
+fn presented_video_uses_the_second_temporal_frame_in_generation() {
+    use h3_hrx::{
+        media_context::{Frame, Media, MediaEntry},
+        Config, DenoiseParams, Noise, PreparedPresentation, Session, Tokenizer,
+    };
+    let resolver = h3_hrx::models::Resolver::new().offline(true);
+    let config = Config {
+        dit: Some(resolver.find(h3_hrx::models::DIT_REF2VA).unwrap()),
+        te: Some(resolver.find(h3_hrx::models::TE).unwrap()),
+        video_vae: Some("/absent/video-vae".into()),
+        audio_vae: Some("/absent/audio-vae".into()),
+        ..Default::default()
+    };
+    // This test needs only conditioning/sampling; no decoder is loaded.
+    let mut session = unsafe {
+        Session::new_with_options(
+            config,
+            h3_hrx::SessionOptions {
+                residency: h3_hrx::ResidencyPolicy::StageScoped,
+                ..Default::default()
+            },
+        )
+    }
+    .unwrap();
+    let mods = RefMod::load(fixture("combined.safetensors")).unwrap();
+    let prepared = mods.prepare(ApplyOptions::default()).unwrap();
+    let refs = prepared.references();
+    let frame = |value| Frame {
+        pixels: vec![value; 64 * 64 * 3].into(),
+        width: 64,
+        height: 64,
+    };
+    let params = DenoiseParams {
+        width: 64,
+        height: 64,
+        frames: 5,
+        steps: 2,
+        seed: 7,
+        ..Default::default()
+    };
+    let shape = Session::shape_for(64, 64, 5).unwrap();
+    let tokenizer = Tokenizer::new().unwrap();
+    let run = |session: &mut Session, second| {
+        let entries = [
+            MediaEntry {
+                media: Media::Video(vec![(0.0, frame(0.2)), (0.5, frame(second))]),
+                role: "reference".into(),
+                metadata: Value::Null,
+            },
+            MediaEntry {
+                media: Media::Audio(vec![0.0; 1600].into()),
+                role: "reference".into(),
+                metadata: Value::Null,
+            },
+        ];
+        let presentation = PreparedPresentation::new(
+            &tokenizer,
+            &entries,
+            "A quiet scene referencing <Video 1> and <Audio 1>.",
+            &shape,
+        )
+        .unwrap();
+        session
+            .denoise_presented(&presentation, &params, Noise::default(), &refs, &[], None)
+            .unwrap()
+    };
+    let same = run(&mut session, 0.2);
+    let different = run(&mut session, 0.8);
+    assert!(same.video.iter().chain(&same.audio).all(|x| x.is_finite()));
+    assert!(different
+        .video
+        .iter()
+        .chain(&different.audio)
+        .all(|x| x.is_finite()));
+    assert_ne!(
+        same.video, different.video,
+        "second temporal frame must reach conditioning"
+    );
+}

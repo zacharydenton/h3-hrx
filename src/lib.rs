@@ -51,16 +51,20 @@ pub mod weights;
 mod cache;
 mod conditioning;
 pub mod error;
+pub mod media_context;
 pub mod models;
 mod noise;
 mod pixels;
+pub mod presentation;
 /// The reference resampler.
 ///
 /// Reference and keyframe images are scaled with PIL's bilinear filter because
 /// that is what the model was conditioned against; another resampler shifts the
 /// conditioning it sees. In the library rather than the CLI so that an
 /// application adapter scales its inputs the same way the CLI does.
-pub mod presentation;
+#[cfg(feature = "prompt-generation")]
+pub mod prompt;
+pub use media_context::PreparedPresentation;
 pub mod refmod;
 pub mod resize;
 mod rope;

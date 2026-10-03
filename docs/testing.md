@@ -289,3 +289,30 @@ the new sources and compiler. Median times were 4.884 s before and 4.862 s after
 (−0.44%). One baseline execution took 31.533 s on the shared machine, so this
 run establishes output equivalence and gives only a coarse timing check; it
 does not establish an end-to-end speedup.
+
+## Optional prompt generation and reference presentation
+
+The CPU suite uses local HTTP stubs for the two-stage prompt processor, repair
+limits, multimodal payloads, endpoint errors and credential redaction. A CLI test
+runs `h3 prompt` against an empty offline model cache and verifies stdout and saved
+provenance. No live LLM service is needed. Feature checks include a library without
+default features, a CLI without `prompt-generation`, and the endpoint-enabled library.
+
+Pinned ComfyUI fixtures in `tests/fixtures/presentation` independently check video
+temporal patches, token IDs, odd-frame padding, timestamps and modality tags.
+The explicit presentation API follows Qwen3-VL's 0.5 normalization; existing
+`Session::denoise` image preprocessing stays unchanged.
+
+```sh
+cargo test --release --test refmod effective_refmod_reconstruction -- --ignored --test-threads=1
+cargo test --release --test refmod presented_video -- --ignored --test-threads=1
+```
+
+The first GPU test reconstructs strength-adjusted visual/audio members and checks
+single-frame, stacked and ordinary video grids. The second performs generation
+with video/audio references and confirms that changing the second temporal frame
+changes the result. These tests establish wiring and local numerical behavior;
+they do not establish prompt quality or full-model parity with the proprietary
+Context-IR service. Evaluate the configured endpoint separately on text, keyframes,
+identity references, voices, video motion and RefMod bundles using fixed generation
+settings and explicit instruction-preservation review.

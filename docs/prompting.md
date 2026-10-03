@@ -3,8 +3,75 @@
 H3 was trained on structured prompts, not free-form sentences. MiniMax publishes the format it expects as a
 skill in the model repository, [`skills/h3-prompt-writing`](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills/h3-prompt-writing);
 `references/base-en.txt` covers the text and keyframe modes and `references/ref-en.txt` the full-reference one.
-This page is the short version plus the prompt behind the clip at the top of the README. Nothing here is
-enforced by `h3` — the prompt is passed to the text encoder verbatim, on stdin or after `-p`.
+This page is the short version plus the prompt behind the clip at the top of the README. Without `--generate-prompt`, the prompt is passed to the text encoder verbatim,
+on stdin or after `-p`. Optional endpoint-based rewriting validates the generated format.
+
+## Optional prompt generation
+
+The default CLI includes a custom processor that follows MiniMax's published
+[base](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md)
+and [reference](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md)
+guides. It is not the proprietary MiniMax Context-IR service. It first analyzes
+reference evidence, then rewrites your instruction into the appropriate H3 format.
+
+Configure an OpenAI-compatible Chat Completions endpoint. The URL includes its
+API prefix; the client appends `/chat/completions`:
+
+```sh
+export H3_PROMPT_BASE_URL=http://localhost:8000/v1
+export H3_PROMPT_MODEL=your-multimodal-model
+# For an authenticated endpoint, also set H3_PROMPT_API_KEY.
+h3 prompt -p 'A red fox crosses a snowy clearing; no music' > fox.txt
+h3 --generate-prompt -p 'A red fox crosses a snowy clearing; no music' \
+  --save-prompt fox.txt --out fox.mp4
+```
+
+`h3 prompt` shares generation's input and shape arguments, writes only prompt
+text to stdout, and does not run video generation. `--prompt-base-url` and
+`--prompt-model` override the environment. `--save-prompt FILE` writes the final
+text plus `FILE.json` with model, template version, effective duration, reference
+mapping, and validation status. Reuse the text without `--generate-prompt` to
+avoid another rewrite. Keep the same reference ordering and presentation options.
+
+For media, explicitly declare the endpoint's supported input types:
+
+```sh
+h3 prompt --prompt-images --first-frame frame.png \
+  -p 'The subject slowly turns toward the camera' > turn.txt
+h3 prompt --prompt-images --prompt-audio person.png voice.wav \
+  -p 'Use Picture 1 for appearance and Audio 1 for the voice' > character.txt
+h3 prompt --prompt-images --prompt-audio movement.mp4 --video-audio 1 \
+  -p 'Continue this scene with its original atmosphere' > continuation.txt
+h3 prompt --prompt-images --prompt-audio --refmod character.safetensors \
+  -p 'The referenced character greets the viewer' > greeting.txt
+```
+
+Images use `image_url` PNG data URLs. Video uses timestamped images sampled at
+2 fps, preserving its timeline instead of relying on a provider-specific video
+field. Audio uses `input_audio` with WAV data. A video soundtrack is included only
+when selected with `--video-audio INDEX` (one-based among positional videos).
+The endpoint must support these payloads; generic chat compatibility alone does
+not imply image or audio support. Unsupported media fails explicitly.
+
+Enabling rewriting sends your instruction and supplied/reconstructed media to
+the configured endpoint. Ordinary generation makes no LLM request. `--offline`
+continues to mean **no checkpoint downloads**; it does not disable the explicitly
+selected endpoint. Prompt-only raw-media requests need no H3 checkpoints or GPU.
+RefMods require the corresponding local VAE and GPU for reconstruction; see
+[RefMod presentation](refmods.md#upstream-presentation).
+
+The processor uses the actual rounded frame count at 24 fps, not an integer API
+duration. Validation checks section order, available media labels, cut timing,
+quoted literal text and the complete H3 token budget, including visual spans.
+One corrective rewrite is allowed. Endpoint failures or an invalid final prompt
+stop before denoising, without silently truncating references or reverting to the
+original instruction. Long video presentations can exhaust the 4096-token budget:
+use shorter/smaller references or a smaller canvas, then rerun.
+
+The endpoint has a 300-second request timeout and no automatic HTTP retries.
+Generation uses two successful endpoint requests, or three when repair is needed.
+There is no built-in model download, model choice, or claim of official Context-IR
+quality. Assess instruction preservation and video quality with your chosen model.
 
 ## The three fields
 

@@ -24,9 +24,10 @@ doc = false
 required-features = ["cli"]
 
 [features]
-default = ["cli"]
+default = ["cli", "prompt-generation"]
 # Disable default features when consuming only the library.
 cli = ["dep:anyhow", "dep:clap"]
+prompt-generation = ["dep:reqwest", "dep:base64", "dep:png", "dep:regex"]
 # One stage of the pipeline at a time, for comparing against a reference or a previous kernel.
 [[bin]]
 name = "h3-dev"
@@ -50,6 +51,11 @@ rand_chacha = "0.9"
 rand_distr = "0.5"
 anyhow = { version = "1", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
+
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"], optional = true }
+base64 = { version = "0.22", optional = true }
+png = { version = "0.18", optional = true }
+regex = { version = "1", optional = true }
 
 [dev-dependencies]
 libm = "0.2"

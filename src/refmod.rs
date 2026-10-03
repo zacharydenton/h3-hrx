@@ -412,6 +412,11 @@ pub struct PreparedRefMod {
     tokens: usize,
 }
 impl PreparedRefMod {
+    /// Active members in conditioning order, including copies. Values already include strength.
+    pub fn members(&self) -> impl Iterator<Item = &RefModMember> {
+        self.indices.iter().map(|&i| &self.members[i])
+    }
+
     pub fn references(&self) -> Vec<Reference<'_>> {
         self.indices
             .iter()

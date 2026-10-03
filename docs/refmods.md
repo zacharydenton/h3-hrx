@@ -82,6 +82,44 @@ applied. Animated curves, training/refinement, and extraction from source videos
 are outside this implementation. Existing encoded visual members, including
 pooled or video-origin members, can still be loaded.
 
+## Upstream presentation
+
+`--refmod-presentation upstream` reconstructs active references through the H3
+VAEs and presents numbered media to H3's text/vision encoder. `--generate-prompt`
+and `h3 prompt` select this path automatically; combining them with
+`--refmod-presentation latent-only` is an error. Ordinary generation keeps the
+existing latent-only default for compatibility.
+
+```sh
+h3 --refmod character.safetensors --refmod-presentation upstream \
+  --out greeting.mp4 < greeting.txt
+```
+
+The implementation follows ComfyUI-MiniMaxH3Mod `f9462081` (`prompt.py`,
+`nodes.py`) and ComfyUI `e9027f2b` (`comfy/text_encoders/minimax.py`). Strength
+transforms and disabled-member filtering happen before reconstruction. Raw
+references precede RefMod members and copies; each media kind has its own counter.
+Each copy receives a consecutive label, while decoded host pixels are shared.
+A single image member is a `<Picture N>`, an image stack/video member is a
+`<Video N>`, and an audio member is an independent `<Audio N>`.
+
+Video presentation samples at 2 fps using `--reference-fps` (default 24) as the
+reconstructed playback rate, pairs frames into temporal patches, and repeats an
+odd final frame. Stack/compressed references do not preserve source chronology;
+the prompt processor treats these timestamps as synthetic. A bundle does not
+implicitly synchronize audio or bind a voice to a subject.
+
+The prepared-presentation path uses upstream Qwen3-VL image/video resizing and
+0.5 normalization. The older direct-generation image path retains its existing
+preprocessing for compatibility.
+
+Visual reconstruction retains float pixels for H3 conditioning. Audio is decoded
+for the optional LLM's analysis; H3's text encoder receives its label, while its
+DiT receives the already-encoded audio. Reference latents are attached once.
+This path requires the relevant VAEs, consumes additional vision tokens and can
+fail the text budget even when latent-only loading succeeds. The prompt-only
+command also needs these VAEs and a GPU when it reconstructs RefMods.
+
 ## Rust
 
 Use `refmod::{RefMod, RefModMember, ApplyOptions, CreateOptions, ImageInput,

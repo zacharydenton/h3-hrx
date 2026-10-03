@@ -11,13 +11,14 @@
 //!
 //! The CLI owns a Rust `Session`; application adapters call that same API.
 mod media;
+mod prompting;
 mod refmods;
 
 use h3_hrx::resize;
 
 use h3_hrx::{
-    Attention as Attn16, Clip, Config, DenoiseParams, Keyframe, LatentGrid, Noise, Presentation,
-    Presented, Reference, Sampler as Sampler16, Session, Tokenizer,
+    Attention as Attn16, Clip, Config, DenoiseParams, Keyframe, LatentGrid, Noise, Presented,
+    Reference, Sampler as Sampler16, Session, Tokenizer,
 };
 
 use anyhow::{Context, Result};
@@ -80,7 +81,51 @@ impl Preset {
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
-
+    #[command(flatten)]
+    generation: GenerationArgs,
+}
+impl std::ops::Deref for Cli {
+    type Target = GenerationArgs;
+    fn deref(&self) -> &Self::Target {
+        &self.generation
+    }
+}
+impl std::ops::DerefMut for Cli {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.generation
+    }
+}
+#[derive(clap::Args)]
+struct GenerationArgs {
+    #[arg(skip)]
+    prompt_only: bool,
+    /// Rewrite the instruction through the configured multimodal endpoint
+    #[arg(long)]
+    generate_prompt: bool,
+    /// Chat API prefix (otherwise H3_PROMPT_BASE_URL)
+    #[arg(long)]
+    prompt_base_url: Option<String>,
+    /// Endpoint model (otherwise H3_PROMPT_MODEL)
+    #[arg(long)]
+    prompt_model: Option<String>,
+    /// Endpoint supports image_url inputs, including sampled video frames
+    #[arg(long)]
+    prompt_images: bool,
+    /// Endpoint supports input_audio WAV inputs
+    #[arg(long)]
+    prompt_audio: bool,
+    /// Save final prompt and a companion .json provenance record
+    #[arg(long, value_name = "FILE")]
+    save_prompt: Option<PathBuf>,
+    /// RefMod text/vision presentation (generated prompts require upstream)
+    #[arg(long, value_enum)]
+    refmod_presentation: Option<RefmodPresentation>,
+    /// Reconstructed RefMod playback rate; stack timing is synthetic
+    #[arg(long, default_value_t = 24.0)]
+    reference_fps: f64,
+    /// Include audio from a one-based positional video reference (repeatable)
+    #[arg(long, value_name = "INDEX")]
+    video_audio: Vec<usize>,
     /// Pre-encoded v4 reference or v5 visual/audio bundle (repeatable)
     #[arg(long = "refmod", value_name = "FILE")]
     refmods: Vec<PathBuf>,
@@ -96,7 +141,7 @@ struct Cli {
     /// Limit effective refmod tokens after modality filtering and copies
     #[arg(long)]
     refmod_max_total_tokens: Option<usize>,
-    /// Reference files, by extension: images become `<Picture i>`, audio becomes `<Audio j>`
+    /// Image, audio or video references, numbered independently as Picture, Audio and Video
     #[arg(value_name = "FILE")]
     files: Vec<PathBuf>,
 
@@ -212,8 +257,16 @@ struct Cli {
     base_weights: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RefmodPresentation {
+    Upstream,
+    LatentOnly,
+}
+
 #[derive(clap::Subcommand)]
 enum Command {
+    /// Generate prompt text only; shares generation inputs and shape options
+    Prompt(Box<GenerationArgs>),
     /// Create or inspect portable encoded references
     Refmod {
         #[command(subcommand)]
@@ -419,9 +472,24 @@ fn lora_options(cli: &Cli) -> Result<Vec<h3_hrx::adapter::Lora>> {
     Ok(loras)
 }
 
-fn run(cli: Cli) -> Result<()> {
-    if let Some(Command::Refmod { command }) = cli.command {
-        return refmods::run(command);
+fn run(mut cli: Cli) -> Result<()> {
+    match cli.command.take() {
+        Some(Command::Refmod { command }) => return refmods::run(command),
+        Some(Command::Prompt(args)) => {
+            cli.generation = *args;
+            cli.prompt_only = true;
+            cli.generate_prompt = true;
+        }
+        None => {}
+    }
+    let generator = prompting::generator(&cli)?;
+    let upstream =
+        cli.refmod_presentation == Some(RefmodPresentation::Upstream) || cli.generate_prompt;
+    if cli.generate_prompt && cli.refmod_presentation == Some(RefmodPresentation::LatentOnly) {
+        usage!("generated prompts require --refmod-presentation upstream");
+    }
+    if !cli.reference_fps.is_finite() || !(1.0..=120.0).contains(&cli.reference_fps) {
+        usage!("--reference-fps must be 1..120");
     }
     let params = parameters(&cli)?;
     let loras = lora_options(&cli)?;
@@ -440,18 +508,30 @@ fn run(cli: Cli) -> Result<()> {
     if active_refmods && cli.preset.turbo().is_some() {
         usage!("Turbo does not support active refmods");
     }
-    let (mut image_files, mut audio_files) = (Vec::new(), Vec::new());
+    let (mut image_files, mut audio_files, mut video_files) = (Vec::new(), Vec::new(), Vec::new());
     for f in &cli.files {
         let e = lower_ext(f);
         if is_image(&e) {
             image_files.push(f.clone());
         } else if is_audio(&e) {
             audio_files.push(f.clone());
+        } else if matches!(e.as_str(), "mp4" | "mov" | "mkv" | "webm") {
+            video_files.push(f.clone());
         } else {
-            usage!("{}: not an image or audio file by extension", f.display());
+            usage!(
+                "{}: not an image, audio, or video file by extension",
+                f.display()
+            );
         }
     }
 
+    if cli
+        .video_audio
+        .iter()
+        .any(|i| *i == 0 || *i > video_files.len())
+    {
+        usage!("--video-audio must name a positional video reference (one-based)");
+    }
     let mut prompt = match &cli.prompt {
         Some(p) => p.clone(),
         None => std::io::read_to_string(std::io::stdin())
@@ -480,7 +560,7 @@ fn run(cli: Cli) -> Result<()> {
     }
     let out_stem = out.with_extension("");
     let wav_path = out.with_extension("wav");
-    if !cli.no_decode && !dir_writable(&out) {
+    if !cli.prompt_only && !cli.no_decode && !dir_writable(&out) {
         usage!(
             "cannot write {}: the directory is missing or not writable",
             out.display()
@@ -503,42 +583,28 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
 
-    // Reuse the standard Hub cache before downloading missing checkpoints.
-    // --offline stops at what is already on disk instead of downloading.
-    let resolver = h3_hrx::models::Resolver::new().offline(cli.offline);
-    let want_refs = !image_files.is_empty() || !audio_files.is_empty() || active_refmods;
-    let ref2va = want_refs && !cli.base_weights;
-    let resolve = |explicit: &Option<PathBuf>, relative: &str| -> Result<PathBuf> {
-        match explicit {
-            Some(path) => Ok(path.clone()),
-            None => Ok(resolver.find(relative)?),
-        }
-    };
-    let dit = resolve(
-        &cli.dit,
-        if ref2va {
+    // Preserve direct-generation checkpoint selection and its early download errors.
+    // Prompt generation deliberately defers these heavyweight checkpoints until validation.
+    let early_dit = if !cli.generate_prompt {
+        let name = if (!image_files.is_empty()
+            || !audio_files.is_empty()
+            || !video_files.is_empty()
+            || active_refmods)
+            && !cli.base_weights
+        {
             h3_hrx::models::DIT_REF2VA
         } else {
             h3_hrx::models::DIT_FL2VA
-        },
-    )?;
-    let te = resolve(&cli.te, h3_hrx::models::TE)?;
-    let video_vae = if cli.first_frame.is_some()
-        || !image_files.is_empty()
-        || (!cli.no_decode && !cli.audio_only)
-    {
-        Some(resolve(&cli.video_vae, h3_hrx::models::VIDEO_VAE)?)
+        };
+        Some(match &cli.dit {
+            Some(path) => path.clone(),
+            None => h3_hrx::models::Resolver::new()
+                .offline(cli.offline)
+                .find(name)?,
+        })
     } else {
-        cli.video_vae.clone()
+        None
     };
-    let audio_vae = if !audio_files.is_empty() || !cli.no_decode {
-        Some(resolve(&cli.audio_vae, h3_hrx::models::AUDIO_VAE)?)
-    } else {
-        cli.audio_vae.clone()
-    };
-    if !dit.exists() {
-        usage!("{} not found (README, Weights; --dit)", dit.display());
-    }
 
     let shape = Session::shape_for(params.height, params.width, params.frames)
         .ok_or_else(|| UsageError("no such shape".into()))?;
@@ -582,28 +648,104 @@ fn run(cli: Cli) -> Result<()> {
         );
     }
 
-    // the presentation: keyframe, then reference images ("<Picture i>: " + a vision span), then
-    // "<Audio j>: ", then the prompt
-    let tok = Tokenizer::new()?; // the vocabulary compiled into the crate (H3_TOKENIZER overrides it)
-    let mut presentation = Presentation::new(&tok);
-    for (_, k) in &keyframe_images {
-        presentation.picture(k.w, k.h)?;
+    let mut raw_videos = Vec::new();
+    for (i, path) in video_files.iter().enumerate() {
+        raw_videos.push(prompting::load_video(
+            path,
+            params.width,
+            params.height,
+            cli.video_audio.contains(&(i + 1)),
+        )?);
     }
-    for im in &ref_images {
-        presentation.picture(im.w, im.h)?;
+    let mut entries =
+        prompting::raw_entries(&keyframe_images, &ref_images, &ref_audio, &raw_videos);
+    if upstream && active_refmods {
+        entries.extend(prompting::refmod_entries(&cli, &prepared_refmods)?);
     }
-    for _ in 0..ref_audio.len() {
-        presentation.audio()?;
+    let tok = Tokenizer::new()?;
+    if let Some(generator) = generator {
+        prompt = prompting::generate(generator, &cli, &entries, &shape, &prompt)?;
+    } else if cli.save_prompt.is_some() {
+        prompting::save(&cli, &prompt, serde_json::json!({"generated":false}))?;
     }
-    let ids = presentation
-        .finish(&prompt, &shape)
-        .map_err(|e| UsageError(e.to_string()))?;
+    let presentation = if upstream || !raw_videos.is_empty() {
+        Some(
+            h3_hrx::PreparedPresentation::new(&tok, &entries, &prompt, &shape)
+                .map_err(|e| UsageError(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+    if cli.prompt_only {
+        println!("{prompt}");
+        return Ok(());
+    }
+    let ids = if let Some(p) = &presentation {
+        p.ids().to_vec()
+    } else {
+        let mut p = h3_hrx::Presentation::new(&tok);
+        for (_, image) in &keyframe_images {
+            p.picture(image.w, image.h)?;
+        }
+        for image in &ref_images {
+            p.picture(image.w, image.h)?;
+        }
+        for _ in &ref_audio {
+            p.audio()?;
+        }
+        p.finish(&prompt, &shape)
+            .map_err(|e| UsageError(e.to_string()))?
+    };
+    // Reuse the standard Hub cache before downloading missing checkpoints.
+    // --offline stops at what is already on disk instead of downloading.
+    let resolver = h3_hrx::models::Resolver::new().offline(cli.offline);
+    let want_refs = !image_files.is_empty()
+        || !audio_files.is_empty()
+        || !raw_videos.is_empty()
+        || active_refmods;
+    let ref2va = want_refs && !cli.base_weights;
+    let resolve = |explicit: &Option<PathBuf>, relative: &str| -> Result<PathBuf> {
+        match explicit {
+            Some(path) => Ok(path.clone()),
+            None => Ok(resolver.find(relative)?),
+        }
+    };
+    let dit = resolve(
+        &early_dit.or_else(|| cli.dit.clone()),
+        if ref2va {
+            h3_hrx::models::DIT_REF2VA
+        } else {
+            h3_hrx::models::DIT_FL2VA
+        },
+    )?;
+    let te = resolve(&cli.te, h3_hrx::models::TE)?;
+    let video_vae = if cli.first_frame.is_some()
+        || !image_files.is_empty()
+        || !raw_videos.is_empty()
+        || (!cli.no_decode && !cli.audio_only)
+    {
+        Some(resolve(&cli.video_vae, h3_hrx::models::VIDEO_VAE)?)
+    } else {
+        cli.video_vae.clone()
+    };
+    let audio_vae = if !audio_files.is_empty()
+        || raw_videos.iter().any(|v| v.audio.is_some())
+        || !cli.no_decode
+    {
+        Some(resolve(&cli.audio_vae, h3_hrx::models::AUDIO_VAE)?)
+    } else {
+        cli.audio_vae.clone()
+    };
+    if !dit.exists() {
+        usage!("{} not found (README, Weights; --dit)", dit.display());
+    }
 
     eprintln!(
-        "{} frames at {}x{}: {}x{}x{} latents, {} audio latents; {} prompt tokens ({} keyframe, {} reference images, {} reference audio){}",
-        shape.frames, params.width, params.height, shape.latent_t, shape.lat_h, shape.lat_w, shape.audio_t,
-        ids.len(), keyframe_images.len(), ref_images.len(), ref_audio.len(),
-        if ref2va { ", ref2va weights" } else { "" }
+        "{} frames at {}x{}; {} prompt tokens",
+        shape.frames,
+        params.width,
+        params.height,
+        ids.len()
     );
 
     // Installed binaries use their packaged kernel sources; --root opts into a working tree's
@@ -715,6 +857,22 @@ fn run(cli: Cli) -> Result<()> {
         );
     }
 
+    let mut video_latents = Vec::new();
+    for video in &raw_videos {
+        let (z, t) = session.encode_video(Clip {
+            pixels: &video.pixels,
+            frames: video.frames,
+            height: video.height,
+            width: video.width,
+        })?;
+        let audio = video
+            .audio
+            .as_ref()
+            .map(|(samples, n)| session.encode_audio(samples, *n as usize))
+            .transpose()?;
+        video_latents.push((z, t, audio));
+    }
+
     let keyframes: Vec<Keyframe<'_>> = keyframe_images
         .iter()
         .zip(keyframe_latents.iter())
@@ -752,6 +910,23 @@ fn run(cli: Cli) -> Result<()> {
             frames: *t,
         });
     }
+    for (video, (z, t, audio)) in raw_videos.iter().zip(&video_latents) {
+        refs.push(Reference::Video {
+            latents: z,
+            grid: LatentGrid {
+                frames: *t,
+                height: video.height / 16,
+                width: video.width / 16,
+            },
+            audio: None,
+        });
+        if let Some((samples, t)) = audio {
+            refs.push(Reference::Audio {
+                latents: samples,
+                frames: *t,
+            });
+        }
+    }
     for prepared in &prepared_refmods {
         refs.extend(prepared.references());
     }
@@ -767,14 +942,25 @@ fn run(cli: Cli) -> Result<()> {
         let _ = std::io::Write::flush(&mut std::io::stderr());
         false // true would cancel
     };
-    let latents = session.denoise(
-        &ids,
-        &params,
-        Noise::default(),
-        &refs,
-        &keyframes,
-        Some(&mut show),
-    )?;
+    let latents = if let Some(presentation) = &presentation {
+        session.denoise_presented(
+            presentation,
+            &params,
+            Noise::default(),
+            &refs,
+            &keyframes,
+            Some(&mut show),
+        )?
+    } else {
+        session.denoise(
+            &ids,
+            &params,
+            Noise::default(),
+            &refs,
+            &keyframes,
+            Some(&mut show),
+        )?
+    };
     eprintln!();
     let (video, audio) = (latents.video, latents.audio);
     eprintln!("denoised in {:.1} s", t0.elapsed().as_secs_f64());
