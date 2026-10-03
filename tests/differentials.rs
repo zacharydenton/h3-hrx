@@ -69,6 +69,8 @@ fn check(got: String, want: &str, case: &str) {
 
 /// Every canvas the decoder tiles differently: one tile, several across, several down, and the
 /// temporal chunking at both a short and a long frame count.
+/// Spatial blends and minimum-clip padding were corrected against ComfyUI on
+/// 2026-10-02; see docs/testing.md and tests/fixtures/tiles for the oracle.
 #[test]
 #[ignore = "requires gfx1151, provisioned HRX and the video VAE checkpoint"]
 fn video_decode_is_byte_stable_across_the_tilings() {
@@ -77,7 +79,7 @@ fn video_decode_is_byte_stable_across_the_tilings() {
             256,
             256,
             5,
-            "de1b5ccb42ed5d2567e305f72ae504a1bb5bd168d9b469802cdc3ad74cb6c1f4",
+            "2669b306545ddaf54536af4d792b06b0165f754bd1601fa922ffbd21f8eed98c",
         ),
         (
             256,
@@ -89,19 +91,19 @@ fn video_decode_is_byte_stable_across_the_tilings() {
             320,
             320,
             56,
-            "a5265ce69ba09c451317eab859534640d4a1b9f8a707de2a7a4fdd60cf99e116",
+            "f92d130fe16bfa56a8dc11803864e94866bb773d62f143cc81364198591d41b6",
         ),
         (
             480,
             864,
             22,
-            "85658b4ec1bddfc66c2dba92c81b8e16158f91c93aff5f4878224ee2dcdd2b04",
+            "0fe06ed6e5abeac3a214fc0e85b1c3d3225e41b1d9e69fb29a8b196e63b7e81c",
         ),
         (
             480,
             864,
             5,
-            "fa4bddd83729027fab8ae70e0fbe3406f10db6e8a0bf3edda8de3d8fb912795d",
+            "a6fc7e2323bb7f40537377a5aa697c8f7eb298618e1115a6ee70b14aaee77e71",
         ),
         (
             512,
@@ -113,7 +115,7 @@ fn video_decode_is_byte_stable_across_the_tilings() {
             768,
             1344,
             5,
-            "be2c587698034753f2e2c1591e6bef2f5b583b8ab75da9dac418c436f1c2a675",
+            "f93998fb590390a55b4b43ee106f823ba63d1f9f4cfbbc41a32f85b3a32d587f",
         ),
     ];
     let mut stream = hrx::Stream::open().expect("stream");

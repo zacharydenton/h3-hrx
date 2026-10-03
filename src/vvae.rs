@@ -400,73 +400,24 @@ impl VideoVae {
     ) -> Result<()> {
         let (ft, h, w) = (grid.ft, grid.h, grid.w);
         let (frames_n, height, width) = grid.frames();
-        let (ys, yo) = tiles::split_tiles(height);
-        let (xs, xo) = tiles::split_tiles(width);
-        if ys.len() == 1 && xs.len() == 1 {
+        if height <= 256 && width <= 256 {
             return self.decode_clip(stream, c, prof, z, grid, frames);
         }
-        frames.clear();
-        frames.resize(3 * frames_n * height * width, 0.0);
-        let (th, tw) = (height.min(256), width.min(256));
-        let (lh, lw) = (th / VAE_PS, tw / VAE_PS);
-        let mut above: Vec<Vec<f32>> = vec![Vec::new(); xs.len()];
-        let mut row: Vec<Vec<f32>> = vec![Vec::new(); xs.len()];
-        let mut tile: Vec<f32> = Vec::new();
-        let mut latent = vec![0.0f32; LATENT_CH * ft * lh * lw];
-
-        for iy in 0..ys.len() {
-            for ix in 0..xs.len() {
-                for ch in 0..LATENT_CH {
-                    for t in 0..ft {
-                        for y in 0..lh {
-                            let src =
-                                ((ch * ft + t) * h + ys[iy] / VAE_PS + y) * w + xs[ix] / VAE_PS;
-                            let dst = ((ch * ft + t) * lh + y) * lw;
-                            latent[dst..dst + lw].copy_from_slice(&z[src..src + lw]);
-                        }
-                    }
-                }
-                self.decode_clip(
-                    stream,
-                    c,
-                    prof,
-                    &latent,
-                    Grid { ft, h: lh, w: lw },
-                    &mut row[ix],
-                )?;
-                // the neighbours blend against the tile as it was decoded, so the copy this writes
-                // into is the one that gets faded; `tile` keeps its allocation across tiles
-                tile.clear();
-                tile.extend_from_slice(&row[ix]);
-                if iy > 0 {
-                    tiles::blend_pixels(&mut tile, &above[ix], yo[iy - 1], true, frames_n, th, tw);
-                }
-                if ix > 0 {
-                    tiles::blend_pixels(
-                        &mut tile,
-                        &row[ix - 1],
-                        xo[ix - 1],
-                        false,
-                        frames_n,
-                        th,
-                        tw,
-                    );
-                }
-                let keep_h = th - if iy + 1 < ys.len() { yo[iy] } else { 0 };
-                let keep_w = tw - if ix + 1 < xs.len() { xo[ix] } else { 0 };
-                for ch in 0..3 {
-                    for t in 0..frames_n {
-                        for y in 0..keep_h {
-                            let dst = ((ch * frames_n + t) * height + ys[iy] + y) * width + xs[ix];
-                            let src = ((ch * frames_n + t) * th + y) * tw;
-                            frames[dst..dst + keep_w].copy_from_slice(&tile[src..src + keep_w]);
-                        }
+        let mut latent = Vec::new();
+        tiles::stitch_pixels(frames_n, height, width, frames, |y0, x0, th, tw, tile| {
+            let (lh, lw) = (th / VAE_PS, tw / VAE_PS);
+            latent.resize(LATENT_CH * ft * lh * lw, 0.0);
+            for ch in 0..LATENT_CH {
+                for t in 0..ft {
+                    for y in 0..lh {
+                        let src = ((ch * ft + t) * h + y0 / VAE_PS + y) * w + x0 / VAE_PS;
+                        let dst = ((ch * ft + t) * lh + y) * lw;
+                        latent[dst..dst + lw].copy_from_slice(&z[src..src + lw]);
                     }
                 }
             }
-            std::mem::swap(&mut above, &mut row);
-        }
-        Ok(())
+            self.decode_clip(stream, c, prof, &latent, Grid { ft, h: lh, w: lw }, tile)
+        })
     }
 
     /// The whole clip: latents `[24][T][H][W]` in, RGB bytes `[frames][H*16][W*16][3]` out.

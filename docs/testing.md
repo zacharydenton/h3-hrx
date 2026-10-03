@@ -26,6 +26,13 @@ separate from installing or running h3. See the
 The standard-library benchmark parser and cache calibration checks run with
 `python scripts/test_optimization_benchmark.py`.
 
+The CPU tile tests include [golden samples from ComfyUI](../tests/fixtures/tiles/README.md).
+They exercise the decoder's complete spatial compositor, including intersecting
+and triple overlaps. Checking an isolated blend ramp does not catch using raw
+neighbours in place of previously composited pixels. The temporal tests also
+require the minimum five-frame clip to decode seven latent tokens (five repeats
+for lookahead), then trim the extra seventeen output frames.
+
 ## Whole-pipeline digests
 
 `tests/differentials.rs` covers video decodes across the decoder's tilings,
@@ -41,6 +48,16 @@ compares them exactly as well.
 
 `H3_GRAPH=1 cargo test --test differentials --release -- --ignored --test-threads=1` runs the same cases through the
 recorded graphs, which is how the recordings are known to be faithful.
+
+The 2026-10-02 decoder digest update corrects spatial overlap compositing and
+five-frame lookahead padding. Against ComfyUI `a7169322`, a 320×320, 22-frame
+saved-latent decode improved from 0.462 to 0.167 RGB8 RMSE; the corrected 64×64,
+five-frame decode differed by at most one RGB8 level. The independent compositor
+fixture covers the blend logic without model or precision differences. The
+256×512×39 and 512×256×22 decoder digests remain unchanged.
+The additional diffusers check could not run: the cached original VAE index is
+present but its weight shards are missing. Current ComfyUI supplies the independent
+oracle for this update; diffusers 0.40.0 still uses the old raw-neighbour compositor.
 
 A failed assertion reports the actual and expected digests. Before updating an expected digest
 for an intentional numerical change, validate the new output independently with

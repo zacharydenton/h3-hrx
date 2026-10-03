@@ -118,6 +118,68 @@ pub fn blend_pixels(
     }
 }
 
+/// Decode and composite spatial tiles in row order. The previous row's strip is
+/// the finished horizontal composite; the left tile includes its vertical blend.
+/// Keeping raw neighbours instead reintroduces seams wherever overlaps cross.
+pub fn stitch_pixels<E>(
+    frames: usize,
+    height: usize,
+    width: usize,
+    out: &mut Vec<f32>,
+    mut decode: impl FnMut(usize, usize, usize, usize, &mut Vec<f32>) -> Result<(), E>,
+) -> Result<(), E> {
+    let (ys, yo) = split_tiles(height);
+    let (xs, xo) = split_tiles(width);
+    let (th, tw) = (height.min(256), width.min(256));
+    if ys.len() == 1 && xs.len() == 1 {
+        return decode(0, 0, th, tw, out);
+    }
+    out.clear();
+    out.resize(3 * frames * height * width, 0.0);
+    let (mut above, mut next_above, mut left, mut tile) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (iy, &y0) in ys.iter().enumerate() {
+        let bottom = yo.get(iy).copied().unwrap_or(0);
+        next_above.resize(3 * frames * bottom * width, 0.0);
+        for (ix, &x0) in xs.iter().enumerate() {
+            decode(y0, x0, th, tw, &mut tile)?;
+            if iy > 0 {
+                let extent = yo[iy - 1];
+                for cf in 0..3 * frames {
+                    for y in 0..extent {
+                        let wb = y as f32 / extent as f32;
+                        for x in 0..tw {
+                            let dst = (cf * th + y) * tw + x;
+                            let src = (cf * extent + y) * width + x0 + x;
+                            tile[dst] = (1.0 - wb) * above[src] + wb * tile[dst];
+                        }
+                    }
+                }
+            }
+            if ix > 0 {
+                blend_pixels(&mut tile, &left, xo[ix - 1], false, frames, th, tw);
+            }
+            let keep_h = th - bottom;
+            let keep_w = tw - xo.get(ix).copied().unwrap_or(0);
+            for cf in 0..3 * frames {
+                for y in 0..th {
+                    let src = (cf * th + y) * tw;
+                    if y < keep_h {
+                        let dst = (cf * height + y0 + y) * width + x0;
+                        out[dst..dst + keep_w].copy_from_slice(&tile[src..src + keep_w]);
+                    } else {
+                        let dst = (cf * bottom + y - keep_h) * width + x0;
+                        next_above[dst..dst + keep_w].copy_from_slice(&tile[src..src + keep_w]);
+                    }
+                }
+            }
+            std::mem::swap(&mut left, &mut tile);
+        }
+        std::mem::swap(&mut above, &mut next_above);
+    }
+    Ok(())
+}
+
 /// The decoder's temporal cross-fade: the previous chunk's tail faded into this chunk's head.
 ///
 /// The fade length is the smallest of what the overlap holds, what the chunk holds, and what was asked
@@ -182,7 +244,12 @@ pub fn decoder_chunks(tokens: usize, padding: usize) -> usize {
 /// The plan for `t` latent frames.
 pub fn chunk_plan(t: usize) -> ChunkPlan {
     let num_tokens = t + VAE_TOKEN_DROP;
-    let pad_tokens = (VAE_CHUNK - num_tokens % VAE_CHUNK) % VAE_CHUNK;
+    let mut pad_tokens = (VAE_CHUNK - num_tokens % VAE_CHUNK) % VAE_CHUNK;
+    // ComfyUI supplies a full decoder window even for the minimum two-token
+    // clip. Merely clamping the chunk count to one leaves out its lookahead.
+    if (num_tokens + pad_tokens) / VAE_CHUNK <= 1 {
+        pad_tokens += VAE_CHUNK;
+    }
     let chunks = decoder_chunks(t, pad_tokens);
     let pre = (VAE_TRATIO - VAE_CLIP % VAE_TRATIO) % VAE_TRATIO;
     let intra_tail = VAE_CLIP % VAE_TRATIO;
@@ -211,6 +278,64 @@ pub fn chunk_plan(t: usize) -> ChunkPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spatial_compositing_matches_comfyui_at_overlaps_and_intersections() {
+        // Golden samples from unmodified ComfyUI tiled_decode with synthetic
+        // decoder tiles; no GPU or model weights are involved in this oracle.
+        // Source: ComfyUI a7169322, comfy/ldm/minimax/vae.py. Only the
+        // _decode_tile_row callback was replaced, using the formula below.
+        // split_tiles, blend and tiled_decode ran unmodified in float32.
+        // The fixture metadata records the source hash and sample coordinates.
+        let bytes = include_bytes!("../tests/fixtures/tiles/comfy.safetensors");
+        let (_, header) = safetensors::SafeTensors::read_metadata(bytes).unwrap();
+        let cases: serde_json::Value =
+            serde_json::from_str(&header.metadata().as_ref().unwrap()["cases"]).unwrap();
+        let tensors = safetensors::SafeTensors::deserialize(bytes).unwrap();
+        for case in cases.as_array().unwrap() {
+            let h = case["height"].as_u64().unwrap() as usize;
+            let w = case["width"].as_u64().unwrap() as usize;
+            let (ys, _) = split_tiles(h);
+            let (xs, _) = split_tiles(w);
+            let mut out = Vec::new();
+            stitch_pixels(2, h, w, &mut out, |y0, x0, th, tw, tile| {
+                let iy = ys.iter().position(|&y| y == y0).unwrap();
+                let ix = xs.iter().position(|&x| x == x0).unwrap();
+                tile.clear();
+                for c in 0..3 {
+                    for f in 0..2 {
+                        for y in 0..th {
+                            for x in 0..tw {
+                                tile.push(
+                                    (c * 100 + f * 10 + iy * 3 + ix * 7) as f32
+                                        + y as f32 / 256.0
+                                        + x as f32 / 512.0,
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .unwrap();
+            let expected = tensors.tensor(case["name"].as_str().unwrap()).unwrap();
+            let mut expected = expected.data().chunks_exact(4);
+            for cf in 0..6 {
+                for y in case["ys"].as_array().unwrap() {
+                    for x in case["xs"].as_array().unwrap() {
+                        let (y, x) = (y.as_u64().unwrap() as usize, x.as_u64().unwrap() as usize);
+                        let want = f32::from_le_bytes(expected.next().unwrap().try_into().unwrap());
+                        let got = out[(cf * h + y) * w + x];
+                        assert!(
+                            (got - want).abs() < 5e-5,
+                            "{h}x{w}, channel/frame {cf}, ({y},{x}): {got} != {want}"
+                        );
+                    }
+                }
+            }
+            assert!(expected.next().is_none());
+        }
+    }
 
     #[test]
     fn a_length_inside_one_tile_needs_no_overlaps() {
@@ -315,6 +440,9 @@ mod tests {
     fn a_short_clip_still_decodes_in_one_chunk() {
         let p = chunk_plan(2);
         assert_eq!(p.chunks, 1);
+        assert_eq!(p.pad_tokens, 5);
+        assert_eq!(p.padded_tokens, 7);
+        assert_eq!(p.pad_frames, 17);
         assert_eq!(p.pre, 3, "three frames come off the front of every clip");
         assert_eq!(p.overlap_frames, 5, "and the cross-fade spans five");
     }
