@@ -227,13 +227,26 @@ pub fn raw_entries(
     out
 }
 
-pub fn refmod_entries(cli: &Cli, mods: &[PreparedRefMod]) -> Result<Vec<MediaEntry>> {
+pub fn refmod_entries(
+    cli: &Cli,
+    mods: &[PreparedRefMod],
+    paths: &super::refmod_sources::Sources,
+) -> Result<Vec<MediaEntry>> {
     let max_media_bytes = cli
         .refmod_media_budget_mib
         .checked_mul(1024 * 1024)
         .ok_or_else(|| anyhow::anyhow!("--refmod-media-budget-mib overflows"))?;
-    let visual = mods.iter().flat_map(|m| m.members()).any(|m| !m.is_audio());
-    let audio = mods.iter().flat_map(|m| m.members()).any(|m| m.is_audio());
+    let sources = super::refmod_sources::load(cli, mods, paths, max_media_bytes)?;
+    let (visual, audio) = super::refmod_sources::missing_modalities(mods, paths);
+    let options = RefModPresentationOptions {
+        fps: cli.reference_fps,
+        max_media_bytes,
+    };
+    if !visual && !audio {
+        return Ok(h3_hrx::refmod::entries_from_sources(
+            mods, options, &sources,
+        )?);
+    }
     let resolver = h3_hrx::models::Resolver::new().offline(cli.offline);
     let resolve = |explicit: &Option<std::path::PathBuf>, name: &str| -> Result<_> {
         Ok(match explicit {
@@ -278,13 +291,7 @@ pub fn refmod_entries(cli: &Cli, mods: &[PreparedRefMod]) -> Result<Vec<MediaEnt
             &context,
         )
     }?;
-    Ok(session.refmod_entries(
-        mods,
-        RefModPresentationOptions {
-            fps: cli.reference_fps,
-            max_media_bytes,
-        },
-    )?)
+    Ok(session.refmod_entries_with_sources(mods, options, &sources)?)
 }
 
 #[cfg(feature = "local-prompt-generation")]

@@ -12,6 +12,7 @@
 //! The CLI owns a Rust `Session`; application adapters call that same API.
 mod media;
 mod prompting;
+mod refmod_sources;
 mod refmods;
 mod world_session;
 
@@ -143,7 +144,7 @@ struct GenerationArgs {
     /// Reconstructed RefMod playback rate; stack timing is synthetic
     #[arg(long, default_value_t = 24.0)]
     reference_fps: f64,
-    /// Host float-media budget for RefMod reconstruction, excluding model allocations
+    /// Host float-media budget for RefMod sources/reconstruction, excluding models and codecs
     #[arg(long, default_value_t = 1024)]
     refmod_media_budget_mib: usize,
     /// Include audio from a one-based positional video reference (repeatable)
@@ -152,6 +153,9 @@ struct GenerationArgs {
     /// Pre-encoded v4 reference or v5 visual/audio bundle (repeatable)
     #[arg(long = "refmod", value_name = "FILE")]
     refmods: Vec<PathBuf>,
+    /// Original presentation media for a RefMod member; repeat for ordered stack images
+    #[arg(long, value_name = "SLOT:MEMBER=PATH")]
+    refmod_source: Vec<String>,
     /// Visual strength for a one-based refmod slot: INDEX=VALUE (0..1)
     #[arg(long, value_name = "INDEX=VALUE")]
     refmod_visual_strength: Vec<String>,
@@ -581,10 +585,15 @@ fn run(mut cli: Cli) -> Result<()> {
         None => {}
     }
     let generator = prompting::generator(&cli)?;
-    let upstream =
-        cli.refmod_presentation == Some(RefmodPresentation::Upstream) || cli.generate_prompt;
-    if cli.generate_prompt && cli.refmod_presentation == Some(RefmodPresentation::LatentOnly) {
-        usage!("generated prompts require --refmod-presentation upstream");
+    let upstream = cli.refmod_presentation == Some(RefmodPresentation::Upstream)
+        || cli.generate_prompt
+        || !cli.refmod_source.is_empty();
+    if (cli.generate_prompt || !cli.refmod_source.is_empty())
+        && cli.refmod_presentation == Some(RefmodPresentation::LatentOnly)
+    {
+        usage!(
+            "generated prompts and original RefMod sources require --refmod-presentation upstream"
+        );
     }
     if !cli.reference_fps.is_finite() || !(1.0..=120.0).contains(&cli.reference_fps) {
         usage!("--reference-fps must be 1..120");
@@ -602,6 +611,7 @@ fn run(mut cli: Cli) -> Result<()> {
         );
     }
     let prepared_refmods = refmods::prepare(&cli)?;
+    let refmod_sources = refmod_sources::parse(&cli, &prepared_refmods)?;
     let active_refmods = prepared_refmods.iter().any(|r| r.token_count() > 0);
     if active_refmods && cli.preset.turbo().is_some() {
         usage!("Turbo does not support active refmods");
@@ -762,6 +772,13 @@ fn run(mut cli: Cli) -> Result<()> {
     let mut entries =
         prompting::raw_entries(&keyframe_images, &ref_images, &ref_audio, &raw_videos);
     prompting::check_local_audio(&cli, &entries, &prepared_refmods)?;
+    if upstream && active_refmods {
+        entries.extend(prompting::refmod_entries(
+            &cli,
+            &prepared_refmods,
+            &refmod_sources,
+        )?);
+    }
     let local_budget = if cli.generate_prompt && cli.prompt_backend == PromptBackend::Local {
         memory_budget_bytes(&cli)?
             .map(hrx::residency::ResidencyManager::new)
@@ -840,9 +857,6 @@ fn run(mut cli: Cli) -> Result<()> {
     } else {
         None
     };
-    if upstream && active_refmods {
-        entries.extend(prompting::refmod_entries(&cli, &prepared_refmods)?);
-    }
     let early_encoded = if !cli.prompt_only {
         local_session
             .as_mut()

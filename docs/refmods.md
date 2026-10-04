@@ -120,6 +120,55 @@ This path requires the relevant VAEs, consumes additional vision tokens and can
 fail the text budget even when latent-only loading succeeds. The prompt-only
 command also needs these VAEs and a GPU when it reconstructs RefMods.
 
+### Use original files without VAE reconstruction
+
+Supply `--refmod-source SLOT:MEMBER=PATH` to use original media for prompt analysis
+and H3 text/vision presentation. Both indices are one-based: `SLOT` is the position
+in the `--refmod` list, and `MEMBER` is the original member number printed by
+`h3 refmod inspect`. Member numbers stay fixed when another modality is disabled;
+copies inherit the same source and share its decoded buffers.
+
+```sh
+h3 prompt --prompt-images --refmod character.safetensors \
+  --refmod-source '1:1=original portrait.png' \
+  -p 'The referenced character greets the viewer' > greeting.txt
+
+# A visual-stack member followed by an audio member in the same bundle:
+h3 --generate-prompt --prompt-images --prompt-audio \
+  --refmod character-with-voice.safetensors \
+  --refmod-source '1:1=front.png' --refmod-source '1:1=profile.png' \
+  --refmod-source '1:2=voice.wav' \
+  -p 'The referenced character greets the viewer' --out greeting.mp4
+```
+
+An image member accepts one image, an audio member accepts one audio file, and a
+video/stack member accepts either one video file or repeated image paths in the
+desired order. Video files are sampled at 2 fps; all supplied stack images are
+shown at synthetic half-second intervals. Later stack images are center-cropped
+to the first image's aspect ratio. Visuals fit the output canvas pixel budget on
+the 32-pixel grid. Video soundtracks are not implicitly included; use a separate
+audio member and source mapping. Paths with spaces should be quoted.
+
+The flag enables upstream presentation automatically and conflicts with explicit
+`--refmod-presentation latent-only`. It works with endpoint and local prompting,
+and with an existing handwritten prompt. Local prompting still requires audio
+notes for audio labels. Sources replace presentation evidence rather than adding
+positional references: the RefMod latents, strengths and conditioning copies
+remain unchanged, and originals are never VAE-encoded.
+
+Unmapped active members still use VAE reconstruction. When every active member
+has an original source, endpoint `h3 prompt` needs no H3 checkpoints or GPU.
+Normal video generation still needs its model and output decoder. File decoding,
+resizing and endpoint media serialization remain; the skipped step is latent-to-
+pixel VAE reconstruction. Source decoding is bounded by the shared
+`--refmod-media-budget-mib` limit (default 1024 MiB), excluding codec subprocess
+memory, models and endpoint payloads. Oversized sources fail rather than truncate.
+
+Supply files corresponding to the intended members: correspondence cannot be
+verified automatically, especially for pooled or optimized RefMods. Provenance
+records supplied paths as `original_file`, separately from reconstructed latent
+evidence. Originals do not reflect latent strength adjustments.
+
 ## Rust
 
 Use `refmod::{RefMod, RefModMember, ApplyOptions, CreateOptions, ImageInput,
@@ -133,6 +182,13 @@ presentation, including copy labels and synthetic timing. With the optional
 `prompt-generation` feature, `PromptGenerator::generate_refmods` performs this
 preparation and endpoint rewriting together, returning the prompt and matching
 H3 presentation. See the [native Rust example](prompting.md#native-rust-refmod-prompting).
+
+For originals, pass decoded `RefModSource` values to
+`Session::refmod_entries_with_sources`; only unmapped members are reconstructed.
+`refmod::entries_from_sources` assembles fully supplied references without a
+session. Both return the same ordered `MediaEntry` list for prompting and H3
+presentation. `PreparedRefMod::indexed_members()` exposes stable original member
+numbers, including copies. Filesystem decoding remains a CLI concern.
 
 With `Config::dit = None`, `Session::denoise` selects Ref2VA whenever its reference
 list is nonempty. Without references it selects FL2VA, including keyframe-only

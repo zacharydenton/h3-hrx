@@ -1,7 +1,7 @@
 //! ffmpeg and ffprobe as child processes, and the WAV writer. Arguments are passed as an argv, never
 //! through a shell, so paths with quotes or spaces need no escaping.
 use anyhow::{bail, Context, Result};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -69,6 +69,93 @@ pub fn probe_size(path: &Path) -> Result<(i32, i32)> {
         bail!("{path} has a zero size");
     }
     Ok((w, h))
+}
+
+/// Bounded stdout for original RefMod sources. Abort rather than silently truncate
+/// large media; always reap the child, including on a read error.
+fn capture_limited(args: &[&str], max_bytes: usize) -> Result<Vec<u8>> {
+    let mut child = Command::new("ffmpeg")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("cannot run ffmpeg")?;
+    let mut bytes = Vec::new();
+    let read = child
+        .stdout
+        .take()
+        .unwrap()
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes);
+    if read.is_err() || bytes.len() > max_bytes {
+        let _ = child.kill();
+        let _ = child.wait();
+        read?;
+        bail!("refmod source exceeds host media budget (--refmod-media-budget-mib)");
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        bail!("ffmpeg failed ({status})");
+    }
+    Ok(bytes)
+}
+
+/// Only presentation frames, with a conservative four-float-buffer budget.
+pub fn decode_source_visual(
+    path: &Path,
+    still: bool,
+    size: Option<(i32, i32)>,
+    canvas: (i32, i32),
+    budget: usize,
+) -> Result<(Vec<u8>, i32, i32)> {
+    let (w, h) = probe_size(path)?;
+    let (w, h) = size.unwrap_or_else(|| h3_hrx::resize::fit(w, h, canvas.0, canvas.1));
+    let stride = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|n| n.checked_mul(3))
+        .context("refmod source dimensions overflow")?;
+    if stride > budget / 16 {
+        bail!("refmod source exceeds host media budget (--refmod-media-budget-mib)");
+    }
+    let filter = if still && size.is_some() {
+        format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}")
+    } else if still {
+        format!("scale={w}:{h}")
+    } else {
+        format!("fps=2:start_time=0,scale={w}:{h}")
+    };
+    let p = path.to_str().context("source path is not UTF-8")?;
+    let mut args = vec!["-v", "error", "-i", p, "-an", "-vf", &filter];
+    if still {
+        args.extend(["-frames:v", "1"]);
+    }
+    args.extend(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]);
+    let raw = capture_limited(&args, budget / 16)?;
+    if raw.is_empty() || !raw.len().is_multiple_of(stride) {
+        bail!("invalid decoded refmod source visual");
+    }
+    Ok((raw, w, h))
+}
+
+pub fn decode_source_audio(path: &Path, budget: usize) -> Result<Vec<f32>> {
+    let p = path.to_str().context("source path is not UTF-8")?;
+    let raw = capture_limited(
+        &[
+            "-v", "error", "-i", p, "-vn", "-ac", "2", "-ar", "32000", "-f", "f32le", "-",
+        ],
+        budget / 4,
+    )?;
+    if raw.is_empty() || !raw.len().is_multiple_of(8) {
+        bail!("invalid decoded refmod source audio");
+    }
+    let n = raw.len() / 8;
+    let mut samples = vec![0.0; n * 2];
+    for (i, pair) in raw.chunks_exact(8).enumerate() {
+        samples[i] = f32::from_le_bytes(pair[..4].try_into().unwrap());
+        samples[n + i] = f32::from_le_bytes(pair[4..].try_into().unwrap());
+    }
+    Ok(samples)
 }
 
 /// One frame of any format ffmpeg reads, as RGB8 `[h][w][3]`.

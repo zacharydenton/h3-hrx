@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use std::{collections::HashMap, io::Write, path::Path};
 
 mod presentation;
-pub use presentation::RefModPresentationOptions;
+pub use presentation::{entries_from_sources, RefModPresentationOptions, RefModSource};
 
 fn err(e: impl std::fmt::Display) -> Error {
     Error::Invalid(format!("refmod: {e}"))
@@ -325,9 +325,10 @@ impl RefMod {
     pub fn prepare(&self, options: ApplyOptions) -> Result<PreparedRefMod> {
         options.check()?;
         let mut members = Vec::new();
+        let mut source_indices = Vec::new();
         let mut indices = Vec::new();
         let mut tokens = 0usize;
-        for m in &self.members {
+        for (source_index, m) in self.members.iter().enumerate() {
             let strength = if m.is_audio() {
                 options.audio_strength
             } else {
@@ -362,9 +363,11 @@ impl RefMod {
             indices.try_reserve(options.copies).map_err(err)?;
             indices.extend(std::iter::repeat_n(members.len(), options.copies));
             members.push(member);
+            source_indices.push(source_index + 1);
         }
         Ok(PreparedRefMod {
             members,
+            source_indices,
             indices,
             tokens,
         })
@@ -411,6 +414,7 @@ impl ApplyOptions {
 /// Owns each transformed latent once; copies borrow the same storage.
 pub struct PreparedRefMod {
     members: Vec<RefModMember>,
+    source_indices: Vec<usize>,
     indices: Vec<usize>,
     tokens: usize,
 }
@@ -418,6 +422,14 @@ impl PreparedRefMod {
     /// Active members in conditioning order, including copies. Values already include strength.
     pub fn members(&self) -> impl Iterator<Item = &RefModMember> {
         self.indices.iter().map(|&i| &self.members[i])
+    }
+
+    /// One-based original file member numbers and active members, including copies.
+    /// Numbers remain stable when other members are disabled.
+    pub fn indexed_members(&self) -> impl Iterator<Item = (usize, &RefModMember)> {
+        self.indices
+            .iter()
+            .map(|&i| (self.source_indices[i], &self.members[i]))
     }
 
     pub fn references(&self) -> Vec<Reference<'_>> {

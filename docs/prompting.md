@@ -44,6 +44,9 @@ h3 prompt --prompt-images --prompt-audio movement.mp4 --video-audio 1 \
   -p 'Continue this scene with its original atmosphere' > continuation.txt
 h3 prompt --prompt-images --prompt-audio --refmod character.safetensors \
   -p 'The referenced character greets the viewer' > greeting.txt
+h3 prompt --prompt-images --refmod portrait.safetensors \
+  --refmod-source '1:1=original portrait.png' \
+  -p 'The referenced character greets the viewer' > greeting.txt
 ```
 
 Images use `image_url` PNG data URLs. Video uses timestamped images sampled at
@@ -57,7 +60,9 @@ Enabling rewriting sends your instruction and supplied/reconstructed media to
 the configured endpoint. Ordinary generation makes no LLM request. `--offline`
 continues to mean **no checkpoint downloads**; it does not disable the explicitly
 selected endpoint. Prompt-only raw-media requests need no H3 checkpoints or GPU.
-RefMods require the corresponding local VAE and GPU for reconstruction; see
+RefMod members without `--refmod-source SLOT:MEMBER=PATH` require the corresponding
+local VAE and GPU for reconstruction. Supplying originals for every active member
+also makes endpoint RefMod prompting independent of H3 checkpoints and GPU; see
 [RefMod presentation](refmods.md#upstream-presentation).
 
 The processor uses the actual rounded frame count at 24 fps, not an integer API

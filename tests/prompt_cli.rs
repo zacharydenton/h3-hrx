@@ -7,15 +7,13 @@ use std::{
     time::Duration,
 };
 
-#[test]
-fn prompt_command_uses_shared_arguments_and_needs_no_models_or_runtime() {
+fn endpoint(final_prompt: &'static str) -> (String, std::thread::JoinHandle<Vec<Value>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let worker = std::thread::spawn(move || {
-        let final_prompt="integrated_multimodal_description: [Shot 1] Cinematic, a red ball rolls.\noverall_soundscape: Soft rolling.\nnon_diegetic_music: N/A";
         let mut requests = Vec::new();
-        for content in ["A red ball, no reference assets.", final_prompt] {
+        for content in ["A red ball.", final_prompt] {
             let start = std::time::Instant::now();
             let (mut stream, _) = loop {
                 match listener.accept() {
@@ -56,6 +54,12 @@ fn prompt_command_uses_shared_arguments_and_needs_no_models_or_runtime() {
         }
         requests
     });
+    (url, worker)
+}
+
+#[test]
+fn prompt_command_uses_shared_arguments_and_needs_no_models_or_runtime() {
+    let (url, worker) = endpoint("integrated_multimodal_description: [Shot 1] Cinematic, a red ball rolls.\noverall_soundscape: Soft rolling.\nnon_diegetic_music: N/A");
     let dir = tempfile::tempdir().unwrap();
     let saved = dir.path().join("prompt.txt");
     let result = Command::new(env!("CARGO_BIN_EXE_h3"))
@@ -183,4 +187,122 @@ fn local_audio_notes_fail_before_any_checkpoint_or_runtime_is_opened() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn original_refmod_images_prompt_without_models_and_keep_copy_labels() {
+    use h3_hrx::{
+        refmod::{RefMod, RefModMember},
+        LatentGrid,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("original image=red.png");
+    let mut encoder = png::Encoder::new(std::fs::File::create(&original).unwrap(), 64, 64);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .unwrap()
+        .write_image_data(&[255, 0, 0].repeat(64 * 64))
+        .unwrap();
+    let refmod = dir.path().join("reference.safetensors");
+    RefMod::new(
+        "red",
+        vec![RefModMember::visual(
+            "red",
+            vec![0.0; 24 * 4 * 4],
+            LatentGrid {
+                frames: 1,
+                width: 4,
+                height: 4,
+            },
+        )
+        .unwrap()],
+    )
+    .unwrap()
+    .save(&refmod, false)
+    .unwrap();
+    let (url, worker) = endpoint("subject_definitions: <Subject 1> is the ball in <Picture 1> and <Picture 2>.\nsummary: [reference generation] A ball rolls.\nretention_analysis: <Subject 1>: fully_preserved - color and shape.\ndetailed_description: Cinematic. [Shot 1] The red ball rolls.\noverall_soundscape: Soft rolling.\nnon_diegetic_music: N/A");
+    let saved = dir.path().join("prompt.txt");
+    let output = Command::new(env!("CARGO_BIN_EXE_h3"))
+        .args([
+            "prompt",
+            "--offline",
+            "--prompt-images",
+            "--prompt-base-url",
+            &url,
+            "--prompt-model",
+            "mock",
+            "--width",
+            "64",
+            "--height",
+            "64",
+            "--refmod",
+        ])
+        .arg(&refmod)
+        .args([
+            "--refmod-source",
+            &format!("1:1={}", original.display()),
+            "--refmod-copies",
+            "1=2",
+            "--refmod-visual-strength",
+            "1=0.4",
+            "--video-vae",
+            "/absent/video-vae",
+            "--audio-vae",
+            "/absent/audio-vae",
+            "--te",
+            "/absent/te",
+            "--dit",
+            "/absent/dit",
+            "-p",
+            "Make the ball roll",
+            "--save-prompt",
+        ])
+        .arg(&saved)
+        .env("HF_HUB_CACHE", dir.path().join("empty-cache"))
+        .env("HF_HUB_OFFLINE", "1")
+        .env("HRX_OFFLINE", "1")
+        .env_remove("H3_PROMPT_API_KEY")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = worker.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    let images: Vec<_> = requests[0]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .filter(|p| p["type"] == "image_url")
+        .collect();
+    assert_eq!(images.len(), 2);
+    assert_eq!(images[0], images[1]);
+    // Verify the actual original pixels reach the endpoint, not just the labels.
+    use base64::Engine;
+    let url = images[0]["image_url"]["url"].as_str().unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(url.split_once(',').unwrap().1)
+        .unwrap();
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes))
+        .read_info()
+        .unwrap();
+    let mut pixels = vec![0; decoder.output_buffer_size().unwrap()];
+    let info = decoder.next_frame(&mut pixels).unwrap();
+    assert!(pixels[..info.buffer_size()]
+        .chunks_exact(3)
+        .all(|p| p == [255, 0, 0]));
+    let record: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("prompt.txt.json")).unwrap())
+            .unwrap();
+    let record_text = record.to_string();
+    assert!(record_text.contains("original_file"));
+    assert!(record_text.contains("<Picture 2>"));
+    assert!(!record_text.contains("<Picture 3>"));
+    assert!(!dir.path().join("empty-cache").exists());
 }
