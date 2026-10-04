@@ -255,6 +255,53 @@ pub(crate) fn float_at(dtype: Dtype, bytes: &[u8], index: usize) -> Result<f32> 
     Ok(value)
 }
 
+/// Recognize the released PEFT naming convention and require the complete world adapter.
+fn normalize_world(file: &mut Checkpoint) -> Result<()> {
+    if !file.entries().keys().any(|k| k.contains(".default.weight")) {
+        return Ok(());
+    }
+    let names = world_names(file.entries())?;
+    file.rename_entries(names);
+    Ok(())
+}
+
+fn world_names(entries: &BTreeMap<String, Entry>) -> Result<BTreeMap<String, Entry>> {
+    let mut names = BTreeMap::new();
+    for (key, entry) in entries {
+        if !(key.ends_with(".lora_A.default.weight") || key.ends_with(".lora_B.default.weight")) {
+            return invalid(format!("unexpected world adapter tensor {key}"));
+        }
+        names.insert(
+            format!(
+                "diffusion_model.{}",
+                key.replace(".default.weight", ".weight")
+            ),
+            entry.clone(),
+        );
+    }
+    let specs = validate_lora_header(&names)?;
+    if specs.len() != 104
+        || specs
+            .iter()
+            .any(|s| s.rank != 32 || !s.prefix.contains(".attn."))
+    {
+        return invalid("world adapter requires all 104 rank-32 attention projection pairs");
+    }
+    Ok(names)
+}
+
+/// Validate the released world format before creating a GPU session.
+///
+/// # Safety
+/// The checkpoint must remain immutable for the duration of this call.
+pub unsafe fn validate_world(path: &std::path::Path) -> Result<()> {
+    let mut file = unsafe { Checkpoint::open(path) }?;
+    if !file.entries().keys().any(|k| k.contains(".default.weight")) {
+        return invalid("expected the released H3-World adapter format");
+    }
+    normalize_world(&mut file)
+}
+
 impl Adapter {
     /// Load and validate weighted H3 LoRAs. Unlisted projections retain the base
     /// path. All supplied tensors must be accounted for; no format guessing.
@@ -272,7 +319,8 @@ impl Adapter {
                 continue;
             }
             // Safety: inherited from this function's caller.
-            let file = unsafe { Checkpoint::open(&lora.path) }?;
+            let mut file = unsafe { Checkpoint::open(&lora.path) }?;
+            normalize_world(&mut file)?;
             let mut specs = validate_lora_header(file.entries())?;
             for spec in &mut specs {
                 if let Ok(alpha) = file.at(&format!("{}.alpha", spec.prefix)) {
@@ -484,5 +532,33 @@ mod tests {
         );
         assert_eq!(audio.sigmas, vec![1.0, 0.9, 0.75, 0.5, 0.0]);
         assert_eq!(TurboPreset::Eight.schedules().0.timesteps.len(), 8);
+    }
+    #[test]
+    fn world_names_require_every_attention_pair_including_refiner() {
+        let mut entries = BTreeMap::new();
+        for spec in specifications()
+            .into_iter()
+            .filter(|s| s.prefix.contains(".attn."))
+        {
+            let prefix = spec.prefix.strip_prefix("diffusion_model.").unwrap();
+            for (suffix, shape) in [("A", vec![32, spec.input]), ("B", vec![spec.output, 32])] {
+                entries.insert(
+                    format!("{prefix}.lora_{suffix}.default.weight"),
+                    Entry {
+                        dtype: Dtype::BF16,
+                        shape,
+                        offset: 0,
+                        bytes: 0,
+                    },
+                );
+            }
+        }
+        assert_eq!(world_names(&entries).unwrap().len(), 208);
+        let key = "token_refiner.blocks.1.attn.out_proj.lora_B.default.weight";
+        let value = entries.remove(key).unwrap();
+        assert!(world_names(&entries).is_err());
+        entries.insert(key.into(), value);
+        entries.get_mut(key).unwrap().shape[1] = 16;
+        assert!(world_names(&entries).is_err());
     }
 }

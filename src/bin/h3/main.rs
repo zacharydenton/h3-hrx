@@ -13,6 +13,7 @@
 mod media;
 mod prompting;
 mod refmods;
+mod world_session;
 
 use h3_hrx::resize;
 
@@ -95,11 +96,30 @@ impl std::ops::DerefMut for Cli {
         &mut self.generation
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum PromptBackend {
+    Endpoint,
+    Local,
+}
+
 #[derive(clap::Args)]
 struct GenerationArgs {
+    /// Prompt processor: remote endpoint or resident shared Qwen3-VL
+    #[arg(long, value_enum, default_value_t = PromptBackend::Endpoint)]
+    prompt_backend: PromptBackend,
+    /// Directory containing Qwen3-VL-32B-Instruct shards 11..14
+    #[arg(long)]
+    prompt_local_model_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 8192)]
+    prompt_context_tokens: usize,
+    #[arg(long, default_value_t = 1024)]
+    prompt_max_tokens: usize,
+    /// Local-only user descriptions, keyed by the final Audio N label
+    #[arg(long, value_name = "INDEX=TEXT")]
+    prompt_audio_note: Vec<String>,
     #[arg(skip)]
     prompt_only: bool,
-    /// Rewrite the instruction through the configured multimodal endpoint
+    /// Rewrite the instruction through the selected prompt backend
     #[arg(long)]
     generate_prompt: bool,
     /// Chat API prefix (otherwise H3_PROMPT_BASE_URL)
@@ -123,6 +143,9 @@ struct GenerationArgs {
     /// Reconstructed RefMod playback rate; stack timing is synthetic
     #[arg(long, default_value_t = 24.0)]
     reference_fps: f64,
+    /// Host float-media budget for RefMod reconstruction, excluding model allocations
+    #[arg(long, default_value_t = 1024)]
+    refmod_media_budget_mib: usize,
     /// Include audio from a one-based positional video reference (repeatable)
     #[arg(long, value_name = "INDEX")]
     video_audio: Vec<usize>,
@@ -263,10 +286,29 @@ enum RefmodPresentation {
     LatentOnly,
 }
 
+#[derive(clap::Args)]
+struct WorldArgs {
+    #[command(flatten)]
+    generation: GenerationArgs,
+    /// Held keyboard action for the whole clip
+    #[arg(long, conflicts_with = "actions", required_unless_present = "actions")]
+    action_preset: Option<String>,
+    /// JSON array containing one array of held keys per output frame
+    #[arg(long, conflicts_with = "action_preset")]
+    actions: Option<PathBuf>,
+    /// Released step-10000.safetensors (otherwise resolved through the Hub cache)
+    #[arg(long)]
+    world_adapter: Option<PathBuf>,
+}
+
 #[derive(clap::Subcommand)]
 enum Command {
     /// Generate prompt text only; shares generation inputs and shape options
     Prompt(Box<GenerationArgs>),
+    /// H3-World action-controlled generation from a first frame
+    World(Box<WorldArgs>),
+    /// Continue an observation-conditioned world, with save/resume and turn-by-turn controls
+    WorldSession(Box<world_session::Args>),
     /// Create or inspect portable encoded references
     Refmod {
         #[command(subcommand)]
@@ -400,7 +442,9 @@ fn cache_policy(cli: &Cli) -> Result<h3_hrx::CachePolicy> {
 }
 
 fn memory_budget_bytes(cli: &Cli) -> Result<Option<usize>> {
-    let Some(mib) = cli.memory_budget_mib else {
+    let Some(mib) = cli.memory_budget_mib.or_else(|| {
+        (cli.generate_prompt && cli.prompt_backend == PromptBackend::Local).then_some(48 * 1024)
+    }) else {
         if cli.residency == Residency::Budgeted {
             usage!("--residency budgeted requires --memory-budget-mib");
         }
@@ -473,7 +517,61 @@ fn lora_options(cli: &Cli) -> Result<Vec<h3_hrx::adapter::Lora>> {
 }
 
 fn run(mut cli: Cli) -> Result<()> {
+    let mut world_schedule = None;
     match cli.command.take() {
+        Some(Command::WorldSession(args)) => return world_session::run(*args),
+        Some(Command::World(args)) => {
+            let WorldArgs {
+                generation,
+                action_preset,
+                actions,
+                world_adapter,
+            } = *args;
+            cli.generation = generation;
+            if cli.first_frame.is_none() || cli.prompt.as_ref().is_none_or(|p| p.trim().is_empty())
+            {
+                usage!("world requires --first-frame and -p with a static scene description");
+            }
+            if cli.last_frame.is_some()
+                || !cli.files.is_empty()
+                || !cli.refmods.is_empty()
+                || cli.preset != Preset::Base
+                || !cli.loras.is_empty()
+                || !cli.lora_strength.is_empty()
+                || cache_policy(&cli)? != h3_hrx::CachePolicy::Off
+                || cli.sampler.is_some_and(|s| s != Sampler::Euler)
+            {
+                usage!("world supports one first frame and its released adapter, without references, Turbo, adapter composition or step caching");
+            }
+            cli.width = Some(cli.width.unwrap_or(832));
+            cli.height = Some(cli.height.unwrap_or(480));
+            cli.frames = Some(cli.frames.unwrap_or(124));
+            cli.steps = Some(cli.steps.unwrap_or(51));
+            cli.sampler = Some(Sampler::Euler);
+            cli.attn = Attn::F16;
+            cli.refmod_presentation = Some(RefmodPresentation::Upstream);
+            let frames = cli.frames.unwrap() as usize;
+            let schedule = if let Some(path) = actions {
+                h3_hrx::ActionSchedule::from_json(&std::fs::read_to_string(path)?)?
+            } else {
+                h3_hrx::ActionSchedule::preset(
+                    action_preset.as_deref().unwrap_or("forward"),
+                    frames,
+                )?
+            };
+            schedule.sentences(frames)?;
+            let adapter = match world_adapter {
+                Some(path) => path,
+                None => h3_hrx::models::Resolver::new()
+                    .repository("DANNY621", "H3-World")
+                    .revision(Some(h3_hrx::world::ADAPTER_REVISION.into()))
+                    .offline(cli.offline)
+                    .find(h3_hrx::world::ADAPTER_FILE)?,
+            };
+            unsafe { h3_hrx::adapter::validate_world(&adapter) }?;
+            cli.loras.push(adapter);
+            world_schedule = Some(schedule);
+        }
         Some(Command::Refmod { command }) => return refmods::run(command),
         Some(Command::Prompt(args)) => {
             cli.generation = *args;
@@ -622,7 +720,11 @@ fn run(mut cli: Cli) -> Result<()> {
             keyframe_images.push((
                 index,
                 Image {
-                    pixels: resize::pil_bilinear(&rgb, w, h, params.width, params.height),
+                    pixels: if world_schedule.is_some() {
+                        resize::world_first_frame(&rgb, w, h, params.width, params.height)
+                    } else {
+                        resize::pil_bilinear(&rgb, w, h, params.width, params.height)
+                    },
                     w: params.width,
                     h: params.height,
                 },
@@ -659,12 +761,135 @@ fn run(mut cli: Cli) -> Result<()> {
     }
     let mut entries =
         prompting::raw_entries(&keyframe_images, &ref_images, &ref_audio, &raw_videos);
+    prompting::check_local_audio(&cli, &entries, &prepared_refmods)?;
+    let local_budget = if cli.generate_prompt && cli.prompt_backend == PromptBackend::Local {
+        memory_budget_bytes(&cli)?
+            .map(hrx::residency::ResidencyManager::new)
+            .transpose()?
+    } else {
+        None
+    };
+    let mut local_session = if local_budget.is_some() {
+        let resolver = h3_hrx::models::Resolver::new().offline(cli.offline);
+        let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
+            memory_budget: local_budget.as_ref().map(|b| b.budget()),
+            ..Default::default()
+        })?;
+        let te = match &cli.te {
+            Some(p) => p.clone(),
+            None => resolver.find(h3_hrx::models::TE)?,
+        };
+        let dit = if cli.base_weights && !cli.prompt_only {
+            Some(resolver.find(h3_hrx::models::DIT_FL2VA)?)
+        } else {
+            early_dit.clone().or_else(|| cli.dit.clone())
+        };
+        let video_vae = if !cli.prompt_only
+            && (!keyframe_images.is_empty() || !ref_images.is_empty() || !raw_videos.is_empty())
+        {
+            Some(match &cli.video_vae {
+                Some(p) => p.clone(),
+                None => resolver.find(h3_hrx::models::VIDEO_VAE)?,
+            })
+        } else {
+            cli.video_vae.clone()
+        };
+        let audio_vae = if !cli.prompt_only
+            && (!ref_audio.is_empty() || raw_videos.iter().any(|v| v.audio.is_some()))
+        {
+            Some(match &cli.audio_vae {
+                Some(p) => p.clone(),
+                None => resolver.find(h3_hrx::models::AUDIO_VAE)?,
+            })
+        } else {
+            cli.audio_vae.clone()
+        };
+        // Safety: this CLI does not modify checkpoint files while they are mapped.
+        Some(unsafe {
+            Session::new_in(
+                Config {
+                    te: Some(te),
+                    dit,
+                    video_vae,
+                    audio_vae,
+                    loras: loras.clone(),
+                    kernel_sources: cli
+                        .root
+                        .as_ref()
+                        .map(|r| r.join("kernels"))
+                        .unwrap_or_default(),
+                    loom_library: std::env::var_os("HRX_LOOM_LIBRARY").map(Into::into),
+                    attention: match cli.attn {
+                        Attn::F16 => Attn16::F16,
+                        Attn::I8 => Attn16::I8,
+                        Attn::I4 => Attn16::I4,
+                    },
+                },
+                h3_hrx::SessionOptions {
+                    residency: match cli.residency {
+                        Residency::StageScoped => h3_hrx::ResidencyPolicy::StageScoped,
+                        Residency::Retain => h3_hrx::ResidencyPolicy::Retain,
+                        Residency::Budgeted => h3_hrx::ResidencyPolicy::Budgeted,
+                    },
+                    cache: cache_policy(&cli)?,
+                    turbo: cli.preset.turbo(),
+                },
+                &context,
+            )
+        }?)
+    } else {
+        None
+    };
     if upstream && active_refmods {
         entries.extend(prompting::refmod_entries(&cli, &prepared_refmods)?);
     }
+    let early_encoded = if !cli.prompt_only {
+        local_session
+            .as_mut()
+            .map(|session| {
+                encode_prompt_inputs(
+                    session,
+                    &keyframe_images,
+                    &ref_images,
+                    &ref_audio,
+                    &raw_videos,
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let tok = Tokenizer::new()?;
-    if let Some(generator) = generator {
-        prompt = prompting::generate(generator, &cli, &entries, &shape, &prompt)?;
+    let world = world_schedule
+        .as_ref()
+        .map(|schedule| h3_hrx::WorldRequest::new(&tok, schedule, params.frames as usize))
+        .transpose()?;
+    let mut prompt_shape = shape;
+    if let Some(world) = &world {
+        prompt_shape.text_rows_max = prompt_shape
+            .text_rows_max
+            .checked_sub(i32::try_from(world.token_count())?)
+            .filter(|n| *n > 0)
+            .context("actions exhaust the text token budget")?;
+    }
+    if let Some(session) = &mut local_session {
+        prompt = prompting::generate_local(
+            session,
+            &cli,
+            &entries,
+            &prompt_shape,
+            &prompt,
+            world.is_some(),
+        )?;
+    } else if let Some(generator) = generator {
+        prompt = prompting::generate(
+            generator,
+            &cli,
+            &entries,
+            &prompt_shape,
+            &prompt,
+            world.is_some(),
+        )?;
     } else if cli.save_prompt.is_some() {
         prompting::save(&cli, &prompt, serde_json::json!({"generated":false}))?;
     }
@@ -785,21 +1010,25 @@ fn run(mut cli: Cli) -> Result<()> {
         memory_budget: residency_manager.as_ref().map(|manager| manager.budget()),
         ..Default::default()
     })?;
-    let mut session = unsafe {
-        Session::new_in(
-            config,
-            h3_hrx::SessionOptions {
-                residency: match cli.residency {
-                    Residency::StageScoped => h3_hrx::ResidencyPolicy::StageScoped,
-                    Residency::Retain => h3_hrx::ResidencyPolicy::Retain,
-                    Residency::Budgeted => h3_hrx::ResidencyPolicy::Budgeted,
+    let mut session = if let Some(session) = local_session.take() {
+        session
+    } else {
+        unsafe {
+            Session::new_in(
+                config,
+                h3_hrx::SessionOptions {
+                    residency: match cli.residency {
+                        Residency::StageScoped => h3_hrx::ResidencyPolicy::StageScoped,
+                        Residency::Retain => h3_hrx::ResidencyPolicy::Retain,
+                        Residency::Budgeted => h3_hrx::ResidencyPolicy::Budgeted,
+                    },
+                    cache: cache_policy(&cli)?,
+                    turbo: cli.preset.turbo(),
                 },
-                cache: cache_policy(&cli)?,
-                turbo: cli.preset.turbo(),
-            },
-            &context,
-        )
-    }?;
+                &context,
+            )
+        }?
+    };
     eprintln!(
         "session in {:.1} s ({}, {} attention)",
         t0.elapsed().as_secs_f64(),
@@ -820,58 +1049,16 @@ fn run(mut cli: Cli) -> Result<()> {
 
     // encoders: latents for the keyframe and the references, encoded before the run so a bad input
     // fails early. Each reference borrows its own latents, which live until the denoise returns.
-    let mut keyframe_latents = Vec::new();
-    for (_, k) in &keyframe_images {
-        keyframe_latents.push(
-            session
-                .encode_video(Clip {
-                    pixels: &k.pixels,
-                    frames: 1,
-                    height: k.h as usize,
-                    width: k.w as usize,
-                })
-                .context("encode keyframe")?
-                .0,
-        );
-    }
-    let mut image_latents = Vec::with_capacity(ref_images.len());
-    for im in &ref_images {
-        image_latents.push(
-            session
-                .encode_video(Clip {
-                    pixels: &im.pixels,
-                    frames: 1,
-                    height: im.h as usize,
-                    width: im.w as usize,
-                })
-                .context("encode reference image")?
-                .0,
-        );
-    }
-    let mut audio_latents = Vec::with_capacity(ref_audio.len());
-    for (samples, n) in &ref_audio {
-        audio_latents.push(
-            session
-                .encode_audio(samples, *n as usize)
-                .context("encode reference audio")?,
-        );
-    }
-
-    let mut video_latents = Vec::new();
-    for video in &raw_videos {
-        let (z, t) = session.encode_video(Clip {
-            pixels: &video.pixels,
-            frames: video.frames,
-            height: video.height,
-            width: video.width,
-        })?;
-        let audio = video
-            .audio
-            .as_ref()
-            .map(|(samples, n)| session.encode_audio(samples, *n as usize))
-            .transpose()?;
-        video_latents.push((z, t, audio));
-    }
+    let (keyframe_latents, image_latents, audio_latents, video_latents) = match early_encoded {
+        Some(encoded) => encoded,
+        None => encode_prompt_inputs(
+            &mut session,
+            &keyframe_images,
+            &ref_images,
+            &ref_audio,
+            &raw_videos,
+        )?,
+    };
 
     let keyframes: Vec<Keyframe<'_>> = keyframe_images
         .iter()
@@ -942,7 +1129,16 @@ fn run(mut cli: Cli) -> Result<()> {
         let _ = std::io::Write::flush(&mut std::io::stderr());
         false // true would cancel
     };
-    let latents = if let Some(presentation) = &presentation {
+    let latents = if let Some(world) = &world {
+        session.denoise_world(
+            presentation.as_ref().expect("world presentation"),
+            world,
+            &params,
+            Noise::default(),
+            &keyframes[0],
+            Some(&mut show),
+        )?
+    } else if let Some(presentation) = &presentation {
         session.denoise_presented(
             presentation,
             &params,
@@ -962,6 +1158,20 @@ fn run(mut cli: Cli) -> Result<()> {
         )?
     };
     eprintln!();
+    if let Some(world) = &world {
+        let metadata = serde_json::json!({
+            "upstream_revision": h3_hrx::world::UPSTREAM_REVISION,
+            "adapter": cli.loras[0], "adapter_sha256": hrx::bundle::file_digest(&cli.loras[0])?, "adapter_source_revision": h3_hrx::world::ADAPTER_REVISION, "scene_prompt": prompt, "seed": params.seed,
+            "frames": params.frames,"width":params.width,"height":params.height,"fps":24,
+            "evaluations":params.steps-1,"sampler":"euler","video_shift":12,"audio_shift":3,
+            "attention":"f16","action_sentences":world.sentences(),
+            "frame_keys_bits":world_schedule.as_ref().unwrap().0.iter().map(|a|a.0).collect::<Vec<_>>()
+        });
+        std::fs::write(
+            cli.out.with_extension("world.json"),
+            serde_json::to_vec_pretty(&metadata)?,
+        )?;
+    }
     let (video, audio) = (latents.video, latents.audio);
     eprintln!("denoised in {:.1} s", t0.elapsed().as_secs_f64());
     if let Some(report) = session.profile_report()? {
@@ -1047,6 +1257,80 @@ fn run(mut cli: Cli) -> Result<()> {
     );
     println!("{}", out.display());
     Ok(())
+}
+
+type EncodedPromptInputs = (
+    Vec<Vec<f32>>,
+    Vec<Vec<f32>>,
+    Vec<(Vec<f32>, usize)>,
+    Vec<(Vec<f32>, usize, Option<(Vec<f32>, usize)>)>,
+);
+fn encode_prompt_inputs(
+    session: &mut Session,
+    keyframe_images: &[(i32, Image)],
+    ref_images: &[Image],
+    ref_audio: &[(Vec<f32>, i32)],
+    raw_videos: &[prompting::RawVideo],
+) -> Result<EncodedPromptInputs> {
+    let mut keyframe_latents = Vec::new();
+    for (_, k) in keyframe_images {
+        keyframe_latents.push(
+            session
+                .encode_video(Clip {
+                    pixels: &k.pixels,
+                    frames: 1,
+                    height: k.h as usize,
+                    width: k.w as usize,
+                })
+                .context("encode keyframe")?
+                .0,
+        );
+    }
+    let mut image_latents = Vec::with_capacity(ref_images.len());
+    for im in ref_images {
+        image_latents.push(
+            session
+                .encode_video(Clip {
+                    pixels: &im.pixels,
+                    frames: 1,
+                    height: im.h as usize,
+                    width: im.w as usize,
+                })
+                .context("encode reference image")?
+                .0,
+        );
+    }
+    let mut audio_latents = Vec::with_capacity(ref_audio.len());
+    for (samples, n) in ref_audio {
+        audio_latents.push(
+            session
+                .encode_audio(samples, *n as usize)
+                .context("encode reference audio")?,
+        );
+    }
+
+    let mut video_latents = Vec::new();
+    for video in raw_videos {
+        let (z, t) = session.encode_video(Clip {
+            pixels: &video.pixels,
+            frames: video.frames,
+            height: video.height,
+            width: video.width,
+        })?;
+        let audio = video
+            .audio
+            .as_ref()
+            .map(|(samples, n)| session.encode_audio(samples, *n as usize))
+            .transpose()?;
+        video_latents.push((z, t, audio));
+    }
+
+    Ok((
+        keyframe_latents,
+        image_latents,
+        audio_latents,
+        video_latents,
+    ))
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ use crate::model::*;
 use crate::weights::Weights;
 
 /// What one image's tower run produces.
+#[derive(Clone)]
 pub struct Embedding {
     /// `[n/4][5120]`, one row per merged 2x2 patch block
     pub merged: Vec<f32>,

@@ -1,0 +1,32 @@
+// Bitwise copy of 16-bit elements.
+amdgpu.target<gfx11-generic> @h3_copy_u16_gfx11 {subgroup_size = 32}
+
+
+
+kernel.def target(@h3_copy_u16_gfx11) export("h3_copy_u16") @h3_copy_u16(%count: index) {
+  %c1 = index.constant 1 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %rounded = index.add %count, %c255 : index
+  %groups = index.div %rounded, %c256 : index
+  kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%count: index, %x: buffer, %y: buffer) {
+  %c256 = index.constant 256 : index
+  %c0_offset = index.constant 0 : offset
+  %count_b = index.assume %count [range(%count, 1, 1073741824)] : index
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %wg, %c256 : index
+  %i = index.add %base, %lane : index
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %y_global = buffer.assume.memory_space<global> %y : buffer
+  %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%count_b]xi16>
+  %y_view = buffer.view %y_global[%c0_offset] : buffer -> view<[%count_b]xi16>
+  %active = index.cmp ult, %i, %count_b : index
+  scf.if %active {
+    %ii = index.assume %i [lt(%i, %count_b)] : index
+    %xv = view.load %x_view[%ii] : view<[%count_b]xi16> -> i16
+    view.store %xv, %y_view[%ii] : i16, view<[%count_b]xi16>
+  }
+  kernel.return
+}

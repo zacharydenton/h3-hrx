@@ -73,6 +73,129 @@ Generation uses two successful endpoint requests, or three when repair is needed
 There is no built-in model download, model choice, or claim of official Context-IR
 quality. Assess instruction preservation and video quality with your chosen model.
 
+### Fully local shared-Qwen backend
+
+This backend is experimental. Native text decoding and basic image recognition
+have been exercised; full prompt/RefMod/World qualification is still pending
+because concurrent GPU workloads exhausted available RAM during testing. See
+[validation status](testing.md#shared-qwen-local-prompting).
+
+Build with `cargo build --release --features local-prompt-generation`, then select
+`--prompt-backend local`. The endpoint remains the default backend. Local prompting
+makes no chat API requests; model provisioning can contact Hugging Face unless
+`--offline` is set.
+
+```sh
+h3 prompt --prompt-backend local --refmod character.safetensors \
+  -p 'The referenced character walks through a forest' > forest.txt
+h3 --generate-prompt --prompt-backend local --refmod character-with-voice.safetensors \
+  --prompt-audio-note '1=Use this reference for the character voice; say Hello.' \
+  -p 'The character greets the viewer' --save-prompt greeting.txt --out greeting.mp4
+h3 world --generate-prompt --prompt-backend local --first-frame scene.png \
+  --action-preset pan-left -p 'Describe this room' --out room.mp4
+```
+
+This backend shares H3's existing INT8 Qwen3-VL-32B encoder and vision weights,
+then adds BF16 language layers 50–63, final normalization and the output head.
+The continuation comes from `Qwen/Qwen3-VL-32B-Instruct` revision
+`0cfaf48183f594c314753d30a4c4974bc75f3ccb`; only shards 11–14 are downloaded.
+`--prompt-local-model-dir DIR` uses those same four files locally, with their
+pinned SHA-256 identities checked. This is not the Qwen3.6 checkpoint used by
+qwen-hrx. The embedded H3 tokenizer is required.
+
+Visual analysis and rewriting run locally with greedy decoding and at most one
+corrective rewrite. Reference labels, strengths and synthetic stack timing are
+preserved. Audio is **not listened to**: provide a nonempty `--prompt-audio-note
+INDEX=TEXT` for every active Audio label, including copies. Notes describe intended
+use and are recorded as user statements, not observed evidence. Audio RefMod
+latents still condition H3 normally. Missing notes fail before reconstruction.
+
+The resident model has a default **48 GiB native allocation ceiling** and needs
+additional system headroom. The loader estimates weights, KV storage and workspace
+before uploading, and requires another **8 GiB of available RAM**. It fails if the
+model does not fit; there is no offloading or endpoint fallback. Override the
+ceiling with `--memory-budget-mib`. Host media has its separate
+`--refmod-media-budget-mib` limit.
+Decoding rechecks available RAM between tokens and stops below the 8 GiB reserve.
+Failed completions release both the generation weights and shared encoder. Other processes
+can still allocate RAM between checks; the reserve is not a system-wide reservation.
+
+`--prompt-context-tokens` defaults to 8192 and `--prompt-max-tokens` to 1024 per
+completion. Oversized contexts and completions that hit the output limit fail
+explicitly. The generation-only weights and KV caches are released after writing
+the prompt; the shared encoder and bounded vision cache remain available for H3
+conditioning. Raw-reference VAE encoding runs before local prompt generation.
+`H3_STAGE_TRACE=1` reports prefill and decoding progress without printing content.
+Saved prompt provenance includes model paths/revision, precision, audio notes,
+token limits, validation and completion timings.
+
+For Rust, use `local_prompt::{LocalPromptConfig, LocalPromptGenerator, AudioNote}`.
+Construct the generator with `unsafe { LocalPromptGenerator::new(config) }`, keeping
+its checkpoint files immutable while used by a session. Call `generate`,
+`generate_refmods`, or `generate_world_scene` with `&mut Session`; the RefMod result
+has the same `prompt` and `presentation` fields as the endpoint path. The session
+must use a live `ResidencyManager` allocation budget no larger than the configured
+local ceiling. Keep the manager alive and prefer stage-scoped residency. Set the
+config's optional atomic cancellation flag to stop between language blocks/tokens.
+
+### Native Rust RefMod prompting
+
+With the `prompt-generation` feature, `PromptGenerator::generate_refmods` accepts
+prepared RefMods directly. It decodes their effective image/video/audio latents
+through the local VAEs, calls the configured endpoint, and returns the final prompt
+plus its matching `PreparedPresentation`. Original source files are unnecessary.
+The CLI uses the same native reconstruction method, `Session::refmod_entries`.
+
+```rust,no_run
+use h3_hrx::{Config, DenoiseParams, ResidencyPolicy, Session, SessionOptions, shape_for};
+use h3_hrx::prompt::{EndpointConfig, PromptGenerator, RefModPromptRequest};
+use h3_hrx::refmod::{ApplyOptions, RefMod, RefModPresentationOptions};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let file = RefMod::load("character-with-voice.safetensors")?;
+let mods = [file.prepare(ApplyOptions::default())?];
+let mut endpoint = EndpointConfig::new(
+    "http://localhost:8000/v1".into(), "your-multimodal-model".into(),
+);
+endpoint.images = true;
+endpoint.audio = true;
+let generator = PromptGenerator::new(endpoint)?;
+let budget = hrx::residency::ResidencyManager::new(8 * 1024 * 1024 * 1024)?;
+let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
+    memory_budget: Some(budget.budget()),
+    ..Default::default()
+})?;
+// Safety: checkpoint files remain unchanged while the session exists.
+let mut session = unsafe { Session::new_in(Config::default(), SessionOptions {
+    residency: ResidencyPolicy::StageScoped,
+    ..Default::default()
+}, &context) }?;
+let params = DenoiseParams::default();
+let shape = shape_for(params.height, params.width, params.frames).ok_or("invalid output shape")?;
+let generated = generator.generate_refmods(&mut session, RefModPromptRequest {
+    instruction: "The referenced character greets the viewer",
+    entries: &[], // Optional raw media goes before RefMod members.
+    refmods: &mods,
+    shape: &shape,
+    presentation: RefModPresentationOptions::default(),
+})?;
+println!("{}", generated.prompt.text);
+let references: Vec<_> = mods.iter().flat_map(|m| m.references()).collect();
+// In an inference session with enough memory for H3, pass generated.presentation
+// and these same references to Session::denoise_presented.
+# let _ = references;
+# Ok(()) }
+```
+
+The 8 GiB model allocation cap above is for small-reference prompt preparation;
+full H3 inference needs a larger budget. Reconstruction defaults to a conservative
+1 GiB host float-media budget and synthetic 24 fps playback. Set
+`RefModPresentationOptions::{max_media_bytes, fps}` explicitly to change those
+limits (CLI: `--refmod-media-budget-mib` and `--reference-fps`). The host media budget excludes model weights, GPU scratch, encoded HTTP
+payloads and the later vision presentation. Copies share decoded buffers; disabled
+members need neither decoding nor endpoint media support. Capability and media
+budget failures stop before reconstruction. Keep the prepared RefMods and their
+ordering unchanged when using the returned presentation for inference.
+
 ## The three fields
 
 Text-to-video-with-audio (T2VA) prompts are three labelled fields, in this order:

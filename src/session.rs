@@ -11,6 +11,8 @@ use crate::error::{invalid, Result};
 use crate::layout::{shape_for, Shape};
 use crate::te::TextEncoder;
 use crate::vvae::{Clip, VideoVae};
+#[cfg(feature = "local-prompt-generation")]
+mod local_prompt;
 mod residency;
 
 /// How long a session keeps completed models on the device.
@@ -97,6 +99,8 @@ pub struct Session {
 }
 
 struct State {
+    #[cfg(feature = "local-prompt-generation")]
+    local: Option<crate::local_prompt::Engine>,
     stream: hrx::Stream,
     compiler: Compiler,
     config: Config,
@@ -239,7 +243,7 @@ impl Session {
         progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
     ) -> Result<Latents> {
         self.validate(ids, p, noise, refs, kfs)?;
-        self.scheduled(|state| state.denoise(ids, p, noise, refs, kfs, progress, None))
+        self.scheduled(|state| state.denoise(ids, p, noise, refs, kfs, progress, None, None))
     }
 
     /// Denoise with an explicit, upstream-compatible text/vision presentation.
@@ -266,8 +270,79 @@ impl Session {
                 kfs,
                 progress,
                 Some(presentation.blocks()),
+                None,
             )
         })
+    }
+
+    /// Generate a fixed-horizon H3-World clip. The session must have exactly the released
+    /// world adapter at strength one; action encoding never passes through an LLM.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_world(
+        &mut self,
+        presentation: &crate::PreparedPresentation,
+        world: &crate::WorldRequest,
+        p: &DenoiseParams,
+        noise: Noise<'_>,
+        first_frame: &Keyframe<'_>,
+        progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
+    ) -> Result<Latents> {
+        let kfs = std::slice::from_ref(first_frame);
+        let shape = self.validate(presentation.ids(), p, noise, &[], kfs)?;
+        if presentation.labels().len() != 1
+            || presentation.labels()[0].role != "first_frame"
+            || presentation.blocks().len() != 1
+            || presentation.blocks()[0].video
+        {
+            return invalid("world presentation requires exactly one first-frame picture");
+        }
+        if first_frame.frame_index != 0
+            || first_frame.audio.is_some()
+            || p.frames as usize != world.frames
+            || p.sampler != crate::Sampler::Euler
+            || p.cache_threshold != 0.0
+        {
+            return invalid("world mode requires a first frame, matching action duration, Euler and no step cache");
+        }
+        let text_rows = presentation.ids().len() + world.token_count();
+        if text_rows > shape.text_rows_max as usize {
+            return invalid("world presentation exceeds text budget");
+        }
+        let frame_rows = (shape.lat_h as usize / 2) * (shape.lat_w as usize / 2);
+        let rows =
+            text_rows + (shape.latent_t as usize + 1) * frame_rows + shape.audio_t as usize * 2;
+        if rows > 65536 {
+            return invalid("world sequence exceeds the native attention limit of 65536 rows");
+        }
+        self.scheduled(|state| {
+            if state.options.turbo.is_some()
+                || state.options.cache != crate::CachePolicy::Off
+                || state.config.loras.len() != 1
+                || state.config.loras[0].strength != 1.0
+            {
+                return invalid("world mode requires exactly one H3-World adapter at strength one, without Turbo or step caching");
+            }
+            // Safety: the session's checkpoint immutability contract covers this validation.
+            unsafe { crate::adapter::validate_world(&state.config.loras[0].path) }?;
+            state.denoise(
+                presentation.ids(), p, noise, &[], kfs, progress,
+                Some(presentation.blocks()), Some(world),
+            )
+        })
+    }
+
+    pub(crate) fn world_adapter_identity(&self) -> Result<String> {
+        let state = self.native.state()?;
+        if state.options.turbo.is_some()
+            || state.options.cache != crate::CachePolicy::Off
+            || state.config.loras.len() != 1
+            || state.config.loras[0].strength != 1.0
+        {
+            return invalid("world mode requires exactly one H3-World adapter at strength one, without Turbo or step caching");
+        }
+        // SAFETY: the session's checkpoint immutability contract applies.
+        unsafe { crate::adapter::validate_world(&state.config.loras[0].path) }?;
+        hrx::bundle::file_digest(&state.config.loras[0].path).map_err(Into::into)
     }
 
     /// Reconstruct effective reference latents as interleaved RGB floats in [0,1],
@@ -411,6 +486,8 @@ impl State {
             vvae: None,
             avae: None,
             units,
+            #[cfg(feature = "local-prompt-generation")]
+            local: None,
         })
     }
 
@@ -608,6 +685,7 @@ impl State {
         kfs: &[Keyframe<'_>],
         progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
         visuals: Option<&[crate::media_context::VisualBlock]>,
+        world: Option<&crate::WorldRequest>,
     ) -> Result<Latents> {
         // Everything cheap, before a checkpoint opens or a kernel compiles. This was written once,
         // lost in a refactor, and not missed — because the tests called the validators rather than
@@ -621,7 +699,8 @@ impl State {
         crate::trace::event("conditioning_start", String::new);
         let result = (|| {
             let (stream, c, prof, dit, te) = self.prompt_pair(!refs.is_empty())?;
-            let prepared = dit.prepare_denoise(stream, c, prof, te, ids, p, refs, kfs, visuals)?;
+            let prepared =
+                dit.prepare_denoise(stream, c, prof, te, ids, p, refs, kfs, visuals, world)?;
             crate::trace::event("conditioning_ready", String::new);
             self.release_completed(true, false, false)?;
             crate::trace::event("encoder_released", || {

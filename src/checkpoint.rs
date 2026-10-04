@@ -37,6 +37,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 pub struct Checkpoint {
     file: FileView,
+    names: Option<BTreeMap<String, Entry>>,
+    shards: Vec<(usize, FileView)>,
 }
 
 impl Checkpoint {
@@ -66,18 +68,73 @@ impl Checkpoint {
             path: path.clone(),
             message: error.to_string(),
         })?;
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            names: None,
+            shards: Vec::new(),
+        })
+    }
+
+    /// Map disjoint tensor shards without copying their payloads.
+    /// # Safety
+    /// All paths share the immutability contract of `open`.
+    pub unsafe fn open_shards(paths: &[PathBuf]) -> Result<Self> {
+        let first = paths.first().ok_or_else(|| Error::Header {
+            path: PathBuf::new(),
+            message: "empty checkpoint shard list".into(),
+        })?;
+        let mut out = unsafe { Self::open(first) }?;
+        let mut names = out.entries().clone();
+        let mut end = names
+            .values()
+            .map(|e| e.offset + e.bytes)
+            .max()
+            .unwrap_or(0);
+        for path in &paths[1..] {
+            let shard = unsafe { Self::open(path) }?;
+            let base = end.checked_add(1).ok_or_else(|| Error::Header {
+                path: path.clone(),
+                message: "shard offsets overflow".into(),
+            })?;
+            for (name, entry) in shard.entries() {
+                let mut e = entry.clone();
+                e.offset = base.checked_add(e.offset).ok_or_else(|| Error::Header {
+                    path: path.clone(),
+                    message: "shard offsets overflow".into(),
+                })?;
+                end = end.max(e.offset.checked_add(e.bytes).ok_or_else(|| Error::Header {
+                    path: path.clone(),
+                    message: "shard offsets overflow".into(),
+                })?);
+                if names.insert(name.clone(), e).is_some() {
+                    return Err(Error::Header {
+                        path: path.clone(),
+                        message: format!("duplicate tensor {name}"),
+                    });
+                }
+            }
+            out.shards.push((base, shard.file));
+        }
+        out.names = Some(names);
+        Ok(out)
+    }
+
+    pub fn path(&self) -> &Path {
+        self.file.path()
     }
 
     pub fn entries(&self) -> &BTreeMap<String, Entry> {
-        self.file.entries()
+        self.names.as_ref().unwrap_or_else(|| self.file.entries())
+    }
+    pub(crate) fn rename_entries(&mut self, entries: BTreeMap<String, Entry>) {
+        self.names = Some(entries);
     }
     pub fn has(&self, name: &str) -> bool {
-        self.file.contains(name)
+        self.entries().contains_key(name)
     }
 
     pub fn at(&self, name: &str) -> Result<&Entry> {
-        self.file.entries().get(name).ok_or_else(|| Error::Missing {
+        self.entries().get(name).ok_or_else(|| Error::Missing {
             name: name.to_string(),
             path: self.file.path().to_path_buf(),
         })
@@ -105,6 +162,16 @@ impl Checkpoint {
 
     /// A tensor's bytes, still in the mapping. Reading them faults their pages in.
     pub fn bytes(&self, entry: &Entry) -> &[u8] {
+        if let Some((base, shard)) = self
+            .shards
+            .iter()
+            .rev()
+            .find(|(base, _)| entry.offset >= *base)
+        {
+            let mut e = entry.clone();
+            e.offset -= base;
+            return shard.bytes(&e).expect("validated shard entry");
+        }
         self.file
             .bytes(entry)
             .expect("checkpoint entry belongs to this file")
@@ -113,6 +180,9 @@ impl Checkpoint {
     /// Hint the kernel to read a range ahead of a sequential pass over it.
     pub fn will_need(&self, range: &[u8]) {
         self.file.will_need_bytes(range);
+        for (_, shard) in &self.shards {
+            shard.will_need_bytes(range);
+        }
     }
 
     /// Release a range's pages once its bytes are on the device. A tensor is read once, and tens of
@@ -126,6 +196,9 @@ impl Checkpoint {
         });
         if !keep {
             self.file.done_with_bytes(range);
+            for (_, shard) in &self.shards {
+                shard.done_with_bytes(range);
+            }
         }
     }
 }
@@ -152,6 +225,20 @@ mod tests {
     use hrx::artifacts::safetensors::DType as Dtype;
     use std::fs::File;
     use std::io::Write;
+
+    #[test]
+    fn shards_preserve_each_files_bytes_and_reject_duplicate_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.safetensors");
+        let b = dir.path().join("b.safetensors");
+        write_checkpoint(&a, &[("a", "F32", vec![2], vec![1; 8])], None);
+        write_checkpoint(&b, &[("b", "F32", vec![2], vec![2; 8])], None);
+        // Safety: these test files remain immutable while mapped.
+        let ck = unsafe { Checkpoint::open_shards(&[a.clone(), b]) }.unwrap();
+        assert_eq!(ck.bytes(ck.at("a").unwrap()), &[1; 8]);
+        assert_eq!(ck.bytes(ck.at("b").unwrap()), &[2; 8]);
+        assert!(unsafe { Checkpoint::open_shards(&[a.clone(), a]) }.is_err());
+    }
 
     /// Writes a safetensors file: `(name, dtype, shape, bytes)` entries laid out in order.
     fn write_checkpoint(

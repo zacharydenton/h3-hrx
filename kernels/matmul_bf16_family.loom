@@ -68,7 +68,7 @@ template.decl @h3.shared_matmul_bias_bf16_wmma(%m_size: index, %a: buffer, %w: b
 
 template.def<@h3.shared_matmul_bias_bf16_wmma> @h3_body_matmul_bias_bf16_wmma(%m_size: index, %a: buffer, %w: buffer, %bias: buffer, %c: buffer, %cfg_k_size: index, %cfg_n_size: index, %activation: index) {
   %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 32, 8192), mul(%cfg_k_size, 32)] : index
-  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 64, 8192), mul(%cfg_n_size, 64)] : index
+  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 64, 262144), mul(%cfg_n_size, 64)] : index
 
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -211,7 +211,7 @@ amdgpu.target<gfx11-generic> @h3_matmul_wmma_gfx11 {subgroup_size = 32}
 
 config.decl @h3.matmul_bias_bf16_wmma.k_size : %value: index where [range(%value, 32, 8192), mul(%value, 32)]
 
-config.decl @h3.matmul_bias_bf16_wmma.n_size : %value: index where [range(%value, 64, 8192), mul(%value, 64)]
+config.decl @h3.matmul_bias_bf16_wmma.n_size : %value: index where [range(%value, 64, 262144), mul(%value, 64)]
 
 kernel.def target(@h3_matmul_wmma_gfx11) export("h3_matmul_bias_bf16_wmma") @h3_matmul_bias_bf16_wmma(%m_size: index) {
   %c1 = index.constant 1 : index

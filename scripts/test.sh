@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # CPU checks by default. --gpu adds the kernel regressions, which need gfx1151 and a provisioned
 # HRX but no checkpoints. --full adds the whole-pipeline digests, which need the checkpoints and
-# take several minutes. --adapters checks the cached Turbo adapters and Orbit LoRA.
+# take several minutes (including the cached H3-World adapter). --adapters checks the cached Turbo adapters and Orbit LoRA.
 # H3_GRAPH=1 selects recorded graphs for the normal pipeline tests.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -13,16 +13,19 @@ case "${1:---cpu}" in
   *) echo 'usage: scripts/test.sh [--cpu|--gpu|--full|--adapters]' >&2; exit 2;;
 esac
 cargo fmt --all -- --check
-cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-features
 if [ "$gpu" = 1 ]; then
-  cargo test --locked --lib --release -- --ignored --test-threads=1 --skip session::tests:: --skip stack::adapter::tests::
+  cargo test --locked --lib --release -- --ignored --test-threads=1 --skip session::tests:: --skip stack::adapter::tests:: --skip prompt::tests::native_refmod_
   cargo test --locked --test kernels --release -- --ignored --test-threads=1
+  cargo test --locked --features local-prompt-generation --lib --release stack::causal::tests -- --ignored --test-threads=1
 fi
 if [ "$full" = 1 ]; then
+  cargo test --locked --lib --release prompt::tests::native_refmod_ -- --ignored --test-threads=1
   cargo test --locked --lib --release session::tests:: -- --ignored --test-threads=1
   cargo test --locked --test differentials --release -- --ignored --test-threads=1
   cargo test --locked --test refmod --release -- --ignored --test-threads=1
+  cargo test --locked --test world --release -- --ignored --test-threads=1
 fi
 if [ "$adapters" = 1 ]; then
   cargo test --locked --lib --release stack::adapter::tests:: -- --ignored --test-threads=1

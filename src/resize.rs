@@ -85,6 +85,70 @@ pub fn fit(width: i32, height: i32, canvas_width: i32, canvas_height: i32) -> (i
     (round(width), round(height))
 }
 
+/// H3-World cover resize with Lanczos-3 followed by a centered crop.
+/// Intermediate RGB8 rounding follows PIL's two-pass image resizing.
+pub fn world_first_frame(rgb: &[u8], sw: i32, sh: i32, dw: i32, dh: i32) -> Vec<f32> {
+    let scale = (dw as f64 / sw as f64).max(dh as f64 / sh as f64);
+    let rw = (sw as f64 * scale).round_ties_even() as usize;
+    let rh = (sh as f64 * scale).round_ties_even() as usize;
+    let coeff = |input: usize, output: usize, x: usize| {
+        let scale = input as f64 / output as f64;
+        let filter = scale.max(1.0);
+        let center = (x as f64 + 0.5) * scale;
+        let lo = ((center - 3.0 * filter + 0.5) as isize).max(0) as usize;
+        let hi = ((center + 3.0 * filter + 0.5) as usize).min(input);
+        let mut weights: Vec<f64> = (lo..hi)
+            .map(|i| {
+                let t = ((i as f64 - center + 0.5) / filter).abs();
+                if t == 0.0 {
+                    1.0
+                } else if t >= 3.0 {
+                    0.0
+                } else {
+                    let t = t * std::f64::consts::PI;
+                    t.sin() / t * (t / 3.0).sin() / (t / 3.0)
+                }
+            })
+            .collect();
+        let total: f64 = weights.iter().sum();
+        for w in &mut weights {
+            *w /= total;
+        }
+        (lo, weights)
+    };
+    let mut horizontal = vec![0u8; rw * sh as usize * 3];
+    for x in 0..rw {
+        let (lo, weights) = coeff(sw as usize, rw, x);
+        for y in 0..sh as usize {
+            for c in 0..3 {
+                let v: f64 = weights
+                    .iter()
+                    .enumerate()
+                    .map(|(i, w)| w * rgb[(y * sw as usize + lo + i) * 3 + c] as f64)
+                    .sum();
+                horizontal[(y * rw + x) * 3 + c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    let mut out = vec![0.0; dw as usize * dh as usize * 3];
+    let left = (rw - dw as usize) / 2;
+    let top = (rh - dh as usize) / 2;
+    for y in 0..dh as usize {
+        let (lo, weights) = coeff(sh as usize, rh, y + top);
+        for x in 0..dw as usize {
+            for c in 0..3 {
+                let v: f64 = weights
+                    .iter()
+                    .enumerate()
+                    .map(|(i, w)| w * horizontal[((lo + i) * rw + x + left) * 3 + c] as f64)
+                    .sum();
+                out[(y * dw as usize + x) * 3 + c] = v.round().clamp(0.0, 255.0) as f32 / 255.0;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

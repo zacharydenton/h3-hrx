@@ -127,6 +127,13 @@ AudioInput}`. `Session::create_refmod` accepts decoded RGB8 images and optional
 planar stereo samples; use a retaining session to reuse encoder weights.
 Filesystem decoding is a CLI concern.
 
+`Session::refmod_entries(&prepared_mods, RefModPresentationOptions::default())`
+reconstructs the active members as ordered `MediaEntry` values for upstream
+presentation, including copy labels and synthetic timing. With the optional
+`prompt-generation` feature, `PromptGenerator::generate_refmods` performs this
+preparation and endpoint rewriting together, returning the prompt and matching
+H3 presentation. See the [native Rust example](prompting.md#native-rust-refmod-prompting).
+
 With `Config::dit = None`, `Session::denoise` selects Ref2VA whenever its reference
 list is nonempty. Without references it selects FL2VA, including keyframe-only
 requests. A reused session switches checkpoints as needed, including when models

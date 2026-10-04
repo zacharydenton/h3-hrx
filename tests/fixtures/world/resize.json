@@ -1,0 +1,46 @@
+[
+  {
+    "input": [
+      83,
+      51
+    ],
+    "output": [
+      64,
+      32
+    ],
+    "file": "resize-83x51-64x32.rgb"
+  },
+  {
+    "input": [
+      35,
+      61
+    ],
+    "output": [
+      32,
+      64
+    ],
+    "file": "resize-35x61-32x64.rgb"
+  },
+  {
+    "input": [
+      17,
+      19
+    ],
+    "output": [
+      64,
+      32
+    ],
+    "file": "resize-17x19-64x32.rgb"
+  },
+  {
+    "input": [
+      64,
+      32
+    ],
+    "output": [
+      64,
+      32
+    ],
+    "file": "resize-64x32-64x32.rgb"
+  }
+]

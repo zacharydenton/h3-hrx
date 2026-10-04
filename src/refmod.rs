@@ -12,6 +12,9 @@ use safetensors::{
 use serde_json::{json, Value};
 use std::{collections::HashMap, io::Write, path::Path};
 
+mod presentation;
+pub use presentation::RefModPresentationOptions;
+
 fn err(e: impl std::fmt::Display) -> Error {
     Error::Invalid(format!("refmod: {e}"))
 }

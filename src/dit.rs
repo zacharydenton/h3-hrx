@@ -74,6 +74,7 @@ struct Refiner {
 /// Resident DiT state and recordings, used only on the stream passed to `open`.
 pub struct Dit {
     adapter: Option<crate::adapter::Adapter>,
+    world_codes: Option<Vec<i32>>,
     stream_id: usize,
     weights: Weights,
     constants: Constants,
@@ -99,6 +100,7 @@ impl Dit {
     ) -> Result<Self> {
         Ok(Self {
             adapter: None,
+            world_codes: None,
             stream_id: stream.id(),
             weights: unsafe { Weights::open(path, crate::plan::dit::plan) }?,
             constants: Constants::new(stream)?,
@@ -802,7 +804,7 @@ impl Dit {
         crate::cache::CachePolicy::Off
             .validate(p.cache_threshold)
             .map_err(|e| crate::Error::Invalid(e.into()))?;
-        let prepared = self.prepare_denoise(stream, c, prof, te, ids, p, refs, kfs, None)?;
+        let prepared = self.prepare_denoise(stream, c, prof, te, ids, p, refs, kfs, None, None)?;
         self.sample_prepared(
             stream,
             c,
@@ -831,6 +833,7 @@ impl Dit {
         refs: &[Reference<'_>],
         kfs: &[Keyframe<'_>],
         visuals: Option<&[crate::media_context::VisualBlock]>,
+        world: Option<&crate::WorldRequest>,
     ) -> Result<crate::layout::Layout> {
         self.check_stream(stream)?;
         let sh = crate::layout::shape_for(p.height, p.width, p.frames)
@@ -840,7 +843,14 @@ impl Dit {
         }
         self.ensure_conditioning(stream, c)?;
 
-        let n = ids.len();
+        let action_spans = world.map(|w| w.spans(ids.len()));
+        let n = action_spans
+            .as_ref()
+            .and_then(|s| s.last())
+            .map_or(ids.len(), |r| r.end);
+        if n > sh.text_rows_max as usize {
+            return invalid("world presentation exceeds text budget");
+        }
         let lay_refs: Vec<crate::layout::Ref> = refs
             .iter()
             .map(|r| {
@@ -898,6 +908,32 @@ impl Dit {
                 .map_err(crate::error::Error::Invalid)?;
         }
         self.text_in(stream, c, prof, te, ids, &spans)?;
+        self.world_codes = None;
+        if let Some(world) = world {
+            // Encode and refine each unique sentence independently. Host staging bounds device
+            // residency and prevents the shared text scratch from overwriting previous segments.
+            let mut packed = vec![0.0f32; ids.len() * HID];
+            self.read_rows(stream, ids.len(), &mut packed)?;
+            let mut cache = std::collections::HashMap::<Vec<i32>, Vec<f32>>::new();
+            for tokens in &world.tokens {
+                if !cache.contains_key(tokens) {
+                    self.text_in(stream, c, prof, te, tokens, &[])?;
+                    let mut rows = vec![0.0; tokens.len() * HID];
+                    self.read_rows(stream, tokens.len(), &mut rows)?;
+                    cache.insert(tokens.clone(), rows);
+                }
+                packed.extend_from_slice(&cache[tokens]);
+            }
+            stream.upload_at(
+                &self.seq.as_ref().expect("sized").x,
+                0,
+                crate::vvae::as_bytes(&packed),
+            )?;
+            self.world_codes = Some(crate::world::configure(
+                &mut lay,
+                action_spans.as_ref().expect("world spans"),
+            )?);
+        }
 
         // the packed layout's per-row tables
         {
@@ -938,7 +974,30 @@ impl Dit {
             .ok_or_else(|| crate::error::Error::Invalid("no such shape".into()))?;
         let lr = lay.text_len + lay.ref_rows;
         let (na, nv, s) = (lay.audio_rows, lay.video_rows, lay.seq_len);
+        let qk_bits = if self.world_codes.is_some() {
+            16
+        } else {
+            qk_bits
+        };
         self.ensure_blocks(stream, c, s, lr, qk_bits)?;
+        // Graphs own the old routing buffers. Drop them before replacing routing, including
+        // when returning to ordinary generation. Leave ordinary graph reuse untouched.
+        if self.world_codes.is_some()
+            || self
+                .blocks
+                .as_ref()
+                .expect("built")
+                .stack
+                .has_world_routing()
+        {
+            self.block_graph = None;
+            self.suffix_graph = None;
+            self.blocks.as_mut().expect("built").stack.world_routing(
+                c,
+                stream,
+                self.world_codes.as_deref(),
+            )?;
+        }
         crate::trace::event("sampling_loaded", || {
             format!(
             ",\"text_rows\":{},\"reference_rows\":{},\"audio_rows\":{},\"video_rows\":{},\"total_rows\":{},\"sequence_capacity\":{},\"attention_capacity\":{},\"prefix_copy_bytes\":{},\"qk_bits\":{}",
@@ -1244,16 +1303,7 @@ impl Dit {
                 if count != (h / 32) * (w / 32) {
                     return invalid("visual block does not match token span");
                 }
-                let e = crate::vision::embed_pair(
-                    stream,
-                    c,
-                    prof,
-                    te.weights(),
-                    &b.first.pixels,
-                    &b.second.pixels,
-                    h,
-                    w,
-                )?;
+                let e = te.vision_pair(stream, c, prof, &b.first.pixels, &b.second.pixels, h, w)?;
                 Ok((
                     VisionSpan {
                         start,
@@ -1620,6 +1670,7 @@ mod tests {
         let weights = unsafe { Weights::open(file.path(), |_, _| Ok(())) }.unwrap();
         let mut dit = Dit {
             adapter: None,
+            world_codes: None,
             stream_id: stream.id(),
             weights,
             constants: Constants::new(&mut stream).unwrap(),

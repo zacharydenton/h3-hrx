@@ -14,6 +14,17 @@ dispatch through `hrx::Stream`, and read results back through HRX staging. They
 are ignored by default; explicitly running them requires working hardware and
 the provisioned native bundle. No Python or Torch dependency is involved.
 
+Native RefMod prompt preparation has CPU coverage for effective strengths,
+disabled members, copy sharing, label order, metadata filtering, capability
+preflight and host media limits. The full tier also exercises real image/video
+and audio VAE reconstruction against a local mock prompt endpoint with an 8 GiB
+model allocation cap, verifying mixed raw/RefMod ordering and the returned H3
+presentation. Run that focused check with:
+
+```sh
+cargo test --locked --lib --release prompt::tests::native_refmod_ -- --ignored --test-threads=1
+```
+
 For the optional independent Turbo and Orbit block reference, export six fixtures with
 `H3_ADAPTER_BLOCK_FIXTURE=build/adapter-blocks scripts/test.sh --adapters`, then
 run `scripts/adapter_block_reference.py build/adapter-blocks` using the native
@@ -316,3 +327,70 @@ they do not establish prompt quality or full-model parity with the proprietary
 Context-IR service. Evaluate the configured endpoint separately on text, keyframes,
 identity references, voices, video motion and RefMod bundles using fixed generation
 settings and explicit instruction-preservation review.
+
+## H3-World
+
+`tests/world.rs` checks all 512 keyboard states and tokenization against pinned
+upstream fixtures, plus Pillow cover-resize fixtures and CLI validation.
+`world_attention_matches_directed_cpu_oracle` in `tests/kernels.rs` exercises
+both masked FP16 launch sizes, padding and changed routing against a CPU oracle.
+Run `cargo test --test world world_changes_actions_and_reuses_a_session -- --ignored`
+with the base and pinned world adapter cached to compare left/right/left requests
+in one stage-scoped session. This test validates action-sensitive latents and
+repeatability, not directional video quality. `scripts/test.sh --full` includes this
+test and therefore also requires the pinned world adapter in the cache. See
+[world generation](world.md).
+
+World rollout CPU tests cover lossless checkpoint round trips, exact last-frame
+handoff, seed/frame accounting, branching, failure/cancellation rollback,
+corrupt and oversized input rejection, command parsing and exclusive state
+writers. `world_rollout_decodes_and_resumes` exercises two decoded segments
+through a budgeted session and resumes the second from a serialized observation.
+These verify the continuation mechanism; they do not establish long-horizon
+scene or physics consistency.
+
+## Shared-Qwen local prompting
+
+The optional `local-prompt-generation` feature adds CPU tests for shard mapping,
+chat/vision span placement, audio notes, limits and CLI selection. Run its checks:
+
+```sh
+cargo clippy --locked --workspace --all-targets --features local-prompt-generation -- -D warnings
+cargo test --locked --workspace --features local-prompt-generation
+cargo test --locked --release --features local-prompt-generation --test kernels qwen_ -- --ignored --test-threads=1
+cargo test --locked --release --features local-prompt-generation --lib stack::causal::tests -- --ignored --test-threads=1
+```
+
+The small GPU checks use synthetic weights to compare cached attention with a
+scalar CPU oracle and cached transformer blocks with full-prefix execution.
+The attention oracle covers both one KV head and Qwen's actual eight KV heads,
+including partial prefill tiles and nonzero decode offsets.
+They also check shared weight ownership, wide BF16 preparation and compilation
+of the actual vocabulary-sized output projection.
+
+The real checkpoint checks are separate and require the cached Qwen tail shards:
+
+```sh
+cargo test --locked --features local-prompt-generation --lib local_prompt::tail::tests -- --ignored --nocapture
+cargo test --locked --release --features local-prompt-generation --lib local_prompt::native_tests -- --ignored --nocapture --test-threads=1
+```
+
+Set `H3_LOCAL_FETCH=1` only on the tail-shard test to provision missing pinned
+files. It maps headers without uploading model weights. The resident generation
+test uses a 48 GiB allocation ceiling and checks available RAM before uploading;
+missing hardware/checkpoints or insufficient RAM are failures, never silent skips.
+Run it serially with no other GPU tests. Kernel equivalence and prompt format
+checks alone do not establish visual-description quality.
+The first native test also checks factual text decoding and red/blue image
+recognition. The second reconstructs a mixed image/audio RefMod, generates its
+six-section prompt using an explicit audio note, and then reuses the encoder
+for a static World scene. It checks that generation-only allocations are released.
+
+Qualification on gfx1151, 2026-10-04: the CPU suite, feature builds, all 33 kernel
+regressions, cached-block equivalence, and pinned shard checks passed. Native
+decoding correctly returned Paris and distinguished red from blue images. The
+subsequent full prompt run was stopped by an external RAM monitor when competing
+GPU allocations consumed the reserve. The implementation now also checks RAM
+between tokens and before loading the continuation. The complete native prompt,
+RefMod, and World tests remain pending; these partial checks do not establish
+end-to-end prompt quality or parity with a full BF16 upstream model.

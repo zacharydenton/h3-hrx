@@ -2922,3 +2922,212 @@ fn seven_tap_audio_convolution_preserves_ordered_fp32_dots() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires gfx1151"]
+fn world_attention_matches_directed_cpu_oracle() {
+    let mut h = Harness::new();
+    for waves in [4usize, 8] {
+        let stem = if waves == 4 {
+            "attention_world_lds_f16_wmma"
+        } else {
+            "attention_world8_lds_f16_wmma"
+        };
+        let (tokens, capacity, d) = (97usize, 256usize, 128usize);
+        let pad = |scale| {
+            let mut x = vec![f16::ZERO; capacity * d];
+            for (a, b) in x.iter_mut().zip(values(tokens * d, scale)) {
+                *a = f16::from_f32(b);
+            }
+            x
+        };
+        let (q, k, v) = (pad(0.5), pad(0.45), pad(0.6));
+        for swap in [false, true] {
+            let mut routing = vec![0i32; capacity * 2];
+            for row in 5..33 {
+                routing[row * 2] = if row < 17 { 1 } else { 2 };
+            }
+            for row in 41..tokens {
+                routing[row * 2 + 1] = if (row < 63) ^ swap { 1 } else { 2 };
+            }
+            let allowed = |r: usize, j: usize| {
+                let (a, b, c, e) = (
+                    routing[r * 2],
+                    routing[j * 2],
+                    routing[r * 2 + 1],
+                    routing[j * 2 + 1],
+                );
+                (b == 0 || a == b || c == b) && (a == 0 || e == 0 || a == e)
+            };
+            let scale = 1.0 / (d as f64).sqrt();
+            let mut want = vec![0.0; tokens * d];
+            for row in 0..tokens {
+                let scores: Vec<_> = (0..tokens)
+                    .map(|j| {
+                        if allowed(row, j) {
+                            scale
+                                * (0..d)
+                                    .map(|c| q[row * d + c].to_f64() * k[j * d + c].to_f64())
+                                    .sum::<f64>()
+                        } else {
+                            f64::NEG_INFINITY
+                        }
+                    })
+                    .collect();
+                let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let weights: Vec<_> = scores.iter().map(|s| (s - max).exp()).collect();
+                let sum: f64 = weights.iter().sum();
+                for c in 0..d {
+                    want[row * d + c] = (0..tokens)
+                        .map(|j| weights[j] * v[j * d + c].to_f64() / sum)
+                        .sum();
+                }
+            }
+            let mut config = cfg(&[
+                ("q_stride", d),
+                ("kv_stride", d),
+                ("out_stride", d),
+                ("tokens", tokens),
+                ("token_capacity", capacity),
+            ]);
+            config.push(("scale", format!("{scale:.17}")));
+            let out = h.run_module(
+                "attention_world_family",
+                stem,
+                &config,
+                [tokens.div_ceil(16 * waves) as u32, 1, 1],
+                (32 * waves) as u32,
+                &[tokens as u64, 1],
+                &[
+                    bytes(&q),
+                    bytes(&k),
+                    bytes(&v),
+                    vec![0; tokens * d * 2],
+                    bytes(&routing),
+                ],
+            );
+            for (i, (a, b)) in halves(&out[3], false).iter().zip(&want).enumerate() {
+                assert!(
+                    a.is_finite() && (a - b).abs() < 0.002,
+                    "waves={waves} swap={swap} element={i}: {a} != {b}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn qwen_cached_attention_uses_absolute_causal_positions() {
+    let mut h = Harness::new();
+    for (offset, tokens, kv_heads) in [
+        (0usize, 17usize, 1),
+        (15, 1, 1),
+        (16, 3, 1),
+        (31, 17, 1),
+        (79, 1, 1),
+        (0, 22, 8),
+        (22, 1, 8),
+        (31, 17, 8),
+    ] {
+        let (heads, d) = (kv_heads * 8, 128);
+        let qs = heads * d;
+        let kvs = kv_heads * d;
+        let capacity = (tokens + 16).div_ceil(32) * 32;
+        let kv_capacity = (offset + tokens + 16).div_ceil(32) * 32;
+        let q: Vec<f16> = values(capacity * qs, 0.5)
+            .into_iter()
+            .map(f16::from_f32)
+            .collect();
+        let k: Vec<f16> = values(kv_capacity * kvs, 0.45)
+            .into_iter()
+            .map(f16::from_f32)
+            .collect();
+        let v: Vec<f16> = values(kv_capacity * kvs, 0.6)
+            .into_iter()
+            .map(f16::from_f32)
+            .collect();
+        let scale = 1.0 / (d as f64).sqrt();
+        let mut want = vec![0f64; tokens * qs];
+        for row in 0..tokens {
+            for head in 0..heads {
+                let score = |key: usize| {
+                    scale
+                        * (0..d)
+                            .map(|c| {
+                                q[row * qs + head * d + c].to_f64()
+                                    * k[key * kvs + (head / 8) * d + c].to_f64()
+                            })
+                            .sum::<f64>()
+                };
+                let top = (0..=offset + row).map(score).fold(f64::MIN, f64::max);
+                let weights: Vec<_> = (0..=offset + row).map(|j| (score(j) - top).exp()).collect();
+                let total: f64 = weights.iter().sum();
+                for (key, w) in weights.iter().enumerate() {
+                    for c in 0..d {
+                        want[row * qs + head * d + c] +=
+                            w / total * v[key * kvs + (head / 8) * d + c].to_f64();
+                    }
+                }
+            }
+        }
+        let mut config = cfg(&[
+            ("q_stride", qs),
+            ("kv_stride", kvs),
+            ("out_stride", qs),
+            ("tokens", tokens),
+            ("token_capacity", capacity),
+            ("kv_capacity", kv_capacity),
+        ]);
+        config.push(("scale", format!("{scale:.17}")));
+        let out = h.run(
+            "attention_qwen_cached",
+            &config,
+            [tokens.div_ceil(16) as u32, kv_heads as u32, 1],
+            256,
+            &[offset as u64],
+            &[bytes(&q), bytes(&k), bytes(&v), vec![0; tokens * qs * 2]],
+        );
+        for (a, b) in halves(&out[3], false).iter().zip(want) {
+            assert!(
+                a.is_finite() && (a - b).abs() <= 0.002 + 0.002 * b.abs(),
+                "offset={offset}: {a} vs {b}"
+            );
+        }
+    }
+    let input: Vec<u16> = (0..1031).map(|i| (i * 37) as u16).collect();
+    let out = h.run(
+        "copy_u16",
+        &[],
+        [5, 1, 1],
+        256,
+        &[1031],
+        &[bytes(&input), vec![0; 1031 * 2]],
+    );
+    assert_eq!(out[1], bytes(&input));
+}
+
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn qwen_wide_bf16_preparation_does_not_need_large_lds() {
+    let mut h = Harness::new();
+    for width in [5120usize, 25600] {
+        let input: Vec<f16> = values(width, 0.6).into_iter().map(f16::from_f32).collect();
+        let stride = width + 128;
+        let out = h.run_module(
+            "prepare_bf16_family",
+            "prepare_plain_bf16",
+            &cfg(&[("width", width), ("lanes", 256), ("out_stride", stride)]),
+            [1, 1, 1],
+            256,
+            &[1],
+            &[bytes(&input), vec![0; stride * 2]],
+        );
+        let expected: Vec<_> = input.iter().map(|x| bf16::from_f32(x.to_f32())).collect();
+        assert_eq!(&out[1][..width * 2], bytes(&expected));
+    }
+    // Compile the actual vocabulary-sized projection without allocating its 1.45 GiB weight.
+    let c = h3_hrx::compile::Compiler::new(None, std::path::PathBuf::new());
+    h3_hrx::dispatch::Matmul16::build(&c, &mut h.stream, "bias", 5120, 151936).unwrap();
+    c.flush(&mut h.stream).unwrap();
+}

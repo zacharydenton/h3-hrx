@@ -129,6 +129,34 @@ pub struct Weights {
 const CHUNK: usize = 16 << 20;
 
 impl Weights {
+    /// # Safety
+    /// Every shard must remain immutable for the lifetime of these weights.
+    pub unsafe fn open_shards(
+        paths: &[std::path::PathBuf],
+        plan: impl FnOnce(&Checkpoint, &mut BTreeMap<String, Recipe>) -> Result<()>,
+    ) -> Result<Self> {
+        let file = unsafe { Checkpoint::open_shards(paths) }?;
+        let mut recipes = BTreeMap::new();
+        plan(&file, &mut recipes)?;
+        Ok(Self {
+            file,
+            recipes,
+            uploaded: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        self.recipes.values().map(Recipe::device_bytes).sum()
+    }
+    #[cfg(feature = "local-prompt-generation")]
+    pub(crate) fn uploaded_bytes(&self) -> usize {
+        self.uploaded
+            .lock()
+            .expect("not poisoned")
+            .keys()
+            .map(|name| self.recipes[name].device_bytes())
+            .sum()
+    }
     /// Maps the file and builds its recipe table. The plan validates every source tensor's dtype and
     /// shape, so a checkpoint that does not match fails here rather than mid-generation.
     /// # Safety

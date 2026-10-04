@@ -45,12 +45,16 @@ pub mod te;
 pub mod vision;
 pub mod vvae;
 pub mod weights;
+pub mod world;
+pub use world::{Action, ActionSchedule, WorldRequest, WorldSegment, WorldState};
 
 // Reached from nowhere outside this crate, and so never public.
 
 mod cache;
 mod conditioning;
 pub mod error;
+#[cfg(feature = "local-prompt-generation")]
+pub mod local_prompt;
 pub mod media_context;
 pub mod models;
 mod noise;

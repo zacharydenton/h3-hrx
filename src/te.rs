@@ -26,7 +26,7 @@ pub struct Span<'a> {
 /// The longest image span the DeepStack staging buffer takes.
 const MAX_SPAN: usize = 4096;
 
-fn dims() -> StackDims {
+pub(crate) fn dims() -> StackDims {
     StackDims {
         hidden: TE_HID,
         heads: TE_HEADS,
@@ -58,6 +58,8 @@ struct Built {
 }
 
 pub struct TextEncoder {
+    #[cfg(feature = "local-prompt-generation")]
+    vision_cache: std::sync::Mutex<std::collections::VecDeque<(u64, crate::vision::Embedding)>>,
     weights: Weights,
     constants: Constants,
     built: Option<Built>,
@@ -75,7 +77,74 @@ impl TextEncoder {
             weights: unsafe { Weights::open(path, crate::plan::te::plan) }?,
             constants: Constants::new(stream)?,
             built: None,
+            #[cfg(feature = "local-prompt-generation")]
+            vision_cache: Default::default(),
         })
+    }
+
+    /// Cached temporal vision features, scoped to this checkpoint owner and bounded to 128 MiB.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn vision_pair(
+        &self,
+        stream: &mut hrx::Stream,
+        c: &Compiler,
+        prof: &mut Profile,
+        first: &[f32],
+        second: &[f32],
+        height: usize,
+        width: usize,
+    ) -> Result<crate::vision::Embedding> {
+        #[cfg(not(feature = "local-prompt-generation"))]
+        {
+            crate::vision::embed_pair(
+                stream,
+                c,
+                prof,
+                self.weights(),
+                first,
+                second,
+                height,
+                width,
+            )
+        }
+        #[cfg(feature = "local-prompt-generation")]
+        {
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            (height, width).hash(&mut hash);
+            for x in first.iter().chain(second) {
+                x.to_bits().hash(&mut hash);
+            }
+            let key = hash.finish();
+            let mut cache = self.vision_cache.lock().expect("vision cache");
+            if let Some((_, e)) = cache.iter().find(|(k, _)| *k == key) {
+                return Ok(e.clone());
+            }
+            let e = crate::vision::embed_pair(
+                stream,
+                c,
+                prof,
+                self.weights(),
+                first,
+                second,
+                height,
+                width,
+            )?;
+            let bytes = (e.merged.len() + e.deepstack.len()) * 4;
+            if bytes <= 128 << 20 {
+                while cache
+                    .iter()
+                    .map(|(_, e)| (e.merged.len() + e.deepstack.len()) * 4)
+                    .sum::<usize>()
+                    + bytes
+                    > 128 << 20
+                {
+                    cache.pop_front();
+                }
+                cache.push_back((key, e.clone()));
+            }
+            Ok(e)
+        }
     }
 
     /// The checkpoint, which also holds the vision tower's weights.
@@ -88,7 +157,7 @@ impl TextEncoder {
     /// The table is bf16 in the file and widened here. A row covered by an image span keeps the
     /// tower's embedding instead, and its token id is allowed to be negative — that is how a caller
     /// says "there is no token here", and it is the only case where a negative id is not an error.
-    fn embed(&self, ids: &[i32], spans: &[Span<'_>]) -> Result<Vec<f32>> {
+    pub(crate) fn embed(&self, ids: &[i32], spans: &[Span<'_>]) -> Result<Vec<f32>> {
         let n = ids.len();
         let mut emb = vec![0.0f32; n * TEXT_DIM];
         for sp in spans {

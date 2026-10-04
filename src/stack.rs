@@ -14,6 +14,13 @@ use std::sync::{Arc, OnceLock};
 
 #[path = "stack_adapter.rs"]
 mod adapter;
+#[cfg(feature = "local-prompt-generation")]
+#[path = "stack_causal.rs"]
+mod causal;
+#[cfg(feature = "local-prompt-generation")]
+use causal::CachedAttention;
+#[cfg(feature = "local-prompt-generation")]
+pub(crate) use causal::KvCache;
 
 pub type Result<T> = std::result::Result<T, crate::compile::Error>;
 
@@ -153,6 +160,8 @@ pub fn env_once(name: &'static str) -> Option<&'static str> {
 }
 
 pub struct Stack {
+    #[cfg(feature = "local-prompt-generation")]
+    causal_cache: Option<CachedAttention>,
     adapter: Option<adapter::AdapterRuntime>,
     d: StackDims,
     tokens: usize,
@@ -183,6 +192,7 @@ pub struct Stack {
     qkv_group: u32,
     rope: Option<crate::compile::Kernel>,
     attention: crate::compile::Kernel,
+    world_attention: Option<(crate::compile::Kernel, hrx::Buffer)>,
     colmean: Option<crate::compile::Kernel>,
     prep_q: Option<crate::compile::Kernel>,
     prep_k: Option<crate::compile::Kernel>,
@@ -733,6 +743,8 @@ impl Stack {
         c.flush(stream)?;
 
         Ok(Self {
+            #[cfg(feature = "local-prompt-generation")]
+            causal_cache: None,
             adapter: None,
             d,
             tokens,
@@ -758,6 +770,7 @@ impl Stack {
             qkv_group,
             rope,
             attention,
+            world_attention: None,
             colmean,
             prep_q,
             prep_k,
@@ -1089,6 +1102,13 @@ impl Stack {
             if self.fused_operands {
                 self.prepare_fused_operands(sink, prof, t, qnorm, knorm, cos, sin)?;
             }
+            #[cfg(feature = "local-prompt-generation")]
+            if self.causal_cache.is_some() {
+                self.attend_cached(sink, prof, i, q, k, v)?;
+            } else {
+                self.attend(sink, prof, t, q, k, v)?;
+            }
+            #[cfg(not(feature = "local-prompt-generation"))]
             self.attend(sink, prof, t, q, k, v)?;
 
             let attn_operand = if self.direct_attn {
@@ -1320,6 +1340,57 @@ impl Stack {
         Ok(())
     }
 
+    pub(crate) fn has_world_routing(&self) -> bool {
+        self.world_attention.is_some()
+    }
+
+    pub(crate) fn world_routing(
+        &mut self,
+        c: &Compiler,
+        stream: &mut hrx::Stream,
+        codes: Option<&[i32]>,
+    ) -> Result<()> {
+        self.world_attention = None;
+        let Some(codes) = codes else {
+            return Ok(());
+        };
+        if self.d.attn_qk_bits != 16 || self.d.head_dim != 128 || codes.len() != self.tokens {
+            return err("world routing requires f16 H3 attention and one code per row");
+        }
+        let stem = if self.waves == 8 {
+            "attention_world8_lds_f16_wmma"
+        } else {
+            "attention_world_lds_f16_wmma"
+        };
+        let ns = format!("h3.{stem}.");
+        let cfg = vec![
+            (format!("{ns}q_stride"), self.d.inner().to_string()),
+            (format!("{ns}kv_stride"), self.d.kv_inner().to_string()),
+            (format!("{ns}out_stride"), self.attn_width.to_string()),
+            (format!("{ns}tokens"), self.tokens.to_string()),
+            (format!("{ns}token_capacity"), self.capacity.to_string()),
+            (
+                format!("{ns}scale"),
+                num(1.0 / (self.d.head_dim as f64).sqrt()),
+            ),
+        ];
+        let kernel = c.get(
+            stream,
+            "attention_world_family",
+            &format!("h3_{stem}"),
+            &cfg,
+        )?;
+        let mut rows = vec![0i32; self.capacity * 2];
+        for (i, code) in codes.iter().enumerate() {
+            rows[i * 2] = (*code).max(0);
+            rows[i * 2 + 1] = (-*code).max(0);
+        }
+        let buffer = stream.allocate(rows.len() * 4)?;
+        stream.upload(buffer.binding(), bytemuck::cast_slice(&rows))?;
+        self.world_attention = Some((kernel, buffer));
+        Ok(())
+    }
+
     /// Attention, on f16 Q/K/V or on the narrowed integer operands.
     fn attend<'g>(
         &'g self,
@@ -1347,6 +1418,25 @@ impl Stack {
             } else {
                 [32 * self.waves as u32, 1, 1]
             };
+            if let Some((kernel, routing)) = &self.world_attention {
+                return emit(
+                    sink,
+                    kernel,
+                    Some(prof),
+                    "world attention",
+                    grid,
+                    block,
+                    &[t],
+                    &[q, k, v, self.attn.binding(), routing.binding()],
+                    &[
+                        cap * self.d.inner() * 2,
+                        cap * self.d.kv_inner() * 2,
+                        cap * self.d.kv_inner() * 2,
+                        out,
+                        cap * 8,
+                    ],
+                );
+            }
             return emit(
                 sink,
                 &self.attention,
