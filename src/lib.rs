@@ -53,8 +53,6 @@ pub use world::{Action, ActionSchedule, WorldRequest, WorldSegment, WorldState};
 mod cache;
 mod conditioning;
 pub mod error;
-#[cfg(feature = "local-prompt-generation")]
-pub mod local_prompt;
 pub mod media_context;
 pub mod models;
 mod noise;

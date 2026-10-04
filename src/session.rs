@@ -11,8 +11,6 @@ use crate::error::{invalid, Result};
 use crate::layout::{shape_for, Shape};
 use crate::te::TextEncoder;
 use crate::vvae::{Clip, VideoVae};
-#[cfg(feature = "local-prompt-generation")]
-mod local_prompt;
 mod residency;
 
 /// How long a session keeps completed models on the device.
@@ -43,8 +41,12 @@ pub struct Config {
     /// Explicit checkpoint paths override automatic resolution through the Hugging Face cache.
     /// `None` selects Ref2VA for denoising with references and FL2VA otherwise
     /// (including keyframes and standalone text refinement). Reused sessions
-    /// switch checkpoints when the request changes; an explicit path always wins.
+    /// switch checkpoints when the request changes; `base_weights` forces FL2VA.
+    /// An explicit path always wins.
     pub dit: Option<std::path::PathBuf>,
+    /// Use FL2VA even with raw or RefMod references, matching CLI `--base-weights`.
+    /// References still participate in conditioning. An explicit `dit` path wins.
+    pub base_weights: bool,
     pub te: Option<std::path::PathBuf>,
     pub video_vae: Option<std::path::PathBuf>,
     pub audio_vae: Option<std::path::PathBuf>,
@@ -63,6 +65,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             dit: None,
+            base_weights: false,
             te: None,
             video_vae: None,
             audio_vae: None,
@@ -71,6 +74,17 @@ impl Default for Config {
             loom_library: None,
             attention: crate::dit::Attention::default(),
         }
+    }
+}
+
+impl Config {
+    fn dit_checkpoint(&self, references: bool) -> Result<std::path::PathBuf> {
+        let relative = if references && !self.base_weights {
+            crate::models::DIT_REF2VA
+        } else {
+            crate::models::DIT_FL2VA
+        };
+        checkpoint_path(&self.dit, relative)
     }
 }
 
@@ -99,8 +113,6 @@ pub struct Session {
 }
 
 struct State {
-    #[cfg(feature = "local-prompt-generation")]
-    local: Option<crate::local_prompt::Engine>,
     stream: hrx::Stream,
     compiler: Compiler,
     config: Config,
@@ -486,8 +498,6 @@ impl State {
             vvae: None,
             avae: None,
             units,
-            #[cfg(feature = "local-prompt-generation")]
-            local: None,
         })
     }
 
@@ -536,12 +546,7 @@ impl State {
     }
 
     fn dit(&mut self, references: bool) -> Result<&mut Dit> {
-        let relative = if references {
-            crate::models::DIT_REF2VA
-        } else {
-            crate::models::DIT_FL2VA
-        };
-        let path = checkpoint_path(&self.config.dit, relative)?;
+        let path = self.config.dit_checkpoint(references)?;
         if let Some(units) = &mut self.units {
             units.dit.checkout(&mut self.dit)?;
         }
@@ -965,12 +970,15 @@ mod tests {
             ResidencyPolicy::StageScoped,
             ResidencyPolicy::Budgeted,
         ] {
-            for explicit in [None, Some(base.clone())] {
+            for (explicit, base_weights) in
+                [(None, false), (None, true), (Some(base.clone()), false)]
+            {
                 // Safety: cached checkpoints remain immutable throughout this test.
                 let mut session = unsafe {
                     Session::new_in(
                         Config {
                             dit: explicit.clone(),
+                            base_weights,
                             ..Default::default()
                         },
                         SessionOptions {
@@ -985,7 +993,7 @@ mod tests {
                     session
                         .scheduled(|state| {
                             state.dit(references)?;
-                            let expected = if references && explicit.is_none() {
+                            let expected = if references && explicit.is_none() && !base_weights {
                                 &reference
                             } else {
                                 &base
@@ -1206,6 +1214,29 @@ mod tests {
                 checkpoint_path(&Some(explicit.clone()), crate::models::VIDEO_VAE).unwrap(),
                 explicit
             );
+            let snapshot = expected.parent().unwrap().parent().unwrap();
+            for base_weights in [false, true] {
+                for references in [false, true] {
+                    let config = Config {
+                        base_weights,
+                        ..Default::default()
+                    };
+                    let relative = if references && !base_weights {
+                        crate::models::DIT_REF2VA
+                    } else {
+                        crate::models::DIT_FL2VA
+                    };
+                    assert_eq!(
+                        config.dit_checkpoint(references).unwrap(),
+                        snapshot.join(relative)
+                    );
+                    let config = Config {
+                        dit: Some(explicit.clone()),
+                        ..config
+                    };
+                    assert_eq!(config.dit_checkpoint(references).unwrap(), explicit);
+                }
+            }
             return;
         }
 
@@ -1222,6 +1253,11 @@ mod tests {
         std::fs::create_dir_all(repo.join("refs")).unwrap();
         std::fs::write(repo.join("refs/main"), revision).unwrap();
         std::fs::write(&checkpoint, b"cached checkpoint fixture").unwrap();
+        for relative in [crate::models::DIT_FL2VA, crate::models::DIT_REF2VA] {
+            let dit = repo.join("snapshots").join(revision).join(relative);
+            std::fs::create_dir_all(dit.parent().unwrap()).unwrap();
+            std::fs::write(dit, b"cached checkpoint fixture").unwrap();
+        }
 
         // The retired model-directory override must not shadow the Hub cache.
         let legacy = dir.path().join("legacy-models");
@@ -1265,6 +1301,7 @@ mod tests {
         Config {
             loras: Vec::new(),
             dit: None,
+            base_weights: false,
             te: None,
             video_vae: None,
             audio_vae: None,

@@ -61,20 +61,6 @@ impl Tokenizer {
         Ok(())
     }
 
-    /// Local generation requires the exact vocabulary used by the shared H3 checkpoint.
-    #[cfg(feature = "local-prompt-generation")]
-    pub(crate) fn checked_local() -> Result<Self> {
-        if let Some(path) = std::env::var_os("H3_TOKENIZER").filter(|s| !s.is_empty()) {
-            let bytes = std::fs::read(path).map_err(|e| Error(e.to_string()))?;
-            if bytes != EMBEDDED {
-                return Err(Error(
-                    "local Qwen requires the embedded H3 tokenizer".into(),
-                ));
-            }
-        }
-        Self::from_bytes(EMBEDDED)
-    }
-
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
         self.0.decode(ids, true).map_err(|e| Error(e.to_string()))
     }

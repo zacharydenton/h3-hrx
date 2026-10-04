@@ -27,7 +27,6 @@ required-features = ["cli"]
 default = ["cli", "prompt-generation"]
 # Disable default features when consuming only the library.
 cli = ["dep:anyhow", "dep:clap"]
-local-prompt-generation = ["prompt-generation"]
 prompt-generation = ["dep:reqwest", "dep:base64", "dep:png", "dep:regex"]
 # One stage of the pipeline at a time, for comparing against a reference or a previous kernel.
 [[bin]]

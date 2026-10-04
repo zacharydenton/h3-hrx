@@ -78,72 +78,48 @@ Generation uses two successful endpoint requests, or three when repair is needed
 There is no built-in model download, model choice, or claim of official Context-IR
 quality. Assess instruction preservation and video quality with your chosen model.
 
-### Fully local shared-Qwen backend
+### Native Rust RefMod prompting
 
-This backend is experimental. Native text decoding and basic image recognition
-have been exercised; full prompt/RefMod/World qualification is still pending
-because concurrent GPU workloads exhausted available RAM during testing. See
-[validation status](testing.md#shared-qwen-local-prompting).
+Prompt generation uses the configured endpoint. With originals, call
+`PromptGenerator::generate_refmods_with_sources(None, request, &sources)`.
+This returns the prompt and its matching H3 presentation without opening a
+session, loading model weights, or initializing a GPU. The application decodes
+its source files into `Media`; each `RefModSource` selects a one-based RefMod slot
+and original member number. For example, for a single image member:
 
-Build with `cargo build --release --features local-prompt-generation`, then select
-`--prompt-backend local`. The endpoint remains the default backend. Local prompting
-makes no chat API requests; model provisioning can contact Hugging Face unless
-`--offline` is set.
+```rust,no_run
+use h3_hrx::{media_context::{Frame, Media}, Shape};
+use h3_hrx::prompt::{PromptGenerator, RefModPromptRequest, RefModPromptResult, PromptError};
+use h3_hrx::refmod::{ApplyOptions, RefMod, RefModSource};
 
-```sh
-h3 prompt --prompt-backend local --refmod character.safetensors \
-  -p 'The referenced character walks through a forest' > forest.txt
-h3 --generate-prompt --prompt-backend local --refmod character-with-voice.safetensors \
-  --prompt-audio-note '1=Use this reference for the character voice; say Hello.' \
-  -p 'The character greets the viewer' --save-prompt greeting.txt --out greeting.mp4
-h3 world --generate-prompt --prompt-backend local --first-frame scene.png \
-  --action-preset pan-left -p 'Describe this room' --out room.mp4
+fn prompt_from_original(
+    generator: &PromptGenerator, // Configure EndpointConfig.images = true.
+    refmod: &RefMod,
+    original: Frame, // Decoded RGB floats, dimensions aligned to 32 pixels.
+    shape: &Shape,
+) -> Result<RefModPromptResult, PromptError> {
+    let mods = [refmod.prepare(ApplyOptions::default())?];
+    let sources = [RefModSource {
+        slot: 1,
+        member: 1,
+        media: Media::Picture(original),
+        provenance: serde_json::json!({"path":"original.png"}),
+        synthetic_timing: false,
+    }];
+    generator.generate_refmods_with_sources(None, RefModPromptRequest {
+        instruction: "The referenced character greets the viewer",
+        entries: &[],
+        refmods: &mods,
+        shape,
+        presentation: Default::default(),
+    }, &sources)
+}
 ```
 
-This backend shares H3's existing INT8 Qwen3-VL-32B encoder and vision weights,
-then adds BF16 language layers 50–63, final normalization and the output head.
-The continuation comes from `Qwen/Qwen3-VL-32B-Instruct` revision
-`0cfaf48183f594c314753d30a4c4974bc75f3ccb`; only shards 11–14 are downloaded.
-`--prompt-local-model-dir DIR` uses those same four files locally, with their
-pinned SHA-256 identities checked. This is not the Qwen3.6 checkpoint used by
-qwen-hrx. The embedded H3 tokenizer is required.
-
-Visual analysis and rewriting run locally with greedy decoding and at most one
-corrective rewrite. Reference labels, strengths and synthetic stack timing are
-preserved. Audio is **not listened to**: provide a nonempty `--prompt-audio-note
-INDEX=TEXT` for every active Audio label, including copies. Notes describe intended
-use and are recorded as user statements, not observed evidence. Audio RefMod
-latents still condition H3 normally. Missing notes fail before reconstruction.
-
-The resident model has a default **48 GiB native allocation ceiling** and needs
-additional system headroom. The loader estimates weights, KV storage and workspace
-before uploading, and requires another **8 GiB of available RAM**. It fails if the
-model does not fit; there is no offloading or endpoint fallback. Override the
-ceiling with `--memory-budget-mib`. Host media has its separate
-`--refmod-media-budget-mib` limit.
-Decoding rechecks available RAM between tokens and stops below the 8 GiB reserve.
-Failed completions release both the generation weights and shared encoder. Other processes
-can still allocate RAM between checks; the reserve is not a system-wide reservation.
-
-`--prompt-context-tokens` defaults to 8192 and `--prompt-max-tokens` to 1024 per
-completion. Oversized contexts and completions that hit the output limit fail
-explicitly. The generation-only weights and KV caches are released after writing
-the prompt; the shared encoder and bounded vision cache remain available for H3
-conditioning. Raw-reference VAE encoding runs before local prompt generation.
-`H3_STAGE_TRACE=1` reports prefill and decoding progress without printing content.
-Saved prompt provenance includes model paths/revision, precision, audio notes,
-token limits, validation and completion timings.
-
-For Rust, use `local_prompt::{LocalPromptConfig, LocalPromptGenerator, AudioNote}`.
-Construct the generator with `unsafe { LocalPromptGenerator::new(config) }`, keeping
-its checkpoint files immutable while used by a session. Call `generate`,
-`generate_refmods`, or `generate_world_scene` with `&mut Session`; the RefMod result
-has the same `prompt` and `presentation` fields as the endpoint path. The session
-must use a live `ResidencyManager` allocation budget no larger than the configured
-local ceiling. Keep the manager alive and prefer stage-scoped residency. Set the
-config's optional atomic cancellation flag to stop between language blocks/tokens.
-
-### Native Rust RefMod prompting
+Every active member needs a source when the session is `None`; missing sources
+fail before contacting the endpoint. Pass `Some(&mut session)` to reconstruct
+unmapped members through the VAEs. Original media changes presentation only;
+use the same RefMods, ordering and preparation options for latent conditioning.
 
 With the `prompt-generation` feature, `PromptGenerator::generate_refmods` accepts
 prepared RefMods directly. It decodes their effective image/video/audio latents

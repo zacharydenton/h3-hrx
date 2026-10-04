@@ -58,8 +58,6 @@ struct Built {
 }
 
 pub struct TextEncoder {
-    #[cfg(feature = "local-prompt-generation")]
-    vision_cache: std::sync::Mutex<std::collections::VecDeque<(u64, crate::vision::Embedding)>>,
     weights: Weights,
     constants: Constants,
     built: Option<Built>,
@@ -77,12 +75,10 @@ impl TextEncoder {
             weights: unsafe { Weights::open(path, crate::plan::te::plan) }?,
             constants: Constants::new(stream)?,
             built: None,
-            #[cfg(feature = "local-prompt-generation")]
-            vision_cache: Default::default(),
         })
     }
 
-    /// Cached temporal vision features, scoped to this checkpoint owner and bounded to 128 MiB.
+    /// Temporal vision features for one frame pair.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn vision_pair(
         &self,
@@ -94,57 +90,16 @@ impl TextEncoder {
         height: usize,
         width: usize,
     ) -> Result<crate::vision::Embedding> {
-        #[cfg(not(feature = "local-prompt-generation"))]
-        {
-            crate::vision::embed_pair(
-                stream,
-                c,
-                prof,
-                self.weights(),
-                first,
-                second,
-                height,
-                width,
-            )
-        }
-        #[cfg(feature = "local-prompt-generation")]
-        {
-            use std::hash::{Hash, Hasher};
-            let mut hash = std::collections::hash_map::DefaultHasher::new();
-            (height, width).hash(&mut hash);
-            for x in first.iter().chain(second) {
-                x.to_bits().hash(&mut hash);
-            }
-            let key = hash.finish();
-            let mut cache = self.vision_cache.lock().expect("vision cache");
-            if let Some((_, e)) = cache.iter().find(|(k, _)| *k == key) {
-                return Ok(e.clone());
-            }
-            let e = crate::vision::embed_pair(
-                stream,
-                c,
-                prof,
-                self.weights(),
-                first,
-                second,
-                height,
-                width,
-            )?;
-            let bytes = (e.merged.len() + e.deepstack.len()) * 4;
-            if bytes <= 128 << 20 {
-                while cache
-                    .iter()
-                    .map(|(_, e)| (e.merged.len() + e.deepstack.len()) * 4)
-                    .sum::<usize>()
-                    + bytes
-                    > 128 << 20
-                {
-                    cache.pop_front();
-                }
-                cache.push_back((key, e.clone()));
-            }
-            Ok(e)
-        }
+        crate::vision::embed_pair(
+            stream,
+            c,
+            prof,
+            self.weights(),
+            first,
+            second,
+            height,
+            width,
+        )
     }
 
     /// The checkpoint, which also holds the vision tower's weights.

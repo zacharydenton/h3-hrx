@@ -18,7 +18,6 @@ cargo test --locked --workspace --all-features
 if [ "$gpu" = 1 ]; then
   cargo test --locked --lib --release -- --ignored --test-threads=1 --skip session::tests:: --skip stack::adapter::tests:: --skip prompt::tests::native_refmod_
   cargo test --locked --test kernels --release -- --ignored --test-threads=1
-  cargo test --locked --features local-prompt-generation --lib --release stack::causal::tests -- --ignored --test-threads=1
 fi
 if [ "$full" = 1 ]; then
   cargo test --locked --lib --release prompt::tests::native_refmod_ -- --ignored --test-threads=1

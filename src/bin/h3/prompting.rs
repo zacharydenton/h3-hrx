@@ -17,17 +17,6 @@ pub type Generator = h3_hrx::prompt::PromptGenerator;
 pub struct Generator;
 
 pub fn generator(cli: &Cli) -> Result<Option<Generator>> {
-    if cli.generate_prompt && cli.prompt_backend == super::PromptBackend::Local {
-        #[cfg(not(feature = "local-prompt-generation"))]
-        anyhow::bail!("rebuild h3 with --features local-prompt-generation");
-        #[cfg(feature = "local-prompt-generation")]
-        {
-            // Validate limits before media decoding or checkpoint resolution.
-            // Safety: no mappings are opened here; the CLI keeps checkpoints immutable.
-            unsafe { h3_hrx::local_prompt::LocalPromptGenerator::new(local_config(cli)?) }?;
-            return Ok(None);
-        }
-    }
     endpoint_generator(
         cli.generate_prompt,
         cli.prompt_base_url.as_deref(),
@@ -292,85 +281,4 @@ pub fn refmod_entries(
         )
     }?;
     Ok(session.refmod_entries_with_sources(mods, options, &sources)?)
-}
-
-#[cfg(feature = "local-prompt-generation")]
-fn local_notes(cli: &Cli) -> Result<Vec<h3_hrx::local_prompt::AudioNote>> {
-    cli.prompt_audio_note
-        .iter()
-        .map(|s| {
-            let (index, text) = s
-                .split_once('=')
-                .context("--prompt-audio-note needs INDEX=TEXT")?;
-            Ok(h3_hrx::local_prompt::AudioNote {
-                index: index.parse()?,
-                text: text.into(),
-            })
-        })
-        .collect()
-}
-pub fn check_local_audio(cli: &Cli, entries: &[MediaEntry], mods: &[PreparedRefMod]) -> Result<()> {
-    if !cli.generate_prompt || cli.prompt_backend != super::PromptBackend::Local {
-        return Ok(());
-    }
-    #[cfg(feature = "local-prompt-generation")]
-    {
-        let count = entries
-            .iter()
-            .filter(|e| matches!(e.media, Media::Audio(_)))
-            .count()
-            + mods
-                .iter()
-                .flat_map(|m| m.members())
-                .filter(|m| m.is_audio())
-                .count();
-        h3_hrx::local_prompt::validate_audio_notes(count, &local_notes(cli)?)?;
-    }
-    #[cfg(not(feature = "local-prompt-generation"))]
-    let _ = (entries, mods);
-    Ok(())
-}
-#[cfg(feature = "local-prompt-generation")]
-fn local_config(cli: &Cli) -> Result<h3_hrx::local_prompt::LocalPromptConfig> {
-    Ok(h3_hrx::local_prompt::LocalPromptConfig {
-        model_dir: cli.prompt_local_model_dir.clone(),
-        offline: cli.offline,
-        context_tokens: cli.prompt_context_tokens,
-        max_tokens: cli.prompt_max_tokens,
-        memory_budget_bytes: super::memory_budget_bytes(cli)?.unwrap_or(48 << 30),
-        ..Default::default()
-    })
-}
-
-pub fn generate_local(
-    session: &mut Session,
-    cli: &Cli,
-    entries: &[MediaEntry],
-    shape: &Shape,
-    instruction: &str,
-    world: bool,
-) -> Result<String> {
-    #[cfg(feature = "local-prompt-generation")]
-    {
-        use h3_hrx::local_prompt::LocalPromptGenerator;
-        // Safety: the CLI never changes checkpoint files during this operation.
-        let generator = unsafe { LocalPromptGenerator::new(local_config(cli)?) }?;
-        let request = h3_hrx::prompt::PromptRequest {
-            instruction,
-            entries,
-            shape,
-        };
-        let result = if world {
-            generator.generate_world_scene(session, request)?
-        } else {
-            generator.generate(session, request, &local_notes(cli)?)?
-        };
-        save(cli, &result.text, result.record)?;
-        Ok(result.text)
-    }
-    #[cfg(not(feature = "local-prompt-generation"))]
-    {
-        let _ = (session, cli, entries, shape, instruction, world);
-        anyhow::bail!("rebuild h3 with --features local-prompt-generation")
-    }
 }

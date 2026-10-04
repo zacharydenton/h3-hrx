@@ -14,13 +14,6 @@ use std::sync::{Arc, OnceLock};
 
 #[path = "stack_adapter.rs"]
 mod adapter;
-#[cfg(feature = "local-prompt-generation")]
-#[path = "stack_causal.rs"]
-mod causal;
-#[cfg(feature = "local-prompt-generation")]
-use causal::CachedAttention;
-#[cfg(feature = "local-prompt-generation")]
-pub(crate) use causal::KvCache;
 
 pub type Result<T> = std::result::Result<T, crate::compile::Error>;
 
@@ -160,8 +153,6 @@ pub fn env_once(name: &'static str) -> Option<&'static str> {
 }
 
 pub struct Stack {
-    #[cfg(feature = "local-prompt-generation")]
-    causal_cache: Option<CachedAttention>,
     adapter: Option<adapter::AdapterRuntime>,
     d: StackDims,
     tokens: usize,
@@ -743,8 +734,6 @@ impl Stack {
         c.flush(stream)?;
 
         Ok(Self {
-            #[cfg(feature = "local-prompt-generation")]
-            causal_cache: None,
             adapter: None,
             d,
             tokens,
@@ -1102,13 +1091,6 @@ impl Stack {
             if self.fused_operands {
                 self.prepare_fused_operands(sink, prof, t, qnorm, knorm, cos, sin)?;
             }
-            #[cfg(feature = "local-prompt-generation")]
-            if self.causal_cache.is_some() {
-                self.attend_cached(sink, prof, i, q, k, v)?;
-            } else {
-                self.attend(sink, prof, t, q, k, v)?;
-            }
-            #[cfg(not(feature = "local-prompt-generation"))]
             self.attend(sink, prof, t, q, k, v)?;
 
             let attn_operand = if self.direct_attn {

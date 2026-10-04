@@ -3018,98 +3018,7 @@ fn world_attention_matches_directed_cpu_oracle() {
 
 #[test]
 #[ignore = "requires gfx1151 and provisioned HRX"]
-fn qwen_cached_attention_uses_absolute_causal_positions() {
-    let mut h = Harness::new();
-    for (offset, tokens, kv_heads) in [
-        (0usize, 17usize, 1),
-        (15, 1, 1),
-        (16, 3, 1),
-        (31, 17, 1),
-        (79, 1, 1),
-        (0, 22, 8),
-        (22, 1, 8),
-        (31, 17, 8),
-    ] {
-        let (heads, d) = (kv_heads * 8, 128);
-        let qs = heads * d;
-        let kvs = kv_heads * d;
-        let capacity = (tokens + 16).div_ceil(32) * 32;
-        let kv_capacity = (offset + tokens + 16).div_ceil(32) * 32;
-        let q: Vec<f16> = values(capacity * qs, 0.5)
-            .into_iter()
-            .map(f16::from_f32)
-            .collect();
-        let k: Vec<f16> = values(kv_capacity * kvs, 0.45)
-            .into_iter()
-            .map(f16::from_f32)
-            .collect();
-        let v: Vec<f16> = values(kv_capacity * kvs, 0.6)
-            .into_iter()
-            .map(f16::from_f32)
-            .collect();
-        let scale = 1.0 / (d as f64).sqrt();
-        let mut want = vec![0f64; tokens * qs];
-        for row in 0..tokens {
-            for head in 0..heads {
-                let score = |key: usize| {
-                    scale
-                        * (0..d)
-                            .map(|c| {
-                                q[row * qs + head * d + c].to_f64()
-                                    * k[key * kvs + (head / 8) * d + c].to_f64()
-                            })
-                            .sum::<f64>()
-                };
-                let top = (0..=offset + row).map(score).fold(f64::MIN, f64::max);
-                let weights: Vec<_> = (0..=offset + row).map(|j| (score(j) - top).exp()).collect();
-                let total: f64 = weights.iter().sum();
-                for (key, w) in weights.iter().enumerate() {
-                    for c in 0..d {
-                        want[row * qs + head * d + c] +=
-                            w / total * v[key * kvs + (head / 8) * d + c].to_f64();
-                    }
-                }
-            }
-        }
-        let mut config = cfg(&[
-            ("q_stride", qs),
-            ("kv_stride", kvs),
-            ("out_stride", qs),
-            ("tokens", tokens),
-            ("token_capacity", capacity),
-            ("kv_capacity", kv_capacity),
-        ]);
-        config.push(("scale", format!("{scale:.17}")));
-        let out = h.run(
-            "attention_qwen_cached",
-            &config,
-            [tokens.div_ceil(16) as u32, kv_heads as u32, 1],
-            256,
-            &[offset as u64],
-            &[bytes(&q), bytes(&k), bytes(&v), vec![0; tokens * qs * 2]],
-        );
-        for (a, b) in halves(&out[3], false).iter().zip(want) {
-            assert!(
-                a.is_finite() && (a - b).abs() <= 0.002 + 0.002 * b.abs(),
-                "offset={offset}: {a} vs {b}"
-            );
-        }
-    }
-    let input: Vec<u16> = (0..1031).map(|i| (i * 37) as u16).collect();
-    let out = h.run(
-        "copy_u16",
-        &[],
-        [5, 1, 1],
-        256,
-        &[1031],
-        &[bytes(&input), vec![0; 1031 * 2]],
-    );
-    assert_eq!(out[1], bytes(&input));
-}
-
-#[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
-fn qwen_wide_bf16_preparation_does_not_need_large_lds() {
+fn wide_bf16_preparation_does_not_need_large_lds() {
     let mut h = Harness::new();
     for width in [5120usize, 25600] {
         let input: Vec<f16> = values(width, 0.6).into_iter().map(f16::from_f32).collect();
@@ -3126,8 +3035,4 @@ fn qwen_wide_bf16_preparation_does_not_need_large_lds() {
         let expected: Vec<_> = input.iter().map(|x| bf16::from_f32(x.to_f32())).collect();
         assert_eq!(&out[1][..width * 2], bytes(&expected));
     }
-    // Compile the actual vocabulary-sized projection without allocating its 1.45 GiB weight.
-    let c = h3_hrx::compile::Compiler::new(None, std::path::PathBuf::new());
-    h3_hrx::dispatch::Matmul16::build(&c, &mut h.stream, "bias", 5120, 151936).unwrap();
-    c.flush(&mut h.stream).unwrap();
 }

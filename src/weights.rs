@@ -148,15 +148,6 @@ impl Weights {
     pub fn device_bytes(&self) -> usize {
         self.recipes.values().map(Recipe::device_bytes).sum()
     }
-    #[cfg(feature = "local-prompt-generation")]
-    pub(crate) fn uploaded_bytes(&self) -> usize {
-        self.uploaded
-            .lock()
-            .expect("not poisoned")
-            .keys()
-            .map(|name| self.recipes[name].device_bytes())
-            .sum()
-    }
     /// Maps the file and builds its recipe table. The plan validates every source tensor's dtype and
     /// shape, so a checkpoint that does not match fails here rather than mid-generation.
     /// # Safety

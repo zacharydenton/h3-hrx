@@ -128,65 +128,34 @@ fn generated_prompts_reject_legacy_refmod_presentation_before_media_access() {
     );
 }
 
-#[cfg(not(feature = "local-prompt-generation"))]
 #[test]
-fn local_backend_reports_its_optional_build_feature() {
-    let output = Command::new(env!("CARGO_BIN_EXE_h3"))
-        .args(["prompt", "--prompt-backend", "local", "-p", "A ball rolls"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("local-prompt-generation"));
-}
-
-#[cfg(feature = "local-prompt-generation")]
-#[test]
-fn local_limits_fail_before_media_or_model_access() {
-    let output = Command::new(env!("CARGO_BIN_EXE_h3"))
-        .args([
-            "prompt",
-            "--prompt-backend",
-            "local",
-            "--prompt-context-tokens",
-            "0",
-            "--te",
-            "/absent/encoder",
-            "--refmod",
-            "/absent/reference",
-            "-p",
-            "A ball rolls",
-        ])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("local context must be"));
-}
-
-#[cfg(feature = "local-prompt-generation")]
-#[test]
-fn local_audio_notes_fail_before_any_checkpoint_or_runtime_is_opened() {
-    let output = Command::new(env!("CARGO_BIN_EXE_h3"))
-        .args([
-            "prompt",
-            "--prompt-backend",
-            "local",
-            "--offline",
-            "--te",
-            "/absent/encoder",
-            "--refmod",
-            "tests/fixtures/refmod/combined.safetensors",
-            "-p",
-            "Greet the viewer",
-        ])
-        .env("HRX_OFFLINE", "1")
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("audio note"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+fn removed_local_prompt_flags_are_rejected_before_loading_media() {
+    for (flag, value) in [
+        ("--prompt-backend", "local"),
+        ("--prompt-local-model-dir", "/absent/model"),
+        ("--prompt-context-tokens", "4096"),
+        ("--prompt-max-tokens", "128"),
+        ("--prompt-audio-note", "1=voice"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_h3"))
+            .args([
+                "prompt",
+                flag,
+                value,
+                "--refmod",
+                "/absent/refmod",
+                "-p",
+                "A ball rolls",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("unexpected argument") && error.contains(flag),
+            "{error}"
+        );
+    }
 }
 
 #[test]

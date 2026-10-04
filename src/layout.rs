@@ -631,4 +631,70 @@ mod tests {
         assert_eq!(l.ref_segs[0].kind, 3);
         assert_eq!(l.tclass[l.ref_segs[0].row0], 2);
     }
+
+    #[test]
+    fn keyframes_keep_target_positions_and_reference_indices_when_combined() {
+        let refs = [
+            Ref {
+                kind: 0,
+                latent_t: 1,
+                lat_h: 4,
+                lat_w: 6,
+                audio_t: 0,
+                has_audio: false,
+            },
+            Ref {
+                kind: 2,
+                latent_t: 2,
+                lat_h: 4,
+                lat_w: 6,
+                audio_t: 12,
+                has_audio: true,
+            },
+        ];
+        let kfs = [
+            Keyframe {
+                frame_index: 0,
+                audio_t: 0,
+                has_audio: false,
+            },
+            Keyframe {
+                frame_index: 21,
+                audio_t: 0,
+                has_audio: false,
+            },
+        ];
+        let l = Layout::new(4, 7, 4, 6, 5, &refs, &kfs).unwrap();
+        let target = l.video_span_start();
+        let first = &l.ref_segs[0];
+        let last = &l.ref_segs[1];
+        assert_eq!(
+            (first.kind, first.index, first.row0, first.rows),
+            (3, 0, 4, 6)
+        );
+        assert_eq!((last.kind, last.index, last.rows), (3, 1, 6));
+        // Reference spans advance the target origin, even though keyframes pack first.
+        assert_eq!(l.pos[3 * target], 4.0 + 1.0 + 12.0);
+        for row in 0..first.rows {
+            let a = 3 * (first.row0 + row);
+            let b = 3 * (target + row);
+            assert_eq!(&l.pos[a..a + 3], &l.pos[b..b + 3]);
+            let c = 3 * (last.row0 + row);
+            assert_eq!(l.pos[c], l.pos[b] + FRAME_RESCALE * 21.0);
+            assert_eq!(&l.pos[c + 1..c + 3], &l.pos[b + 1..b + 3]);
+        }
+        assert_eq!(
+            l.ref_segs[2..]
+                .iter()
+                .map(|s| (s.kind, s.index, s.audio))
+                .collect::<Vec<_>>(),
+            [(0, 0, false), (2, 1, true), (2, 1, false)]
+        );
+        assert_eq!(l.ref_rows, 6 + 6 + 6 + 24 + 12);
+        for seg in &l.ref_segs {
+            assert!(l.tclass[seg.row0..seg.row0 + seg.rows]
+                .iter()
+                .all(|&c| c == if seg.audio { 3 } else { 2 }));
+        }
+    }
 }

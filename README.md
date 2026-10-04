@@ -37,7 +37,7 @@ generated locally with h3 in **39m58s**. [First frame and reproduction](docs/sho
 
 - **H3-World:** action-controlled generation and observation-conditioned world sessions with turn-by-turn controls, save/resume and branching. See [usage and validation](docs/world.md).
 
-- **Optional prompt generation:** use a configurable multimodal chat endpoint, or the experimental local shared-Qwen backend, to turn instructions and references into H3 prompts. See [setup and examples](docs/prompting.md#optional-prompt-generation).
+- **Optional prompt generation:** use a configurable multimodal chat endpoint to turn instructions and references into H3 prompts. See [setup and examples](docs/prompting.md#optional-prompt-generation).
 - **Text to video with sound:** generate an MP4 and a separate WAV from a structured prompt.
 - **Image to video:** animate a first frame or condition generation on reference images.
 - **Audio references:** guide generation with voices and sounds alongside image references.

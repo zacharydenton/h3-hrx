@@ -82,6 +82,42 @@ applied. Animated curves, training/refinement, and extraction from source videos
 are outside this implementation. Existing encoded visual members, including
 pooled or video-origin members, can still be loaded.
 
+### First frame + RefMod with FL2VA
+
+Use `--first-frame` for the opening composition, `--refmod` for separate reference
+conditioning, and `--base-weights` to keep the FL2VA checkpoint:
+
+```sh
+h3 --base-weights --first-frame opening.png \
+  --refmod character.safetensors --out clip.mp4 < prompt.txt
+
+# Endpoint prompting with an original image for a single-image RefMod:
+h3 --base-weights --first-frame opening.png \
+  --refmod character.safetensors --refmod-source '1:1=portrait.png' \
+  --generate-prompt --prompt-images \
+  -p 'Start from the opening image; the referenced character turns and waves' \
+  --out clip.mp4
+```
+
+This keeps the first frame on the target timeline at frame zero and appends
+RefMod blocks separately. References do not replace the keyframe or shift its
+anchor away from the target's first frame. With upstream presentation, both the
+first frame and RefMod visuals reach H3's text/vision encoder. Endpoint rewriting
+uses the six-section reference format and distinguishes keyframe composition
+from the RefMod's requested identity, appearance or sound. Supply the manifest's
+actual labels when writing a prompt manually; stacks use `<Video N>` labels.
+For a bundle containing audio, endpoint prompting also needs `--prompt-audio`.
+
+The community [combined I2V/reference node](https://github.com/BigStationW/ComfyUi-MiniMax-H3-Image-And-Reference-To-Video)
+uses separate keyframe and reference payloads plus joint vision presentation;
+its author recommends hybrid weights. A separate [same-input checkpoint comparison](https://www.reddit.com/r/StableDiffusion/comments/1vr5ezm/minimax_h3_multiple_reference_images_working/)
+reports extra references working with stock FL2VA. That comparison uses raw
+images, not stored RefMods; applying it to RefMods follows from their use of the
+same reference-block mechanism. Reference fidelity with stock FL2VA is not
+guaranteed by that single example, and this project's combined path has CPU
+regression coverage, not a new GPU quality comparison. RefMod tokens still add
+attention work; choosing FL2VA does not remove that cost.
+
 ## Upstream presentation
 
 `--refmod-presentation upstream` reconstructs active references through the H3
@@ -150,9 +186,8 @@ the 32-pixel grid. Video soundtracks are not implicitly included; use a separate
 audio member and source mapping. Paths with spaces should be quoted.
 
 The flag enables upstream presentation automatically and conflicts with explicit
-`--refmod-presentation latent-only`. It works with endpoint and local prompting,
-and with an existing handwritten prompt. Local prompting still requires audio
-notes for audio labels. Sources replace presentation evidence rather than adding
+`--refmod-presentation latent-only`. It works with endpoint prompting
+and with an existing handwritten prompt. Sources replace presentation evidence rather than adding
 positional references: the RefMod latents, strengths and conditioning copies
 remain unchanged, and originals are never VAE-encoded.
 
@@ -189,9 +224,16 @@ For originals, pass decoded `RefModSource` values to
 session. Both return the same ordered `MediaEntry` list for prompting and H3
 presentation. `PreparedRefMod::indexed_members()` exposes stable original member
 numbers, including copies. Filesystem decoding remains a CLI concern.
+For endpoint prompting in one call, use
+`PromptGenerator::generate_refmods_with_sources(None, request, &sources)` when
+all active members have originals, or pass `Some(&mut session)` for partial
+coverage. The result includes the prompt and matching H3 presentation; see the
+[Rust original-media example](prompting.md#native-rust-refmod-prompting).
 
-With `Config::dit = None`, `Session::denoise` selects Ref2VA whenever its reference
-list is nonempty. Without references it selects FL2VA, including keyframe-only
+With `Config::dit = None` and the default `base_weights: false`, `Session::denoise`
+selects Ref2VA whenever its reference list is nonempty. Set `base_weights: true`
+to use FL2VA with references, including a RefMod plus first frame. Without
+references it selects FL2VA, including keyframe-only
 requests. A reused session switches checkpoints as needed, including when models
 are held in the budgeted residency cache. An explicit `Config::dit` path overrides
 this selection. Standalone `Session::text_in` uses FL2VA by default.
@@ -206,6 +248,44 @@ let references = prepared.references();
 # Ok(())
 # }
 ```
+
+For FL2VA plus a first frame, construct the session with
+`Config { base_weights: true, ..Default::default() }`, then pass the first-frame
+latents and RefMod references together:
+
+```rust,no_run
+use h3_hrx::{Clip, DenoiseParams, Keyframe, Latents, Noise, Presented, Session};
+use h3_hrx::refmod::PreparedRefMod;
+
+fn first_frame_with_refmod(
+    session: &mut Session, // Config.base_weights = true
+    ids: &[i32],
+    params: &DenoiseParams,
+    first_rgb: &[f32], // Interleaved RGB [0,1], resized to the output canvas.
+    prepared: &PreparedRefMod,
+) -> h3_hrx::Result<Latents> {
+    let clip = Clip {
+        pixels: first_rgb, frames: 1,
+        height: params.height as usize, width: params.width as usize,
+    };
+    let (latents, _) = session.encode_video(clip)?;
+    let first = Keyframe {
+        frame_index: 0, latents: &latents, audio: None,
+        presented: Some(Presented {
+            pixels: first_rgb, height: clip.height, width: clip.width,
+        }),
+    };
+    session.denoise(ids, params, Noise::default(), &prepared.references(), &[first], None)
+}
+```
+
+For endpoint prompting, include that same RGB frame in
+`RefModPromptRequest.entries` as `MediaEntry { role: "first_frame".into(),
+media: Media::Picture(frame), metadata: serde_json::json!({"frame_index": 0}) }`.
+Pass the returned presentation to `Session::denoise_presented` with the same
+RefMod references and `Keyframe { frame_index: 0, ... }`. The explicit
+presentation already contains the first-frame vision block, so its keyframe
+`presented` field may be `None`; the keyframe latents are still required.
 
 Members own normalized latents. Visual storage is `[24,T,H,W]`; native audio is
 `[2,32,T]`. File import/export transposes audio to/from upstream `[1,32,2,T]`.

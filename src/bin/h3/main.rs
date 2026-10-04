@@ -97,30 +97,11 @@ impl std::ops::DerefMut for Cli {
         &mut self.generation
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum PromptBackend {
-    Endpoint,
-    Local,
-}
-
 #[derive(clap::Args)]
 struct GenerationArgs {
-    /// Prompt processor: remote endpoint or resident shared Qwen3-VL
-    #[arg(long, value_enum, default_value_t = PromptBackend::Endpoint)]
-    prompt_backend: PromptBackend,
-    /// Directory containing Qwen3-VL-32B-Instruct shards 11..14
-    #[arg(long)]
-    prompt_local_model_dir: Option<PathBuf>,
-    #[arg(long, default_value_t = 8192)]
-    prompt_context_tokens: usize,
-    #[arg(long, default_value_t = 1024)]
-    prompt_max_tokens: usize,
-    /// Local-only user descriptions, keyed by the final Audio N label
-    #[arg(long, value_name = "INDEX=TEXT")]
-    prompt_audio_note: Vec<String>,
     #[arg(skip)]
     prompt_only: bool,
-    /// Rewrite the instruction through the selected prompt backend
+    /// Rewrite the instruction through the configured prompt endpoint
     #[arg(long)]
     generate_prompt: bool,
     /// Chat API prefix (otherwise H3_PROMPT_BASE_URL)
@@ -279,7 +260,7 @@ struct GenerationArgs {
     #[arg(long, value_name = "PREFIX")]
     latents: Option<PathBuf>,
 
-    /// Use the base checkpoint for reference files instead of ref2va
+    /// Use FL2VA for raw references and RefMods instead of Ref2VA
     #[arg(long)]
     base_weights: bool,
 }
@@ -446,9 +427,7 @@ fn cache_policy(cli: &Cli) -> Result<h3_hrx::CachePolicy> {
 }
 
 fn memory_budget_bytes(cli: &Cli) -> Result<Option<usize>> {
-    let Some(mib) = cli.memory_budget_mib.or_else(|| {
-        (cli.generate_prompt && cli.prompt_backend == PromptBackend::Local).then_some(48 * 1024)
-    }) else {
+    let Some(mib) = cli.memory_budget_mib else {
         if cli.residency == Residency::Budgeted {
             usage!("--residency budgeted requires --memory-budget-mib");
         }
@@ -771,7 +750,6 @@ fn run(mut cli: Cli) -> Result<()> {
     }
     let mut entries =
         prompting::raw_entries(&keyframe_images, &ref_images, &ref_audio, &raw_videos);
-    prompting::check_local_audio(&cli, &entries, &prepared_refmods)?;
     if upstream && active_refmods {
         entries.extend(prompting::refmod_entries(
             &cli,
@@ -779,100 +757,6 @@ fn run(mut cli: Cli) -> Result<()> {
             &refmod_sources,
         )?);
     }
-    let local_budget = if cli.generate_prompt && cli.prompt_backend == PromptBackend::Local {
-        memory_budget_bytes(&cli)?
-            .map(hrx::residency::ResidencyManager::new)
-            .transpose()?
-    } else {
-        None
-    };
-    let mut local_session = if local_budget.is_some() {
-        let resolver = h3_hrx::models::Resolver::new().offline(cli.offline);
-        let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
-            memory_budget: local_budget.as_ref().map(|b| b.budget()),
-            ..Default::default()
-        })?;
-        let te = match &cli.te {
-            Some(p) => p.clone(),
-            None => resolver.find(h3_hrx::models::TE)?,
-        };
-        let dit = if cli.base_weights && !cli.prompt_only {
-            Some(resolver.find(h3_hrx::models::DIT_FL2VA)?)
-        } else {
-            early_dit.clone().or_else(|| cli.dit.clone())
-        };
-        let video_vae = if !cli.prompt_only
-            && (!keyframe_images.is_empty() || !ref_images.is_empty() || !raw_videos.is_empty())
-        {
-            Some(match &cli.video_vae {
-                Some(p) => p.clone(),
-                None => resolver.find(h3_hrx::models::VIDEO_VAE)?,
-            })
-        } else {
-            cli.video_vae.clone()
-        };
-        let audio_vae = if !cli.prompt_only
-            && (!ref_audio.is_empty() || raw_videos.iter().any(|v| v.audio.is_some()))
-        {
-            Some(match &cli.audio_vae {
-                Some(p) => p.clone(),
-                None => resolver.find(h3_hrx::models::AUDIO_VAE)?,
-            })
-        } else {
-            cli.audio_vae.clone()
-        };
-        // Safety: this CLI does not modify checkpoint files while they are mapped.
-        Some(unsafe {
-            Session::new_in(
-                Config {
-                    te: Some(te),
-                    dit,
-                    video_vae,
-                    audio_vae,
-                    loras: loras.clone(),
-                    kernel_sources: cli
-                        .root
-                        .as_ref()
-                        .map(|r| r.join("kernels"))
-                        .unwrap_or_default(),
-                    loom_library: std::env::var_os("HRX_LOOM_LIBRARY").map(Into::into),
-                    attention: match cli.attn {
-                        Attn::F16 => Attn16::F16,
-                        Attn::I8 => Attn16::I8,
-                        Attn::I4 => Attn16::I4,
-                    },
-                },
-                h3_hrx::SessionOptions {
-                    residency: match cli.residency {
-                        Residency::StageScoped => h3_hrx::ResidencyPolicy::StageScoped,
-                        Residency::Retain => h3_hrx::ResidencyPolicy::Retain,
-                        Residency::Budgeted => h3_hrx::ResidencyPolicy::Budgeted,
-                    },
-                    cache: cache_policy(&cli)?,
-                    turbo: cli.preset.turbo(),
-                },
-                &context,
-            )
-        }?)
-    } else {
-        None
-    };
-    let early_encoded = if !cli.prompt_only {
-        local_session
-            .as_mut()
-            .map(|session| {
-                encode_prompt_inputs(
-                    session,
-                    &keyframe_images,
-                    &ref_images,
-                    &ref_audio,
-                    &raw_videos,
-                )
-            })
-            .transpose()?
-    } else {
-        None
-    };
     let tok = Tokenizer::new()?;
     let world = world_schedule
         .as_ref()
@@ -886,16 +770,7 @@ fn run(mut cli: Cli) -> Result<()> {
             .filter(|n| *n > 0)
             .context("actions exhaust the text token budget")?;
     }
-    if let Some(session) = &mut local_session {
-        prompt = prompting::generate_local(
-            session,
-            &cli,
-            &entries,
-            &prompt_shape,
-            &prompt,
-            world.is_some(),
-        )?;
-    } else if let Some(generator) = generator {
+    if let Some(generator) = generator {
         prompt = prompting::generate(
             generator,
             &cli,
@@ -996,6 +871,7 @@ fn run(mut cli: Cli) -> Result<()> {
         .unwrap_or_default();
     let loom_library = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
     let config = Config {
+        base_weights: cli.base_weights,
         dit: if cli.preset.turbo().is_some() {
             None
         } else {
@@ -1024,25 +900,21 @@ fn run(mut cli: Cli) -> Result<()> {
         memory_budget: residency_manager.as_ref().map(|manager| manager.budget()),
         ..Default::default()
     })?;
-    let mut session = if let Some(session) = local_session.take() {
-        session
-    } else {
-        unsafe {
-            Session::new_in(
-                config,
-                h3_hrx::SessionOptions {
-                    residency: match cli.residency {
-                        Residency::StageScoped => h3_hrx::ResidencyPolicy::StageScoped,
-                        Residency::Retain => h3_hrx::ResidencyPolicy::Retain,
-                        Residency::Budgeted => h3_hrx::ResidencyPolicy::Budgeted,
-                    },
-                    cache: cache_policy(&cli)?,
-                    turbo: cli.preset.turbo(),
+    let mut session = unsafe {
+        Session::new_in(
+            config,
+            h3_hrx::SessionOptions {
+                residency: match cli.residency {
+                    Residency::StageScoped => h3_hrx::ResidencyPolicy::StageScoped,
+                    Residency::Retain => h3_hrx::ResidencyPolicy::Retain,
+                    Residency::Budgeted => h3_hrx::ResidencyPolicy::Budgeted,
                 },
-                &context,
-            )
-        }?
-    };
+                cache: cache_policy(&cli)?,
+                turbo: cli.preset.turbo(),
+            },
+            &context,
+        )
+    }?;
     eprintln!(
         "session in {:.1} s ({}, {} attention)",
         t0.elapsed().as_secs_f64(),
@@ -1063,16 +935,13 @@ fn run(mut cli: Cli) -> Result<()> {
 
     // encoders: latents for the keyframe and the references, encoded before the run so a bad input
     // fails early. Each reference borrows its own latents, which live until the denoise returns.
-    let (keyframe_latents, image_latents, audio_latents, video_latents) = match early_encoded {
-        Some(encoded) => encoded,
-        None => encode_prompt_inputs(
-            &mut session,
-            &keyframe_images,
-            &ref_images,
-            &ref_audio,
-            &raw_videos,
-        )?,
-    };
+    let (keyframe_latents, image_latents, audio_latents, video_latents) = encode_prompt_inputs(
+        &mut session,
+        &keyframe_images,
+        &ref_images,
+        &ref_audio,
+        &raw_videos,
+    )?;
 
     let keyframes: Vec<Keyframe<'_>> = keyframe_images
         .iter()

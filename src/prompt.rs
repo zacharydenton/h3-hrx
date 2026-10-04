@@ -1,6 +1,6 @@
 //! Optional endpoint-based prompt orchestration. Never called implicitly by inference.
 use crate::media_context::{Media, MediaEntry, PreparedPresentation, ReferenceLabel};
-use crate::refmod::{PreparedRefMod, RefModPresentationOptions};
+use crate::refmod::{PreparedRefMod, RefModPresentationOptions, RefModSource};
 use crate::{Session, Shape, Tokenizer};
 use base64::Engine;
 use regex::Regex;
@@ -8,7 +8,7 @@ use reqwest::blocking::Client;
 use serde_json::{json, Value};
 use std::{io::Read, time::Duration};
 
-pub const TEMPLATE_VERSION: &str = "h3-custom-1";
+pub const TEMPLATE_VERSION: &str = "h3-custom-2";
 
 #[derive(Debug, thiserror::Error)]
 pub enum PromptError {
@@ -119,8 +119,23 @@ impl PromptGenerator {
         session: &mut Session,
         request: RefModPromptRequest<'_>,
     ) -> Result<RefModPromptResult, PromptError> {
-        self.generate_refmods_with(request, |mods, options| {
-            session.refmod_entries(mods, options)
+        self.generate_refmods_with_sources(Some(session), request, &[])
+    }
+
+    /// Generate at the endpoint using original decoded media for selected members.
+    /// Pass `None` when every active member has a source: no checkpoints or GPU
+    /// runtime are needed. With a session, missing sources use VAE reconstruction.
+    /// Sources affect presentation only; pass the same prepared latent references
+    /// to H3 generation. File decoding belongs to the calling application.
+    pub fn generate_refmods_with_sources(
+        &self,
+        session: Option<&mut Session>,
+        request: RefModPromptRequest<'_>,
+        sources: &[RefModSource],
+    ) -> Result<RefModPromptResult, PromptError> {
+        self.generate_refmods_with(request, |mods, options| match session {
+            Some(session) => session.refmod_entries_with_sources(mods, options, sources),
+            None => crate::refmod::entries_from_sources(mods, options, sources),
         })
     }
 
@@ -326,7 +341,7 @@ impl PromptGenerator {
     }
 }
 
-pub(crate) fn rewrite(
+fn rewrite(
     request: PromptRequest<'_>,
     analysis: &str,
     model: &str,
@@ -384,7 +399,7 @@ pub(crate) fn rewrite(
     unreachable!()
 }
 
-pub(crate) fn label_json(labels: &[ReferenceLabel]) -> Value {
+fn label_json(labels: &[ReferenceLabel]) -> Value {
     Value::Array(
         labels
             .iter()
@@ -747,6 +762,137 @@ mod tests {
         assert_eq!(result.prompt.text, BASE);
         assert!(result.presentation.labels().is_empty());
         assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn first_frame_and_original_refmods_share_endpoint_and_h3_presentation_without_session() {
+        use crate::{
+            media_context::Frame,
+            refmod::{ApplyOptions, RefMod, RefModMember},
+            LatentGrid,
+        };
+        let visual = |frames| {
+            RefModMember::visual(
+                "ball",
+                vec![0.0; 24 * frames * 4 * 4],
+                LatentGrid {
+                    frames,
+                    width: 4,
+                    height: 4,
+                },
+            )
+            .unwrap()
+        };
+        let mods = [RefMod::new(
+            "ball and sound",
+            vec![
+                visual(1),
+                visual(2),
+                RefModMember::audio("sound", vec![0.0; 64], 1).unwrap(),
+            ],
+        )
+        .unwrap()
+        .prepare(ApplyOptions::default())
+        .unwrap()];
+        let frame = Frame {
+            pixels: vec![0.5; 64 * 64 * 3].into(),
+            width: 64,
+            height: 64,
+        };
+        let media = [
+            Media::Picture(frame.clone()),
+            Media::Video(vec![(0.0, frame.clone()), (0.5, frame.clone())]),
+            Media::Audio(vec![0.25; 1600].into()),
+        ];
+        let sources: Vec<_> = media
+            .into_iter()
+            .enumerate()
+            .map(|(index, media)| RefModSource {
+                slot: 1,
+                member: index + 1,
+                media,
+                provenance: json!({"name":"original", "strength_applied":false}),
+                synthetic_timing: index == 1,
+            })
+            .collect();
+        let entries = [MediaEntry {
+            media: Media::Picture(frame.clone()),
+            role: "first_frame".into(),
+            metadata: json!({"frame_index": 0}),
+        }];
+        let rewritten = REF
+            .replace("<Picture 1>", "<Picture 2>")
+            .replace("[reference generation + audio reference]", "[keyframe completion + reference generation + audio reference]")
+            .replace("retention_analysis: ", "retention_analysis: <Picture 1>: fully_preserved - opening composition at 0.00 seconds. ")
+            .replace("[Shot 1] The ball rolls.", "[Shot 1] At 0.00 seconds, the opening composition matches <Picture 1>. The ball rolls.");
+        let (url, server) = server(vec![
+            completion("A ball and rolling sound."),
+            completion(&rewritten),
+        ]);
+        let mut config = EndpointConfig::new(url, "multimodal".into());
+        config.images = true;
+        config.audio = true;
+        let generator = PromptGenerator::new(config).unwrap();
+        let shape = crate::shape_for(64, 64, 124).unwrap();
+        let request = || RefModPromptRequest {
+            instruction: "Roll the ball",
+            entries: &entries,
+            refmods: &mods,
+            shape: &shape,
+            presentation: Default::default(),
+        };
+        // Incomplete originals fail before contacting the endpoint when no session is supplied.
+        assert!(generator
+            .generate_refmods_with_sources(None, request(), &sources[..2])
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("no original source"));
+        let result = generator
+            .generate_refmods_with_sources(None, request(), &sources)
+            .unwrap();
+        assert_eq!(result.prompt.text, rewritten);
+        assert_eq!(
+            result
+                .presentation
+                .labels()
+                .iter()
+                .map(|l| l.label.as_str())
+                .collect::<Vec<_>>(),
+            ["<Picture 1>", "<Picture 2>", "<Video 1>", "<Audio 1>"]
+        );
+        assert_eq!(result.presentation.labels()[0].role, "first_frame");
+        assert!(result
+            .presentation
+            .labels()
+            .iter()
+            .skip(1)
+            .all(|l| l.metadata["presentation_source"] == "original_file"));
+        assert_eq!(mods[0].references().len(), 3);
+        assert!(mods[0]
+            .members()
+            .all(|m| m.values().iter().all(|&v| v == 0.0)));
+        assert_eq!(
+            result.presentation.blocks()[0].first.pixels.as_ref(),
+            frame.pixels.as_ref()
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        let parts = requests[0]["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(parts.iter().filter(|p| p["type"] == "image_url").count(), 4);
+        assert_eq!(
+            parts.iter().filter(|p| p["type"] == "input_audio").count(),
+            1
+        );
+        assert_eq!(
+            result.prompt.record["references"][1]["metadata"]["presentation_source"],
+            "original_file"
+        );
+        assert_eq!(result.prompt.record["references"][0]["role"], "first_frame");
+        assert!(requests[1]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("keyframe completion + reference generation"));
     }
 
     #[test]

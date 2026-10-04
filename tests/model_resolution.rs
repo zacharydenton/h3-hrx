@@ -106,6 +106,25 @@ fn reference_generation_fetches_ref2va_and_explicit_base_mode_fetches_fl2va() {
         (vec!["reference.wav"], "minimax_h3_ref2va_"),
         (vec!["reference.jpg", "--base-weights"], "minimax_h3_fl2va_"),
         (vec!["--first-frame", "first.png"], "minimax_h3_fl2va_"),
+        (
+            vec![
+                "--first-frame",
+                "first.png",
+                "--refmod",
+                "tests/fixtures/refmod/combined.safetensors",
+            ],
+            "minimax_h3_ref2va_",
+        ),
+        (
+            vec![
+                "--first-frame",
+                "first.png",
+                "--refmod",
+                "tests/fixtures/refmod/combined.safetensors",
+                "--base-weights",
+            ],
+            "minimax_h3_fl2va_",
+        ),
     ] {
         let mut args = vec!["-p", "test prompt", "--no-decode"];
         args.extend(extra);
