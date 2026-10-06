@@ -145,6 +145,98 @@ fn video_decode_is_byte_stable_across_the_tilings() {
     }
 }
 
+/// Frozen before encoder scratch caching; grow, shrink, change input and revisit shapes.
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151, provisioned HRX and the video VAE checkpoint"
+)]
+fn video_encode_is_byte_stable_across_scratch_reuse() {
+    const CASES: &[(usize, usize, usize, &str)] = &[
+        (
+            64,
+            64,
+            1,
+            "d0baf3bf1a9b43e92a7843a6726f0258293147de607386deab5a4770023198b2",
+        ),
+        (
+            64,
+            64,
+            5,
+            "84f56e32709741e03d8fb59a96c476334beeafea832fbaf5e98bcc48e9fde067",
+        ),
+        (
+            64,
+            64,
+            22,
+            "c84f1c961a46475cd9d66b73e8758ba836f0ee4f157dab9cf04f8d3868e049ff",
+        ),
+        (
+            32,
+            32,
+            1,
+            "5899c39943933fb71ad25f5bfc7f8cc0eb83d0008c6f78ba076af8655d38fb97",
+        ),
+        (
+            32,
+            32,
+            5,
+            "6713e328fcbf1cd9985148e8de1b3a2d435b5d5f0a22aacf79adfe9f2c744cdf",
+        ),
+        (
+            64,
+            320,
+            1,
+            "3f2f01a184a8cf6bbced958fecce09c63b53464b768eddd5e072e8a9b74dfdff",
+        ),
+    ];
+    let manager = hrx::residency::ResidencyManager::new(4 << 30).unwrap();
+    let mut stream = hrx::Stream::open()
+        .unwrap()
+        .with_memory_budget(manager.budget());
+    let c = compiler();
+    let path = h3_hrx::models::Resolver::new()
+        .find(h3_hrx::models::VIDEO_VAE)
+        .unwrap();
+    // SAFETY: this test keeps the checkpoint immutable while mapped.
+    let mut vae = unsafe { VideoVae::open(&mut stream, path) }.unwrap();
+    for &(height, width, frames, expected) in CASES.iter().chain(CASES[..3].iter().rev()) {
+        let pixels: Vec<f32> = Normals(0xe11c0de)
+            .take(frames * height * width * 3)
+            .into_iter()
+            .map(|v| (0.5 + v * 0.15).clamp(0., 1.))
+            .collect();
+        let (latent, t) = vae
+            .encode_video(
+                &mut stream,
+                &c,
+                &mut Profile::default(),
+                h3_hrx::Clip {
+                    pixels: &pixels,
+                    frames,
+                    height,
+                    width,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            t,
+            if frames == 1 {
+                1
+            } else {
+                frames.div_ceil(17) * 5 - 3
+            }
+        );
+        assert!(latent.iter().all(|v| v.is_finite()));
+        let actual = digest_f32(&latent);
+        check(actual, expected, "video encode scratch reuse");
+    }
+    drop(vae);
+    drop(c);
+    drop(stream);
+    assert_eq!(manager.statistics().reserved_bytes, 0);
+}
+
 /// Both directions of the audio VAE, at the lengths that exercise its padding: one latent, one
 /// sample, a length on and a length just past the 800-sample hop, and a long clip.
 #[test]

@@ -86,12 +86,26 @@ struct Built {
     graph: Option<hrx::GraphExec>,
 }
 
+/// Encoder tiles reuse their widest channels-last planes and padded host input.
+struct EncoderScratch {
+    rows: usize,
+    frames: usize,
+    input: Vec<half::f16>,
+    x: hrx::Buffer,
+    h: hrx::Buffer,
+    y: hrx::Buffer,
+    tmp: hrx::Buffer,
+    sc: hrx::Buffer,
+    stats: hrx::Buffer,
+}
+
 /// Resident video VAE state, used only on the stream passed to `open`.
 pub struct VideoVae {
     stream_id: usize,
     weights: Weights,
     constants: Constants,
     built: Option<Built>,
+    encoder: Option<EncoderScratch>,
     /// post_quant_conv, a 24x24 matrix and a bias applied per voxel on the host
     pq_w: Vec<f32>,
     pq_b: Vec<f32>,
@@ -124,6 +138,7 @@ impl VideoVae {
             weights,
             constants: Constants::new(stream)?,
             built: None,
+            encoder: None,
         })
     }
 
@@ -138,6 +153,9 @@ impl VideoVae {
     /// for a different one.
     fn ensure(&mut self, stream: &mut hrx::Stream, c: &Compiler, grid: Grid) -> Result<()> {
         self.check_stream(stream)?;
+        // Encoding finishes with a blocking read. Release its scratch before decoding,
+        // including when the decoder already has a matching cached grid.
+        self.encoder = None;
         if self.built.as_ref().is_some_and(|b| b.grid == grid) {
             return Ok(());
         }
@@ -628,6 +646,41 @@ const ENC_SDOWN: [usize; 6] = [2, 2, 2, 2, 1, 1];
 const ENC_TDOWN: [usize; 6] = [1, 2, 2, 1, 1, 1];
 
 impl VideoVae {
+    fn ensure_encoder(
+        &mut self,
+        stream: &mut hrx::Stream,
+        rows: usize,
+        frames: usize,
+    ) -> Result<()> {
+        self.check_stream(stream)?;
+        if self
+            .encoder
+            .as_ref()
+            .is_some_and(|s| s.rows >= rows && s.frames >= frames)
+        {
+            return Ok(());
+        }
+        let (rows, frames) = self
+            .encoder
+            .as_ref()
+            .map_or((rows, frames), |s| (rows.max(s.rows), frames.max(s.frames)));
+        // Free the old planes first so growth does not temporarily double residency.
+        self.encoder = None;
+        let plane_bytes = rows * 128 * 2;
+        self.encoder = Some(EncoderScratch {
+            rows,
+            frames,
+            input: vec![half::f16::ZERO; rows * 8],
+            x: stream.allocate(rows * 8 * 2)?,
+            h: stream.allocate(plane_bytes)?,
+            y: stream.allocate(plane_bytes)?,
+            tmp: stream.allocate(plane_bytes)?,
+            sc: stream.allocate(plane_bytes)?,
+            stats: stream.allocate(frames * 32 * 2 * 4)?,
+        });
+        Ok(())
+    }
+
     /// One tile of `frames` frames to moment rows, then to model-space latents `[24][T][h][w]`.
     ///
     /// A still image and a clip use different weights and a different tap count — `.w2` with one
@@ -657,7 +710,9 @@ impl VideoVae {
 
         // input rows [frames*th*tw][8] f16: ImageNet-normalised pixels, channels 3..7 left at zero
         let rows0 = frames * th * tw;
-        let mut inrows = vec![half::f16::ZERO; rows0 * 8];
+        self.ensure_encoder(stream, rows0, frames)?;
+        let scratch = self.encoder.as_mut().expect("sized above");
+        let inrows = &mut scratch.input[..rows0 * 8];
         for t in 0..frames {
             for y in 0..th {
                 for x in 0..tw {
@@ -675,15 +730,13 @@ impl VideoVae {
             }
         }
 
-        let x = stream.allocate(rows0 * 8 * 2)?;
-        stream.upload(x.binding(), as_bytes_f16(&inrows))?;
-        // the widest [rows][channels] plane of the stack: rows fall as fast as channels rise
-        let plane_bytes = rows0 * 128 * 2;
-        let mut h = stream.allocate(plane_bytes)?;
-        let y = stream.allocate(plane_bytes)?;
-        let mut tmp = stream.allocate(plane_bytes)?;
-        let sc = stream.allocate(plane_bytes)?;
-        let stats = stream.allocate(frames * 32 * 2 * 4)?;
+        let x = &scratch.x;
+        stream.upload(x.binding(), as_bytes_f16(inrows))?;
+        let mut h = &scratch.h;
+        let y = &scratch.y;
+        let mut tmp = &scratch.tmp;
+        let sc = &scratch.sc;
+        let stats = &scratch.stats;
 
         let w3 = |stream: &mut hrx::Stream, nm: &str, cout_pad: usize, k: usize| {
             self.weights
