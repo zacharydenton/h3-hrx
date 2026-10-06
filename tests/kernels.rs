@@ -1805,108 +1805,117 @@ fn quantized_preparation_matches_group_rotation_and_packing() {
             if bits == 4 && kind == "lnorm" {
                 continue;
             }
-            let (tokens, width, stride, lanes) = (3usize, 512usize, 640usize, 64usize);
-            let input = values(tokens * width, 0.4);
-            let weights = vec![1.0f32; width];
-            let table = vec![0.0f32; 2 * width];
-            let classes = vec![0i32; tokens];
-            let mut want = vec![0.; tokens * width];
-            for row in 0..tokens {
-                let x: Vec<f64> = input[row * width..(row + 1) * width]
-                    .iter()
-                    .map(|&v| {
-                        if kind == "plain" {
-                            f16::from_f32(v).to_f64()
-                        } else {
-                            f64::from(v)
-                        }
-                    })
-                    .collect();
-                let mean = if kind == "lnorm" {
-                    x.iter().sum::<f64>() / width as f64
-                } else {
-                    0.
-                };
-                let variance = x.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / width as f64;
-                for col in 0..width {
-                    want[row * width + col] = (0..256)
-                        .map(|j| {
-                            let sign = (0..4).fold(1., |s, digit| {
-                                if ((col % 256) >> (2 * digit) & 3) + (j >> (2 * digit) & 3) == 3 {
-                                    -s
-                                } else {
-                                    s
-                                }
-                            });
-                            let value = x[col / 256 * 256 + j];
-                            sign * if kind == "plain" {
-                                value
+            let shapes = if bits == 8 && kind == "plain" {
+                vec![(512usize, 640usize, 64usize), (7168, 7232, 448)]
+            } else {
+                vec![(512, 640, 64)]
+            };
+            for (width, stride, lanes) in shapes {
+                let tokens = 3;
+                let input = values(tokens * width, 0.4);
+                let weights = vec![1.0f32; width];
+                let table = vec![0.0f32; 2 * width];
+                let classes = vec![0i32; tokens];
+                let mut want = vec![0.; tokens * width];
+                for row in 0..tokens {
+                    let x: Vec<f64> = input[row * width..(row + 1) * width]
+                        .iter()
+                        .map(|&v| {
+                            if kind == "plain" {
+                                f16::from_f32(v).to_f64()
                             } else {
-                                (value - mean) / (variance + 1e-5).sqrt()
+                                f64::from(v)
                             }
                         })
-                        .sum::<f64>()
-                        / 16.;
-                }
-            }
-            let mut config = cfg(&[("width", width), ("out_stride", stride), ("lanes", lanes)]);
-            let mut data = if kind == "plain" {
-                vec![bytes(
-                    &input.iter().copied().map(f16::from_f32).collect::<Vec<_>>(),
-                )]
-            } else {
-                config.extend([("eps", "1e-5".into()), ("classes", "1".into())]);
-                vec![
-                    bytes(&input),
-                    bytes(&weights),
-                    bytes(&table),
-                    bytes(&classes),
-                ]
-            };
-            let output = data.len();
-            data.push(vec![0x55; tokens * stride * bits / 8]);
-            data.push(vec![0; tokens * 4]);
-            let stem = format!("prepare_{kind}_i{bits}");
-            let module = format!("prepare_i{bits}_family");
-            let out = h.run_module(
-                &module,
-                &stem,
-                &config,
-                [tokens as u32, 1, 1],
-                lanes as u32,
-                &[tokens as u64],
-                &data,
-            );
-            let scales = floats(&out[output + 1]);
-            let qmax = if bits == 4 { 7. } else { 127. };
-            for row in 0..tokens {
-                let max = want[row * width..(row + 1) * width]
-                    .iter()
-                    .map(|v| v.abs())
-                    .fold(0., f64::max);
-                close(&[scales[row]], &[max / qmax], 1e-7, 1e-4);
-                for col in 0..width {
-                    let i = row * stride + col;
-                    let q = if bits == 8 {
-                        i32::from(out[output][i] as i8)
+                        .collect();
+                    let mean = if kind == "lnorm" {
+                        x.iter().sum::<f64>() / width as f64
                     } else {
-                        let n = (out[output][i / 2] >> ((i % 2) * 4)) & 15;
-                        if n >= 8 {
-                            i32::from(n) - 16
-                        } else {
-                            i32::from(n)
-                        }
+                        0.
                     };
-                    let expected = (want[row * width + col] / scales[row]).clamp(-qmax, qmax);
-                    assert!(
-                        (f64::from(q) - expected).abs() <= 0.501,
-                        "{stem} row {row} col {col}: {q} vs {expected}"
-                    );
+                    let variance = x.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / width as f64;
+                    for col in 0..width {
+                        want[row * width + col] = (0..256)
+                            .map(|j| {
+                                let sign = (0..4).fold(1., |s, digit| {
+                                    if ((col % 256) >> (2 * digit) & 3) + (j >> (2 * digit) & 3)
+                                        == 3
+                                    {
+                                        -s
+                                    } else {
+                                        s
+                                    }
+                                });
+                                let value = x[col / 256 * 256 + j];
+                                sign * if kind == "plain" {
+                                    value
+                                } else {
+                                    (value - mean) / (variance + 1e-5).sqrt()
+                                }
+                            })
+                            .sum::<f64>()
+                            / 16.;
+                    }
                 }
-                assert!(out[output]
-                    [(row * stride + width) * bits / 8..(row + 1) * stride * bits / 8]
-                    .iter()
-                    .all(|&v| v == 0x55));
+                let mut config = cfg(&[("width", width), ("out_stride", stride), ("lanes", lanes)]);
+                let mut data = if kind == "plain" {
+                    vec![bytes(
+                        &input.iter().copied().map(f16::from_f32).collect::<Vec<_>>(),
+                    )]
+                } else {
+                    config.extend([("eps", "1e-5".into()), ("classes", "1".into())]);
+                    vec![
+                        bytes(&input),
+                        bytes(&weights),
+                        bytes(&table),
+                        bytes(&classes),
+                    ]
+                };
+                let output = data.len();
+                data.push(vec![0x55; tokens * stride * bits / 8]);
+                data.push(vec![0; tokens * 4]);
+                let stem = format!("prepare_{kind}_i{bits}");
+                let module = format!("prepare_i{bits}_family");
+                let out = h.run_module(
+                    &module,
+                    &stem,
+                    &config,
+                    [tokens as u32, 1, 1],
+                    lanes as u32,
+                    &[tokens as u64],
+                    &data,
+                );
+                let scales = floats(&out[output + 1]);
+                let qmax = if bits == 4 { 7. } else { 127. };
+                for row in 0..tokens {
+                    let max = want[row * width..(row + 1) * width]
+                        .iter()
+                        .map(|v| v.abs())
+                        .fold(0., f64::max);
+                    close(&[scales[row]], &[max / qmax], 1e-7, 1e-4);
+                    for col in 0..width {
+                        let i = row * stride + col;
+                        let q = if bits == 8 {
+                            i32::from(out[output][i] as i8)
+                        } else {
+                            let n = (out[output][i / 2] >> ((i % 2) * 4)) & 15;
+                            if n >= 8 {
+                                i32::from(n) - 16
+                            } else {
+                                i32::from(n)
+                            }
+                        };
+                        let expected = (want[row * width + col] / scales[row]).clamp(-qmax, qmax);
+                        assert!(
+                            (f64::from(q) - expected).abs() <= 0.501,
+                            "{stem} row {row} col {col}: {q} vs {expected}"
+                        );
+                    }
+                    assert!(out[output]
+                        [(row * stride + width) * bits / 8..(row + 1) * stride * bits / 8]
+                        .iter()
+                        .all(|&v| v == 0x55));
+                }
             }
         }
     }

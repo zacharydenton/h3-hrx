@@ -550,7 +550,19 @@ impl Prepare {
         } else {
             format!("prepare_{form}_{elem}")
         };
-        let lanes = (if tiled { Some(256) } else { lanes_for(width) }).ok_or_else(|| {
+        let lanes = (if tiled {
+            Some(256)
+        } else if form == "plain"
+            && elem == "i8"
+            && width == INNER
+            && input_type == ActivationType::F16
+        {
+            // Two eight-value chunks per lane improve occupancy for the attention output row.
+            Some(448)
+        } else {
+            lanes_for(width)
+        })
+        .ok_or_else(|| {
             crate::compile::Error::Io(format!("no prepare lane count for width {width}"))
         })?;
         let ns = format!("h3.{stem}.");

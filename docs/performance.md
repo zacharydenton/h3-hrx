@@ -163,6 +163,9 @@ a 512 MiB GPU allocation budget. Setup and output readback stay outside timing.
 and 8,192 tokens with the same allocation cap and HRX profiling support.
 `transpose_v_f16` covers 1, 257, 2,048 and 8,192 tokens, checking exact half bits
 and zeroed padding after transposing across reused capacity.
+`prepare_attention_output_i8` compares 128/224/448-thread workgroups for the
+7,168-value FP16 attention output. Every case checks packed codes and scales
+against the 128-thread kernel outside timing and uses a 512 MiB allocation cap.
 
 `H3_PROFILE=device` uses HRX's owned graphs and device-clock markers. Each
 `H3_GPU_PROFILE` JSON line records the stage, symbol, launch geometry, scalar

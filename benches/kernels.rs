@@ -201,6 +201,88 @@ fn attention_preparation(c: &mut Criterion) {
     group.finish();
 }
 
+fn attention_output_preparation(c: &mut Criterion) {
+    use h3_hrx::dispatch::{emit, Profile};
+    use h3_hrx::model::{gemm_pitch, INNER};
+    let mut group = c.benchmark_group("prepare_attention_output_i8");
+    for tokens in [1usize, 256, 2048, 8192] {
+        for lanes in [128usize, 224, 448] {
+            group.throughput(Throughput::Elements((tokens * INNER) as u64));
+            group.bench_function(format!("{tokens}/lanes_{lanes}"), |b| {
+                let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+                let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                let compiler = compiler();
+                let stride = gemm_pitch(INNER, 8);
+                let build = |stream: &mut Stream, lanes: usize| {
+                    compiler
+                        .get(
+                            stream,
+                            "prepare_i8_family",
+                            "h3_prepare_plain_i8",
+                            &vec![
+                                ("h3.prepare_plain_i8.width".into(), INNER.to_string()),
+                                ("h3.prepare_plain_i8.lanes".into(), lanes.to_string()),
+                                ("h3.prepare_plain_i8.out_stride".into(), stride.to_string()),
+                            ],
+                        )
+                        .unwrap()
+                };
+                let reference = build(&mut stream, 128);
+                let kernel = build(&mut stream, lanes);
+                compiler.flush(&mut stream).unwrap();
+                let input: Vec<_> = (0..tokens * INNER)
+                    .map(|i| f16::from_f32(((i * 17 % 127) as f32 - 63.0) * 0.25))
+                    .collect();
+                let x = upload(&mut stream, bytemuck::cast_slice(&input));
+                let codes = upload(&mut stream, &vec![0x55; tokens * stride]);
+                let scales = stream.allocate_zeroed(tokens * 4).unwrap();
+                let bindings = [x.binding(), codes.binding(), scales.binding()];
+                let required = bindings.map(|view| view.len());
+                emit(
+                    &mut Sink::Stream(&mut stream),
+                    &reference,
+                    None,
+                    "reference",
+                    [tokens as u32, 1, 1],
+                    [128, 1, 1],
+                    &[tokens as u32],
+                    &bindings,
+                    &required,
+                )
+                .unwrap();
+                let mut expected = vec![0; tokens * stride];
+                stream
+                    .read_blocking(codes.binding(), &mut expected)
+                    .unwrap();
+                let expected_scales = check_f32(&mut stream, &scales);
+                let mut profile = Profile::from_env();
+                let mut run = |stream: &mut Stream| {
+                    emit(
+                        &mut Sink::Stream(stream),
+                        &kernel,
+                        Some(&mut profile),
+                        "prepare out input",
+                        [tokens as u32, 1, 1],
+                        [lanes as u32, 1, 1],
+                        &[tokens as u32],
+                        &bindings,
+                        &required,
+                    )
+                    .unwrap();
+                    stream.synchronize().unwrap();
+                };
+                run(&mut stream);
+                b.iter(|| run(&mut stream));
+                let mut actual = vec![0; expected.len()];
+                stream.read_blocking(codes.binding(), &mut actual).unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(check_f32(&mut stream, &scales), expected_scales);
+            });
+        }
+    }
+    group.finish();
+}
+
 fn gemm(c: &mut Criterion) {
     let mut group = c.benchmark_group("gemm");
     for elem in ["i8", "bf16"] {
@@ -668,6 +750,6 @@ criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10).warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3));
-    targets = preparation, attention_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
+    targets = preparation, attention_preparation, attention_output_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
 }
 criterion_main!(benches);
