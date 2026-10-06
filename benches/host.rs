@@ -47,10 +47,18 @@ fn host(c: &mut Criterion) {
                 .unwrap()
         })
     });
-    let rgb: Vec<_> = (0..1920 * 1080 * 3).map(|i| (i % 251) as u8).collect();
-    c.bench_function("resize/1080p_to_480p", |b| {
-        b.iter(|| h3_hrx::resize::pil_bilinear(black_box(&rgb), 1920, 1080, 864, 480))
-    });
+    for (name, sw, sh, dw, dh) in [
+        ("1080p_to_480p", 1920, 1080, 864, 480),
+        ("1080p_to_768p", 1920, 1080, 1344, 768),
+        ("upscale", 640, 480, 864, 768),
+        ("identity", 864, 480, 864, 480),
+        ("large_downscale", 3000, 2000, 288, 192),
+    ] {
+        let rgb: Vec<_> = (0..sw * sh * 3).map(|i| (i % 251) as u8).collect();
+        c.bench_function(&format!("resize/{name}"), |b| {
+            b.iter(|| h3_hrx::resize::pil_bilinear(black_box(&rgb), sw, sh, dw, dh))
+        });
+    }
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/refmod/combined.safetensors");
     c.bench_function("refmod/load", |b| {

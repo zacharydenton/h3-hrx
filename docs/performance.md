@@ -17,6 +17,13 @@ Results and baselines belong in ignored `target/criterion/`, never in Git.
 | `pipeline` | Complete text, first/last-frame, image/audio reference, video/audio reference, RefMod, LoRA, Turbo and World renders; cache observation/reuse; WAV and H.264/AAC output; fresh CLI processes |
 | `memory` | Complete text and reference renders under stage-scoped and budgeted residency, measuring sampled peak reservations and process RSS separately |
 
+Host resize cases cover 1080p to 480p/768p, enlargement, unchanged dimensions,
+and a large downscale. They exercise the reference/keyframe bilinear path:
+
+```sh
+cargo bench --bench host -- resize/
+```
+
 Video stage cases cross spatial tile overlaps horizontally and vertically and
 use 5/22/39/56 frames across temporal chunks. Audio cases cover the 800-sample
 hop and 255/256/257 latent-frame boundaries, plus a full 124-frame soundtrack.

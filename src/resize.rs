@@ -35,31 +35,56 @@ fn weights(in_len: i32, out_len: i32, x: i32) -> (i32, i32, Vec<f64>) {
 /// RGB8 `[sh][sw][3]` -> f32 `[dh][dw][3]` in `[0, 1]`.
 pub fn pil_bilinear(rgb: &[u8], sw: i32, sh: i32, dw: i32, dh: i32) -> Vec<f32> {
     let (swz, shz, dwz, dhz) = (sw as usize, sh as usize, dw as usize, dh as usize);
-    let mut horiz = vec![0.0f32; shz * dwz * 3]; // [sh][dw][3]
     let mut out = vec![0.0f32; dhz * dwz * 3]; // [dh][dw][3]
+    if swz == 0 || shz == 0 || dwz == 0 || dhz == 0 {
+        return out;
+    }
+    if (sw, sh) == (dw, dh) {
+        for (dest, source) in out.iter_mut().zip(&rgb[..dhz * dwz * 3]) {
+            *dest = (*source as f64 / 255.0) as f32;
+        }
+        return out;
+    }
+    let mut horiz = vec![0.0f32; shz * dwz * 3]; // [sh][dw][3]
 
-    for x in 0..dw {
-        let (lo, hi, w) = weights(sw, dw, x);
-        for y in 0..shz {
-            for c in 0..3 {
-                let mut acc = 0.0f64;
-                for i in lo..hi {
-                    acc += w[(i - lo) as usize] * rgb[(y * swz + i as usize) * 3 + c] as f64;
+    let horizontal_weights: Vec<_> = (0..dw).map(|x| weights(sw, dw, x)).collect();
+    // Visit whole rows so input and intermediate pixels stay local. Accumulate
+    // RGB together, preserving each channel's tap order and f32 pass boundary.
+    for (source, dest) in rgb[..shz * swz * 3]
+        .chunks_exact(swz * 3)
+        .zip(horiz.chunks_exact_mut(dwz * 3))
+    {
+        for ((lo, hi, w), pixel) in horizontal_weights.iter().zip(dest.chunks_exact_mut(3)) {
+            let mut acc = [0.0f64; 3];
+            for (weight, input) in w
+                .iter()
+                .zip(source[*lo as usize * 3..*hi as usize * 3].chunks_exact(3))
+            {
+                for c in 0..3 {
+                    acc[c] += weight * input[c] as f64;
                 }
-                horiz[(y * dwz + x as usize) * 3 + c] = (acc / 255.0) as f32;
+            }
+            for c in 0..3 {
+                pixel[c] = (acc[c] / 255.0) as f32;
             }
         }
     }
+    let mut acc = vec![0.0f64; dwz * 3];
     for y in 0..dh {
         let (lo, hi, w) = weights(sh, dh, y);
-        for x in 0..dwz {
-            for c in 0..3 {
-                let mut acc = 0.0f64;
-                for i in lo..hi {
-                    acc += w[(i - lo) as usize] * horiz[(i as usize * dwz + x) * 3 + c] as f64;
-                }
-                out[(y as usize * dwz + x) * 3 + c] = (acc as f32).clamp(0.0, 1.0);
+        acc.fill(0.0);
+        // The tap remains the accumulation order for each component, while
+        // contiguous row updates let the compiler vectorize across components.
+        for (weight, source) in w
+            .iter()
+            .zip(horiz[lo as usize * dwz * 3..hi as usize * dwz * 3].chunks_exact(dwz * 3))
+        {
+            for (sum, value) in acc.iter_mut().zip(source) {
+                *sum += weight * *value as f64;
             }
+        }
+        for (dest, sum) in out[y as usize * dwz * 3..][..dwz * 3].iter_mut().zip(&acc) {
+            *dest = (*sum as f32).clamp(0.0, 1.0);
         }
     }
     out
@@ -152,6 +177,63 @@ pub fn world_first_frame(rgb: &[u8], sw: i32, sh: i32, dw: i32, dh: i32) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_wise_resize_preserves_scalar_output_bits() {
+        for (sw, sh, dw, dh) in [
+            (1920, 1080, 864, 480),
+            (1920, 1080, 1344, 768),
+            (640, 480, 864, 768),
+            (864, 480, 864, 480),
+            (3000, 2000, 288, 192),
+            (37, 53, 64, 96),
+            (100, 100, 32, 32),
+            (1, 1, 7, 3),
+            (17, 9, 1, 1),
+            (0, 1, 2, 3),
+            (1, 0, 2, 3),
+            (2, 3, 0, 1),
+            (2, 3, 1, 0),
+        ] {
+            let rgb: Vec<_> = (0..sw * sh * 3)
+                .map(|i| ((i * 37 + i / 7) % 256) as u8)
+                .collect();
+            let mut horizontal = vec![0.0f32; (sh * dw * 3) as usize];
+            // Original scalar two-pass order, including rounding between passes.
+            for x in 0..dw {
+                let (lo, hi, coeff) = weights(sw, dw, x);
+                for y in 0..sh {
+                    for c in 0..3 {
+                        let mut sum = 0.0f64;
+                        for i in lo..hi {
+                            sum += coeff[(i - lo) as usize]
+                                * rgb[((y * sw + i) * 3 + c) as usize] as f64;
+                        }
+                        horizontal[((y * dw + x) * 3 + c) as usize] = (sum / 255.0) as f32;
+                    }
+                }
+            }
+            let actual = pil_bilinear(&rgb, sw, sh, dw, dh);
+            for y in 0..dh {
+                let (lo, hi, coeff) = weights(sh, dh, y);
+                for x in 0..dw {
+                    for c in 0..3 {
+                        let mut sum = 0.0f64;
+                        for i in lo..hi {
+                            sum += coeff[(i - lo) as usize]
+                                * horizontal[((i * dw + x) * 3 + c) as usize] as f64;
+                        }
+                        let expected = (sum as f32).clamp(0.0, 1.0);
+                        assert_eq!(
+                            actual[((y * dw + x) * 3 + c) as usize].to_bits(),
+                            expected.to_bits(),
+                            "{sw}x{sh}->{dw}x{dh}, pixel {x},{y},{c}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn weights_sum_to_one_and_stay_in_range() {
