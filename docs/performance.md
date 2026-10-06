@@ -121,6 +121,10 @@ that execution path; it is not a quality-qualified cache preset.
 
 ## Measurement boundaries
 
+- **Temporal video assembly:** `video_temporal` measures window-buffer allocation,
+  copying prebuilt decoded fixtures, temporal trimming, cross-fades and float RGB
+  output writes. Cases cover short and multiple-window clips through 768p; peak
+  benchmark buffers stay below 2 GiB. Model execution and RGB byte conversion are excluded.
 - **Video decoder output:** `video_decoder_output` measures FP16 conversion and
   unpacking into channel-major float frames, from single tokens through a full
   7×16×16 tile. `reused` keeps the output allocation across calls, as tiled decoding

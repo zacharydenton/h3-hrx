@@ -567,8 +567,6 @@ impl VideoVae {
             shape.lat_h as usize,
             shape.lat_w as usize,
         );
-        let want_frames = shape.frames as usize;
-        let plane = h * w * VAE_PS * VAE_PS;
         let plan = tiles::chunk_plan(t_len);
         let tp = plan.padded_tokens;
 
@@ -585,11 +583,45 @@ impl VideoVae {
             }
         }
 
-        let mut overlap: Vec<f32> = Vec::new();
-        let mut have_overlap = false;
-        let mut decoded = 0usize;
-        // the frames actually written, capped at what the caller asked for
-        let mut append = |chunk: &[f32], nf: usize, src_ft: usize, decoded: &mut usize| {
+        let mut z = Vec::new();
+        decode_temporal(
+            shape,
+            |start, ft, clip| {
+                z.clear();
+                z.resize(LATENT_CH * ft * h * w, 0.0);
+                for ch in 0..LATENT_CH {
+                    let src = (ch * tp + start) * h * w;
+                    let dst = ch * ft * h * w;
+                    z[dst..dst + ft * h * w].copy_from_slice(&zp[src..src + ft * h * w]);
+                }
+                self.decode_spatial(stream, c, prof, &z, Grid { ft, h, w }, clip)
+            },
+            write,
+        )
+    }
+}
+
+/// Decode temporal windows and assemble the video VAE's channel-major float pixels.
+///
+/// The decoder callback receives a start token, a token count (including padded latents),
+/// and a reusable output buffer for `[3][tokens*4][height][width]` pixels. The writer receives
+/// an interleaved RGB output index, an ImageNet-normalized value, and its channel.
+/// Trimming and cross-fades follow the released VAE's temporal chunk plan.
+pub fn decode_temporal(
+    shape: &crate::layout::Shape,
+    mut decode: impl FnMut(usize, usize, &mut Vec<f32>) -> Result<()>,
+    write: &mut impl FnMut(usize, f32, usize),
+) -> Result<()> {
+    let want_frames = shape.frames as usize;
+    let plane = shape.lat_h as usize * shape.lat_w as usize * VAE_PS * VAE_PS;
+    let plan = tiles::chunk_plan(shape.latent_t as usize);
+    let mut overlap: Vec<f32> = Vec::new();
+    let mut have_overlap = false;
+    let mut decoded = 0usize;
+    // the frames actually written, capped at what the caller asked for
+    let mut append =
+        |chunk: &[f32], frames: std::ops::Range<usize>, src_ft: usize, decoded: &mut usize| {
+            let nf = frames.len();
             let take = if *decoded < want_frames {
                 nf.min(want_frames - *decoded)
             } else {
@@ -598,7 +630,7 @@ impl VideoVae {
             for f in 0..take {
                 for q in 0..plane {
                     for ch in 0..3 {
-                        let v = chunk[(ch * src_ft + f) * plane + q];
+                        let v = chunk[(ch * src_ft + frames.start + f) * plane + q];
                         write(((*decoded + f) * plane + q) * 3 + ch, v, ch);
                     }
                 }
@@ -606,62 +638,50 @@ impl VideoVae {
             *decoded += nf;
         };
 
-        // one allocation each, reused by every chunk: a chunk of a 480p clip is over a hundred
-        // megabytes, and the last chunk is the only one that is a different size
-        let (mut z, mut clip, mut chunk) = (Vec::new(), Vec::new(), Vec::new());
-        for i in 0..plan.chunks {
-            let start = i * VAE_CHUNK;
-            let ft = (VAE_CHUNK + VAE_OVERLAP).min(tp - start);
-            z.clear();
-            z.resize(LATENT_CH * ft * h * w, 0.0);
-            for ch in 0..LATENT_CH {
-                let src = (ch * tp + start) * h * w;
-                let dst = ch * ft * h * w;
-                z[dst..dst + ft * h * w].copy_from_slice(&zp[src..src + ft * h * w]);
-            }
-            self.decode_spatial(stream, c, prof, &z, Grid { ft, h, w }, &mut clip)?;
-            let clip_frames = ft * VAE_TRATIO;
-            for j in 0..2 {
-                let f0 = j * plan.chunk_frames + plan.pre;
-                let f1 = ((j + 1) * plan.chunk_frames).min(clip_frames);
-                if f0 >= f1 {
-                    if j == 1 {
-                        have_overlap = false;
-                    }
-                    continue;
+    let mut clip = Vec::new();
+    for i in 0..plan.chunks {
+        let start = i * VAE_CHUNK;
+        let ft = (VAE_CHUNK + VAE_OVERLAP).min(plan.padded_tokens - start);
+        decode(start, ft, &mut clip)?;
+        let clip_frames = ft * VAE_TRATIO;
+        for j in 0..2 {
+            let f0 = j * plan.chunk_frames + plan.pre;
+            let f1 = ((j + 1) * plan.chunk_frames).min(clip_frames);
+            if f0 >= f1 {
+                if j == 1 {
+                    have_overlap = false;
                 }
-                let nf = f1 - f0;
-                chunk.clear();
-                chunk.resize(3 * nf * plane, 0.0);
+                continue;
+            }
+            let nf = f1 - f0;
+            if j == 0 {
+                if have_overlap {
+                    tiles::crossfade(&mut clip, f0..f1, &overlap, plane, plan.overlap_frames);
+                }
+                append(&clip, f0..f1, clip_frames, &mut decoded);
+            } else {
+                // Retain only the tail needed by the next window. Emitted frames are
+                // blended and read directly from clip, without a full-window scratch copy.
+                overlap.resize(3 * nf * plane, 0.0);
                 for ch in 0..3 {
                     let src = (ch * clip_frames + f0) * plane;
-                    chunk[ch * nf * plane..(ch + 1) * nf * plane]
+                    overlap[ch * nf * plane..(ch + 1) * nf * plane]
                         .copy_from_slice(&clip[src..src + nf * plane]);
                 }
-                if j == 0 {
-                    if have_overlap {
-                        tiles::crossfade(&mut chunk, nf, &overlap, plane, plan.overlap_frames);
-                    }
-                    append(&chunk, nf, nf, &mut decoded);
-                } else {
-                    // the swap hands the old overlap back as the next chunk's allocation
-                    std::mem::swap(&mut overlap, &mut chunk);
-                    have_overlap = true;
-                }
+                have_overlap = true;
             }
         }
-        if have_overlap {
-            let nf = overlap.len() / (3 * plane);
-            let tail = std::mem::take(&mut overlap);
-            append(&tail, nf, nf, &mut decoded);
-        }
-
-        let kept = decoded - plan.pad_frames;
-        if kept != want_frames {
-            return other(format!("decoded {kept} frames, expected {want_frames}"));
-        }
-        Ok(())
     }
+    if have_overlap {
+        let nf = overlap.len() / (3 * plane);
+        append(&overlap, 0..nf, nf, &mut decoded);
+    }
+
+    let kept = decoded - plan.pad_frames;
+    if kept != want_frames {
+        return other(format!("decoded {kept} frames, expected {want_frames}"));
+    }
+    Ok(())
 }
 
 /// Pixels and the shape they are in: `[frames][height][width][3]` in `[0, 1]`.
@@ -1251,6 +1271,76 @@ fn bytes_mut(v: &mut [half::f16]) -> &mut [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporal_assembly_matches_scalar_frame_mapping() {
+        fn pixel(start: usize, c: usize, frame: usize, q: usize) -> f32 {
+            ((start * 100003 + c * 997 + frame * 29 + q * 7) % 4093) as f32 / 127.0 - 16.0
+        }
+        for frames in [5, 22, 39, 56, 73, 124, 362] {
+            let shape = crate::shape_for(32, 32, frames).unwrap();
+            let plane = 32 * 32;
+            let windows = ((frames as usize - 5) / 17).max(1);
+            let mut calls = 0;
+            let mut written = 0;
+            decode_temporal(
+                &shape,
+                |start, ft, clip| {
+                    assert_eq!((start, ft), (calls * 5, 7));
+                    calls += 1;
+                    clip.clear();
+                    for c in 0..3 {
+                        for f in 0..ft * 4 {
+                            for q in 0..plane {
+                                clip.push(pixel(start, c, f, q));
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+                &mut |index, value, c| {
+                    assert_eq!(index, written);
+                    assert_eq!(c, index % 3);
+                    written += 1;
+                    let f = index / (3 * plane);
+                    let q = index / 3 % plane;
+                    // Each full window emits raw frames 3..20. Its final 23..28 frames
+                    // supply the next cross-fade, or the final five output frames.
+                    let window = (f / 17).min(windows - 1);
+                    let k = f - window * 17;
+                    let raw_frame = if k < 17 { 3 + k } else { 23 + k - 17 };
+                    let current = pixel(window * 5, c, raw_frame, q);
+                    let expected = if window > 0 && k < 5 {
+                        let previous = pixel((window - 1) * 5, c, 23 + k, q);
+                        let weight = k as f32 / 5.0;
+                        (1.0 - weight) * previous + weight * current
+                    } else {
+                        current
+                    };
+                    assert_eq!(
+                        value.to_bits(),
+                        expected.to_bits(),
+                        "{frames} frames, index {index}"
+                    );
+                },
+            )
+            .unwrap();
+            assert_eq!(calls, windows);
+            assert_eq!(written, frames as usize * 3 * plane);
+        }
+    }
+
+    #[test]
+    fn temporal_assembly_propagates_decode_errors() {
+        let shape = crate::shape_for(32, 32, 39).unwrap();
+        let err = decode_temporal(
+            &shape,
+            |_, _, _| crate::error::invalid("decoder failed"),
+            &mut |_, _, _| panic!("failed decode must not write pixels"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("decoder failed"));
+    }
 
     #[test]
     fn unpatchify_preserves_half_bits_and_overwrites_reused_frames() {

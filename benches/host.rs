@@ -203,5 +203,32 @@ fn video_decoder_output(c: &mut Criterion) {
     }
     group.finish();
 }
-criterion_group! { name = benches; config = support::criterion(); targets = host, rotary, video_decoder_input, video_decoder_output }
+fn video_temporal(c: &mut Criterion) {
+    let mut group = c.benchmark_group("video_temporal");
+    for (height, width, frames) in [(64, 64, 5), (64, 64, 124), (480, 864, 39), (768, 1344, 39)] {
+        let shape = h3_hrx::shape_for(height, width, frames).unwrap();
+        let plane = height as usize * width as usize;
+        let fixture = support::values(3 * 28 * plane, 0.5);
+        let mut out = vec![0.0f32; 3 * shape.frames as usize * plane];
+        group.throughput(Throughput::Elements(out.len() as u64));
+        group.bench_function(format!("{height}x{width}x{frames}"), |b| {
+            b.iter(|| {
+                h3_hrx::vvae::decode_temporal(
+                    black_box(&shape),
+                    |_, ft, clip| {
+                        let count = 3 * ft * 4 * plane;
+                        clip.resize(count, 0.0);
+                        clip.copy_from_slice(&fixture[..count]);
+                        Ok(())
+                    },
+                    &mut |index, value, _| out[index] = value,
+                )
+                .unwrap();
+                black_box(&out);
+            });
+        });
+    }
+    group.finish();
+}
+criterion_group! { name = benches; config = support::criterion(); targets = host, rotary, video_decoder_input, video_decoder_output, video_temporal }
 criterion_main!(benches);

@@ -180,27 +180,28 @@ pub fn stitch_pixels<E>(
     Ok(())
 }
 
-/// The decoder's temporal cross-fade: the previous chunk's tail faded into this chunk's head.
+/// The decoder's temporal cross-fade: the previous chunk's tail faded into a decoded frame range.
 ///
 /// The fade length is the smallest of what the overlap holds, what the chunk holds, and what was asked
 /// for — the last chunk of a clip is often shorter than the overlap it has to accept.
 pub fn crossfade(
     chunk: &mut [f32],
-    nf: usize,
+    frames: std::ops::Range<usize>,
     overlap: &[f32],
     plane: usize,
     overlap_frames: usize,
 ) {
     let ov = overlap.len() / (3 * plane);
-    let be = ov.min(nf).min(overlap_frames);
+    let be = ov.min(frames.len()).min(overlap_frames);
     if be == 0 {
         return;
     }
+    let src_frames = chunk.len() / (3 * plane);
     for c in 0..3 {
         for k in 0..be {
             let wb = k as f32 / be as f32;
             let wa = 1.0 - wb;
-            let d0 = (c * nf + k) * plane;
+            let d0 = (c * src_frames + frames.start + k) * plane;
             let s0 = (c * ov + ov - be + k) * plane;
             for q in 0..plane {
                 chunk[d0 + q] = wa * overlap[s0 + q] + wb * chunk[d0 + q];
@@ -508,7 +509,7 @@ mod tests {
             .map(|i| (i % (ov * plane)) as f32)
             .collect();
         let mut chunk = vec![100.0f32; 3 * nf * plane];
-        crossfade(&mut chunk, nf, &overlap, plane, 2);
+        crossfade(&mut chunk, 0..nf, &overlap, plane, 2);
         // be = 2: frame 0 is all of the overlap's frame 2, frame 1 is halfway to the chunk
         assert_eq!(chunk[0], 4.0);
         assert_eq!(chunk[plane], (6.0 + 100.0) / 2.0);
@@ -516,11 +517,31 @@ mod tests {
     }
 
     #[test]
+    fn a_crossfade_range_preserves_surrounding_frames_in_every_channel() {
+        let (plane, frames) = (2, 6);
+        let mut clip = vec![100.0; 3 * frames * plane];
+        let overlap: Vec<_> = (0..3 * 4 * plane).map(|i| i as f32).collect();
+        crossfade(&mut clip, 2..5, &overlap, plane, 2);
+        for c in 0..3 {
+            for f in 0..frames {
+                for q in 0..plane {
+                    let expected = match f {
+                        2 => overlap[(c * 4 + 2) * plane + q],
+                        3 => 0.5 * overlap[(c * 4 + 3) * plane + q] + 50.0,
+                        _ => 100.0,
+                    };
+                    assert_eq!(clip[(c * frames + f) * plane + q], expected);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_short_chunk_fades_over_what_it_has() {
         let plane = 1usize;
         let overlap = vec![0.0f32; 3 * 8 * plane];
         let mut chunk = vec![100.0f32; 3 * plane];
-        crossfade(&mut chunk, 1, &overlap, plane, 8);
+        crossfade(&mut chunk, 0..1, &overlap, plane, 8);
         assert_eq!(
             chunk[0], 0.0,
             "one frame means the whole fade is the overlap"
