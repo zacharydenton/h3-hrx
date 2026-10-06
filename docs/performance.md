@@ -235,3 +235,19 @@ measurement window; slow cases necessarily exceed that window. Criterion's
 The suite covers the local inference and media pipeline. External prompt/LLM
 services, network downloads, disk-cache eviction and long World save/resume
 rollouts are outside these benchmarks.
+
+## Latent upscaler
+
+`cargo bench` includes the `upscale` Criterion target: checkpoint metadata,
+cold/warm learned-network execution, reference-conditioned refinement, and
+both generation passes through video/audio decoding. Inputs are bounded to
+64×64 → 128×128 and five frames. Existing `H3_BENCH_BUDGET_GIB`, residency,
+attention and HRX profiling controls apply.
+
+```sh
+cargo bench --bench upscale
+H3_PROFILE=device cargo bench --bench upscale -- upscale/network/warm_weights --test
+```
+
+Network profiles separate convolutions, whole-volume normalization, temporal
+convolutions, interpolation and residual updates. Results remain under `target/`.

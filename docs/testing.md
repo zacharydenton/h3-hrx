@@ -147,3 +147,9 @@ branching, last-frame handoff, seed/frame accounting, rollback and writer locks.
 `world_rollout_decodes_and_resumes` runs two decoded segments through a budgeted
 session. These tests run by default and require the pinned world adapter.
 See [world validation](world.md#validation) for visual qualification guidance.
+
+The upscaler tests cover the released 3D checkpoint against a small upstream
+FP16 fixture, temporal chunk blending, scalar convolution/normalization
+oracles, ER-SDE with explicit noise, and two-pass generation with RefMods,
+fixed audio, target-grid keyframes and cancellation recovery. They run through
+`cargo test`; CPU-only builds skip hardware tests. Fixtures need no Python.

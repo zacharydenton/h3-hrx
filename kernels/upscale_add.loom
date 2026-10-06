@@ -1,0 +1,39 @@
+amdgpu.target<gfx11-generic> @target {subgroup_size = 32}
+
+kernel.def target(@target) export("h3_upscale_add") @h3_upscale_add(%count: index) {
+  %one = index.constant 1 : index
+  %tile = index.constant 256 : index
+  %tail = index.constant 255 : index
+  %rounded = index.add %count, %tail : index
+  %groups = index.div %rounded, %tile : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%tile, %one, %one) : index
+} launch(%count: index, %x: buffer, %residual: buffer) {
+
+  %z = index.constant 0 : index
+  %one = index.constant 1 : index
+  %two = index.constant 2 : index
+  %four = index.constant 4 : index
+  %tile = index.constant 256 : index
+  %offset = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %wg, %tile : index
+  %i = index.add %base, %lane : index
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %residual_global = buffer.assume.memory_space<global> %residual : buffer
+  %active = index.cmp ult, %i, %count : index
+  scf.if %active {
+    %iv = index.assume %i [lt(%i, %count)] : index
+    %xv = buffer.view %x_global[%offset] : buffer -> view<[%count]xf16>
+    %rv = buffer.view %residual_global[%offset] : buffer -> view<[%count]xf16>
+    %a16 = view.load %xv[%iv] : view<[%count]xf16> -> f16
+    %b16 = view.load %rv[%iv] : view<[%count]xf16> -> f16
+    %a = scalar.extf %a16 : f16 to f32
+    %b = scalar.extf %b16 : f16 to f32
+    %sum = scalar.addf %a, %b : f32
+    %sum16 = scalar.fptrunc %sum : f32 to f16
+    view.store %sum16, %xv[%iv] : f16, view<[%count]xf16>
+  }
+  kernel.return
+}

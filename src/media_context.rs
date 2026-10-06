@@ -2,7 +2,7 @@
 use crate::{Error, Presentation, Result, Shape, Tokenizer};
 use std::sync::Arc;
 
-/// RGB floats in [0,1], with dimensions aligned to H3's 32-pixel vision blocks.
+/// RGB floats in `[0,1]`, with dimensions aligned to H3's 32-pixel vision blocks.
 #[derive(Clone, Debug)]
 pub struct Frame {
     pub pixels: Arc<[f32]>,

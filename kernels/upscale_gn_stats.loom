@@ -1,0 +1,90 @@
+// Whole-volume GroupNorm mean and centered variance, accumulated in FP32.
+amdgpu.target<gfx11-generic> @h3_upscale_gn_stats_gfx11 {subgroup_size = 32}
+
+config.decl @h3.upscale_gn_stats.channels : %value: index where [range(%value, 32, 4096), mul(%value, 32)]
+
+config.decl @h3.upscale_gn_stats.groups : %value: index where [range(%value, 1, 64)]
+
+config.decl @h3.upscale_gn_stats.plane : %value: index where [range(%value, 1, 1048576)]
+
+config.decl @h3.upscale_gn_stats.rows_bound : %value: index where [range(%value, 64, 2097152), mul(%value, 64)]
+
+kernel.def target(@h3_upscale_gn_stats_gfx11) export("h3_upscale_gn_stats") @h3_upscale_gn_stats(%frames: index) {
+  %c1 = index.constant 1 : index
+  %c32 = index.constant 32 : index
+  %groups = config.get @h3.upscale_gn_stats.groups : index
+  kernel.launch.config workgroups(%frames, %groups, %c1) workgroup_size(%c32, %c1, %c1) : index
+} launch(%frames: index, %x: buffer, %out: buffer) {
+  %channels = config.get @h3.upscale_gn_stats.channels : index
+  %groups = config.get @h3.upscale_gn_stats.groups : index
+  %plane = config.get @h3.upscale_gn_stats.plane : index
+  %rows_bound = config.get @h3.upscale_gn_stats.rows_bound : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c32 = index.constant 32 : index
+  %c0_offset = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %frames_b = index.assume %frames [range(%frames, 1, 64)] : index
+  %rows0 = index.mul %frames_b, %plane : index
+  %rows = index.assume %rows0 [range(%rows0, 1, 2097152), le(%rows0, %rows_bound)] : index
+  %t0 = kernel.workgroup.id<x> : index
+  %t = index.assume %t0 [lt(%t0, %frames_b)] : index
+  %g0 = kernel.workgroup.id<y> : index
+  %g = index.assume %g0 [lt(%g0, %groups)] : index
+  %lane = kernel.workitem.id<x> : index
+  %per_group = index.div %channels, %groups : index
+  %cbase = index.mul %g, %per_group : index
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %out_global = buffer.assume.memory_space<global> %out : buffer
+  %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%rows]x[%channels]xf16>
+  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%frames_b]x[%groups]x[%c2]xf32>
+  %row_base = index.mul %t, %plane : index
+  // Center the mean reduction too: large common offsets never enter the sum.
+  %anchor_col = index.assume %cbase [lt(%cbase, %channels)] : index
+  %anchor_row = index.assume %row_base [lt(%row_base, %rows)] : index
+  %anchor_half = view.load %x_view[%anchor_row, %anchor_col] : view<[%rows]x[%channels]xf16> -> f16
+  %anchor = scalar.extf %anchor_half : f16 to f32
+  %sum_l = scf.for %p = [%lane to %plane step %c32](%s = %zero : f32) -> (f32) {
+    %row0 = index.add %row_base, %p : index
+    %row = index.assume %row0 [lt(%row0, %rows)] : index
+    %s_in = scf.for %ci = [%c0 to %per_group step %c1](%s2 = %s : f32) -> (f32) {
+      %col0 = index.add %cbase, %ci : index
+      %col = index.assume %col0 [lt(%col0, %channels)] : index
+      %v16 = view.load %x_view[%row, %col] : view<[%rows]x[%channels]xf16> -> f16
+      %v = scalar.extf %v16 : f16 to f32
+      %centered = scalar.subf %v, %anchor : f32
+      %s3 = scalar.addf %s2, %centered : f32
+      scf.yield %s3 : f32
+    }
+    scf.yield %s_in : f32
+  }
+  %sum = kernel.subgroup.reduce<addf> %sum_l : f32
+  %count = index.mul %plane, %per_group : index
+  %counti = index.cast %count : index to i32
+  %countf = scalar.sitofp %counti : i32 to f32
+  %mean_delta = scalar.divf %sum, %countf : f32
+  %mean = scalar.addf %mean_delta, %anchor : f32
+  %var_l = scf.for %vp = [%lane to %plane step %c32](%vs = %zero : f32) -> (f32) {
+    %vr0 = index.add %row_base, %vp : index
+    %vr = index.assume %vr0 [lt(%vr0, %rows)] : index
+    %inner = scf.for %vc = [%c0 to %per_group step %c1](%acc = %vs : f32) -> (f32) {
+      %vc0 = index.add %cbase, %vc : index
+      %col = index.assume %vc0 [lt(%vc0, %channels)] : index
+      %half = view.load %x_view[%vr, %col] : view<[%rows]x[%channels]xf16> -> f16
+      %value = scalar.extf %half : f16 to f32
+      %delta = scalar.subf %value, %mean : f32
+      %next = scalar.fmaf %delta, %delta, %acc : f32
+      scf.yield %next : f32
+    }
+    scf.yield %inner : f32
+  }
+  %var_sum = kernel.subgroup.reduce<addf> %var_l : f32
+  %variance = scalar.divf %var_sum, %countf : f32
+  %is0 = index.cmp eq, %lane, %c0 : index
+  scf.if %is0 {
+    view.store %mean, %out_view[%t, %g, %c0] : f32, view<[%frames_b]x[%groups]x[%c2]xf32>
+    view.store %variance, %out_view[%t, %g, %c1] : f32, view<[%frames_b]x[%groups]x[%c2]xf32>
+  }
+  kernel.return
+}

@@ -1,4 +1,4 @@
-//! A session: the four checkpoints, the compiler and the device, opened lazily and reused.
+//! A session: the checkpoints, the compiler and the device, opened lazily and reused.
 //!
 //! The CLI and application adapters use this API directly.
 //! Checkpoints open on first use because most callers want one or two of them: decoding a clip needs
@@ -35,7 +35,7 @@ pub struct SessionOptions {
     pub turbo: Option<crate::adapter::TurboPreset>,
 }
 
-/// Where the four checkpoints live, and how kernels are built.
+/// Where the checkpoints live, and how kernels are built.
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Explicit checkpoint paths override automatic resolution through the Hugging Face cache.
@@ -50,6 +50,7 @@ pub struct Config {
     pub te: Option<std::path::PathBuf>,
     pub video_vae: Option<std::path::PathBuf>,
     pub audio_vae: Option<std::path::PathBuf>,
+    pub latent_upscaler: Option<std::path::PathBuf>,
     /// Weighted H3 LoRAs. Their files share the checkpoint immutability contract.
     pub loras: Vec<crate::adapter::Lora>,
     /// Empty selects the sources embedded in this model package.
@@ -69,6 +70,7 @@ impl Default for Config {
             te: None,
             video_vae: None,
             audio_vae: None,
+            latent_upscaler: None,
             loras: Vec::new(),
             kernel_sources: std::path::PathBuf::new(),
             loom_library: None,
@@ -122,6 +124,8 @@ struct State {
     te: Option<TextEncoder>,
     vvae: Option<VideoVae>,
     avae: Option<AudioVae>,
+    upscaler: Option<crate::upscale::Upscaler>,
+    last_world: bool,
     units: Option<residency::Units>,
 }
 
@@ -166,7 +170,7 @@ impl Session {
     }
 
     /// Open against an application's selected GPU and shared allocation budget.
-    /// All four lazy model units, growing workspaces and transfer staging use
+    /// All lazy model units, growing workspaces and transfer staging use
     /// that ceiling before allocating. StageScoped drains and releases finished
     /// units; Retain pins them for reuse and Budgeted caches each idle unit until
     /// allocation pressure evicts it. Each stage reserves the context's compute
@@ -357,7 +361,7 @@ impl Session {
         hrx::bundle::file_digest(&state.config.loras[0].path).map_err(Into::into)
     }
 
-    /// Reconstruct effective reference latents as interleaved RGB floats in [0,1],
+    /// Reconstruct effective reference latents as interleaved RGB floats in `[0,1]`,
     /// returning pixels and frame count, without imposing the output canvas or duration.
     pub fn decode_reference_visual(
         &mut self,
@@ -433,6 +437,118 @@ impl Session {
         self.scheduled(|state| state.vision_embed(pixels, height, width))
     }
 
+    /// Enlarge normalized video latents; audio is returned unchanged.
+    pub fn upscale_latents(
+        &mut self,
+        input: &Latents,
+        shape: &Shape,
+        settings: &crate::UpscaleSettings,
+        progress: Option<&mut dyn FnMut(usize, usize, f64) -> Control>,
+    ) -> Result<crate::UpscaledLatents> {
+        settings.output_shape(shape)?;
+        if input.video.len()
+            != 24 * shape.latent_t as usize * shape.lat_h as usize * shape.lat_w as usize
+            || input.audio.len() != 64 * shape.audio_t as usize
+        {
+            return invalid("upscale latent lengths do not match shape");
+        }
+        if self.options.turbo.is_some() || self.native.state()?.last_world {
+            return invalid("latent upscaling is not supported with Turbo or World");
+        }
+        self.scheduled(|state| {
+            state.release_completed(true, true, true)?;
+            if let Some(units) = &mut state.units {
+                units.upscaler.checkout(&mut state.upscaler)?;
+            }
+            let result = (|| {
+                if state.upscaler.is_none() {
+                    let path = match &state.config.latent_upscaler {
+                        Some(p) => p.clone(),
+                        None => crate::models::Resolver::new()
+                            .repository("LBH-123-AI", "Minimax_h3_latent_Upscaler")
+                            .find(crate::upscale::CHECKPOINT)?,
+                    };
+                    crate::trace::checkpoint("latent_upscaler", &path);
+                    // SAFETY: Session's immutable checkpoint contract includes this model.
+                    state.upscaler = Some(unsafe { crate::upscale::Upscaler::open(path) }?);
+                }
+                let (shape, video) = state.upscaler.as_ref().expect("opened").run(
+                    &mut state.stream,
+                    &state.compiler,
+                    &mut state.prof,
+                    &input.video,
+                    shape,
+                    settings,
+                    progress,
+                )?;
+                Ok(crate::UpscaledLatents {
+                    shape,
+                    latents: Latents {
+                        video,
+                        audio: input.audio.clone(),
+                    },
+                })
+            })();
+            state.release_completed(false, false, false)?;
+            result
+        })
+    }
+
+    /// ER-SDE refinement of clean latents with fixed audio and unchanged reference conditioning.
+    /// Keyframes must use the target grid. An explicit presentation retains RefMod/vision spans.
+    #[allow(clippy::too_many_arguments)]
+    pub fn refine(
+        &mut self,
+        ids: &[i32],
+        presentation: Option<&crate::PreparedPresentation>,
+        p: &DenoiseParams,
+        initial: &Latents,
+        settings: &crate::RefinementSettings,
+        refs: &[Reference<'_>],
+        kfs: &[Keyframe<'_>],
+        progress: Option<&mut dyn FnMut(usize, usize, f64) -> Control>,
+    ) -> Result<Latents> {
+        let schedule = settings.schedule()?;
+        let mut p = *p;
+        p.steps = settings.steps.max(2);
+        p.seed = settings.seed.unwrap_or(p.seed);
+        let ids = presentation.map_or(ids, |v| v.ids());
+        let shape = self.validate(ids, &p, Noise::default(), refs, kfs)?;
+        if initial.video.len()
+            != 24 * shape.latent_t as usize * shape.lat_h as usize * shape.lat_w as usize
+            || initial.audio.len() != 64 * shape.audio_t as usize
+        {
+            return invalid("refinement latent lengths do not match target shape");
+        }
+        crate::error::finite_output("refine", "initial video", &initial.video)?;
+        crate::error::finite_output("refine", "initial audio", &initial.audio)?;
+        if self.options.turbo.is_some() || self.native.state()?.last_world {
+            return invalid("refinement is not supported with Turbo or World");
+        }
+        if schedule.timesteps.is_empty() {
+            return Ok(Latents {
+                video: initial.video.clone(),
+                audio: initial.audio.clone(),
+            });
+        }
+        crate::trace::event("refinement_start", String::new);
+        let result = self.scheduled(|state| {
+            state.denoise_refinement(
+                ids,
+                &p,
+                Noise::default(),
+                refs,
+                kfs,
+                progress,
+                presentation.map(|v| v.blocks()),
+                None,
+                Some((initial, settings)),
+            )
+        });
+        crate::trace::event("refinement_finished", String::new);
+        result
+    }
+
     /// Decode into borrowed RGB8 storage. Invalid arguments leave output intact;
     /// a failure during execution can leave partially written temporal chunks.
     pub fn decode_video(&mut self, shape: &Shape, latents: &[f32], out: &mut [u8]) -> Result<()> {
@@ -497,6 +613,8 @@ impl State {
             te: None,
             vvae: None,
             avae: None,
+            upscaler: None,
+            last_world: false,
             units,
         })
     }
@@ -508,6 +626,7 @@ impl State {
         }
         self.stream.synchronize()?;
         if let Some(units) = &mut self.units {
+            units.upscaler.checkin(&mut self.upscaler);
             if encoder {
                 units.te.checkin(&mut self.te);
             }
@@ -520,6 +639,7 @@ impl State {
             }
             return Ok(());
         }
+        self.upscaler = None;
         if encoder {
             self.te = None;
         }
@@ -692,6 +812,22 @@ impl State {
         visuals: Option<&[crate::media_context::VisualBlock]>,
         world: Option<&crate::WorldRequest>,
     ) -> Result<Latents> {
+        self.denoise_refinement(ids, p, noise, refs, kfs, progress, visuals, world, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_refinement(
+        &mut self,
+        ids: &[i32],
+        p: &DenoiseParams,
+        noise: Noise<'_>,
+        refs: &[Reference<'_>],
+        kfs: &[Keyframe<'_>],
+        progress: Option<&mut dyn FnMut(usize, usize, f64) -> Control>,
+        visuals: Option<&[crate::media_context::VisualBlock]>,
+        world: Option<&crate::WorldRequest>,
+        refinement: Option<(&Latents, &crate::RefinementSettings)>,
+    ) -> Result<Latents> {
+        self.last_world = world.is_some();
         // Everything cheap, before a checkpoint opens or a kernel compiles. This was written once,
         // lost in a refactor, and not missed — because the tests called the validators rather than
         // this path. There is a test below that calls `denoise` itself now.
@@ -727,6 +863,7 @@ impl State {
                     kfs,
                     progress,
                     cache_policy,
+                    refinement,
                 )
         })();
         // Cleanup also runs after cancellation or a failed preparation. A failed fence
@@ -1320,6 +1457,7 @@ mod tests {
             te: None,
             video_vae: None,
             audio_vae: None,
+            latent_upscaler: None,
             kernel_sources: "kernels".into(),
             loom_library: None,
             attention,

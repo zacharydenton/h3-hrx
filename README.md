@@ -66,6 +66,29 @@ classifier-free guidance. Use `h3 --help` for all flags.
 | Action-controlled clips, save/resume and branching | [H3-World](docs/world.md) |
 | WAV-only output and still frames | [Audio and stills](docs/tricks.md) |
 
+## Latent upscaling
+
+Generate a smaller clip, upscale its latents with the learned 3D model, then
+refine with the same references and RefMods:
+
+```sh
+h3 --width 640 --height 384 --frames 124 --upscale \
+  --refmod character.safetensors --out clip.mp4 < reference-prompt.txt
+```
+
+The second pass defaults to 1.2 megapixels (1024² pixels per megapixel),
+32-pixel alignment, four ER-SDE evaluations, a linear-quadratic schedule and
+0.4 denoise. Audio stays unchanged. Use `--upscale-scale 2` or
+`--upscale-width 1344 --upscale-height 768` to choose the target; use
+`--upscale-steps`, `--upscale-denoise` and `--upscale-seed` to adjust refinement.
+A zero denoise value returns the learned upscale without sampling.
+
+The FP16 3D checkpoint downloads from
+[LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
+into the Hub cache, or supply `--upscale-model FILE`. Temporal chunking is
+on by default. This mode supports ordinary H3 generation; World, Turbo,
+the 2D upscaler and Split Upscale are excluded.
+
 ## Benchmarks
 
 Run the complete Criterion suite:
@@ -101,7 +124,7 @@ and [release checks](docs/releasing.md).
 
 ## License and credits
 
-Code: [Apache-2.0](LICENSE). Model weights are licensed separately by MiniMax.
+Code: [Apache-2.0](LICENSE), with [MIT upscaler attribution](THIRD_PARTY_NOTICES). Model weights are licensed separately by MiniMax.
 See [asset attribution](assets/README.md) for the embedded tokenizer.
 
 Built with AMD's Loom, HRX and MiniMax H3, using ComfyUI as a numerical reference.

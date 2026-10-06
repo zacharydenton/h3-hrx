@@ -61,6 +61,10 @@ harness = false
 required-features = ["cli"]
 
 [[bench]]
+name = "upscale"
+harness = false
+
+[[bench]]
 name = "memory"
 harness = false
 required-features = ["cli"]

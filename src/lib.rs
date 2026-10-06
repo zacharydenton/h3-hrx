@@ -2,7 +2,7 @@
 //!
 //! # The supported API
 //!
-//! [`Session`] is the whole of it: open one against the four checkpoints, then denoise, decode and
+//! [`Session`] is the whole of it: open one against the model checkpoints, then denoise, decode and
 //! encode. Requests are described by [`DenoiseParams`], [`Reference`], [`Keyframe`] and [`Clip`],
 //! which validate their own buffers against the extents they claim; [`Shape`] says what a request
 //! produces before any work begins. Errors are [`Error`], and a failing call never leaves a partial
@@ -42,9 +42,11 @@ pub mod model;
 pub mod plan;
 pub mod stack;
 pub mod te;
+pub mod upscale;
 pub mod vision;
 pub mod vvae;
 pub mod weights;
+pub use upscale::{RefinementSettings, UpscaleSettings, UpscaleTarget, UpscaledLatents};
 pub mod world;
 pub use world::{Action, ActionSchedule, WorldRequest, WorldSegment, WorldState};
 

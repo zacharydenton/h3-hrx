@@ -1,7 +1,7 @@
 # h3-hrx clients: Rust and Elixir
 
 The Cargo package is `h3-hrx`; the Rust library is named `h3_hrx`.
-`Session` is the interface: open one against the four checkpoints, then denoise, decode and encode.
+`Session` is the interface: open one against the model checkpoints, then denoise, decode and encode.
 The examples share the root Cargo workspace and lockfile. Checkpoints are resolved
 on demand from the standard Hugging Face cache; see
 [setup](../docs/setup.md#checkpoints). The native runtime
@@ -40,3 +40,21 @@ conditioning. Keep manifest and latent-reference ordering identical. The existin
 `Session::denoise` API remains available to current callers.
 
 See [prompt configuration and CLI examples](../docs/prompting.md#optional-prompt-generation).
+
+For two-pass generation, call `Session::upscale_latents` after denoising, then
+`Session::refine` with the returned shape and latents. Pass the same references
+and `PreparedPresentation` to refinement. RefMod strengths are already applied
+by `PreparedRefMod`; reuse those buffers without preparing them a second time.
+Only keyframe latent buffers need re-encoding for the larger target grid.
+`refine` uses ER-SDE, preserves audio exactly, and accepts `RefinementSettings`.
+`UpscaleSettings` selects a scale factor, pixel dimensions or megapixel target.
+`Config::latent_upscaler` overrides the automatically resolved 3D checkpoint.
+
+The Rust example accepts an optional upscale factor and RefMod path:
+
+```sh
+cargo run -p h3-hrx-example --release -- "prompt" 22 4 clip 2 character.safetensors
+```
+
+The examples accept latent references directly. For visual prompt presentation,
+build a media manifest as described above; the CLI prepares this automatically.

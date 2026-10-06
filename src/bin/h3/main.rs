@@ -99,6 +99,28 @@ impl std::ops::DerefMut for Cli {
 }
 #[derive(clap::Args)]
 struct GenerationArgs {
+    /// Learned 3D latent upscale followed by reference-conditioned ER-SDE refinement
+    #[arg(long)]
+    upscale: bool,
+    #[arg(long, requires = "upscale")]
+    upscale_model: Option<PathBuf>,
+    #[arg(long, requires="upscale", conflicts_with_all=["upscale_megapixels","upscale_width","upscale_height"])]
+    upscale_scale: Option<f64>,
+    /// Target size in 1024² pixels (default 1.2)
+    #[arg(long, requires="upscale", conflicts_with_all=["upscale_scale","upscale_width","upscale_height"])]
+    upscale_megapixels: Option<f64>,
+    #[arg(long, requires_all=["upscale","upscale_height"])]
+    upscale_width: Option<i32>,
+    #[arg(long, requires_all=["upscale","upscale_width"])]
+    upscale_height: Option<i32>,
+    #[arg(long, default_value_t = 4)]
+    upscale_steps: usize,
+    #[arg(long, default_value_t = 0.4)]
+    upscale_denoise: f64,
+    #[arg(long, requires = "upscale")]
+    upscale_seed: Option<u64>,
+    #[arg(long, requires = "upscale")]
+    upscale_no_chunking: bool,
     #[arg(skip)]
     prompt_only: bool,
     /// Rewrite the instruction through the configured prompt endpoint
@@ -577,7 +599,28 @@ fn run(mut cli: Cli) -> Result<()> {
     if !cli.reference_fps.is_finite() || !(1.0..=120.0).contains(&cli.reference_fps) {
         usage!("--reference-fps must be 1..120");
     }
-    let params = parameters(&cli)?;
+    let mut params = parameters(&cli)?;
+    if cli.upscale && (world_schedule.is_some() || cli.preset.turbo().is_some() || cli.audio_only) {
+        usage!("--upscale requires ordinary video generation without World or Turbo");
+    }
+    let upscale_settings = h3_hrx::UpscaleSettings {
+        target: if let Some(scale) = cli.upscale_scale {
+            h3_hrx::UpscaleTarget::Scale(scale)
+        } else if let (Some(width), Some(height)) = (cli.upscale_width, cli.upscale_height) {
+            h3_hrx::UpscaleTarget::Dimensions { width, height }
+        } else {
+            h3_hrx::UpscaleTarget::Megapixels(cli.upscale_megapixels.unwrap_or(1.2))
+        },
+        temporal_chunking: !cli.upscale_no_chunking,
+    };
+    let refinement_settings = h3_hrx::RefinementSettings {
+        steps: cli.upscale_steps,
+        denoise: cli.upscale_denoise,
+        seed: cli.upscale_seed,
+    };
+    if cli.upscale {
+        refinement_settings.validate()?;
+    }
     let loras = lora_options(&cli)?;
     if cli.preset.turbo().is_some() && loras.iter().any(|l| l.strength != 0.0) {
         usage!("custom LoRAs cannot be combined with Turbo presets");
@@ -693,8 +736,12 @@ fn run(mut cli: Cli) -> Result<()> {
         None
     };
 
-    let shape = Session::shape_for(params.height, params.width, params.frames)
+    let mut shape = Session::shape_for(params.height, params.width, params.frames)
         .ok_or_else(|| UsageError("no such shape".into()))?;
+
+    if cli.upscale {
+        upscale_settings.output_shape(&shape)?;
+    }
 
     // inputs first: they are cheap and they fail fast. The keyframe fills the canvas; references are
     // scaled to at most the canvas' pixel count on a 32-pixel grid.
@@ -871,6 +918,7 @@ fn run(mut cli: Cli) -> Result<()> {
         .unwrap_or_default();
     let loom_library = std::env::var_os("HRX_LOOM_LIBRARY").map(std::path::PathBuf::from);
     let config = Config {
+        latent_upscaler: cli.upscale_model.clone(),
         base_weights: cli.base_weights,
         dit: if cli.preset.turbo().is_some() {
             None
@@ -1012,7 +1060,7 @@ fn run(mut cli: Cli) -> Result<()> {
         let _ = std::io::Write::flush(&mut std::io::stderr());
         h3_hrx::Control::Continue
     };
-    let latents = if let Some(world) = &world {
+    let mut latents = if let Some(world) = &world {
         session.denoise_world(
             presentation.as_ref().expect("world presentation"),
             world,
@@ -1054,6 +1102,50 @@ fn run(mut cli: Cli) -> Result<()> {
             cli.out.with_extension("world.json"),
             serde_json::to_vec_pretty(&metadata)?,
         )?;
+    }
+    if cli.upscale {
+        eprintln!("upscaling video latents");
+        let upscaled =
+            session.upscale_latents(&latents, &shape, &upscale_settings, Some(&mut show))?;
+        eprintln!();
+        shape = upscaled.shape;
+        (params.width, params.height) = shape.size();
+        let mut target_latents = Vec::new();
+        for path in [&cli.first_frame, &cli.last_frame].into_iter().flatten() {
+            let (pixels, w, h) = media::decode_image(path)?;
+            let pixels = resize::pil_bilinear(&pixels, w, h, params.width, params.height);
+            target_latents.push(
+                session
+                    .encode_video(Clip {
+                        pixels: &pixels,
+                        frames: 1,
+                        height: params.height as usize,
+                        width: params.width as usize,
+                    })?
+                    .0,
+            );
+        }
+        // Keep the original presentation pixels and spans; only keyframe latent grids change.
+        let target_keyframes = keyframes
+            .iter()
+            .zip(&target_latents)
+            .map(|(kf, z)| Keyframe { latents: z, ..*kf })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "refining {}x{} with {} steps (audio fixed)",
+            params.width, params.height, refinement_settings.steps
+        );
+        latents = session.refine(
+            &ids,
+            presentation.as_ref(),
+            &params,
+            &upscaled.latents,
+            &refinement_settings,
+            &refs,
+            &target_keyframes,
+            Some(&mut show),
+        )?;
+        eprintln!();
     }
     let (video, audio) = (latents.video, latents.audio);
     eprintln!("denoised in {:.1} s", t0.elapsed().as_secs_f64());
@@ -1453,5 +1545,36 @@ mod tests {
         assert!(dir_writable(&dir.join("clip.mp4")));
         assert!(dir_writable(Path::new("clip.mp4")));
         assert!(!dir_writable(&dir.join("missing-dir-for-h3-test/clip.mp4")));
+    }
+}
+
+#[cfg(test)]
+mod upscale_options {
+    use super::*;
+    #[test]
+    fn upscale_targets_are_exclusive_and_require_the_second_pass() {
+        assert!(Cli::try_parse_from(["h3", "--upscale-scale", "2"]).is_err());
+        assert!(Cli::try_parse_from(["h3", "--upscale", "--upscale-width", "128"]).is_err());
+        assert!(Cli::try_parse_from([
+            "h3",
+            "--upscale",
+            "--upscale-scale",
+            "2",
+            "--upscale-megapixels",
+            "1.2"
+        ])
+        .is_err());
+        let cli = Cli::try_parse_from([
+            "h3",
+            "--upscale",
+            "--upscale-width",
+            "128",
+            "--upscale-height",
+            "64",
+        ])
+        .unwrap();
+        assert_eq!(cli.upscale_steps, 4);
+        assert_eq!(cli.upscale_denoise, 0.4);
+        assert!(!cli.upscale_no_chunking);
     }
 }

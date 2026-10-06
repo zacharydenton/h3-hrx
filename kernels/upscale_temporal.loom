@@ -1,0 +1,73 @@
+amdgpu.target<gfx11-generic> @target {subgroup_size = 32}
+config.decl @h3.upscale_temporal.channels : %value: index where [range(%value, 64, 1024), mul(%value, 64)]
+config.decl @h3.upscale_temporal.plane : %value: index where [range(%value, 1, 1048576)]
+config.decl @h3.upscale_temporal.frames : %value: index where [range(%value, 1, 64)]
+config.decl @h3.upscale_temporal.taps : %value: index where [range(%value, 1, 31)]
+kernel.def target(@target) export("h3_upscale_temporal") @h3_upscale_temporal(%count: index) {
+  %one = index.constant 1 : index
+  %tile = index.constant 256 : index
+  %tail = index.constant 255 : index
+  %rounded = index.add %count, %tail : index
+  %groups = index.div %rounded, %tile : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%tile, %one, %one) : index
+} launch(%count: index, %x: buffer, %weight: buffer, %bias: buffer, %out: buffer) {
+  %channels = config.get @h3.upscale_temporal.channels : index
+  %plane = config.get @h3.upscale_temporal.plane : index
+  %frames = config.get @h3.upscale_temporal.frames : index
+  %taps = config.get @h3.upscale_temporal.taps : index
+  %z = index.constant 0 : index
+  %one = index.constant 1 : index
+  %two = index.constant 2 : index
+  %four = index.constant 4 : index
+  %tile = index.constant 256 : index
+  %offset = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %wg, %tile : index
+  %i = index.add %base, %lane : index
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %weight_global = buffer.assume.memory_space<global> %weight : buffer
+  %bias_global = buffer.assume.memory_space<global> %bias : buffer
+  %out_global = buffer.assume.memory_space<global> %out : buffer
+  %total_rows = index.mul %frames, %plane : index
+  %total = index.mul %total_rows, %channels : index
+  %active = index.cmp ult, %i, %total : index
+  scf.if %active {
+    %rows = index.mul %frames, %plane : index
+    %xv = buffer.view %x_global[%offset] : buffer -> view<[%rows]x[%channels]xf16>
+    %ov = buffer.view %out_global[%offset] : buffer -> view<[%rows]x[%channels]xf16>
+    %wv = buffer.view %weight_global[%offset] : buffer -> view<[%channels]x[%taps]xf16>
+    %bv = buffer.view %bias_global[%offset] : buffer -> view<[%channels]xf32>
+    %c = index.rem %i, %channels : index
+    %row0 = index.div %i, %channels : index
+    %row = index.assume %row0 [lt(%row0, %rows)] : index
+    %t = index.div %row, %plane : index
+    %p = index.rem %row, %plane : index
+    %pad = index.div %taps, %two : index
+    %end = index.add %frames, %pad : index
+    %biasv = view.load %bv[%c] : view<[%channels]xf32> -> f32
+    %value = scf.for %k = [%z to %taps step %one](%sum = %biasv : f32) -> (f32) {
+      %tp = index.add %t, %k : index
+      %lo = index.cmp uge, %tp, %pad : index
+      %hi = index.cmp ult, %tp, %end : index
+      %ok = scalar.andi %lo, %hi : i1
+      %next = scf.if %ok -> (f32) {
+        %ti = index.sub %tp, %pad : index
+        %rb = index.mul %ti, %plane : index
+        %r0 = index.add %rb, %p : index
+        %r = index.assume %r0 [lt(%r0, %rows)] : index
+        %v16 = view.load %xv[%r, %c] : view<[%rows]x[%channels]xf16> -> f16
+        %w16 = view.load %wv[%c, %k] : view<[%channels]x[%taps]xf16> -> f16
+        %v = scalar.extf %v16 : f16 to f32
+        %w = scalar.extf %w16 : f16 to f32
+        %acc = scalar.fmaf %v, %w, %sum : f32
+        scf.yield %acc : f32
+      } else { scf.yield %sum : f32 }
+      scf.yield %next : f32
+    }
+    %half = scalar.fptrunc %value : f32 to f16
+    view.store %half, %ov[%row, %c] : f16, view<[%rows]x[%channels]xf16>
+  }
+  kernel.return
+}

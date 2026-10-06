@@ -1,0 +1,65 @@
+amdgpu.target<gfx11-generic> @target {subgroup_size = 32}
+config.decl @h3.upscale_resize.channels : %value: index where [range(%value, 64, 1024), mul(%value, 64)]
+config.decl @h3.upscale_resize.in_plane : %value: index where [range(%value, 1, 1048576)]
+config.decl @h3.upscale_resize.out_plane : %value: index where [range(%value, 1, 1048576)]
+config.decl @h3.upscale_resize.frames : %value: index where [range(%value, 1, 64)]
+kernel.def target(@target) export("h3_upscale_resize") @h3_upscale_resize(%count: index) {
+  %one = index.constant 1 : index
+  %tile = index.constant 256 : index
+  %tail = index.constant 255 : index
+  %rounded = index.add %count, %tail : index
+  %groups = index.div %rounded, %tile : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%tile, %one, %one) : index
+} launch(%count: index, %x: buffer, %indices: buffer, %weights: buffer, %out: buffer) {
+  %channels = config.get @h3.upscale_resize.channels : index
+  %in_plane = config.get @h3.upscale_resize.in_plane : index
+  %out_plane = config.get @h3.upscale_resize.out_plane : index
+  %frames = config.get @h3.upscale_resize.frames : index
+  %z = index.constant 0 : index
+  %one = index.constant 1 : index
+  %two = index.constant 2 : index
+  %four = index.constant 4 : index
+  %tile = index.constant 256 : index
+  %offset = index.constant 0 : offset
+  %zero = scalar.constant 0.0 : f32
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %wg, %tile : index
+  %i = index.add %base, %lane : index
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %indices_global = buffer.assume.memory_space<global> %indices : buffer
+  %weights_global = buffer.assume.memory_space<global> %weights : buffer
+  %out_global = buffer.assume.memory_space<global> %out : buffer
+  %total_rows = index.mul %frames, %out_plane : index
+  %total = index.mul %total_rows, %channels : index
+  %active = index.cmp ult, %i, %total : index
+  scf.if %active {
+    %in_rows = index.mul %frames, %in_plane : index
+    %out_rows = index.mul %frames, %out_plane : index
+    %xv = buffer.view %x_global[%offset] : buffer -> view<[%in_rows]x[%channels]xf16>
+    %ov = buffer.view %out_global[%offset] : buffer -> view<[%out_rows]x[%channels]xf16>
+    %ixv = buffer.view %indices_global[%offset] : buffer -> view<[%out_plane]x4xi32>
+    %wv = buffer.view %weights_global[%offset] : buffer -> view<[%out_plane]x4xf32>
+    %c = index.rem %i, %channels : index
+    %row0 = index.div %i, %channels : index
+    %row = index.assume %row0 [lt(%row0, %out_rows)] : index
+    %t = index.div %row, %out_plane : index
+    %p = index.rem %row, %out_plane : index
+    %in_base = index.mul %t, %in_plane : index
+    %value = scf.for %k = [%z to %four step %one](%sum = %zero : f32) -> (f32) {
+      %ix32 = view.load %ixv[%p, %k] : view<[%out_plane]x4xi32> -> i32
+      %ix0 = index.cast %ix32 : i32 to index
+      %ix = index.assume %ix0 [range(%ix0, 0, 1048575), lt(%ix0, %in_plane)] : index
+      %r0 = index.add %in_base, %ix : index
+      %r = index.assume %r0 [lt(%r0, %in_rows)] : index
+      %v16 = view.load %xv[%r, %c] : view<[%in_rows]x[%channels]xf16> -> f16
+      %v = scalar.extf %v16 : f16 to f32
+      %weight = view.load %wv[%p, %k] : view<[%out_plane]x4xf32> -> f32
+      %next = scalar.fmaf %v, %weight, %sum : f32
+      scf.yield %next : f32
+    }
+    %half = scalar.fptrunc %value : f32 to f16
+    view.store %half, %ov[%row, %c] : f16, view<[%out_rows]x[%channels]xf16>
+  }
+  kernel.return
+}

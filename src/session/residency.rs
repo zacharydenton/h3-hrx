@@ -50,6 +50,7 @@ impl<T: Send + 'static> Drop for Unit<T> {
 }
 
 pub(super) struct Units {
+    pub upscaler: Unit<crate::upscale::Upscaler>,
     pub dit: Unit<super::LoadedDit>,
     pub te: Unit<crate::te::TextEncoder>,
     pub video: Unit<crate::vvae::VideoVae>,
@@ -61,6 +62,7 @@ impl Units {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         Self {
+            upscaler: Unit::new(manager, id, "upscaler"),
             dit: Unit::new(manager, id, "dit"),
             te: Unit::new(manager, id, "text"),
             video: Unit::new(manager, id, "video"),

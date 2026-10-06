@@ -3819,3 +3819,189 @@ fn f32_dispatch_rejects_half_sized_activation_bindings() {
         )
         .is_err());
 }
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
+fn upscale_convolution_uses_symmetric_zero_padding() {
+    let mut harness = Harness::new();
+    let (t, h, w, ci, co) = (3usize, 4usize, 4usize, 24usize, 64usize);
+    let k = (27 * ci).div_ceil(32) * 32;
+    let rows = t * h * w;
+    let x = values(rows * ci, 0.3)
+        .into_iter()
+        .map(f16::from_f32)
+        .collect::<Vec<_>>();
+    let weights = values(co * k, 0.2)
+        .into_iter()
+        .map(f16::from_f32)
+        .collect::<Vec<_>>();
+    let bias = values(co, 0.1);
+    let mut want = vec![0f64; rows * co];
+    for z in 0..t {
+        for y in 0..h {
+            for xx in 0..w {
+                for o in 0..co {
+                    let mut sum = bias[o] as f64;
+                    for dz in 0..3 {
+                        for dy in 0..3 {
+                            for dx in 0..3 {
+                                let (iz, iy, ix) = (
+                                    z as isize + dz as isize - 1,
+                                    y as isize + dy as isize - 1,
+                                    xx as isize + dx as isize - 1,
+                                );
+                                if iz < 0
+                                    || iy < 0
+                                    || ix < 0
+                                    || iz >= t as isize
+                                    || iy >= h as isize
+                                    || ix >= w as isize
+                                {
+                                    continue;
+                                }
+                                for c in 0..ci {
+                                    sum += x[((iz as usize * h + iy as usize) * w + ix as usize)
+                                        * ci
+                                        + c]
+                                        .to_f64()
+                                        * weights[o * k + ((dz * 3 + dy) * 3 + dx) * ci + c]
+                                            .to_f64();
+                                }
+                            }
+                        }
+                    }
+                    want[((z * h + y) * w + xx) * co + o] = sum;
+                }
+            }
+        }
+    }
+    let config = cfg(&[
+        ("frames", t),
+        ("height", h),
+        ("width", w),
+        ("stride", 1),
+        ("tstride", 1),
+        ("taps_t", 3),
+        ("cin_pad", ci),
+        ("cin_stride", ci),
+        ("rows_bound", rows.div_ceil(64) * 64),
+        ("k_size", k),
+        ("n_size", co),
+    ]);
+    let out = harness.run_module(
+        "conv3d_f16_family",
+        "upscale_conv3d",
+        &config,
+        [1, rows.div_ceil(64) as u32, 1],
+        256,
+        &[rows as u64],
+        &[
+            bytes(&x),
+            bytes(&weights),
+            bytes(&bias),
+            bytes(&vec![f16::from_f32(123.0); rows * co + 64]),
+        ],
+    );
+    let got = halves(&out[3], false);
+    close(&got[..rows * co], &want, 0.002, 0.003);
+    assert!(got[rows * co..].iter().all(|v| *v == 123.0));
+}
+
+#[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires provisioned HRX")]
+fn upscale_groupnorm_centered_variance_handles_large_offsets() {
+    let mut harness = Harness::new();
+    let (rows, channels) = (128usize, 64usize);
+    for offset in [0.0, 10000.0] {
+        let input = (0..rows * channels)
+            .map(|i| f16::from_f32(offset + ((i * 7) % 19) as f32 * 8.0))
+            .collect::<Vec<_>>();
+        let config = cfg(&[
+            ("channels", channels),
+            ("groups", 32),
+            ("plane", rows),
+            ("rows_bound", rows),
+        ]);
+        let stats = harness.run(
+            "upscale_gn_stats",
+            &config,
+            [1, 32, 1],
+            32,
+            &[1],
+            &[bytes(&input), bytes(&vec![0.0f32; 64])],
+        );
+        let got = stats[1]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        for g in 0..32 {
+            let data = (0..rows)
+                .flat_map(|r| {
+                    [
+                        input[r * channels + g * 2].to_f64(),
+                        input[r * channels + g * 2 + 1].to_f64(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let mean = data.iter().sum::<f64>() / data.len() as f64;
+            let variance = data.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / data.len() as f64;
+            assert!((got[g * 2] as f64 - mean).abs() < 0.01);
+            assert!((got[g * 2 + 1] as f64 - variance).abs() < 0.01);
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires provisioned HRX")]
+fn upscale_temporal_depthwise_keeps_channels_separate() {
+    let mut harness = Harness::new();
+    let (frames, plane, channels, taps) = (3usize, 4usize, 64usize, 5usize);
+    let count = frames * plane * channels;
+    let input = values(count, 0.2)
+        .into_iter()
+        .map(f16::from_f32)
+        .collect::<Vec<_>>();
+    let weight = values(channels * taps, 0.3)
+        .into_iter()
+        .map(f16::from_f32)
+        .collect::<Vec<_>>();
+    let bias = values(channels, 0.1);
+    let mut want = vec![0f64; count];
+    for t in 0..frames {
+        for p in 0..plane {
+            for c in 0..channels {
+                let mut sum = bias[c] as f64;
+                for k in 0..taps {
+                    let ti = t as isize + k as isize - (taps / 2) as isize;
+                    if ti >= 0 && ti < frames as isize {
+                        sum += input[(ti as usize * plane + p) * channels + c].to_f64()
+                            * weight[c * taps + k].to_f64();
+                    }
+                }
+                want[(t * plane + p) * channels + c] = sum;
+            }
+        }
+    }
+    let out = harness.run(
+        "upscale_temporal",
+        &cfg(&[
+            ("frames", frames),
+            ("plane", plane),
+            ("channels", channels),
+            ("taps", taps),
+        ]),
+        [count.div_ceil(256) as u32, 1, 1],
+        256,
+        &[count as u64],
+        &[
+            bytes(&input),
+            bytes(&weight),
+            bytes(&bias),
+            bytes(&vec![f16::ZERO; count]),
+        ],
+    );
+    close(&halves(&out[3], false), &want, 0.001, 0.002);
+}

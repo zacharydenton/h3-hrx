@@ -1017,7 +1017,37 @@ impl Conv3d {
         k_size: usize,
         cout_pad: usize,
     ) -> Result<Self> {
-        let stem = if add {
+        Self::build_padding(
+            c, stream, add, frames, h, w, stride, tstride, taps_t, cin_pad, cin_stride, k_size,
+            cout_pad, false,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_padding(
+        c: &Compiler,
+        stream: &mut hrx::Stream,
+        add: bool,
+        frames: usize,
+        h: usize,
+        w: usize,
+        stride: usize,
+        tstride: usize,
+        taps_t: usize,
+        cin_pad: usize,
+        cin_stride: usize,
+        k_size: usize,
+        cout_pad: usize,
+        symmetric: bool,
+    ) -> Result<Self> {
+        if symmetric && (add || stride != 1 || tstride != 1 || taps_t != 3) {
+            return Err(crate::compile::Error::Io(
+                "symmetric conv3d requires stride one, three temporal taps and a separate residual"
+                    .into(),
+            ));
+        }
+        let stem = if symmetric {
+            "upscale_conv3d"
+        } else if add {
             "conv3d_f16_wmma_add"
         } else {
             "conv3d_f16_wmma"

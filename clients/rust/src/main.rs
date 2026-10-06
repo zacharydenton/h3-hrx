@@ -1,5 +1,5 @@
 //! Generate video frames and audio through the h3-hrx library.
-//! Run with `cargo run -p h3-hrx-example --release -- "prompt" [frames] [steps] [out]`.
+//! Run with `cargo run -p h3-hrx-example --release -- "prompt" [frames] [steps] [out] [upscale-factor] [refmod]`.
 use h3_hrx::{Config, Control, DenoiseParams, Noise, Session, Tokenizer};
 use std::io::Write;
 
@@ -26,14 +26,14 @@ fn main() {
         .expect("session")
     };
 
-    let p = DenoiseParams {
+    let mut p = DenoiseParams {
         height: 480,
         width: 864,
         frames: args.get(2).map_or(124, |v| v.parse().unwrap()),
         steps: args.get(3).map_or(31, |v| v.parse().unwrap()),
         ..DenoiseParams::default()
     };
-    let sh = Session::shape_for(p.height, p.width, p.frames).expect("invalid parameters");
+    let mut sh = Session::shape_for(p.height, p.width, p.frames).expect("invalid parameters");
     eprintln!(
         "{} frames, {}x{}x{} latents, {} audio latents, {} prompt tokens",
         sh.frames,
@@ -44,13 +44,47 @@ fn main() {
         ids.len()
     );
 
+    let prepared = args.get(6).map(|path| {
+        h3_hrx::refmod::RefMod::load(path)
+            .expect("RefMod")
+            .prepare(Default::default())
+            .expect("RefMod strengths")
+    });
+    let refs = prepared
+        .as_ref()
+        .map(|r| r.references())
+        .unwrap_or_default();
     let mut show = |step: usize, steps: usize, seconds: f64| {
         eprintln!("  step {step}/{steps}  {seconds:.1} s");
         Control::Continue
     };
-    let latents = session
-        .denoise(&ids, &p, Noise::default(), &[], &[], Some(&mut show))
+    let mut latents = session
+        .denoise(&ids, &p, Noise::default(), &refs, &[], Some(&mut show))
         .expect("denoise");
+
+    if let Some(scale) = args.get(5) {
+        let settings = h3_hrx::UpscaleSettings {
+            target: h3_hrx::UpscaleTarget::Scale(scale.parse().expect("upscale factor")),
+            ..Default::default()
+        };
+        let out = session
+            .upscale_latents(&latents, &sh, &settings, Some(&mut show))
+            .expect("upscale");
+        sh = out.shape;
+        (p.width, p.height) = sh.size();
+        latents = session
+            .refine(
+                &ids,
+                None,
+                &p,
+                &out.latents,
+                &h3_hrx::RefinementSettings::default(),
+                &refs,
+                &[],
+                Some(&mut show),
+            )
+            .expect("refine");
+    }
 
     let mut frames = vec![0u8; sh.frames as usize * p.height as usize * p.width as usize * 3];
     session

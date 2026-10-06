@@ -7,6 +7,7 @@
 use crate::model::*;
 
 pub(crate) mod device;
+pub(crate) mod er_sde;
 
 /// The reference the resident sampler is checked against; nothing dispatches it.
 #[cfg(test)]

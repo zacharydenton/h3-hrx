@@ -77,7 +77,7 @@ recorded dispatch and DiT execution, including submission and completion waits.
 ## Session ownership
 
 HRX's `NativeSession` handles compute-lane admission, completion fencing and
-quarantine after uncertain completion. H3's four lazy model units share a memory
+quarantine after uncertain completion. H3's lazy model units share a memory
 budget and residency manager. See [session lifecycle](runtime-options.md) for
 cancellation, eviction and callback constraints.
 

@@ -24,3 +24,27 @@ Rustler is optional and confined to this adapter; neither model nor HRX requires
 BEAM at build or run time.
 The resource and scheduler choices follow the [Rustler resource documentation](https://docs.rs/rustler/0.38.0/rustler/struct.ResourceArc.html)
 and [NIF scheduling documentation](https://docs.rs/rustler/0.38.0/rustler/attr.nif.html).
+
+`generate/4` queues generation, learned upscaling and ER-SDE refinement:
+
+```elixir
+:ok = H3.Native.generate(model, %{
+  prompt: "A red fox walks through snow.", width: 64, height: 64,
+  frames: 5, steps: 4, seed: 7, references: [], refmods: [],
+  upscale_width: 128, upscale_height: 128, upscale_steps: 4,
+  upscale_denoise: 0.4, upscale_seed: nil
+}, 43)
+```
+
+Reference entries are `{:image, latents, latent_height, latent_width}`,
+`{:audio, latents, audio_frames}` or
+`{:video, latents, latent_frames, latent_height, latent_width}`. Float lists use
+the native Session layouts. RefMod entries are
+`{path, visual_strength, audio_strength, copies}`. They use latent-only
+presentation; the same prepared conditioning reaches both passes.
+
+Generation returns `{:h3_result, id, {:ok, {width, height, frames, video, audio}}}`.
+Video and audio are little-endian float32 binaries of normalized latents; audio
+is unchanged by the second pass. Decode using the native Session API in an
+application adapter. Models resolve through the Hub cache. The worker uses
+stage-scoped residency and keeps the existing bounded queue.

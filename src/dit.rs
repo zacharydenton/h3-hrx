@@ -834,6 +834,7 @@ impl Dit {
             kfs,
             progress,
             crate::cache::CachePolicy::Off,
+            None,
         )
     }
 
@@ -985,6 +986,7 @@ impl Dit {
         kfs: &[Keyframe<'_>],
         mut progress: Option<&mut dyn FnMut(usize, usize, f64) -> Control>,
         cache_policy: crate::cache::CachePolicy,
+        refinement: Option<(&Latents, &crate::RefinementSettings)>,
     ) -> Result<Latents> {
         self.check_stream(stream)?;
         let sh = crate::layout::shape_for(p.height, p.width, p.frames)
@@ -1031,7 +1033,7 @@ impl Dit {
             sh.lat_w as usize,
             sh.audio_t as usize,
         );
-        let res = p.sampler == Sampler::ResMultistep;
+        let res = refinement.is_some() || p.sampler == Sampler::ResMultistep;
         let (shift_v, shift_a) = (
             if p.video_shift > 0.0 {
                 p.video_shift
@@ -1061,6 +1063,48 @@ impl Dit {
             Some(z) => crate::sampler::audio_tensor_to_rows(z, &mut arows, a),
             None => rng.fill(&mut arows),
         }
+        let mut sv = match refinement {
+            Some((_, settings)) => settings.schedule()?,
+            None => crate::layout::Schedule::new(p.steps, shift_v),
+        };
+        if refinement.is_some() && sv.sigmas[0] >= 1.0 {
+            let base = 1.0 - 1e-4;
+            sv.sigmas[0] = ((shift_v * base / (1.0 + (shift_v - 1.0) * base)) as f32)
+                .min(f32::from_bits(1.0f32.to_bits() - 1));
+            sv.timesteps[0] = 1.0 - sv.sigmas[0];
+        }
+        let _refinement_host_reservation = if refinement.is_some() {
+            // Evolving rows, clean estimates, solver history and head readback coexist.
+            stream
+                .memory_budget()
+                .map(|budget| {
+                    budget.reserve(
+                        (nv * VIDEO_PATCH * 10 + na * AUDIO_CH * 7 + generated * FINAL_N) * 4,
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let mut sa = if refinement.is_some() {
+            crate::layout::Schedule {
+                sigmas: vec![0.0; sv.sigmas.len()],
+                timesteps: vec![1.0; sv.timesteps.len()],
+            }
+        } else {
+            crate::layout::Schedule::new(p.steps, shift_a)
+        };
+        if let Some((initial, _)) = refinement {
+            let mut clean = vec![0.0; vrows.len()];
+            crate::sampler::tensor_to_rows(&initial.video, &mut clean, t_len, h, w);
+            let sigma = sv.sigmas[0];
+            for (x, z) in vrows.iter_mut().zip(clean) {
+                *x = sigma * *x + (1.0 - sigma) * z;
+            }
+            crate::sampler::audio_tensor_to_rows(&initial.audio, &mut arows, a);
+        }
+        let mut er = refinement
+            .map(|_| crate::sampler::er_sde::ErSde::new(vrows.len(), p.seed.wrapping_add(1)));
         // carry = sigma_a / sigma_v is one at sigma_v = 1, so the carried variable starts as the noise
         let mut yrows = if res { arows.clone() } else { Vec::new() };
         // Multistep reuses all host workspaces; Euler keeps its evolving latents on GPU.
@@ -1080,8 +1124,6 @@ impl Dit {
                 .upload(stream, &arows, &vrows)?;
         }
 
-        let mut sv = crate::layout::Schedule::new(p.steps, shift_v);
-        let mut sa = crate::layout::Schedule::new(p.steps, shift_a);
         crate::trace::event("schedule", || {
             use crate::cache::CachePolicy;
             let (mode, thresholds) = match cache_policy {
@@ -1095,8 +1137,8 @@ impl Dit {
                 }
             };
             format!(
-                ",\"evaluations\":{},\"video_sigmas\":{:?},\"audio_sigmas\":{:?},\"seed\":{},\"sampler\":\"{:?}\",\"cache_mode\":\"{mode}\",\"cache_thresholds\":{:?}",
-                sv.timesteps.len(), sv.sigmas, sa.sigmas, p.seed, p.sampler, thresholds,
+                ",\"evaluations\":{},\"video_sigmas\":{:?},\"audio_sigmas\":{:?},\"seed\":{},\"sampler\":\"{}\",\"cache_mode\":\"{mode}\",\"cache_thresholds\":{:?}",
+                sv.timesteps.len(), sv.sigmas, sa.sigmas, p.seed, if refinement.is_some() { "ErSde" } else { match p.sampler {Sampler::Euler=>"Euler",Sampler::ResMultistep=>"ResMultistep"} }, thresholds,
             )
         });
         if sv.timesteps.len() != sa.timesteps.len() {
@@ -1129,7 +1171,7 @@ impl Dit {
             self.build_mods(stream, (&tv, &ta, &tcv, &tca))?;
 
             // audio rows then video rows, each through its f32 patch projection
-            if res {
+            if res && refinement.is_none() {
                 let carry = sa.sigmas[step] / sv.sigmas[step];
                 for (x, y) in arows.iter_mut().zip(&yrows) {
                     *x = y * carry;
@@ -1236,15 +1278,19 @@ impl Dit {
                 }
                 let (sg_v, sg_a) = (sv.sigmas[step], sa.sigmas[step]);
                 crate::sampler::denoised_video_into(&vrows, &vout, sg_v, &mut den_v);
-                crate::sampler::denoised_audio_into(
-                    &yrows, &arows, &aout, sg_v, sg_a, ascale, &mut den_a,
-                );
-                let previous_v = (step > 0).then_some(old_v.as_slice());
-                let previous_a = (step > 0).then_some(old_a.as_slice());
-                crate::sampler::advance(&mut vrows, &den_v, previous_v, &sv.sigmas, step);
-                crate::sampler::advance(&mut yrows, &den_a, previous_a, &sv.sigmas, step);
-                std::mem::swap(&mut old_v, &mut den_v);
-                std::mem::swap(&mut old_a, &mut den_a);
+                if let Some(er) = &mut er {
+                    er.advance(&mut vrows, &den_v, &sv.sigmas, step);
+                } else {
+                    crate::sampler::denoised_audio_into(
+                        &yrows, &arows, &aout, sg_v, sg_a, ascale, &mut den_a,
+                    );
+                    let previous_v = (step > 0).then_some(old_v.as_slice());
+                    let previous_a = (step > 0).then_some(old_a.as_slice());
+                    crate::sampler::advance(&mut vrows, &den_v, previous_v, &sv.sigmas, step);
+                    crate::sampler::advance(&mut yrows, &den_a, previous_a, &sv.sigmas, step);
+                    std::mem::swap(&mut old_v, &mut den_v);
+                    std::mem::swap(&mut old_a, &mut den_a);
+                }
             }
             if let Some(cb) = progress.as_deref_mut() {
                 // Progress reports completed steps, even when Euler stays on the GPU.
@@ -1292,6 +1338,9 @@ impl Dit {
             a,
             res.then_some(ascale),
         );
+        if let Some((initial, _)) = refinement {
+            audio.copy_from_slice(&initial.audio);
+        }
         crate::error::finite_output("denoise", "video latents", &video)?;
         crate::error::finite_output("denoise", "audio latents", &audio)?;
         Ok(Latents { video, audio })

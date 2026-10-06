@@ -1,8 +1,8 @@
 // Shared bodies; exported wrappers retain the original launch and configuration contracts.
 
-template.decl @h3.shared_conv3d_f16_wmma_add(%m_size: index, %a: buffer, %w: buffer, %bias: buffer, %c: buffer, %residual: buffer, %cfg_frames: index, %cfg_height: index, %cfg_width: index, %cfg_stride: index, %cfg_tstride: index, %cfg_taps_t: index, %cfg_cin_pad: index, %cfg_cin_stride: index, %cfg_rows_bound: index, %cfg_k_size: index, %cfg_n_size: index, %add_residual: i1)
+template.decl @h3.shared_conv3d_f16_wmma_add(%m_size: index, %a: buffer, %w: buffer, %bias: buffer, %c: buffer, %residual: buffer, %cfg_frames: index, %cfg_height: index, %cfg_width: index, %cfg_stride: index, %cfg_tstride: index, %cfg_taps_t: index, %cfg_cin_pad: index, %cfg_cin_stride: index, %cfg_rows_bound: index, %cfg_k_size: index, %cfg_n_size: index, %add_residual: i1, %symmetric: i1)
 
-template.def<@h3.shared_conv3d_f16_wmma_add> @h3_body_conv3d_f16_wmma_add(%m_size: index, %a: buffer, %w: buffer, %bias: buffer, %c: buffer, %residual: buffer, %cfg_frames: index, %cfg_height: index, %cfg_width: index, %cfg_stride: index, %cfg_tstride: index, %cfg_taps_t: index, %cfg_cin_pad: index, %cfg_cin_stride: index, %cfg_rows_bound: index, %cfg_k_size: index, %cfg_n_size: index, %add_residual: i1) {
+template.def<@h3.shared_conv3d_f16_wmma_add> @h3_body_conv3d_f16_wmma_add(%m_size: index, %a: buffer, %w: buffer, %bias: buffer, %c: buffer, %residual: buffer, %cfg_frames: index, %cfg_height: index, %cfg_width: index, %cfg_stride: index, %cfg_tstride: index, %cfg_taps_t: index, %cfg_cin_pad: index, %cfg_cin_stride: index, %cfg_rows_bound: index, %cfg_k_size: index, %cfg_n_size: index, %add_residual: i1, %symmetric: i1) {
   %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 32, 32768), mul(%cfg_k_size, 32)] : index
   %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 64, 8192), mul(%cfg_n_size, 64)] : index
 
@@ -128,9 +128,12 @@ template.def<@h3.shared_conv3d_f16_wmma_add> @h3_body_conv3d_f16_wmma_add(%m_siz
     %dy_first = index.div %rem9_first, %c3 : index
     %dx_first = index.rem %rem9_first, %c3 : index
     %dt_first = scf.select %is_2d, %c2, %dt_full_first : index
-    // time: ti = tb + dt - 2, inside iff tb + dt >= 2
+    %pad_t_first = scf.select %symmetric, %c1, %c2 : index
     %tplus_first = index.add %tb_first, %dt_first : index
-    %t_ok_first = index.cmp uge, %tplus_first, %c2 : index
+    %tlo_first = index.cmp uge, %tplus_first, %pad_t_first : index
+    %tend_first = index.add %cfg_frames, %pad_t_first : index
+    %thi_first = index.cmp ult, %tplus_first, %tend_first : index
+    %tok_first = scalar.andi %tlo_first, %thi_first : i1
     // space, stride 1: y0 = yo + dy in [0, H + 1] -> reflect(y0 - 1); stride 2: y0 = 2*yo + dy in [0, H] -> H maps to H - 2
     %y0_first = index.add %ys_first, %dy_first : index
     %x0_first = index.add %xs_first, %dx_first : index
@@ -163,8 +166,17 @@ template.def<@h3.shared_conv3d_f16_wmma_add> @h3_body_conv3d_f16_wmma_add(%m_siz
     %xi_s2_first = scf.select %x_isW, %wm2_first, %x0_first : index
     %yi0_first = scf.select %is_s2, %yi_s2_first, %yi_s1_first : index
     %xi0_first = scf.select %is_s2, %xi_s2_first, %xi_s1_first : index
+    %ylo_first = index.cmp uge, %y0_first, %c1 : index
+    %xlo_first = index.cmp uge, %x0_first, %c1 : index
+    %yhi_first = index.cmp ule, %y0_first, %cfg_height : index
+    %xhi_first = index.cmp ule, %x0_first, %cfg_width : index
+    %yok_first = scalar.andi %ylo_first, %yhi_first : i1
+    %xok_first = scalar.andi %xlo_first, %xhi_first : i1
+    %xyok_first = scalar.andi %yok_first, %xok_first : i1
+    %allok_first = scalar.andi %tok_first, %xyok_first : i1
+    %t_ok_first = scf.select %symmetric, %allok_first, %tok_first : i1
     %loaded_first = scf.if %t_ok_first -> (vector<8xf16>) {
-      %ti0_first = index.sub %tplus_first, %c2 : index
+      %ti0_first = index.sub %tplus_first, %pad_t_first : index
       %ti_first = index.assume %ti0_first [lt(%ti0_first, %cfg_frames)] : index
       %yi_first = index.assume %yi0_first [lt(%yi0_first, %cfg_height)] : index
       %xi_first = index.assume %xi0_first [lt(%xi0_first, %cfg_width)] : index
@@ -217,9 +229,12 @@ template.def<@h3.shared_conv3d_f16_wmma_add> @h3_body_conv3d_f16_wmma_add(%m_siz
       %dy_next = index.div %rem9_next, %c3 : index
       %dx_next = index.rem %rem9_next, %c3 : index
       %dt_next = scf.select %is_2d, %c2, %dt_full_next : index
-      // time: ti = tb + dt - 2, inside iff tb + dt >= 2
+      %pad_t_next = scf.select %symmetric, %c1, %c2 : index
       %tplus_next = index.add %tb_next, %dt_next : index
-      %t_ok_next = index.cmp uge, %tplus_next, %c2 : index
+      %tlo_next = index.cmp uge, %tplus_next, %pad_t_next : index
+      %tend_next = index.add %cfg_frames, %pad_t_next : index
+      %thi_next = index.cmp ult, %tplus_next, %tend_next : index
+      %tok_next = scalar.andi %tlo_next, %thi_next : i1
       // space, stride 1: y0 = yo + dy in [0, H + 1] -> reflect(y0 - 1); stride 2: y0 = 2*yo + dy in [0, H] -> H maps to H - 2
       %y0_next = index.add %ys_next, %dy_next : index
       %x0_next = index.add %xs_next, %dx_next : index
@@ -252,8 +267,17 @@ template.def<@h3.shared_conv3d_f16_wmma_add> @h3_body_conv3d_f16_wmma_add(%m_siz
       %xi_s2_next = scf.select %x_isW, %wm2_next, %x0_next : index
       %yi0_next = scf.select %is_s2, %yi_s2_next, %yi_s1_next : index
       %xi0_next = scf.select %is_s2, %xi_s2_next, %xi_s1_next : index
-      %loaded_next = scf.if %t_ok_next -> (vector<8xf16>) {
-        %ti0_next = index.sub %tplus_next, %c2 : index
+        %ylo_next = index.cmp uge, %y0_next, %c1 : index
+      %xlo_next = index.cmp uge, %x0_next, %c1 : index
+      %yhi_next = index.cmp ule, %y0_next, %cfg_height : index
+      %xhi_next = index.cmp ule, %x0_next, %cfg_width : index
+      %yok_next = scalar.andi %ylo_next, %yhi_next : i1
+      %xok_next = scalar.andi %xlo_next, %xhi_next : i1
+      %xyok_next = scalar.andi %yok_next, %xok_next : i1
+      %allok_next = scalar.andi %tok_next, %xyok_next : i1
+      %t_ok_next = scf.select %symmetric, %allok_next, %tok_next : i1
+    %loaded_next = scf.if %t_ok_next -> (vector<8xf16>) {
+        %ti0_next = index.sub %tplus_next, %pad_t_next : index
         %ti_next = index.assume %ti0_next [lt(%ti0_next, %cfg_frames)] : index
         %yi_next = index.assume %yi0_next [lt(%yi0_next, %cfg_height)] : index
         %xi_next = index.assume %xi0_next [lt(%xi0_next, %cfg_width)] : index
@@ -388,7 +412,8 @@ kernel.def target(@h3_conv3d_f16_wmma_gfx11) export("h3_conv3d_f16_wmma") @h3_co
   %cfg_k_size = config.get @h3.conv3d_f16_wmma.k_size : index
   %cfg_n_size = config.get @h3.conv3d_f16_wmma.n_size : index
   %add_residual = scalar.constant false : i1
-  template.apply<@h3.shared_conv3d_f16_wmma_add>(%m_size, %a, %w, %bias, %c, %c, %cfg_frames, %cfg_height, %cfg_width, %cfg_stride, %cfg_tstride, %cfg_taps_t, %cfg_cin_pad, %cfg_cin_stride, %cfg_rows_bound, %cfg_k_size, %cfg_n_size, %add_residual) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, index, index, index, index, i1)
+  %symmetric = scalar.constant false : i1
+  template.apply<@h3.shared_conv3d_f16_wmma_add>(%m_size, %a, %w, %bias, %c, %c, %cfg_frames, %cfg_height, %cfg_width, %cfg_stride, %cfg_tstride, %cfg_taps_t, %cfg_cin_pad, %cfg_cin_stride, %cfg_rows_bound, %cfg_k_size, %cfg_n_size, %add_residual, %symmetric) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, index, index, index, index, i1, i1)
   kernel.return
 }
 
@@ -442,6 +467,62 @@ kernel.def target(@h3_conv3d_f16_wmma_add_gfx11) export("h3_conv3d_f16_wmma_add"
   %cfg_k_size = config.get @h3.conv3d_f16_wmma_add.k_size : index
   %cfg_n_size = config.get @h3.conv3d_f16_wmma_add.n_size : index
   %add_residual = scalar.constant true : i1
-  template.apply<@h3.shared_conv3d_f16_wmma_add>(%m_size, %a, %w, %bias, %c, %residual, %cfg_frames, %cfg_height, %cfg_width, %cfg_stride, %cfg_tstride, %cfg_taps_t, %cfg_cin_pad, %cfg_cin_stride, %cfg_rows_bound, %cfg_k_size, %cfg_n_size, %add_residual) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, index, index, index, index, i1)
+  %symmetric = scalar.constant false : i1
+  template.apply<@h3.shared_conv3d_f16_wmma_add>(%m_size, %a, %w, %bias, %c, %residual, %cfg_frames, %cfg_height, %cfg_width, %cfg_stride, %cfg_tstride, %cfg_taps_t, %cfg_cin_pad, %cfg_cin_stride, %cfg_rows_bound, %cfg_k_size, %cfg_n_size, %add_residual, %symmetric) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, index, index, index, index, i1, i1)
+  kernel.return
+}
+
+amdgpu.target<gfx11-generic> @h3_upscale_conv3d_gfx11 {subgroup_size = 32}
+
+// Input frames/height/width ([frames*H*W][Cin_stride] channels-last f16), the space and time strides, taps_t (3 = 3x3x3,
+// 1 = the last temporal tap only, for single frames), gather width and row stride. k_size is K_pad = 9*taps_t*Cin_pad
+// rounded to 32; the gather zero-fills the tail.
+config.decl @h3.upscale_conv3d.frames : %value: index where [range(%value, 1, 64)]
+
+config.decl @h3.upscale_conv3d.height : %value: index where [range(%value, 2, 4096), mul(%value, 2)]
+
+config.decl @h3.upscale_conv3d.width : %value: index where [range(%value, 2, 4096), mul(%value, 2)]
+
+config.decl @h3.upscale_conv3d.stride : %value: index where [range(%value, 1, 2)]
+
+config.decl @h3.upscale_conv3d.tstride : %value: index where [range(%value, 1, 2)]
+
+config.decl @h3.upscale_conv3d.taps_t : %value: index where [range(%value, 1, 3)]
+
+config.decl @h3.upscale_conv3d.cin_pad : %value: index where [range(%value, 8, 1024), mul(%value, 8)]
+
+config.decl @h3.upscale_conv3d.cin_stride : %value: index where [range(%value, 8, 1024), mul(%value, 8)]
+
+config.decl @h3.upscale_conv3d.rows_bound : %value: index where [range(%value, 64, 2097152), mul(%value, 64)]
+
+config.decl @h3.upscale_conv3d.k_size : %value: index where [range(%value, 32, 32768), mul(%value, 32)]
+
+config.decl @h3.upscale_conv3d.n_size : %value: index where [range(%value, 64, 8192), mul(%value, 64)]
+
+kernel.def target(@h3_upscale_conv3d_gfx11) export("h3_upscale_conv3d") @h3_upscale_conv3d(%m_size: index) {
+  %c1 = index.constant 1 : index
+  %c63 = index.constant 63 : index
+  %c64 = index.constant 64 : index
+  %c256 = index.constant 256 : index
+  %n_size0 = config.get @h3.upscale_conv3d.n_size : index
+  %m_rounded = index.add %m_size, %c63 : index
+  %m_tiles = index.div %m_rounded, %c64 : index
+  %n_tiles = index.div %n_size0, %c64 : index
+  kernel.launch.config workgroups(%n_tiles, %m_tiles, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%m_size: index, %a: buffer, %w: buffer, %bias: buffer, %c: buffer) {
+  %cfg_frames = config.get @h3.upscale_conv3d.frames : index
+  %cfg_height = config.get @h3.upscale_conv3d.height : index
+  %cfg_width = config.get @h3.upscale_conv3d.width : index
+  %cfg_stride = config.get @h3.upscale_conv3d.stride : index
+  %cfg_tstride = config.get @h3.upscale_conv3d.tstride : index
+  %cfg_taps_t = config.get @h3.upscale_conv3d.taps_t : index
+  %cfg_cin_pad = config.get @h3.upscale_conv3d.cin_pad : index
+  %cfg_cin_stride = config.get @h3.upscale_conv3d.cin_stride : index
+  %cfg_rows_bound = config.get @h3.upscale_conv3d.rows_bound : index
+  %cfg_k_size = config.get @h3.upscale_conv3d.k_size : index
+  %cfg_n_size = config.get @h3.upscale_conv3d.n_size : index
+  %add_residual = scalar.constant false : i1
+  %symmetric = scalar.constant true : i1
+  template.apply<@h3.shared_conv3d_f16_wmma_add>(%m_size, %a, %w, %bias, %c, %c, %cfg_frames, %cfg_height, %cfg_width, %cfg_stride, %cfg_tstride, %cfg_taps_t, %cfg_cin_pad, %cfg_cin_stride, %cfg_rows_bound, %cfg_k_size, %cfg_n_size, %add_residual, %symmetric) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, index, index, index, index, i1, i1)
   kernel.return
 }

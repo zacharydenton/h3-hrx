@@ -30,8 +30,8 @@ retains allocations that may still be in flight.
 ## Shared allocation budgets
 
 `Session::new_in(config, options, &context)` selects the context's GPU and
-optional `RuntimeOptions::memory_budget`. All four lazy units (text encoder,
-DiT, video VAE and audio VAE) charge native weights, growing workspace and
+optional `RuntimeOptions::memory_budget`. All five lazy units (text encoder,
+DiT, video VAE, audio VAE and latent upscaler) charge native weights, growing workspace and
 upload/readback staging before allocation. Charges survive queued uses and
 recorded graphs, and are released only when their storage is safe to destroy.
 Budget exhaustion returns an error; it does not offload work to CPU.
@@ -50,7 +50,7 @@ Library callers select `ResidencyPolicy::Budgeted` with `Session::new_in` and a
 live `ResidencyManager`-backed budget. Cache units retain their original private
 stream identity; they are not shared mutable models across sessions. Completed
 or cancelled stages fence before returning units to the cache. Session teardown
-unregisters all four units so mapped checkpoints do not outlive its safety contract.
+unregisters all model units so mapped checkpoints do not outlive its safety contract.
 
 StageScoped leaves the native stream's bounded staging cache resident between
 calls; dropping the session releases it too. Compiler/code-object memory, native
@@ -74,7 +74,7 @@ or device failures.
 The pinned-checkpoint replay (`examples/qualify_session.rs`, budgeted mode)
 matches the frozen audio/video encode, decode and denoise outputs byte-for-byte.
 It also checks caller-thread progress, deferred competing compute, cancellation/
-retry, pressure eviction/reload of all four units, and zero retained budget after
+retry, pressure eviction/reload of model units, and zero retained budget after
 session teardown.
 
 ## Turbo qualification
