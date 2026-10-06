@@ -2317,7 +2317,7 @@ fn fused_qkv_operands_are_byte_identical_to_separate_preparation() {
         let old = h.run(
             "transpose_f16",
             &config,
-            [tokens.div_ceil(32) as u32, (width / 32) as u32, 1],
+            [(width / 32) as u32, tokens.div_ceil(32) as u32, 1],
             256,
             &[tokens as u64],
             &[split[7].clone(), vec![0; capacity * width * 2]],
@@ -2397,32 +2397,33 @@ fn subgroup_shuffle_preparation_matches_lds_repeatedly() {
 )]
 fn transposed_values_clear_reused_capacity() {
     let mut h = Harness::new();
-    for tokens in [1usize, 31, 32, 33, 129, 4096, 4097] {
-        let width = 256;
-        let capacity = (tokens + 32).div_ceil(256) * 256;
-        let input: Vec<f16> = values(tokens * width, 0.7)
-            .into_iter()
-            .map(f16::from_f32)
-            .collect();
-        let actual = h.run(
-            "transpose_f16",
-            &cfg(&[("width", width), ("row_capacity", capacity)]),
-            [(capacity / 32) as u32, (width / 32) as u32, 1],
-            256,
-            &[tokens as u64],
-            &[bytes(&input), vec![0xff; capacity * width * 2]],
-        );
-        for (i, word) in actual[1].as_chunks::<2>().0.iter().enumerate() {
-            let (channel, row) = (i / capacity, i % capacity);
-            let expected = if row < tokens {
-                input[row * width + channel].to_le_bytes()
-            } else {
-                [0, 0]
-            };
-            assert_eq!(
-                *word, expected,
-                "tokens={tokens} row={row} channel={channel}"
+    for width in [32, 96, 256] {
+        for tokens in [1usize, 31, 32, 33, 129, 4096, 4097] {
+            let capacity = (tokens + 32).div_ceil(256) * 256;
+            let input: Vec<f16> = values(tokens * width, 0.7)
+                .into_iter()
+                .map(f16::from_f32)
+                .collect();
+            let actual = h.run(
+                "transpose_f16",
+                &cfg(&[("width", width), ("row_capacity", capacity)]),
+                [(width / 32) as u32, (capacity / 32) as u32, 1],
+                256,
+                &[tokens as u64],
+                &[bytes(&input), vec![0xff; capacity * width * 2]],
             );
+            for (i, word) in actual[1].as_chunks::<2>().0.iter().enumerate() {
+                let (channel, row) = (i / capacity, i % capacity);
+                let expected = if row < tokens {
+                    input[row * width + channel].to_le_bytes()
+                } else {
+                    [0, 0]
+                };
+                assert_eq!(
+                    *word, expected,
+                    "tokens={tokens} row={row} channel={channel}"
+                );
+            }
         }
     }
 }

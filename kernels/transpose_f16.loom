@@ -1,6 +1,7 @@
 // [rows][width] f16 -> [width][row_capacity] f16 through a 32x32 LDS tile: V^T for the attention
-// kernels, whose V tiles are [channel][key]. Columns past `rows` are left as they are (zero headroom).
-// Workgroups (ceil(rows / 32), width / 32) of 256 lanes; a lane moves a vector<4xf16> each way.
+// kernels, whose V tiles are [channel][key]. Launched tiles zero columns past `rows`;
+// callers can launch across the complete capacity to clear reused output storage.
+// Workgroups (width / 32, ceil(rows / 32)) of 256 lanes visit adjacent input columns first.
 amdgpu.target<gfx11-generic> @h3_transpose_f16_gfx11 {subgroup_size = 32}
 
 config.decl @h3.transpose_f16.width : %value: index where [range(%value, 32, 65536), mul(%value, 32)]
@@ -16,7 +17,7 @@ kernel.def target(@h3_transpose_f16_gfx11) export("h3_transpose_f16") @h3_transp
   %rounded = index.add %rows, %c31 : index
   %row_tiles = index.div %rounded, %c32 : index
   %col_tiles = index.div %width, %c32 : index
-  kernel.launch.config workgroups(%row_tiles, %col_tiles, %c1) workgroup_size(%c256, %c1, %c1) : index
+  kernel.launch.config workgroups(%col_tiles, %row_tiles, %c1) workgroup_size(%c256, %c1, %c1) : index
 } launch(%rows: index, %x: buffer, %out: buffer) {
   %width = config.get @h3.transpose_f16.width : index
   %cap = config.get @h3.transpose_f16.row_capacity : index
@@ -33,8 +34,8 @@ kernel.def target(@h3_transpose_f16_gfx11) export("h3_transpose_f16") @h3_transp
   %zero_h = scalar.constant 0.0 : f16
   %zero4 = vector.splat %zero_h : vector<4xf16>
   %rows_b = index.assume %rows [range(%rows, 1, 1048576), le(%rows, %cap)] : index
-  %rt = kernel.workgroup.id<x> : index
-  %ct = kernel.workgroup.id<y> : index
+  %ct = kernel.workgroup.id<x> : index
+  %rt = kernel.workgroup.id<y> : index
   %lane = kernel.workitem.id<x> : index
   %row0 = index.mul %rt, %c32 : index
   %col0a = index.mul %ct, %c32 : index

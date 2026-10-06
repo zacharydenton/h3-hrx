@@ -1525,6 +1525,7 @@ impl Stack {
                 Some(prof),
                 "attention operands",
                 [
+                    (self.d.inner() / 32) as u32,
                     // Reused projection bytes can contain arbitrary half values.
                     // Rewrite the entire V capacity so masked keys cannot see NaNs.
                     if int_qk.vt.is_none() {
@@ -1532,7 +1533,6 @@ impl Stack {
                     } else {
                         t.div_ceil(32)
                     },
-                    (self.d.inner() / 32) as u32,
                     1,
                 ],
                 [THREADS, 1, 1],

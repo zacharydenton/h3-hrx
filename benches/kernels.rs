@@ -287,6 +287,73 @@ fn gemm(c: &mut Criterion) {
     group.finish();
 }
 
+fn attention_transpose(c: &mut Criterion) {
+    use h3_hrx::dispatch::{emit, Profile};
+    use h3_hrx::model::INNER;
+    let mut group = c.benchmark_group("transpose_v_f16");
+    for tokens in [1usize, 257, 2048, 8192] {
+        let capacity = ((tokens + 16).div_ceil(32) * 32).max(tokens.div_ceil(256) * 256);
+        group.throughput(Throughput::Bytes(((tokens + capacity) * INNER * 2) as u64));
+        group.bench_function(BenchmarkId::from_parameter(tokens), |b| {
+            let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+            let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+            let compiler = compiler();
+            let kernel = compiler
+                .get(
+                    &mut stream,
+                    "transpose_f16",
+                    "h3_transpose_f16",
+                    &vec![
+                        ("h3.transpose_f16.width".into(), INNER.to_string()),
+                        ("h3.transpose_f16.row_capacity".into(), capacity.to_string()),
+                    ],
+                )
+                .unwrap();
+            compiler.flush(&mut stream).unwrap();
+            // Include every half bit pattern: transpose must preserve NaNs and signed zero too.
+            let input: Vec<u16> = (0..tokens * INNER)
+                .map(|i| i.wrapping_mul(37) as u16)
+                .collect();
+            let x = upload(&mut stream, bytemuck::cast_slice(&input));
+            let out = upload(&mut stream, &vec![0xff; capacity * INNER * 2]);
+            let bindings = [x.binding(), out.binding()];
+            let required = bindings.map(|view| view.len());
+            let mut profile = Profile::from_env();
+            let mut run = |stream: &mut Stream| {
+                emit(
+                    &mut Sink::Stream(stream),
+                    &kernel,
+                    Some(&mut profile),
+                    "transpose V",
+                    [(INNER / 32) as u32, (capacity / 32) as u32, 1],
+                    [256, 1, 1],
+                    &[tokens as u32],
+                    &bindings,
+                    &required,
+                )
+                .unwrap();
+                stream.synchronize().unwrap();
+            };
+            run(&mut stream);
+            b.iter(|| run(&mut stream));
+            let mut actual = vec![0u16; capacity * INNER];
+            stream
+                .read_blocking(out.binding(), bytemuck::cast_slice_mut(&mut actual))
+                .unwrap();
+            for (i, value) in actual.into_iter().enumerate() {
+                let (column, row) = (i / capacity, i % capacity);
+                let expected = if row < tokens {
+                    (row * INNER + column).wrapping_mul(37) as u16
+                } else {
+                    0
+                };
+                assert_eq!(value, expected, "row={row} column={column}");
+            }
+        });
+    }
+    group.finish();
+}
+
 fn audio_qkv(c: &mut Criterion) {
     let mut group = c.benchmark_group("audio_qkv_f32");
     let (k, n) = (2048, 6144);
@@ -601,6 +668,6 @@ criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10).warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3));
-    targets = preparation, attention_preparation, gemm, audio_qkv, audio_convolution, dispatch
+    targets = preparation, attention_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
 }
 criterion_main!(benches);
