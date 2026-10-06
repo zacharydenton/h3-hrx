@@ -256,6 +256,123 @@ fn audio_qkv(c: &mut Criterion) {
     group.finish();
 }
 
+fn audio_convolution(c: &mut Criterion) {
+    let mut group = c.benchmark_group("audio_encoder_conv_f32");
+    // Full-soundtrack encoder shapes, including dilation, stride and partial tiles.
+    for (cin, len, stride) in [
+        (64usize, 165600usize, 2usize),
+        (128, 82800, 4),
+        (256, 20700, 4),
+        (512, 5175, 5),
+        (1024, 1035, 5),
+    ] {
+        for (ksize, dilation, step) in [
+            (1, 1, 1),
+            (7, 1, 1),
+            (7, 3, 1),
+            (7, 9, 1),
+            (2 * stride, 1, stride),
+        ] {
+            let down = step > 1;
+            let cout = if down { 2 * cin } else { cin };
+            let out_len = len / step;
+            let pad = if down {
+                step.div_ceil(2)
+            } else {
+                ksize / 2 * dilation
+            };
+            for tiled in [false, true] {
+                if down && tiled {
+                    continue; // The four-sample kernel requires stride one.
+                }
+                let layout = if tiled { "four_samples" } else { "scalar" };
+                group.bench_function(
+                    format!("{layout}/{cin}x{cout}x{len}/k{ksize}_d{dilation}_s{step}"),
+                    |b| {
+                        let manager = hrx::residency::ResidencyManager::new(1 << 30).unwrap();
+                        let mut stream =
+                            Stream::open().unwrap().with_memory_budget(manager.budget());
+                        let compiler = compiler();
+                        let build = |stream: &mut Stream, tiled: bool| {
+                            let stem = if tiled { "conv1d4_f32" } else { "conv1d_s_f32" };
+                            let mut config = vec![
+                                ("cin", cin),
+                                ("cout", cout),
+                                ("ksize", ksize),
+                                ("dilation", dilation),
+                                ("pad", pad),
+                            ];
+                            if tiled {
+                                config.extend([
+                                    ("accumulate", 0),
+                                    ("len_bound", len.max(256).next_power_of_two()),
+                                ]);
+                            } else {
+                                config.extend([
+                                    ("stride", step),
+                                    ("in_bound", len.max(256).next_power_of_two()),
+                                    ("out_bound", out_len.max(256).next_power_of_two()),
+                                ]);
+                            }
+                            let config = config
+                                .into_iter()
+                                .map(|(key, value)| (format!("h3.{stem}.{key}"), value.to_string()))
+                                .collect();
+                            compiler
+                                .get(stream, stem, &format!("h3_{stem}"), &config)
+                                .unwrap()
+                        };
+                        let reference = build(&mut stream, false);
+                        let kernel = build(&mut stream, tiled);
+                        compiler.flush(&mut stream).unwrap();
+                        let values = |count| {
+                            (0..count)
+                                .map(|i| ((i * 37 % 101) as f32 - 50.) / 200.)
+                                .collect::<Vec<_>>()
+                        };
+                        let x = upload(&mut stream, bytemuck::cast_slice(&values(cin * len)));
+                        let w = upload(
+                            &mut stream,
+                            bytemuck::cast_slice(&values(cout * cin * ksize)),
+                        );
+                        let bias = upload(&mut stream, bytemuck::cast_slice(&values(cout)));
+                        let out = stream.allocate(cout * out_len * 4).unwrap();
+                        let run =
+                            |stream: &mut Stream, kernel: &h3_hrx::compile::Kernel, tiled: bool| {
+                                let scalars = [out_len as u32, len as u32];
+                                h3_hrx::dispatch::emit(
+                                    &mut Sink::Stream(stream),
+                                    kernel,
+                                    None,
+                                    "audio convolution",
+                                    [out_len.div_ceil(256) as u32, cout as u32, 1],
+                                    [if tiled { 64 } else { 256 }, 1, 1],
+                                    &scalars[..if tiled { 1 } else { 2 }],
+                                    &[x.binding(), w.binding(), bias.binding(), out.binding()],
+                                    &[
+                                        cin * len * 4,
+                                        cout * cin * ksize * 4,
+                                        cout * 4,
+                                        cout * out_len * 4,
+                                    ],
+                                )
+                                .unwrap();
+                                stream.synchronize().unwrap();
+                            };
+                        run(&mut stream, &reference, false);
+                        let expected = check_f32(&mut stream, &out);
+                        run(&mut stream, &kernel, tiled);
+                        assert_eq!(check_f32(&mut stream, &out), expected);
+                        b.iter(|| run(&mut stream, &kernel, tiled));
+                        assert_eq!(check_f32(&mut stream, &out), expected);
+                    },
+                );
+            }
+        }
+    }
+    group.finish();
+}
+
 fn dispatch(c: &mut Criterion) {
     const LAUNCHES: usize = 256;
     let mut group = c.benchmark_group("dispatch_256");
@@ -344,6 +461,6 @@ criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10).warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3));
-    targets = preparation, gemm, audio_qkv, dispatch
+    targets = preparation, gemm, audio_qkv, audio_convolution, dispatch
 }
 criterion_main!(benches);
