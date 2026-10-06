@@ -13,7 +13,7 @@ Results and baselines belong in ignored `target/criterion/`, never in Git.
 | `kernels` | FP32 Hadamard preparation, INT8/BF16 GEMMs with FP32 outputs, cached/rotating weights, eager/graph dispatch |
 | `models` | Resident one-block DiT eager/graph comparison and short audio roundtrip |
 | `stages` | Complete text encoder plus token refiner, vision tower, video encode/decode, audio encode/decode, complete 50-block denoising trajectories with Euler and ResMultistep |
-| `lifecycle` | Mapping/planning each checkpoint, representative tensor packing and completed uploads, forced audio eviction/reload |
+| `lifecycle` | Mapping/planning, tensor packing and completed uploads, block loading throughput, cold-file loading, forced audio eviction/reload |
 | `pipeline` | Complete text, first/last-frame, image/audio reference, video/audio reference, RefMod, LoRA, Turbo and World renders; cache observation/reuse; WAV and H.264/AAC output; fresh CLI processes |
 | `memory` | Complete text and reference renders under stage-scoped and budgeted residency, measuring sampled peak reservations and process RSS separately |
 
@@ -123,7 +123,14 @@ that execution path; it is not a quality-qualified cache preset.
   teardown. Compilation of the Rust binary is outside timing.
 - **Lifecycle:** checkpoint mapping/plan construction, host packing, and packing
   plus completed upload are separate cases. Upload uses a fresh weight owner to
-  prevent a cached lookup from replacing the transfer. Eviction timing includes
+  prevent a cached lookup from replacing the transfer. `load_block` measures the
+  four large projections of one DiT, text or video transformer block, with byte
+  throughput and exact readback checks. OS file caches remain available.
+  On Linux, `cold_file` copies representative DiT tensors to a private checkpoint
+  under `target/`, flushes it, and evicts only that fixture before each iteration.
+  It times allocation, disk faults, packing and completed upload; fixture setup,
+  eviction and validation are excluded. Use a disk-backed workspace for this case.
+  Eviction timing includes
   applying pressure, releasing it, and reloading/decoding the audio model.
 
 Replay digests, finite checks and ffprobe validation run outside latency timing.

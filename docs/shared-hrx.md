@@ -1,9 +1,11 @@
 # Shared HRX integration
 
 H3 uses `hrx-rs` for native loading, allocation, dispatch, graphs, compilation and
-artifact caching. `Cargo.lock` pins the exact release. Model code owns tensor
+artifact caching. `Cargo.toml` pins commit `8f0e084` for direct weight initialization,
+which is newer than the 0.8.16 release. Model code owns tensor
 layouts, source selection and numerical behavior; `Session` is the public API.
 H3 does not enable HRX's optional NPU feature.
+Consumers sharing HRX contexts should use the same Git revision.
 
 ## Provisioning and overrides
 
@@ -22,10 +24,10 @@ Caches live under `$XDG_CACHE_HOME/hrx`, or `~/.cache/hrx` when unset.
 `hrx gc [DAYS]` removes obsolete bundles and kernels unused for that many days
 (default 30). Cache hits refresh last-use timestamps.
 
-For local HRX development, add an ignored `.cargo/config.toml`:
+For local HRX development, add this patch to `.cargo/config.toml`:
 
 ```toml
-[patch.crates-io]
+[patch."https://github.com/zacharydenton/hrx-rs"]
 hrx-rs = { path = "../hrx-rs" }
 ```
 
@@ -45,7 +47,10 @@ HRX owns parallel compilation and verifies cached artifacts. Cache identity
 covers compiler, source, export, target and configuration. Warm requests reuse
 prepared exports and bindings.
 
-Weight uploads copy borrowed checkpoint data into HRX staging before returning.
+Weights use HRX's `allocate_from` to initialize and publish owned GPU buffers
+directly. Repacking uses at most 256 MiB of temporary host storage for row recipes;
+larger gathered tensors retain 16 MiB staging chunks. Source pages are prepared
+in merged intervals before packing and released after copying.
 `Stream::read_blocking` waits for readback completion. Normal inference does not
 synchronize around every kernel; `H3_PROFILE=1` does, changing timing.
 

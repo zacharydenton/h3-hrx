@@ -70,7 +70,8 @@ name = "cache_calibrate"
 test = true
 
 [dependencies]
-hrx = { package = "hrx-rs", version = "0.8.16" }
+# allocate_from avoids a staging copy and a redundant initialization pass for weights.
+hrx = { package = "hrx-rs", version = "0.8.16", git = "https://github.com/zacharydenton/hrx-rs", rev = "8f0e084a9efd69ec0045b5cd7d032852d048195d" }
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"
 thiserror = "2"
@@ -95,6 +96,7 @@ regex = { version = "1", optional = true }
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 libm = "0.2"
+libc = "0.2"
 
 [profile.release]
 opt-level = 2

@@ -7,7 +7,7 @@ Run commands from the repository root.
 - Linux with a working AMD Strix Halo (`gfx1151`) driver and GPU access.
   Development uses a 128 GB unified-memory system.
 - A current stable Rust toolchain and ffmpeg.
-- System libraries compatible with the pinned HRX bundle. HRX 0.8.7 targets
+- System libraries compatible with the pinned HRX bundle. It targets
   Ubuntu 26.04 with glibc 2.43+; see
   [HRX native setup](https://github.com/zacharydenton/hrx-rs/blob/main/docs/GPU-NPU.md#native-setup).
 
@@ -27,7 +27,7 @@ The first GPU operation downloads and verifies HRX's pinned native bundle.
 To provision it ahead of time using the version in `Cargo.lock`:
 
 ```sh
-cargo install --locked hrx-rs --version 0.8.7
+cargo install --locked --git https://github.com/zacharydenton/hrx-rs --rev 8f0e084a9efd69ec0045b5cd7d032852d048195d hrx-rs
 hrx prepare
 hrx doctor
 ```

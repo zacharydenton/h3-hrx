@@ -185,6 +185,18 @@ impl Checkpoint {
         }
     }
 
+    /// Populate a checked range from the entry's shard before CPU packing or upload.
+    pub(crate) fn prepare(&self, entry: &Entry, range: &[u8]) -> hrx::Result<()> {
+        let file = self
+            .shards
+            .iter()
+            .rev()
+            .find(|(base, _)| entry.offset >= *base)
+            .map_or(&self.file, |(_, shard)| shard);
+        file.prepare_bytes(range)?;
+        Ok(())
+    }
+
     /// Release a range's pages once its bytes are on the device. A tensor is read once, and tens of
     /// gigabytes of checkpoint left resident compete with the device allocations for the same memory
     /// on a unified-memory part. `H3_KEEP_MAPPED=1` keeps them, which is what a repeated test or
@@ -237,6 +249,13 @@ mod tests {
         let ck = unsafe { Checkpoint::open_shards(&[a.clone(), b]) }.unwrap();
         assert_eq!(ck.bytes(ck.at("a").unwrap()), &[1; 8]);
         assert_eq!(ck.bytes(ck.at("b").unwrap()), &[2; 8]);
+        for name in ["a", "b"] {
+            let entry = ck.at(name).unwrap();
+            ck.prepare(entry, ck.bytes(entry)).unwrap();
+        }
+        assert!(ck
+            .prepare(ck.at("a").unwrap(), ck.bytes(ck.at("b").unwrap()))
+            .is_err());
         assert!(unsafe { Checkpoint::open_shards(&[a.clone(), a]) }.is_err());
     }
 

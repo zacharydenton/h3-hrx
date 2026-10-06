@@ -127,6 +127,8 @@ pub struct Weights {
 /// Bytes staged per transfer. Large enough that the per-call overhead disappears, small enough that a
 /// 27 GB tensor never needs a host copy of itself.
 const CHUNK: usize = 16 << 20;
+// Most transformer operands fit here. Larger gathered tensors retain chunked staging.
+const DIRECT_PACK_LIMIT: usize = 256 << 20;
 
 impl Weights {
     /// # Safety
@@ -195,11 +197,9 @@ impl Weights {
     /// `expect_bytes` is what the caller has sized its kernel arguments for; a recipe that does not
     /// match is a wiring error and fails here rather than reading past an allocation later.
     ///
-    /// Rows that are one straight run of the mapping at their own pitch go up chunk by chunk with no
-    /// model-owned staging copy. HRX still copies each chunk into its upload staging. Anything gathered at a wider pitch is staged a chunk at a time, so the pad
-    /// between rows stays zero. Either way the file's pages are released once their bytes are on the
-    /// device: a tensor is read once, and tens of gigabytes of resident checkpoint would compete with
-    /// the device allocations for the same memory on this part.
+    /// Contiguous rows initialize their allocation directly from the mapping. Gathered tensors up
+    /// to 256 MiB are assembled once and initialized the same way; larger ones use bounded chunks.
+    /// File pages are released after copying so they do not compete with device allocations.
     pub fn at(
         &self,
         stream: &mut hrx::Stream,
@@ -219,12 +219,7 @@ impl Weights {
         if let Some(buffer) = self.uploaded.lock().expect("not poisoned").get(name) {
             return Ok(buffer.clone());
         }
-        let buffer = Arc::new(
-            stream
-                .allocate(expect_bytes.max(1))
-                .map_err(|e| Error::Device(e.to_string()))?,
-        );
-        self.fill(stream, recipe, &buffer)?;
+        let buffer = Arc::new(self.load(stream, recipe)?);
         self.uploaded
             .lock()
             .expect("not poisoned")
@@ -257,12 +252,20 @@ impl Weights {
         self.at(stream, name, rows * pitch_bytes)
     }
 
-    fn fill(&self, stream: &mut hrx::Stream, recipe: &Recipe, buffer: &hrx::Buffer) -> Result<()> {
+    fn load(&self, stream: &mut hrx::Stream, recipe: &Recipe) -> Result<hrx::Buffer> {
         let device = |e: hrx::Error| Error::Device(e.to_string());
+        let initialize = |bytes: &[u8]| {
+            if bytes.is_empty() {
+                stream.allocate(1)
+            } else {
+                stream.allocate_from(bytes)
+            }
+            .map_err(device)
+        };
         match recipe {
             Recipe::Built { .. } => {
                 let bytes = recipe.assemble(&self.file)?;
-                stream.upload(buffer.binding(), &bytes).map_err(device)?;
+                initialize(&bytes)
             }
             Recipe::Rows {
                 rows,
@@ -270,20 +273,52 @@ impl Weights {
                 pitch_bytes,
                 segments,
             } => {
-                if segments.len() == 1 && pitch_bytes == row_bytes {
-                    // one straight run: borrow the mapping directly for HRX to stage
+                let buffer = if segments.len() == 1 && pitch_bytes == row_bytes {
+                    // HRX owns a published copy before the borrowed mapping can be released.
                     let segment = &segments[0];
+                    if segment.rows != *rows {
+                        return layout(format!(
+                            "a recipe's segments add up to {} rows, not {rows}",
+                            segment.rows
+                        ));
+                    }
                     let entry = self.file.at(&segment.tensor)?;
                     let all = self.file.bytes(entry);
                     let from = segment.row0 * row_bytes;
                     let span = &all[from..from + segment.rows * row_bytes];
+                    // Sequential faults overlap readahead with the copy; eagerly populating
+                    // the entire span first is slower for this contiguous path.
                     self.file.will_need(span);
-                    for (i, chunk) in span.chunks(CHUNK).enumerate() {
-                        stream
-                            .upload_at(buffer, i * CHUNK, chunk)
-                            .map_err(|e| Error::Device(e.to_string()))?;
+                    initialize(span)?
+                } else if recipe.device_bytes() <= DIRECT_PACK_LIMIT {
+                    // Packing order may alternate distant 16-row runs. Prepare each merged
+                    // source interval once, in source row order, instead of faulting in that order.
+                    let mut runs = segments.clone();
+                    runs.sort_unstable_by(|a, b| (&a.tensor, a.row0).cmp(&(&b.tensor, b.row0)));
+                    let mut merged: Vec<Segment> = Vec::new();
+                    for run in runs {
+                        if let Some(last) = merged.last_mut().filter(|last| {
+                            last.tensor == run.tensor && run.row0 <= last.row0 + last.rows
+                        }) {
+                            last.rows =
+                                (run.row0 + run.rows).max(last.row0 + last.rows) - last.row0;
+                        } else {
+                            merged.push(run);
+                        }
                     }
+                    for run in merged {
+                        let entry = self.file.at(&run.tensor)?;
+                        let from = run.row0 * row_bytes;
+                        self.file.prepare(
+                            entry,
+                            &self.file.bytes(entry)[from..from + run.rows * row_bytes],
+                        )?;
+                    }
+                    initialize(&recipe.assemble(&self.file)?)?
                 } else {
+                    let buffer = stream
+                        .allocate(recipe.device_bytes().max(1))
+                        .map_err(device)?;
                     // Gathered at the pitch, through a staging buffer zeroed once. Every row's first
                     // `row_bytes` are overwritten before that row is sent, and the pad past them is
                     // never written at all, so it stays zero for the life of the buffer — refilling
@@ -305,7 +340,7 @@ impl Weights {
                             if staged == per {
                                 stream
                                     .upload_at(
-                                        buffer,
+                                        &buffer,
                                         written * pitch_bytes,
                                         &stage[..staged * pitch_bytes],
                                     )
@@ -318,7 +353,7 @@ impl Weights {
                     if staged > 0 {
                         stream
                             .upload_at(
-                                buffer,
+                                &buffer,
                                 written * pitch_bytes,
                                 &stage[..staged * pitch_bytes],
                             )
@@ -330,8 +365,9 @@ impl Weights {
                             "a recipe's segments add up to {written} rows, not {rows}"
                         ));
                     }
-                }
-                // HRX owns a staging copy; the file's pages are not needed by queued work
+                    buffer
+                };
+                // Direct initialization or HRX staging owns the bytes by this point.
                 for segment in segments {
                     let entry = self.file.at(&segment.tensor)?;
                     let all = self.file.bytes(entry);
@@ -339,9 +375,9 @@ impl Weights {
                     self.file
                         .done_with(&all[from..from + segment.rows * row_bytes]);
                 }
+                Ok(buffer)
             }
         }
-        Ok(())
     }
 
     /// A recipe's bytes as f32, for the tables the host itself reads.
@@ -1093,5 +1129,88 @@ mod tests {
         assert_eq!(w.host_f32("b", 2).unwrap(), vec![1.0, 2.0]);
         assert!(w.host_f32("b", 3).is_err());
         assert!(matches!(w.recipe("nope"), Err(Error::NoRecipe(_))));
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires gfx1151 and provisioned HRX"
+    )]
+    fn initialized_weights_preserve_layout_and_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let width = CHUNK / 64 + 3;
+        let data: Vec<u8> = (0..64 * width)
+            .map(|i| (i.wrapping_mul(37) ^ (i >> 9)) as u8)
+            .collect();
+        let ck = checkpoint(dir.path(), &[("w", "I8", vec![64, width], data)]);
+        drop(ck);
+        // SAFETY: the private test checkpoint is immutable while mapped.
+        let weights = unsafe {
+            Weights::open(dir.path().join("c.safetensors"), |ck, out| {
+                out.insert("straight".into(), rows_of(ck, &["w"], 0)?);
+                out.insert("padded".into(), rows_of(ck, &["w"], width + 5)?);
+                out.insert(
+                    "permuted".into(),
+                    rows_permuted(ck, "w", &[(32, 32), (0, 32)], 0)?,
+                );
+                out.insert("slice".into(), rows_permuted(ck, "w", &[(1, 3)], 0)?);
+                out.insert(
+                    "built".into(),
+                    Recipe::Built {
+                        bytes: 65,
+                        build: Box::new(|_| Ok((0..65).collect())),
+                    },
+                );
+                out.insert(
+                    "empty".into(),
+                    Recipe::Built {
+                        bytes: 0,
+                        build: Box::new(|_| Ok(Vec::new())),
+                    },
+                );
+                out.insert(
+                    "invalid".into(),
+                    Recipe::Built {
+                        bytes: 65,
+                        build: Box::new(|_| Ok(vec![0; 64])),
+                    },
+                );
+                Ok(())
+            })
+        }
+        .unwrap();
+        let manager = hrx::residency::ResidencyManager::new(128 << 20).unwrap();
+        let mut stream = hrx::Stream::open()
+            .unwrap()
+            .with_memory_budget(manager.budget());
+        for name in ["straight", "padded", "permuted", "slice", "built", "empty"] {
+            let expected = weights.assemble(name).unwrap();
+            let before = manager.statistics().reserved_bytes;
+            assert!(weights.at(&mut stream, name, expected.len() + 1).is_err());
+            let buffer = weights.at(&mut stream, name, expected.len()).unwrap();
+            // Direct initialization needs no transfer staging reservation.
+            assert_eq!(
+                manager.statistics().reserved_bytes - before,
+                expected.len().max(1)
+            );
+            assert!(Arc::ptr_eq(
+                &buffer,
+                &weights.at(&mut stream, name, expected.len()).unwrap()
+            ));
+            assert!(weights.at(&mut stream, name, expected.len() + 1).is_err());
+            if !expected.is_empty() {
+                let copy = stream.allocate(expected.len()).unwrap();
+                stream.copy(copy.binding(), buffer.binding()).unwrap();
+                let mut actual = vec![0; expected.len()];
+                stream.read_blocking(copy.binding(), &mut actual).unwrap();
+                assert_eq!(actual, expected, "{name}");
+            }
+        }
+        let before = manager.statistics().reserved_bytes;
+        assert!(weights.at(&mut stream, "invalid", 65).is_err());
+        assert_eq!(manager.statistics().reserved_bytes, before);
+        drop(weights);
+        drop(stream);
+        assert_eq!(manager.statistics().reserved_bytes, 0);
     }
 }

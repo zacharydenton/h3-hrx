@@ -1199,6 +1199,7 @@ dependencies = [
  "criterion",
  "half",
  "hrx-rs",
+ "libc",
  "libm",
  "png",
  "rand 0.9.5",
@@ -1328,8 +1329,7 @@ dependencies = [
 [[package]]
 name = "hrx-rs"
 version = "0.8.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdbec3111a219e3b33d23d0f71e13c61362d54e13896a515a6fc4e1f165ef461"
+source = "git+https://github.com/zacharydenton/hrx-rs?rev=8f0e084a9efd69ec0045b5cd7d032852d048195d#8f0e084a9efd69ec0045b5cd7d032852d048195d"
 dependencies = [
  "flate2",
  "hf-hub",
