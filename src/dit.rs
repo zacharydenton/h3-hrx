@@ -955,9 +955,8 @@ impl Dit {
 
         // the packed layout's per-row tables
         {
-            let (mut cos, mut sin) = (vec![0.0f32; s * ROPE_HALF], vec![0.0f32; s * ROPE_HALF]);
             let inv = &self.cond.as_ref().expect("ready").inv_freq;
-            crate::rope::dit(&lay.pos, inv, &mut cos, &mut sin);
+            let (cos, sin) = lay.rotary_tables(inv);
             let seq = self.seq.as_mut().expect("sized above");
             seq.cls.write(stream, &lay.adaln_rows, CLASSES)?;
             // The final head runs on the generated rows alone, and has only the video and audio

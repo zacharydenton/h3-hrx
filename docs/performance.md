@@ -121,6 +121,10 @@ that execution path; it is not a quality-qualified cache preset.
 
 ## Measurement boundaries
 
+- **Host rotary tables:** `rotary/dit` includes allocation and construction of both
+  tables, from a prebuilt packed layout and inverse frequencies. Cases cover the
+  smoke grid, 480p/768p clips, references with a keyframe, and a 15-second 2x grid.
+  GPU uploads and the rest of conditioning are excluded.
 - **Stages:** setup and initial warmup excluded; API work, allocations, transfers
   and completed host output included. The denoising stage includes prompt
   conditioning and sampling, but excludes VAE decode and media encoding.

@@ -62,6 +62,16 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// Build the DiT rotary tables using the checkpoint's sixteen inverse frequencies.
+    pub fn rotary_tables(&self, inv_freq: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let (mut cos, mut sin) = (
+            vec![0.0; self.seq_len * ROPE_HALF],
+            vec![0.0; self.seq_len * ROPE_HALF],
+        );
+        crate::rope::dit(&self.pos, inv_freq, &mut cos, &mut sin);
+        (cos, sin)
+    }
+
     /// The spatial coordinates of one axis, centred on the canvas.
     fn axis(dim: usize, sqrt_area: f64) -> Vec<f64> {
         let ratio = dim as f64 / sqrt_area;

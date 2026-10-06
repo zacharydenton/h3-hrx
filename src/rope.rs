@@ -22,14 +22,25 @@ pub fn mrope_axis(pair: usize) -> usize {
 /// The angle is computed and passed as `float`, so this is `cosf`, not `cos` narrowed. That is the
 /// difference between this and every other table here.
 pub fn dit(pos: &[f64], inv_freq: &[f32], cos: &mut [f32], sin: &mut [f32]) {
+    // Grid rows repeat the same axis coordinates. Cache after narrowing to float so the
+    // angles retain the checkpoint's arithmetic; bit keys also distinguish signed zero.
+    let mut axes = std::collections::HashMap::new();
     let rows = pos.len() / 3;
     for r in 0..rows {
         for ax in 0..3 {
-            for j in 0..16 {
-                let ang = pos[3 * r + ax] as f32 * inv_freq[j];
-                cos[r * ROPE_HALF + ax * 16 + j] = ang.cos();
-                sin[r * ROPE_HALF + ax * 16 + j] = ang.sin();
-            }
+            let p = pos[3 * r + ax] as f32;
+            let (c, s) = axes.entry(p.to_bits()).or_insert_with(|| {
+                let (mut c, mut s) = ([0.0; 16], [0.0; 16]);
+                for j in 0..16 {
+                    let ang = p * inv_freq[j];
+                    c[j] = ang.cos();
+                    s[j] = ang.sin();
+                }
+                (c, s)
+            });
+            let start = r * ROPE_HALF + ax * 16;
+            cos[start..start + 16].copy_from_slice(c);
+            sin[start..start + 16].copy_from_slice(s);
         }
     }
 }
@@ -193,6 +204,89 @@ mod tests {
         assert_eq!(c[0], angle_f32.cos());
         let angle_f64 = 1e7f64 * f64::from(1.0f32 / 3.0);
         assert_ne!(c[0], angle_f64.cos() as f32, "the angle must stay in f32");
+    }
+
+    fn assert_dit_matches_scalar(pos: &[f64], inv: &[f32]) {
+        let len = pos.len() / 3 * ROPE_HALF;
+        let (mut c, mut s) = (vec![9.0; len + ROPE_HALF], vec![9.0; len + ROPE_HALF]);
+        dit(pos, inv, &mut c, &mut s);
+        for r in 0..pos.len() / 3 {
+            for ax in 0..3 {
+                for (j, &freq) in inv.iter().enumerate() {
+                    let angle = pos[r * 3 + ax] as f32 * freq;
+                    let i = r * ROPE_HALF + ax * 16 + j;
+                    assert_eq!(c[i].to_bits(), angle.cos().to_bits(), "cos at {i}");
+                    assert_eq!(s[i].to_bits(), angle.sin().to_bits(), "sin at {i}");
+                }
+            }
+        }
+        assert!(c[len..].iter().chain(&s[len..]).all(|&v| v == 9.0));
+    }
+
+    #[test]
+    fn dit_tables_match_scalar_for_packed_media() {
+        use crate::layout::{Keyframe, Layout, Ref};
+
+        let refs = [
+            Ref {
+                kind: 0,
+                latent_t: 1,
+                lat_h: 8,
+                lat_w: 12,
+                audio_t: 0,
+                has_audio: false,
+            },
+            Ref {
+                kind: 1,
+                latent_t: 0,
+                lat_h: 0,
+                lat_w: 0,
+                audio_t: 23,
+                has_audio: true,
+            },
+            Ref {
+                kind: 2,
+                latent_t: 7,
+                lat_h: 12,
+                lat_w: 8,
+                audio_t: 37,
+                has_audio: true,
+            },
+        ];
+        let kfs = [
+            Keyframe {
+                frame_index: 0,
+                audio_t: 0,
+                has_audio: false,
+            },
+            Keyframe {
+                frame_index: 123,
+                audio_t: 19,
+                has_audio: true,
+            },
+        ];
+        for (ft, h, w, audio) in [(2, 4, 4, 8), (7, 12, 20, 40), (37, 48, 84, 208)] {
+            let layout = Layout::new(512, ft, h, w, audio, &refs, &kfs).unwrap();
+            let inv: Vec<_> = (0..16)
+                .map(|j| 10_000.0f32.powf(-(j as f32) / 16.0))
+                .collect();
+            assert_dit_matches_scalar(&layout.pos, &inv);
+        }
+    }
+
+    #[test]
+    fn dit_tables_preserve_float_rounding_and_signed_zero() {
+        // Repeated coordinates, distinct doubles that narrow to the same float, and values
+        // outside the usual media grids must retain the original float-angle arithmetic.
+        let mut pos = Vec::new();
+        for p in [0.0, -0.0, 1.0, 1.0 + f64::EPSILON, -0.125, 1e7, 1e20, 1e-40] {
+            pos.extend_from_slice(&[p, p, p]);
+        }
+        pos.extend((0..4096 * 3).map(|i| i as f64 * 0.123456789));
+        for freq in [1.0 / 3.0, -0.25, 0.0] {
+            assert_dit_matches_scalar(&pos, &[freq; 16]);
+            assert_dit_matches_scalar(&[], &[freq; 16]);
+        }
     }
 
     #[test]

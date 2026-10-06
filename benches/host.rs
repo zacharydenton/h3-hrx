@@ -106,5 +106,49 @@ fn host(c: &mut Criterion) {
         })
     });
 }
-criterion_group! { name = benches; config = support::criterion(); targets = host }
+fn rotary(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rotary/dit");
+    let inv: Vec<_> = (0..16)
+        .map(|j| 10_000.0f32.powf(-(j as f32) / 16.0))
+        .collect();
+    for (name, height, width, frames, with_refs) in [
+        ("smoke", 64, 64, 5, false),
+        ("480p_5s", 480, 864, 124, false),
+        ("768p_5s", 768, 1344, 124, false),
+        ("768p_5s_references", 768, 1344, 124, true),
+        ("768p_15s", 768, 1344, 362, false),
+        ("1536p_15s", 1536, 2688, 362, false),
+    ] {
+        let sh = h3_hrx::shape_for(height, width, frames).unwrap();
+        let refs = [h3_hrx::layout::Ref {
+            kind: 2,
+            latent_t: 7,
+            lat_h: 30,
+            lat_w: 54,
+            audio_t: 40,
+            has_audio: true,
+        }];
+        let kfs = [h3_hrx::layout::Keyframe {
+            frame_index: 0,
+            audio_t: 0,
+            has_audio: false,
+        }];
+        let layout = h3_hrx::layout::Layout::new(
+            512,
+            sh.latent_t as usize,
+            sh.lat_h as usize,
+            sh.lat_w as usize,
+            sh.audio_t as usize,
+            if with_refs { &refs } else { &[] },
+            if with_refs { &kfs } else { &[] },
+        )
+        .unwrap();
+        group.throughput(Throughput::Elements(layout.seq_len as u64));
+        group.bench_function(name, |b| {
+            b.iter(|| black_box(&layout).rotary_tables(black_box(&inv)))
+        });
+    }
+    group.finish();
+}
+criterion_group! { name = benches; config = support::criterion(); targets = host, rotary }
 criterion_main!(benches);
