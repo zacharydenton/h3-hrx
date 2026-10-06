@@ -1379,7 +1379,8 @@ fn int8_qk_attention_matches_the_attention_its_operands_define() {
 
 /// RefMods can push the packed sequence into the head-major kernel at 4096
 /// tokens. Check long key loops, partial final tiles and both query-wave halves
-/// against scalar attention; the short cases above cover at most three key tiles.
+/// against scalar attention; very long cases execute 128 query rows against the
+/// entire key sequence to cover production lengths without quadratic test cost.
 #[test]
 #[cfg_attr(
     not(feature = "gpu-tests"),
@@ -1390,7 +1391,8 @@ fn head_major_int8_attention_handles_long_reference_sequences() {
     let mut h = Harness::new();
     let (heads, d) = (3usize, 128usize);
     let stride = heads * d;
-    for tokens in [4096usize, 4097, 8193] {
+    for tokens in [4096usize, 4097, 8193, 65537, 119585, 478340] {
+        let queries = if tokens > 65536 { 128 } else { tokens };
         let capacity = (tokens + 16).div_ceil(256) * 256;
         let mut rng = rand_chacha::ChaCha12Rng::seed_from_u64(tokens as u64);
         let mut normal = || rng.sample::<f32, _>(rand_distr::StandardNormal);
@@ -1431,16 +1433,16 @@ fn head_major_int8_attention_handles_long_reference_sequences() {
             let out = h.run(
                 "attention_i8qkhm_mha8_k64_lds_f16_wmma",
                 &config,
-                [tokens.div_ceil(128) as u32, heads as u32, 1],
+                [queries.div_ceil(128) as u32, heads as u32, 1],
                 256,
-                &[tokens as u64, heads as u64],
+                &[queries as u64, heads as u64],
                 &[
                     bytes(&q),
                     bytes(&qs),
                     bytes(&k),
                     bytes(&ks),
                     bytes(&vt),
-                    vec![0xff; tokens * stride * 2],
+                    vec![0xff; queries * stride * 2],
                 ],
             );
             let got = halves(&out[5], false);
@@ -1448,7 +1450,10 @@ fn head_major_int8_attention_handles_long_reference_sequences() {
             if let Some(previous) = &previous {
                 assert!(previous == &out[5], "unstable attention at {tokens} tokens");
             } else {
-                for row in [0, 15, 16, 31, 63, 64, 127, 128, 4095, tokens - 1] {
+                for row in [0, 15, 16, 31, 63, 64, 127, 128, 4095, tokens - 1]
+                    .into_iter()
+                    .filter(|&row| row < queries)
+                {
                     for head in 0..heads {
                         let score = |key| {
                             let a = (head * capacity + row) * d;
