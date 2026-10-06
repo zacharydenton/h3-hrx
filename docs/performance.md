@@ -10,8 +10,8 @@ Results and baselines belong in ignored `target/criterion/`, never in Git.
 | Target | Coverage |
 | --- | --- |
 | `host` | Short/long tokenization, mixed-media presentation, image resizing, RefMod loading/strength/copies, packed sequence layout |
-| `kernels` | FP32 Hadamard preparation, INT8/BF16 GEMMs with FP32 outputs including DiT projection dimensions, cached/rotating weights, eager/graph dispatch |
-| `models` | Resident one-block DiT eager/graph comparison and short audio roundtrip |
+| `kernels` | FP32 Hadamard preparation, INT8 attention preparation in both layouts, INT8/BF16 GEMMs with FP32 outputs including DiT projection dimensions, cached/rotating weights, eager/graph dispatch |
+| `models` | Resident one-block DiT eager/graph comparison at 256/2048/4096 tokens, covering both integer attention layouts, and short audio roundtrip |
 | `stages` | Complete text encoder plus token refiner, vision tower, video encode/decode, audio encode/decode, complete 50-block denoising trajectories with Euler and ResMultistep |
 | `lifecycle` | Mapping/planning, tensor packing and completed uploads, block loading throughput, cold-file loading, forced audio eviction/reload |
 | `pipeline` | Complete text, first/last-frame, image/audio reference, video/audio reference, RefMod, LoRA, Turbo and World renders; cache observation/reuse; WAV and H.264/AAC output; fresh CLI processes |
@@ -159,6 +159,8 @@ H3_PROFILE=device H3_COMPILE_REPORT_DIR=target/h3-reports cargo bench --bench ke
 GEMM cases include DiT QKV, FFN and down-projection dimensions at 256 and 2,048
 rows. They use the runtime's operand pitches, direct buffer initialization and
 a 512 MiB GPU allocation budget. Setup and output readback stay outside timing.
+`prepare_qk_i8` cases cover token-major and head-major operands at 1, 257, 2,048
+and 8,192 tokens with the same allocation cap and HRX profiling support.
 
 `H3_PROFILE=device` uses HRX's owned graphs and device-clock markers. Each
 `H3_GPU_PROFILE` JSON line records the stage, symbol, launch geometry, scalar

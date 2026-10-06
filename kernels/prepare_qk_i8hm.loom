@@ -181,14 +181,15 @@ kernel.def target(@h3_prepare_qk_i8hm_gfx11) export("h3_prepare_qk_i8hm") @h3_pr
       %dif16 = vector.subf %p16, %s16 : vector<4xf32>
       %r = scf.select %hi16, %dif16, %sum16 : vector<4xf32>
       kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
-      vector.store %r, %row_view[%lc] : vector<4xf32>, view<128xf32>
+      %local_abs = vector.absf %r : vector<4xf32>
+      %local_max = vector.reduce<maxnumf> %local_abs, %zero : vector<4xf32>, f32
+      view.store %local_max, %row_view[%lane] : f32, view<128xf32>
       kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
-      // per (token, head) absmax over the 128 rotated values: every lane scans the row
-      %amax_v = scf.for %i = [%c0 to %c128 step %c4](%acc = %zero4 : vector<4xf32>) -> (vector<4xf32>) {
+      // Scan 32 lane maxima instead of all 128 values; keep the exchange in LDS.
+      %amax_v = scf.for %i = [%c0 to %c32 step %c4](%acc = %zero4 : vector<4xf32>) -> (vector<4xf32>) {
         %ii = index.assume %i [le(%i, %c124), mul(%i, 4)] : index
         %v = vector.load %row_view[%ii] : view<128xf32> -> vector<4xf32>
-        %av = vector.absf %v : vector<4xf32>
-        %m = vector.maxnumf %acc, %av : vector<4xf32>
+        %m = vector.maxnumf %acc, %v : vector<4xf32>
         scf.yield %m : vector<4xf32>
       }
       %amax0 = vector.reduce<maxnumf> %amax_v, %zero : vector<4xf32>, f32

@@ -1059,56 +1059,101 @@ fn prepared_qk(
 )]
 fn prepare_qk_int8_rotates_quantises_and_packs_the_attention_operands() {
     let mut h = Harness::new();
-    let (tokens, heads, d) = (37usize, 4usize, 128usize);
-    let stride = heads * d;
-    let extra = 1.0 / (d as f64).sqrt() / 128.0;
-    let x: Vec<f16> = values(tokens * stride, 0.7)
-        .into_iter()
-        .map(f16::from_f32)
-        .collect();
-    let mean = values(stride, 0.1);
-    let (want_words, want_scales, _) = prepared_qk(&x, &mean, tokens, heads, d, extra);
+    for (tokens, heads) in [(37usize, 4usize), (3, 9), (3, 56)] {
+        let d = 128;
+        let stride = heads * d;
+        let extra = 1.0 / (d as f64).sqrt() / 128.0;
+        let mut x: Vec<f16> = values(tokens * stride, 0.7)
+            .into_iter()
+            .map(f16::from_f32)
+            .collect();
+        let mut mean = values(stride, 0.1);
+        mean[..d].fill(0.0);
+        for row in x.chunks_mut(stride) {
+            row[..d].fill(f16::ZERO);
+            if heads == 56 {
+                row[d..2 * d].fill(f16::MAX);
+            }
+        }
+        let (want_words, want_scales, _) = prepared_qk(&x, &mean, tokens, heads, d, extra);
 
-    let mut config = cfg(&[("row_stride", stride), ("head_offset", 0), ("heads", heads)]);
-    config.push(("extra_scale", format!("{extra:.17e}")));
-    let out = h.run(
-        "prepare_qk_i8",
-        &config,
-        [tokens as u32, 1, 1],
-        256,
-        &[tokens as u64],
-        &[
-            bytes(&x),
-            bytes(&mean),
-            vec![0; tokens * heads * 32 * 4],
-            vec![0; tokens * heads * 4],
-        ],
-    );
-    let words: Vec<i32> = out[2]
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| i32::from_le_bytes(*b))
-        .collect();
-    let differing = words
-        .iter()
-        .zip(&want_words)
-        .filter(|(a, b)| a != b)
-        .count();
-    assert!(
-        differing * 500 < words.len(),
-        "{differing} of {} packed words differ, beyond rounding ties",
-        words.len()
-    );
-    close(
-        &floats(&out[3]),
-        &want_scales
+        let mut config = cfg(&[("row_stride", stride), ("head_offset", 0), ("heads", heads)]);
+        config.push(("extra_scale", format!("{extra:.17e}")));
+        let out = h.run(
+            "prepare_qk_i8",
+            &config,
+            [tokens as u32, 1, 1],
+            256,
+            &[tokens as u64],
+            &[
+                bytes(&x),
+                bytes(&mean),
+                vec![0; tokens * heads * 32 * 4],
+                vec![0; tokens * heads * 4],
+            ],
+        );
+        let words: Vec<i32> = out[2]
+            .as_chunks::<4>()
+            .0
             .iter()
-            .map(|&v| f64::from(v))
-            .collect::<Vec<_>>(),
-        1e-7,
-        1e-4,
-    );
+            .map(|b| i32::from_le_bytes(*b))
+            .collect();
+        let differing = words
+            .iter()
+            .zip(&want_words)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            differing * 500 < words.len(),
+            "{differing} of {} packed words differ, beyond rounding ties",
+            words.len()
+        );
+        close(
+            &floats(&out[3]),
+            &want_scales
+                .iter()
+                .map(|&v| f64::from(v))
+                .collect::<Vec<_>>(),
+            1e-7,
+            1e-4,
+        );
+        let capacity = tokens.div_ceil(32) * 32;
+        config.push(("token_capacity", capacity.to_string()));
+        let head_major = h.run(
+            "prepare_qk_i8hm",
+            &config,
+            [tokens as u32, 1, 1],
+            256,
+            &[tokens as u64],
+            &[
+                bytes(&x),
+                bytes(&mean),
+                vec![0; capacity * stride],
+                vec![0; capacity * heads * 4],
+            ],
+        );
+        for head in 0..heads {
+            for token in 0..capacity {
+                let dst = head * capacity + token;
+                if token < tokens {
+                    let src = token * heads + head;
+                    assert_eq!(
+                        &head_major[2][dst * d..(dst + 1) * d],
+                        &out[2][src * d..(src + 1) * d]
+                    );
+                    assert_eq!(
+                        &head_major[3][dst * 4..(dst + 1) * 4],
+                        &out[3][src * 4..(src + 1) * 4]
+                    );
+                } else {
+                    assert!(head_major[2][dst * d..(dst + 1) * d]
+                        .iter()
+                        .all(|&v| v == 0));
+                    assert_eq!(&head_major[3][dst * 4..(dst + 1) * 4], &[0; 4]);
+                }
+            }
+        }
+    }
 }
 
 /// `attention_i8qk_mha_lds_f16_wmma`, the int8 QK^T path `attn_qk_bits = 8` selects, against the

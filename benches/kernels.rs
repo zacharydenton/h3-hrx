@@ -4,7 +4,7 @@ use h3_hrx::{
     compile::Compiler,
     dispatch::{ActivationType, Gemm, MatmulF32, Prepare, Sink, Tile},
 };
-use half::bf16;
+use half::{bf16, f16};
 use hrx::{Buffer, Stream};
 use std::{path::PathBuf, time::Duration};
 
@@ -113,6 +113,92 @@ fn operand(count: usize, elem: &str, seed: usize) -> Vec<u8> {
             .flat_map(|i| bf16::from_f32(f32::from(value(i)) / 128.).to_le_bytes())
             .collect()
     }
+}
+
+fn attention_preparation(c: &mut Criterion) {
+    use h3_hrx::dispatch::{emit, Profile};
+    use h3_hrx::model::{HEADS, INNER};
+    let mut group = c.benchmark_group("prepare_qk_i8");
+    for tokens in [1usize, 257, 2048, 8192] {
+        for head_major in [false, true] {
+            let layout = if head_major {
+                "head_major"
+            } else {
+                "token_major"
+            };
+            group.throughput(Throughput::Elements((tokens * INNER) as u64));
+            group.bench_function(BenchmarkId::new(layout, tokens), |b| {
+                let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+                let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                let compiler = compiler();
+                let capacity = tokens.div_ceil(32) * 32;
+                let stem = if head_major {
+                    "prepare_qk_i8hm"
+                } else {
+                    "prepare_qk_i8"
+                };
+                let mut cfg = vec![
+                    (format!("h3.{stem}.row_stride"), INNER.to_string()),
+                    (format!("h3.{stem}.head_offset"), "0".into()),
+                    (format!("h3.{stem}.heads"), HEADS.to_string()),
+                    (
+                        format!("h3.{stem}.extra_scale"),
+                        h3_hrx::compile::num(1.0 / 128f64.sqrt() / 128.0),
+                    ),
+                ];
+                if head_major {
+                    cfg.push((format!("h3.{stem}.token_capacity"), capacity.to_string()));
+                }
+                let kernel = compiler
+                    .get(&mut stream, stem, &format!("h3_{stem}"), &cfg)
+                    .unwrap();
+                compiler.flush(&mut stream).unwrap();
+                let input: Vec<_> = (0..tokens * INNER)
+                    .map(|i| f16::from_f32(((i * 37 % 997) as f32 - 498.0) / 128.0))
+                    .collect();
+                let x = upload(&mut stream, bytemuck::cast_slice(&input));
+                let mean = stream.allocate_zeroed(INNER * 4).unwrap();
+                let rows = if head_major { capacity } else { tokens };
+                let codes = stream.allocate_zeroed(rows * INNER).unwrap();
+                let scales = stream.allocate_zeroed(rows * HEADS * 4).unwrap();
+                let bindings = [
+                    x.binding(),
+                    mean.binding(),
+                    codes.binding(),
+                    scales.binding(),
+                ];
+                let required = bindings.map(|view| view.len());
+                let mut profile = Profile::from_env();
+                let mut run = |stream: &mut Stream| {
+                    emit(
+                        &mut Sink::Stream(stream),
+                        &kernel,
+                        Some(&mut profile),
+                        "prepare attention operands",
+                        [tokens as u32, 1, 1],
+                        [256, 1, 1],
+                        &[tokens as u32],
+                        &bindings,
+                        &required,
+                    )
+                    .unwrap();
+                    stream.synchronize().unwrap();
+                };
+                run(&mut stream);
+                let mut expected = vec![0; rows * INNER];
+                stream
+                    .read_blocking(codes.binding(), &mut expected)
+                    .unwrap();
+                let expected_scales = check_f32(&mut stream, &scales);
+                b.iter(|| run(&mut stream));
+                let mut actual = vec![0; expected.len()];
+                stream.read_blocking(codes.binding(), &mut actual).unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(check_f32(&mut stream, &scales), expected_scales);
+            });
+        }
+    }
+    group.finish();
 }
 
 fn gemm(c: &mut Criterion) {
@@ -515,6 +601,6 @@ criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10).warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3));
-    targets = preparation, gemm, audio_qkv, audio_convolution, dispatch
+    targets = preparation, attention_preparation, gemm, audio_qkv, audio_convolution, dispatch
 }
 criterion_main!(benches);

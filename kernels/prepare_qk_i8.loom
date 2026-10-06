@@ -1,11 +1,9 @@
-// SageAttention-style operands for the int4 QK^T attention: per (token, head), subtract a
-// per-channel mean (K smoothing; zero for Q), rotate the 128 channels by the Sylvester
-// Hadamard H_128 (unnormalised butterflies: two within the lane's four values, five across
-// lanes by xor shuffles; the 1/128 rides in Q's scale), quantise to int8 per (token, head)
-// with an absmax/127 scale, and pack 4 codes per i32 word (low byte first: the GEMM /
-// WMMA int4 operand layout). One workgroup per token, a wave per head per round.
+// INT8 QK operands: subtract a per-channel mean (zero for Q), rotate by the
+// unnormalised Hadamard H_128, and quantise with an absmax/127 scale. The 1/128
+// rides in Q's scale. Pack four codes per i32, low byte first.
+// One workgroup per token, a wave per head per round; exchange values through LDS.
 //   x [tokens][row_stride] f16 (heads x 128 at head_offset), mean [row_stride] f32
-//   -> codes [tokens][heads * 32] i32, scales [tokens][heads] f32 (= absmax/7 * extra_scale)
+//   -> codes [tokens][heads * 32] i32, scales [tokens][heads] f32 (= absmax/127 * extra_scale)
 amdgpu.target<gfx11-generic> @h3_prepare_qk_i8_gfx11 {subgroup_size = 32}
 
 config.decl @h3.prepare_qk_i8.row_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
@@ -183,14 +181,15 @@ kernel.def target(@h3_prepare_qk_i8_gfx11) export("h3_prepare_qk_i8") @h3_prepar
       %dif16 = vector.subf %p16, %s16 : vector<4xf32>
       %r = scf.select %hi16, %dif16, %sum16 : vector<4xf32>
       kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
-      vector.store %r, %row_view[%lc] : vector<4xf32>, view<128xf32>
+      %local_abs = vector.absf %r : vector<4xf32>
+      %local_max = vector.reduce<maxnumf> %local_abs, %zero : vector<4xf32>, f32
+      view.store %local_max, %row_view[%lane] : f32, view<128xf32>
       kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
-      // per (token, head) absmax over the 128 rotated values: every lane scans the row
-      %amax_v = scf.for %i = [%c0 to %c128 step %c4](%acc = %zero4 : vector<4xf32>) -> (vector<4xf32>) {
+      // Scan 32 lane maxima instead of all 128 values; keep the exchange in LDS.
+      %amax_v = scf.for %i = [%c0 to %c32 step %c4](%acc = %zero4 : vector<4xf32>) -> (vector<4xf32>) {
         %ii = index.assume %i [le(%i, %c124), mul(%i, 4)] : index
         %v = vector.load %row_view[%ii] : view<128xf32> -> vector<4xf32>
-        %av = vector.absf %v : vector<4xf32>
-        %m = vector.maxnumf %acc, %av : vector<4xf32>
+        %m = vector.maxnumf %acc, %v : vector<4xf32>
         scf.yield %m : vector<4xf32>
       }
       %amax0 = vector.reduce<maxnumf> %amax_v, %zero : vector<4xf32>, f32
