@@ -91,8 +91,11 @@ that retained pair. Use stage-scoped ownership for a 32 GiB complete render:
 H3_BENCH_RESIDENCY=stage-scoped H3_BENCH_BUDGET_GIB=32 cargo bench --locked --bench pipeline -- text/res_multistep/warm_session --test
 ```
 
-Keep enough physical memory available for the chosen budget; the budget is a
-ceiling, not host or device offloading.
+The allocation budget does not cap total process or system memory. Leave room
+for mapped checkpoints, host packing, compiler memory, media encoding and other
+applications. On UMA these compete with GPU allocations for physical RAM. Use
+stage-scoped residency and a smaller budget on a shared machine; run GPU
+benchmarks serially and watch system available memory as well as reservations.
 
 `lora` defaults to the pinned Orbit adapter; `H3_BENCH_LORA` can override it.
 `world` defaults to the pinned H3-World adapter; `H3_BENCH_WORLD_ADAPTER` can
@@ -130,7 +133,35 @@ the production muxer's `-shortest` behavior: rounded audio can trim a partial
 final video-frame interval (the five-frame smoke render encodes four frames).
 These checks complement the
 [independent correctness tests](testing.md); they do not establish visual quality.
-Keep `H3_PROFILE` and stage tracing disabled during timing runs.
+Keep `H3_PROFILE`, `H3_COMPILE_REPORT_DIR` and stage tracing disabled during timing runs.
+
+## HRX diagnostics
+
+Collect diagnostics separately from Criterion latency samples:
+
+```sh
+H3_PROFILE=device H3_COMPILE_REPORT_DIR=target/h3-reports cargo bench --bench stages -- audio_encode/165600 --test 2>target/h3-profile.log
+```
+
+`H3_PROFILE=device` uses HRX's owned graphs and device-clock markers. Each
+`H3_GPU_PROFILE` JSON line records the stage, symbol, launch geometry, scalar
+arguments, binding sizes, distinct retained allocation bytes, device intervals
+and enclosing replay host time. Retained allocation bytes count shared backing
+once and can exceed the sum of sliced binding sizes.
+The diagnostic graph serializes each dispatch and adds markers/barriers; these
+intervals locate costly kernels but do not measure ordinary graph overlap or
+hardware utilization. Unsupported timestamp capture fails explicitly.
+`H3_PROFILE=1` retains synchronized host timing instead.
+
+`H3_COMPILE_REPORT_DIR` writes one detailed Loom report per specialization,
+including resources, complete wait reasons and evidence-backed guidance.
+It compiles separate ordinary and analysis artifacts and requires identical
+executable bytes before dispatch. Normal execution keeps its usual artifact.
+Compiler occupancy and wait counts are models, not measured utilization or stall
+time; unavailable evidence remains null. Reports and profiling logs stay ignored.
+
+The `audio_qkv_f32` kernel cases compare row-major and packed FP32 projections
+at one and 207 rows, checking byte-identical output outside timing.
 
 ## Memory
 

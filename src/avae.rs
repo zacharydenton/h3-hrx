@@ -53,26 +53,41 @@ fn conv_s(
     b: View<'_>,
     out: View<'_>,
 ) -> Result<()> {
-    let ns = "h3.conv1d_s_f32.";
-    let cfg: Cfg = vec![
+    // The encoder's stride-one convolutions use the same flat weights as the
+    // four-sample decoder kernel. Reuse each weight across adjacent samples,
+    // retaining the scalar kernel for short windows and downsampling.
+    let tiled = stride == 1 && in_len == out_len && cin >= 32 && out_len >= 256;
+    let stem = if tiled { "conv1d4_f32" } else { "conv1d_s_f32" };
+    let ns = format!("h3.{stem}.");
+    let mut cfg: Cfg = vec![
         (format!("{ns}cin"), cin.to_string()),
         (format!("{ns}cout"), cout.to_string()),
         (format!("{ns}ksize"), ksize.to_string()),
         (format!("{ns}dilation"), dil.to_string()),
         (format!("{ns}pad"), pad.to_string()),
-        (format!("{ns}stride"), stride.to_string()),
-        (format!("{ns}in_bound"), pow2_bound(in_len).to_string()),
-        (format!("{ns}out_bound"), pow2_bound(out_len).to_string()),
     ];
-    let k = c.get(stream, "conv1d_s_f32", "h3_conv1d_s_f32", &cfg)?;
+    if tiled {
+        cfg.extend([
+            (format!("{ns}accumulate"), "0".into()),
+            (format!("{ns}len_bound"), pow2_bound(out_len).to_string()),
+        ]);
+    } else {
+        cfg.extend([
+            (format!("{ns}stride"), stride.to_string()),
+            (format!("{ns}in_bound"), pow2_bound(in_len).to_string()),
+            (format!("{ns}out_bound"), pow2_bound(out_len).to_string()),
+        ]);
+    }
+    let k = c.get(stream, stem, &format!("h3_{stem}"), &cfg)?;
+    let scalars = [out_len as u32, in_len as u32];
     checked(
         stream,
         &k,
         Some(prof),
         stage,
         [out_len.div_ceil(256) as u32, cout as u32, 1],
-        [THREADS, 1, 1],
-        &[out_len as u32, in_len as u32],
+        [if tiled { 64 } else { THREADS }, 1, 1],
+        &scalars[..if tiled { 1 } else { 2 }],
         &[x, w, b, out],
         &[
             cin * in_len * 4,
@@ -970,7 +985,7 @@ impl AudioVae {
             )?;
             let hoisted_1 = w(stream, "aenc.pre.qkv.w", 6144 * 2048)?;
             let hoisted_2 = w(stream, "aenc.pre.qkv.b", 6144)?;
-            MatmulF32::build(c, stream, 2048, 6144)?.run(
+            MatmulF32::build_packed(c, stream, 2048, 6144)?.run(
                 stream,
                 Some(prof),
                 "aenc matmul",

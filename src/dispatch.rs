@@ -12,11 +12,12 @@ use std::time::Instant;
 
 pub type Result<T> = std::result::Result<T, crate::compile::Error>;
 
-/// Per-stage wall time, printed after a run when `H3_PROFILE` is set. Timing a launch means
-/// synchronising around it, so this is opt-in.
+/// Opt-in stage diagnostics. `H3_PROFILE=1` times synchronized host dispatch;
+/// `H3_PROFILE=device` records HRX device-clock intervals and emits JSON evidence.
 #[derive(Default)]
 pub struct Profile {
     pub on: bool,
+    device: bool,
     timings: hrx::benchmark::StageTimings,
 }
 
@@ -24,6 +25,7 @@ impl Profile {
     pub fn from_env() -> Self {
         Self {
             on: std::env::var_os("H3_PROFILE").is_some_and(|v| !v.is_empty() && v != "0"),
+            device: std::env::var("H3_PROFILE").as_deref() == Ok("device"),
             timings: hrx::benchmark::StageTimings::new(),
         }
     }
@@ -34,8 +36,8 @@ impl Profile {
 
     /// The stages worth naming, largest first: any taking more than `floor` of the total.
     ///
-    /// `H3_PROFILE` costs a synchronise around every launch, so a run that pays for it must get the
-    /// report back — otherwise it is pure slowdown.
+    /// Both modes serialize launches. Device intervals include timestamp/barrier overhead;
+    /// neither mode represents ordinary inference latency.
     pub fn report(&self, floor: f64) -> String {
         let total = self.total_seconds();
         if total <= 0.0 {
@@ -44,7 +46,12 @@ impl Profile {
         let totals = self.timings.totals_ms();
         let mut stages: Vec<(&String, &f64)> = totals.iter().collect();
         stages.sort_by(|a, b| b.1.total_cmp(a.1));
-        let mut out = format!("{total:.1} s:");
+        let clock = if self.device {
+            "device intervals"
+        } else {
+            "host dispatch"
+        };
+        let mut out = format!("{clock} {total:.1} s:");
         for (name, micros) in stages {
             if *micros > floor * total * 1e3 {
                 out.push_str(&format!("  {name} {:.2}s", micros * 1e-3));
@@ -85,6 +92,27 @@ pub(crate) unsafe fn launch(
     // checked 32/64-bit index lowering; arbitrary mixed scalars are never inferred.
     let constants = hrx::Constants::indices(kernel, scalars)?;
     match profile {
+        Some(p) if p.on && p.device => {
+            stream.synchronize()?;
+            let mut graph = stream.owned_graph()?;
+            // Safety: identical dispatch contract to the ordinary path below.
+            unsafe { graph.dispatch(&[], kernel, grid, block, &constants, bindings)? };
+            let retained_binding_bytes = graph.binding_bytes();
+            let mut graph = graph.finish_profiled(&[stage.to_string()])?;
+            let started = Instant::now();
+            let device = stream.launch_profiled(&mut graph)?;
+            let host_ms = started.elapsed().as_secs_f64() * 1e3;
+            p.timings.push(stage, device.interval_union_ms)?;
+            eprintln!(
+                "H3_GPU_PROFILE {}",
+                serde_json::json!({
+                    "stage": stage, "symbol": kernel.symbol(), "grid": grid, "block": block,
+                    "scalars": scalars, "binding_bytes": bindings.iter().map(|v| v.len()).collect::<Vec<_>>(),
+                    "retained_binding_bytes": retained_binding_bytes,
+                    "replay_host_ms": host_ms, "device": device,
+                })
+            );
+        }
         Some(p) if p.on => {
             stream.synchronize()?;
             let started = Instant::now();
@@ -1190,13 +1218,43 @@ pub struct MatmulF32 {
 
 impl MatmulF32 {
     pub fn build(c: &Compiler, stream: &mut hrx::Stream, k: usize, n: usize) -> Result<Self> {
-        let ns = "h3.matmul_f32.";
+        Self::build_layout(c, stream, k, n, false)
+    }
+
+    /// Weights are `[N / 32][K][32]`, preserving the original ordered FP32 dot.
+    pub fn build_packed(
+        c: &Compiler,
+        stream: &mut hrx::Stream,
+        k: usize,
+        n: usize,
+    ) -> Result<Self> {
+        if !n.is_multiple_of(32) {
+            return Err(crate::compile::Error::Io(
+                "packed matmul needs 32-column groups".into(),
+            ));
+        }
+        Self::build_layout(c, stream, k, n, true)
+    }
+
+    fn build_layout(
+        c: &Compiler,
+        stream: &mut hrx::Stream,
+        k: usize,
+        n: usize,
+        packed: bool,
+    ) -> Result<Self> {
+        let stem = if packed {
+            "matmul_packed_f32"
+        } else {
+            "matmul_f32"
+        };
+        let ns = format!("h3.{stem}.");
         let cfg: Cfg = vec![
             (format!("{ns}k"), k.to_string()),
             (format!("{ns}n"), n.to_string()),
         ];
         Ok(Self {
-            kernel: c.get(stream, "matmul_f32", "h3_matmul_f32", &cfg)?,
+            kernel: c.get(stream, stem, &format!("h3_{stem}"), &cfg)?,
             k,
             n,
         })
@@ -1474,6 +1532,55 @@ impl LayerNorm16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires gfx1151 and HRX device timestamps"
+    )]
+    fn device_profiling_preserves_output_and_releases_allocations() {
+        let manager = hrx::residency::ResidencyManager::new(1 << 30).unwrap();
+        {
+            let mut stream = hrx::Stream::open()
+                .unwrap()
+                .with_memory_budget(manager.budget());
+            let compiler = Compiler::new(None, std::path::PathBuf::new());
+            let values = [1f32, -2., 3.5, 4.];
+            let x = stream.allocate(16).unwrap();
+            let y = stream.allocate(16).unwrap();
+            stream
+                .upload_blocking(x.binding(), bytemuck::cast_slice(&values))
+                .unwrap();
+            for device in [false, true] {
+                stream
+                    .upload_blocking(y.binding(), bytemuck::cast_slice(&values))
+                    .unwrap();
+                let mut profile = Profile {
+                    on: true,
+                    device,
+                    ..Default::default()
+                };
+                axpy(
+                    &compiler,
+                    &mut stream,
+                    Some(&mut profile),
+                    "profile regression",
+                    1.,
+                    1.,
+                    values.len(),
+                    x.binding(),
+                    y.binding(),
+                )
+                .unwrap();
+                let result = stream.read(y.binding()).unwrap().wait(&mut stream).unwrap();
+                assert_eq!(result, bytemuck::cast_slice::<f32, u8>(&[2., -4., 7., 8.]));
+                assert!(profile.total_seconds() > 0.);
+                assert!(!profile.take().is_empty());
+                assert_eq!(profile.total_seconds(), 0.);
+            }
+        }
+        assert_eq!(manager.statistics().reserved_bytes, 0);
+    }
 
     #[test]
     fn a_class_is_a_row_of_the_table_it_indexes() {

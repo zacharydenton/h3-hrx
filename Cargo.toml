@@ -70,7 +70,7 @@ name = "cache_calibrate"
 test = true
 
 [dependencies]
-hrx = { package = "hrx-rs", version = "0.8.7" }
+hrx = { package = "hrx-rs", version = "0.8.16" }
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"
 thiserror = "2"

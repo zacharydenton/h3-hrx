@@ -133,13 +133,13 @@ pub(crate) fn packed_conv(cin: usize, cout: usize) -> bool {
     cin >= 32 && cout >= 32 && cout.is_multiple_of(8)
 }
 
-fn pack_conv_weights(bytes: &[u8], outputs: usize, reduction: usize) -> Vec<u8> {
+fn pack_output_channels(bytes: &[u8], outputs: usize, reduction: usize, tile: usize) -> Vec<u8> {
     let mut packed = vec![0; bytes.len()];
-    for group in 0..outputs / 8 {
+    for group in 0..outputs / tile {
         for tap in 0..reduction {
-            for channel in 0..8 {
-                let src = ((group * 8 + channel) * reduction + tap) * 4;
-                let dst = ((group * reduction + tap) * 8 + channel) * 4;
+            for channel in 0..tile {
+                let src = ((group * tile + channel) * reduction + tap) * 4;
+                let dst = ((group * reduction + tap) * tile + channel) * 4;
                 packed[dst..dst + 4].copy_from_slice(&bytes[src..src + 4]);
             }
         }
@@ -165,10 +165,11 @@ fn decoder_conv(
             Recipe::Built {
                 bytes,
                 build: Box::new(move |ck| {
-                    Ok(pack_conv_weights(
+                    Ok(pack_output_channels(
                         ck.bytes(ck.at(&weight)?),
                         cout,
                         cin * kernel,
+                        8,
                     ))
                 }),
             },
@@ -373,7 +374,17 @@ fn encoder(ck: &Checkpoint, out: &mut Table) -> Result<()> {
     ck.at_checked("pre_block.attn.qkv.weight", Dtype::F32, &[6144, 2048])?;
     out.insert(
         "aenc.pre.qkv.w".into(),
-        rows_of(ck, &["pre_block.attn.qkv.weight"], 0)?,
+        Recipe::Built {
+            bytes: 6144 * 2048 * 4,
+            build: Box::new(|ck| {
+                Ok(pack_output_channels(
+                    ck.bytes(ck.at("pre_block.attn.qkv.weight")?),
+                    6144,
+                    2048,
+                    32,
+                ))
+            }),
+        },
     );
     // q, a zero k, and v, concatenated: the attention takes one bias
     for n in ["q_bias", "zero_k_bias", "v_bias"] {
@@ -457,13 +468,30 @@ fn encoder(ck: &Checkpoint, out: &mut Table) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{pack_conv_weights, pack_upsample_weights};
+    use super::{pack_output_channels, pack_upsample_weights};
+
+    #[test]
+    fn qkv_packing_preserves_bits_across_waves() {
+        let input: Vec<u8> = (0..64 * 3u32)
+            .flat_map(|i| (0x7fc0_0000 + i).to_le_bytes())
+            .collect();
+        let packed = pack_output_channels(&input, 64, 3, 32);
+        for output in 0..64 {
+            for k in 0..3 {
+                let at = ((output / 32 * 3 + k) * 32 + output % 32) * 4;
+                assert_eq!(
+                    &packed[at..at + 4],
+                    &(0x7fc0_0000u32 + (output * 3 + k) as u32).to_le_bytes()
+                );
+            }
+        }
+    }
 
     #[test]
     fn convolution_packing_preserves_bits_and_output_groups() {
         let bits: Vec<u32> = (0..32).map(|i| 0x7fc0_0000 + i).collect();
         let input: Vec<u8> = bits.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let packed = pack_conv_weights(&input, 16, 2);
+        let packed = pack_output_channels(&input, 16, 2, 8);
         let expected = [
             0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15, 16, 18, 20, 22, 24, 26, 28, 30,
             17, 19, 21, 23, 25, 27, 29, 31,

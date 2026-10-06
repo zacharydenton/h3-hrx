@@ -2,7 +2,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use h3_hrx::{
     compile::Compiler,
-    dispatch::{ActivationType, Gemm, Prepare, Sink, Tile},
+    dispatch::{ActivationType, Gemm, MatmulF32, Prepare, Sink, Tile},
 };
 use half::bf16;
 use hrx::{Buffer, Stream};
@@ -183,6 +183,79 @@ fn gemm(c: &mut Criterion) {
     group.finish();
 }
 
+fn audio_qkv(c: &mut Criterion) {
+    let mut group = c.benchmark_group("audio_qkv_f32");
+    let (k, n) = (2048, 6144);
+    for m in [1usize, 207] {
+        for packed in [false, true] {
+            let layout = if packed { "packed" } else { "row_major" };
+            group.bench_function(format!("{layout}/{m}x{k}x{n}"), |b| {
+                let mut stream = Stream::open().unwrap();
+                let compiler = compiler();
+                let plain = MatmulF32::build(&compiler, &mut stream, k, n).unwrap();
+                let op = if packed {
+                    MatmulF32::build_packed(&compiler, &mut stream, k, n).unwrap()
+                } else {
+                    MatmulF32::build(&compiler, &mut stream, k, n).unwrap()
+                };
+                compiler.flush(&mut stream).unwrap();
+                let values = |len| {
+                    (0..len)
+                        .map(|i| ((i * 37 % 101) as f32 - 50.) / 200.)
+                        .collect::<Vec<_>>()
+                };
+                let x = upload(&mut stream, bytemuck::cast_slice(&values(m * k)));
+                let w = values(n * k);
+                let reference = upload(&mut stream, bytemuck::cast_slice(&w));
+                let bias = upload(&mut stream, bytemuck::cast_slice(&values(n)));
+                let out = stream.allocate(m * n * 4).unwrap();
+                plain
+                    .run(
+                        &mut stream,
+                        None,
+                        "qkv",
+                        m,
+                        x.binding(),
+                        reference.binding(),
+                        bias.binding(),
+                        out.binding(),
+                    )
+                    .unwrap();
+                let expected = check_f32(&mut stream, &out);
+                let weights = if packed {
+                    let mut permuted = Vec::with_capacity(w.len());
+                    for tile in w.chunks(32 * k) {
+                        for i in 0..k {
+                            for col in 0..32 {
+                                permuted.push(tile[col * k + i]);
+                            }
+                        }
+                    }
+                    upload(&mut stream, bytemuck::cast_slice(&permuted))
+                } else {
+                    reference
+                };
+                b.iter(|| {
+                    op.run(
+                        &mut stream,
+                        None,
+                        "qkv",
+                        m,
+                        x.binding(),
+                        weights.binding(),
+                        bias.binding(),
+                        out.binding(),
+                    )
+                    .unwrap();
+                    stream.synchronize().unwrap();
+                });
+                assert_eq!(check_f32(&mut stream, &out), expected);
+            });
+        }
+    }
+    group.finish();
+}
+
 fn dispatch(c: &mut Criterion) {
     const LAUNCHES: usize = 256;
     let mut group = c.benchmark_group("dispatch_256");
@@ -271,6 +344,6 @@ criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10).warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3));
-    targets = preparation, gemm, dispatch
+    targets = preparation, gemm, audio_qkv, dispatch
 }
 criterion_main!(benches);

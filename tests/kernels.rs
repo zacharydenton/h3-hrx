@@ -275,6 +275,54 @@ fn attention_preserves_the_upper_tile_softmax_maximum() {
     not(feature = "gpu-tests"),
     ignore = "requires gfx1151 and provisioned HRX"
 )]
+fn packed_fp32_projection_preserves_ordered_dots_and_guards() {
+    let mut h = Harness::new();
+    for (m, k, n) in [(1usize, 1usize, 32usize), (3, 129, 288), (5, 2048, 64)] {
+        let x = values(m * k, 0.25);
+        let w = values(n * k, 0.125);
+        let bias = values(n, 0.01);
+        let mut packed = Vec::with_capacity(w.len());
+        for group in w.chunks(32 * k) {
+            for i in 0..k {
+                for column in 0..32 {
+                    packed.push(group[column * k + i]);
+                }
+            }
+        }
+        let mut expected = vec![113f32; m * n + 64];
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = bias[col];
+                for i in 0..k {
+                    acc = x[row * k + i].mul_add(w[col * k + i], acc);
+                }
+                expected[row * n + col] = acc;
+            }
+        }
+        for (stem, weights) in [("matmul_f32", &w), ("matmul_packed_f32", &packed)] {
+            let out = h.run(
+                stem,
+                &cfg(&[("k", k), ("n", n)]),
+                [n.div_ceil(256) as u32, m as u32, 1],
+                256,
+                &[m as u64],
+                &[
+                    bytes(&x),
+                    bytes(weights),
+                    bytes(&bias),
+                    bytes(&vec![113f32; m * n + 64]),
+                ],
+            );
+            assert_eq!(out[3], bytes(&expected), "{stem} {m}x{k}x{n}");
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn audio_convolution_matches_f64_with_padding_residuals_and_guards() {
     let mut h = Harness::new();
     for n in [1usize, 63, 64, 65, 127, 128, 129, 255, 256, 257, 769] {

@@ -132,6 +132,7 @@ struct RequestKey {
 pub struct Compiler {
     library: Option<PathBuf>,
     sources: PathBuf,
+    reports: Option<PathBuf>,
     source_cache: Mutex<HashMap<String, Arc<str>>>,
     /// Built on the first request, for the target that request's stream reported.
     kernels: OnceLock<hrx::loom::KeyedKernels<RequestKey>>,
@@ -141,6 +142,7 @@ impl Compiler {
         Self {
             library,
             sources: sources.into(),
+            reports: std::env::var_os("H3_COMPILE_REPORT_DIR").map(PathBuf::from),
             source_cache: Mutex::new(HashMap::new()),
             kernels: OnceLock::new(),
         }
@@ -248,6 +250,42 @@ impl Compiler {
                         .map_err(|e| hrx::Error::Message(e.to_string()))?;
                     let mut spec = hrx::loom::Specialization::new(&key.symbol);
                     spec.replace_config(key.config.iter().cloned().collect());
+                    if let Some(directory) = &self.reports {
+                        let compiler = self
+                            .kernels(Some(stream.target()))
+                            .map_err(|e| hrx::Error::Message(e.to_string()))?
+                            .kernels()
+                            .compiler();
+                        let module = compiler.module(&source);
+                        let ordinary = module.compile(&spec)?;
+                        let mut detailed = spec.clone();
+                        detailed.set_report(hrx::loom::ReportMode::Details);
+                        let artifact = module.compile(&detailed)?;
+                        if ordinary.bytes() != artifact.bytes() {
+                            return Err(hrx::Error::Message(
+                                "compiler reporting changed executable bytes".into(),
+                            ));
+                        }
+                        let report = artifact.report().ok_or_else(|| {
+                            hrx::Error::Message("compiler omitted detailed report".into())
+                        })?;
+                        let document = serde_json::json!({
+                            "symbol": key.symbol, "configuration": key.config,
+                            "resources": report.entries()?, "wait_reasons": report.wait_reasons()?,
+                            "guidance": report.guidance()?, "diagnostics": artifact.diagnostics(),
+                            "report": report,
+                        });
+                        let path = directory.join(format!(
+                            "{}-{}.json",
+                            key.symbol,
+                            module.key(&detailed)?
+                        ));
+                        write(
+                            &path,
+                            &serde_json::to_vec_pretty(&document)
+                                .map_err(|e| hrx::Error::Message(e.to_string()))?,
+                        )?;
+                    }
                     Ok((source, spec))
                 })
         }?;
