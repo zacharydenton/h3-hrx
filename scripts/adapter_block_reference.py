@@ -60,9 +60,9 @@ def evaluate(directory, native_attention=False):
     gate = raw('gate.f32', (classes, HID))[torch.arange(n) % classes]
     intermediates = {}
     def compare(name, actual):
-        path = directory / (name + '.f16')
+        path = directory / (name + ('.f32' if name == 'hidden' else '.f16'))
         if path.exists():
-            expected = torch.from_numpy(np.fromfile(path, np.float16).astype(np.float32)).reshape(actual.shape)
+            expected = torch.from_numpy(np.fromfile(path, np.float32 if name == 'hidden' else np.float16).astype(np.float32)).reshape(actual.shape)
             intermediates[name] = float(torch.linalg.vector_norm(actual - expected) / torch.linalg.vector_norm(expected))
     base_path = cached('Comfy-Org/MiniMax-H3', 'a98869194787969724c7425d95d0ed73ce9202af', 'diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors')
     adapter_path = cached(*PINS[meta['preset']])
@@ -79,8 +79,8 @@ def evaluate(directory, native_attention=False):
             a = adapter.get_tensor(key + '.lora_A.weight').float()
             b = adapter.get_tensor(key + '.lora_B.weight').float()
             scale = adapter.get_tensor(key + '.alpha').item() / a.shape[0] if key + '.alpha' in adapter.keys() else 1.0
-            ranks = half(x.to(torch.bfloat16).float() @ a.T).to(torch.bfloat16).float()
-            delta = half(ranks @ (b * scale).to(torch.bfloat16).float().T)
+            ranks = (x.to(torch.bfloat16).float() @ a.T).to(torch.bfloat16).float()
+            delta = ranks @ (b * scale).to(torch.bfloat16).float().T
             w = tensor(name + '.weight')
             if meta['refiner']:
                 result = x.to(torch.bfloat16).float() @ w.T
@@ -108,7 +108,7 @@ def evaluate(directory, native_attention=False):
             attention = torch.from_numpy(np.fromfile(directory / 'attention.f16', np.float16).astype(np.float32)).reshape(n, INNER)
         x = x + gate * linear(attention, 'attn.out_proj')
         gu = linear(norm(x, 'norm2'), 'mlp.fc1')
-        hidden = half(torch.nn.functional.silu(gu[:, :FFN]) * gu[:, FFN:])
+        hidden = torch.nn.functional.silu(gu[:, :FFN]) * gu[:, FFN:]
         compare('hidden', hidden)
         actual = x + gate * linear(hidden, 'mlp.fc2')
     relative = float(torch.linalg.vector_norm(actual - expected) / torch.linalg.vector_norm(expected))

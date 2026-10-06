@@ -270,7 +270,7 @@ impl Dit {
             seq.x.slice(0, rows * HID * 4),
             crate::vvae::as_bytes_mut(out),
         )?;
-        Ok(())
+        crate::error::finite_output("text conditioning", "embeddings", out)
     }
 }
 
@@ -1292,6 +1292,8 @@ impl Dit {
             a,
             res.then_some(ascale),
         );
+        crate::error::finite_output("denoise", "video latents", &video)?;
+        crate::error::finite_output("denoise", "audio latents", &audio)?;
         Ok(Latents { video, audio })
     }
 }

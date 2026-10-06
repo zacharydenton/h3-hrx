@@ -1,0 +1,343 @@
+// Wide-row preparation: bounded 16 KiB f32 LDS, two passes over 256-element Hadamard groups.
+// Recompute transformed tiles after the token maximum is known; never narrow partial sums.
+template.decl @h3.prepare_plain_tiled(%tokens: index, %h: buffer, %q: buffer, %q_scale: buffer, %width: index, %lanes: index, %out_stride: index, %input_f32: i1, %bits: index)
+
+template.def<@h3.prepare_plain_tiled> @h3_prepare_plain_tiled(%tokens: index, %h: buffer, %q: buffer, %q_scale: buffer, %width: index, %lanes: index, %out_stride: index, %input_f32: i1, %bits: index) {
+
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %c256 = index.constant 256 : index
+  %tile = index.constant 4096 : index
+  %tile_quads = index.constant 1024 : index
+  %tile_quads_per_lane = index.div %tile_quads, %lanes : index
+  %tile_chunks = index.div %tile, %lanes : index
+  %off0 = index.constant 0 : offset
+  %tile_bytes = index.constant 16384 : offset
+  %zero = scalar.constant 0.0 : f32
+  %one = scalar.constant 1.0 : f32
+  %sixteenth = scalar.constant 0.0625 : f32
+  %tiny = scalar.constant 1e-30 : f32
+  %inf = scalar.constant inf : f32
+  %q127 = scalar.constant 127.0 : f32
+  %q7 = scalar.constant 7.0 : f32
+  %is_i8 = index.cmp eq, %bits, %c8 : index
+  %qmax = scf.select %is_i8, %q127, %q7 : f32
+  %neg_qmax = scalar.subf %zero, %qmax : f32
+  %packed = index.div %c32, %bits : index
+  %out_words = index.div %out_stride, %packed : index
+  %words = index.div %tile, %packed : index
+  %zero_i32 = scalar.constant 0 : i32
+  %mask8 = scalar.constant 255 : i32
+  %mask4 = scalar.constant 15 : i32
+  %mask = scf.select %is_i8, %mask8, %mask4 : i32
+  %tokens_b = index.assume %tokens [range(%tokens, 1, 1048576)] : index
+  %row0 = kernel.workgroup.id<x> : index
+  %row = index.assume %row0 [lt(%row0, %tokens_b)] : index
+  %lane = kernel.workitem.id<x> : index
+  %hg = buffer.assume.memory_space<global> %h : buffer
+  %qg = buffer.assume.memory_space<global> %q : buffer
+  %sg = buffer.assume.memory_space<global> %q_scale : buffer
+  %h16 = buffer.view %hg[%off0] : buffer -> view<[%tokens_b]x[%width]xf16>
+  %h32 = buffer.view %hg[%off0] : buffer -> view<[%tokens_b]x[%width]xf32>
+  %qw = buffer.view %qg[%off0] : buffer -> view<[%tokens_b]x[%out_words]xi32>
+  %sv = buffer.view %sg[%off0] : buffer -> view<[%tokens_b]xf32>
+  %lds = buffer.alloca<workgroup> align(16) %tile_bytes : buffer
+  %x_view = buffer.view %lds[%off0] : buffer -> view<4096xf32>
+  %final_scale = scf.for %pass = [%c0 to %c2 step %c1](%scale = %one : f32) -> (f32) {
+    %first = index.cmp eq, %pass, %c0 : index
+    %valid_scale = scalar.cmpf olt, %scale, %inf : f32
+    %inv = scalar.divf %sixteenth, %scale : f32
+    %max_all = scf.for %base = [%c0 to %width step %tile](%max_prev = %zero : f32) -> (f32) {
+      scf.for %j = [%c0 to %tile_chunks step %c1] {
+        %step = index.mul %j, %lanes : index
+        %local = index.add %step, %lane : index
+        %col = index.add %base, %local : index
+        %active = index.cmp ult, %col, %width : index
+        %value = scf.if %active -> (f32) {
+          %col_b = index.assume %col [lt(%col, %width)] : index
+          %v = scf.if %input_f32 -> (f32) {
+            %f = view.load %h32[%row, %col_b] : view<[%tokens_b]x[%width]xf32> -> f32
+            scf.yield %f : f32
+          } else {
+            %hval = view.load %h16[%row, %col_b] : view<[%tokens_b]x[%width]xf16> -> f16
+            %f = scalar.extf %hval : f16 to f32
+            scf.yield %f : f32
+          }
+          scf.yield %v : f32
+        } else {
+          scf.yield %zero : f32
+        }
+        view.store %value, %x_view[%local] : f32, view<4096xf32>
+      }
+      kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  // Hadamard: four radix-4 stages; each lane owns whole quads, so no barrier inside a stage.
+  scf.for %t_j = [%c0 to %tile_quads_per_lane step %c1] {
+    %t_lane_step = index.mul %t_j, %lanes : index
+    %t0 = index.add %t_lane_step, %lane : index
+    %t = index.assume %t0 [lt(%t0, %tile_quads)] : index
+    %g = index.div %t, %c64 : index
+    %within = index.rem %t, %c64 : index
+    %lo = index.rem %within, %c1 : index
+    %hi = index.div %within, %c1 : index
+    %hi4 = index.mul %hi, %c4 : index
+    %hi4d = index.mul %hi4, %c1 : index
+    %g256 = index.mul %g, %c256 : index
+    %base0 = index.add %g256, %hi4d : index
+    %base = index.add %base0, %lo : index
+    %i1 = index.add %base, %c1 : index
+    %i2 = index.add %i1, %c1 : index
+    %i3 = index.add %i2, %c1 : index
+    %e0 = view.load %x_view[%base] : view<4096xf32> -> f32
+    %e1 = view.load %x_view[%i1] : view<4096xf32> -> f32
+    %e2 = view.load %x_view[%i2] : view<4096xf32> -> f32
+    %e3 = view.load %x_view[%i3] : view<4096xf32> -> f32
+    %s01 = scalar.addf %e0, %e1 : f32
+    %s23 = scalar.addf %e2, %e3 : f32
+    %d01 = scalar.subf %e0, %e1 : f32
+    %d23 = scalar.subf %e2, %e3 : f32
+    %o0 = scalar.addf %s01, %d23 : f32
+    %o1 = scalar.subf %s01, %d23 : f32
+    %o2 = scalar.addf %d01, %s23 : f32
+    %o3 = scalar.subf %s23, %d01 : f32
+    view.store %o0, %x_view[%base] : f32, view<4096xf32>
+    view.store %o1, %x_view[%i1] : f32, view<4096xf32>
+    view.store %o2, %x_view[%i2] : f32, view<4096xf32>
+    view.store %o3, %x_view[%i3] : f32, view<4096xf32>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  scf.for %t_j = [%c0 to %tile_quads_per_lane step %c1] {
+    %t_lane_step = index.mul %t_j, %lanes : index
+    %t0 = index.add %t_lane_step, %lane : index
+    %t = index.assume %t0 [lt(%t0, %tile_quads)] : index
+    %g = index.div %t, %c64 : index
+    %within = index.rem %t, %c64 : index
+    %lo = index.rem %within, %c4 : index
+    %hi = index.div %within, %c4 : index
+    %hi4 = index.mul %hi, %c4 : index
+    %hi4d = index.mul %hi4, %c4 : index
+    %g256 = index.mul %g, %c256 : index
+    %base0 = index.add %g256, %hi4d : index
+    %base = index.add %base0, %lo : index
+    %i1 = index.add %base, %c4 : index
+    %i2 = index.add %i1, %c4 : index
+    %i3 = index.add %i2, %c4 : index
+    %e0 = view.load %x_view[%base] : view<4096xf32> -> f32
+    %e1 = view.load %x_view[%i1] : view<4096xf32> -> f32
+    %e2 = view.load %x_view[%i2] : view<4096xf32> -> f32
+    %e3 = view.load %x_view[%i3] : view<4096xf32> -> f32
+    %s01 = scalar.addf %e0, %e1 : f32
+    %s23 = scalar.addf %e2, %e3 : f32
+    %d01 = scalar.subf %e0, %e1 : f32
+    %d23 = scalar.subf %e2, %e3 : f32
+    %o0 = scalar.addf %s01, %d23 : f32
+    %o1 = scalar.subf %s01, %d23 : f32
+    %o2 = scalar.addf %d01, %s23 : f32
+    %o3 = scalar.subf %s23, %d01 : f32
+    view.store %o0, %x_view[%base] : f32, view<4096xf32>
+    view.store %o1, %x_view[%i1] : f32, view<4096xf32>
+    view.store %o2, %x_view[%i2] : f32, view<4096xf32>
+    view.store %o3, %x_view[%i3] : f32, view<4096xf32>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  scf.for %t_j = [%c0 to %tile_quads_per_lane step %c1] {
+    %t_lane_step = index.mul %t_j, %lanes : index
+    %t0 = index.add %t_lane_step, %lane : index
+    %t = index.assume %t0 [lt(%t0, %tile_quads)] : index
+    %g = index.div %t, %c64 : index
+    %within = index.rem %t, %c64 : index
+    %lo = index.rem %within, %c16 : index
+    %hi = index.div %within, %c16 : index
+    %hi4 = index.mul %hi, %c4 : index
+    %hi4d = index.mul %hi4, %c16 : index
+    %g256 = index.mul %g, %c256 : index
+    %base0 = index.add %g256, %hi4d : index
+    %base = index.add %base0, %lo : index
+    %i1 = index.add %base, %c16 : index
+    %i2 = index.add %i1, %c16 : index
+    %i3 = index.add %i2, %c16 : index
+    %e0 = view.load %x_view[%base] : view<4096xf32> -> f32
+    %e1 = view.load %x_view[%i1] : view<4096xf32> -> f32
+    %e2 = view.load %x_view[%i2] : view<4096xf32> -> f32
+    %e3 = view.load %x_view[%i3] : view<4096xf32> -> f32
+    %s01 = scalar.addf %e0, %e1 : f32
+    %s23 = scalar.addf %e2, %e3 : f32
+    %d01 = scalar.subf %e0, %e1 : f32
+    %d23 = scalar.subf %e2, %e3 : f32
+    %o0 = scalar.addf %s01, %d23 : f32
+    %o1 = scalar.subf %s01, %d23 : f32
+    %o2 = scalar.addf %d01, %s23 : f32
+    %o3 = scalar.subf %s23, %d01 : f32
+    view.store %o0, %x_view[%base] : f32, view<4096xf32>
+    view.store %o1, %x_view[%i1] : f32, view<4096xf32>
+    view.store %o2, %x_view[%i2] : f32, view<4096xf32>
+    view.store %o3, %x_view[%i3] : f32, view<4096xf32>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+  scf.for %t_j = [%c0 to %tile_quads_per_lane step %c1] {
+    %t_lane_step = index.mul %t_j, %lanes : index
+    %t0 = index.add %t_lane_step, %lane : index
+    %t = index.assume %t0 [lt(%t0, %tile_quads)] : index
+    %g = index.div %t, %c64 : index
+    %within = index.rem %t, %c64 : index
+    %lo = index.rem %within, %c64 : index
+    %hi = index.div %within, %c64 : index
+    %hi4 = index.mul %hi, %c4 : index
+    %hi4d = index.mul %hi4, %c64 : index
+    %g256 = index.mul %g, %c256 : index
+    %base0 = index.add %g256, %hi4d : index
+    %base = index.add %base0, %lo : index
+    %i1 = index.add %base, %c64 : index
+    %i2 = index.add %i1, %c64 : index
+    %i3 = index.add %i2, %c64 : index
+    %e0 = view.load %x_view[%base] : view<4096xf32> -> f32
+    %e1 = view.load %x_view[%i1] : view<4096xf32> -> f32
+    %e2 = view.load %x_view[%i2] : view<4096xf32> -> f32
+    %e3 = view.load %x_view[%i3] : view<4096xf32> -> f32
+    %s01 = scalar.addf %e0, %e1 : f32
+    %s23 = scalar.addf %e2, %e3 : f32
+    %d01 = scalar.subf %e0, %e1 : f32
+    %d23 = scalar.subf %e2, %e3 : f32
+    %o0 = scalar.addf %s01, %d23 : f32
+    %o1 = scalar.subf %s01, %d23 : f32
+    %o2 = scalar.addf %d01, %s23 : f32
+    %o3 = scalar.subf %s23, %d01 : f32
+    view.store %o0, %x_view[%base] : f32, view<4096xf32>
+    view.store %o1, %x_view[%i1] : f32, view<4096xf32>
+    view.store %o2, %x_view[%i2] : f32, view<4096xf32>
+    view.store %o3, %x_view[%i3] : f32, view<4096xf32>
+  }
+  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+
+
+      %tile_max = scf.for %j = [%c0 to %tile_chunks step %c1](%prev = %max_prev : f32) -> (f32) {
+        %step = index.mul %j, %lanes : index
+        %local = index.add %step, %lane : index
+        %v = view.load %x_view[%local] : view<4096xf32> -> f32
+        %abs = scalar.absf %v : f32
+        %finite = scalar.cmpf olt, %abs, %inf : f32
+        %checked = scf.select %finite, %abs, %inf : f32
+        %next = scalar.maxnumf %prev, %checked : f32
+        scf.yield %next : f32
+      }
+      scf.if %first {
+      } else {
+        scf.for %word = [%lane to %words step %lanes] {
+          %local0 = index.mul %word, %packed : index
+          %col0 = index.add %base, %local0 : index
+          %active = index.cmp ult, %col0, %width : index
+          scf.if %active {
+            %encoded = scf.for %part = [%c0 to %packed step %c1](%acc = %zero_i32 : i32) -> (i32) {
+              %local = index.add %local0, %part : index
+              %x = view.load %x_view[%local] : view<4096xf32> -> f32
+              %scaled = scalar.mulf %x, %inv : f32
+              %safe = scf.select %valid_scale, %scaled, %zero : f32
+              %rounded = scalar.roundevenf %safe : f32
+              %lo = scalar.maxnumf %rounded, %neg_qmax : f32
+              %hi = scalar.minnumf %lo, %qmax : f32
+              %code = scalar.fptosi %hi : f32 to i32
+              %masked = scalar.andi %code, %mask : i32
+              %shift0 = index.mul %part, %bits : index
+              %shift = index.cast %shift0 : index to i32
+              %shifted = scalar.shli %masked, %shift : i32
+              %next = scalar.ori %acc, %shifted : i32
+              scf.yield %next : i32
+            }
+            %out0 = index.div %col0, %packed : index
+            %out = index.assume %out0 [lt(%out0, %out_words)] : index
+            view.store %encoded, %qw[%row, %out] : i32, view<[%tokens_b]x[%out_words]xi32>
+          }
+        }
+      }
+      kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+      scf.yield %tile_max : f32
+    }
+    %maximum = kernel.workgroup.reduce<maxnumf> %max_all : f32
+    %normal = scalar.mulf %maximum, %sixteenth : f32
+    %safe_max = scalar.maxnumf %normal, %tiny : f32
+    %new_scale = scalar.divf %safe_max, %qmax : f32
+    scf.yield %new_scale : f32
+  }
+  %is_first = index.cmp eq, %lane, %c0 : index
+  scf.if %is_first {
+    view.store %final_scale, %sv[%row] : f32, view<[%tokens_b]xf32>
+  }
+  template.return
+}
+
+amdgpu.target<gfx11-generic> @h3_prepare_plain_tiled_i4_gfx11 {subgroup_size = 32}
+config.decl @h3.prepare_plain_tiled_i4.width : %v: index where [range(%v, 256, 32768), mul(%v, 256)]
+config.decl @h3.prepare_plain_tiled_i4.lanes : %v: index where [range(%v, 32, 1024), mul(%v, 32)]
+config.decl @h3.prepare_plain_tiled_i4.out_stride : %v: index where [range(%v, 256, 65536), mul(%v, 64)]
+kernel.def target(@h3_prepare_plain_tiled_i4_gfx11) export("h3_prepare_plain_tiled_i4") @h3_prepare_plain_tiled_i4(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %lanes = config.get @h3.prepare_plain_tiled_i4.lanes : index
+  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%lanes, %c1, %c1) : index
+} launch(%tokens: index, %h: buffer, %q: buffer, %s: buffer) {
+  %width = config.get @h3.prepare_plain_tiled_i4.width : index
+  %lanes = config.get @h3.prepare_plain_tiled_i4.lanes : index
+  %stride = config.get @h3.prepare_plain_tiled_i4.out_stride : index
+  %f32 = scalar.constant false : i1
+  %bits = index.constant 4 : index
+  template.apply<@h3.prepare_plain_tiled>(%tokens, %h, %q, %s, %width, %lanes, %stride, %f32, %bits) : (index, buffer, buffer, buffer, index, index, index, i1, index)
+  kernel.return
+}
+
+amdgpu.target<gfx11-generic> @h3_prepare_plain_tiled_f32_i4_gfx11 {subgroup_size = 32}
+config.decl @h3.prepare_plain_tiled_f32_i4.width : %v: index where [range(%v, 256, 32768), mul(%v, 256)]
+config.decl @h3.prepare_plain_tiled_f32_i4.lanes : %v: index where [range(%v, 32, 1024), mul(%v, 32)]
+config.decl @h3.prepare_plain_tiled_f32_i4.out_stride : %v: index where [range(%v, 256, 65536), mul(%v, 64)]
+kernel.def target(@h3_prepare_plain_tiled_f32_i4_gfx11) export("h3_prepare_plain_tiled_f32_i4") @h3_prepare_plain_tiled_f32_i4(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %lanes = config.get @h3.prepare_plain_tiled_f32_i4.lanes : index
+  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%lanes, %c1, %c1) : index
+} launch(%tokens: index, %h: buffer, %q: buffer, %s: buffer) {
+  %width = config.get @h3.prepare_plain_tiled_f32_i4.width : index
+  %lanes = config.get @h3.prepare_plain_tiled_f32_i4.lanes : index
+  %stride = config.get @h3.prepare_plain_tiled_f32_i4.out_stride : index
+  %f32 = scalar.constant true : i1
+  %bits = index.constant 4 : index
+  template.apply<@h3.prepare_plain_tiled>(%tokens, %h, %q, %s, %width, %lanes, %stride, %f32, %bits) : (index, buffer, buffer, buffer, index, index, index, i1, index)
+  kernel.return
+}
+
+amdgpu.target<gfx11-generic> @h3_prepare_plain_tiled_i8_gfx11 {subgroup_size = 32}
+config.decl @h3.prepare_plain_tiled_i8.width : %v: index where [range(%v, 256, 32768), mul(%v, 256)]
+config.decl @h3.prepare_plain_tiled_i8.lanes : %v: index where [range(%v, 32, 1024), mul(%v, 32)]
+config.decl @h3.prepare_plain_tiled_i8.out_stride : %v: index where [range(%v, 256, 65536), mul(%v, 64)]
+kernel.def target(@h3_prepare_plain_tiled_i8_gfx11) export("h3_prepare_plain_tiled_i8") @h3_prepare_plain_tiled_i8(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %lanes = config.get @h3.prepare_plain_tiled_i8.lanes : index
+  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%lanes, %c1, %c1) : index
+} launch(%tokens: index, %h: buffer, %q: buffer, %s: buffer) {
+  %width = config.get @h3.prepare_plain_tiled_i8.width : index
+  %lanes = config.get @h3.prepare_plain_tiled_i8.lanes : index
+  %stride = config.get @h3.prepare_plain_tiled_i8.out_stride : index
+  %f32 = scalar.constant false : i1
+  %bits = index.constant 8 : index
+  template.apply<@h3.prepare_plain_tiled>(%tokens, %h, %q, %s, %width, %lanes, %stride, %f32, %bits) : (index, buffer, buffer, buffer, index, index, index, i1, index)
+  kernel.return
+}
+
+amdgpu.target<gfx11-generic> @h3_prepare_plain_tiled_f32_i8_gfx11 {subgroup_size = 32}
+config.decl @h3.prepare_plain_tiled_f32_i8.width : %v: index where [range(%v, 256, 32768), mul(%v, 256)]
+config.decl @h3.prepare_plain_tiled_f32_i8.lanes : %v: index where [range(%v, 32, 1024), mul(%v, 32)]
+config.decl @h3.prepare_plain_tiled_f32_i8.out_stride : %v: index where [range(%v, 256, 65536), mul(%v, 64)]
+kernel.def target(@h3_prepare_plain_tiled_f32_i8_gfx11) export("h3_prepare_plain_tiled_f32_i8") @h3_prepare_plain_tiled_f32_i8(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %lanes = config.get @h3.prepare_plain_tiled_f32_i8.lanes : index
+  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%lanes, %c1, %c1) : index
+} launch(%tokens: index, %h: buffer, %q: buffer, %s: buffer) {
+  %width = config.get @h3.prepare_plain_tiled_f32_i8.width : index
+  %lanes = config.get @h3.prepare_plain_tiled_f32_i8.lanes : index
+  %stride = config.get @h3.prepare_plain_tiled_f32_i8.out_stride : index
+  %f32 = scalar.constant true : i1
+  %bits = index.constant 8 : index
+  template.apply<@h3.prepare_plain_tiled>(%tokens, %h, %q, %s, %width, %lanes, %stride, %f32, %bits) : (index, buffer, buffer, buffer, index, index, index, i1, index)
+  kernel.return
+}

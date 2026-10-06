@@ -110,7 +110,12 @@ template.def<@h3.gemm_bf16_finish> @h3.gemm_bf16_finish_plain(%epilogue: index, 
         %scaled = vector.addf %scaled1, %bias_values : vector<4xf32>
         %sat0 = vector.minnumf %scaled, %f16_max4 : vector<4xf32>
         %sat = vector.maxnumf %sat0, %f16_min4 : vector<4xf32>
-        %narrow = vector.fptrunc %sat : vector<4xf32> to vector<4xf16>
+        // Clamp finite values only; invalid arithmetic must remain observable.
+        %range_inf = vector.constant inf : vector<4xf32>
+        %range_abs = vector.absf %scaled : vector<4xf32>
+        %range_finite = vector.cmpf olt, %range_abs, %range_inf : vector<4xf32> -> vector<4xi1>
+        %range_checked = vector.select %range_finite, %sat, %scaled : vector<4xf32>
+        %narrow = vector.fptrunc %range_checked : vector<4xf32> to vector<4xf16>
         vector.store %narrow, %c_view[%bounded, %out_col] : vector<4xf16>, view<[%m_bounded]x[%n_size]xf16>
       }
     }
@@ -470,8 +475,131 @@ template.def<@h3.gemm_bf16_finish> @h3.gemm_bf16_finish_swiglu(%epilogue: index,
         // saturate: H3's products reach 5e4, and an f16 inf here becomes a NaN token scale downstream
         %sat0 = vector.minnumf %prod, %f16_max4 : vector<4xf32>
         %sat = vector.maxnumf %sat0, %f16_min4 : vector<4xf32>
-        %narrow = vector.fptrunc %sat : vector<4xf32> to vector<4xf16>
+        // Clamp finite values only; invalid arithmetic must remain observable.
+        %range_inf = vector.constant inf : vector<4xf32>
+        %range_abs = vector.absf %prod : vector<4xf32>
+        %range_finite = vector.cmpf olt, %range_abs, %range_inf : vector<4xf32> -> vector<4xi1>
+        %range_checked = vector.select %range_finite, %sat, %prod : vector<4xf32>
+        %narrow = vector.fptrunc %range_checked : vector<4xf32> to vector<4xf16>
         vector.store %narrow, %c_view[%bounded, %out_col] : vector<4xf16>, view<[%m_bounded]x[%n_half]xf16>
+      }
+    }
+    kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+  }
+  template.return
+}
+
+template.def<@h3.gemm_bf16_finish> @h3.gemm_bf16_finish_swiglu_f32(%epilogue: index, %m_bounded: index, %n_size: index, %cfg_classes: index, %has_bias: i1, %lds: buffer, %c: buffer, %bias: buffer, %gate: buffer, %cls: buffer, %base_m: index, %base_n: index, %wave_row: index, %wave_col: index, %lane: index, %wave_result_offset: offset, %acc00: vector<8xf32>, %acc01: vector<8xf32>, %acc02: vector<8xf32>, %acc03: vector<8xf32>, %acc10: vector<8xf32>, %acc11: vector<8xf32>, %acc12: vector<8xf32>, %acc13: vector<8xf32>, %acc20: vector<8xf32>, %acc21: vector<8xf32>, %acc22: vector<8xf32>, %acc23: vector<8xf32>, %acc30: vector<8xf32>, %acc31: vector<8xf32>, %acc32: vector<8xf32>, %acc33: vector<8xf32>) where [eq(%epilogue, 5)] {
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c16 = index.constant 16 : index
+  %c32 = index.constant 32 : index
+  %cf1 = index.constant 1 : index
+  %cf2 = index.constant 2 : index
+  %cf3 = index.constant 3 : index
+  %cf4 = index.constant 4 : index
+  %cf5 = index.constant 5 : index
+  %cf6 = index.constant 6 : index
+  %cf7 = index.constant 7 : index
+  %c0_offset = index.constant 0 : offset
+  %m = index.constant 16 : index
+  %n = index.constant 16 : index
+  %c_global = buffer.assume.memory_space<global> %c : buffer
+  %n_half = index.div %n_size, %c2 : index
+  %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_bounded]x[%n_half]xf32>
+  %result_view = buffer.view %lds[%wave_result_offset] : buffer -> view<16x16xf32>
+  // Publish through LDS. Each lane takes two vector4 slices of each staged 16x16 tile.
+  %publish_row0 = index.div %lane, %c4 : index
+  %publish_col_group = index.rem %lane, %c4 : index
+  %publish_col = index.mul %publish_col_group, %c4 : index
+  %publish_col_half = index.mul %publish_col_group, %c2 : index
+  %one_f32 = scalar.constant 1.0 : f32
+  %zero_f32 = scalar.constant 0.0 : f32
+  %one4 = vector.splat %one_f32 : vector<4xf32>
+  %zero4 = vector.splat %zero_f32 : vector<4xf32>
+  %f16_max = scalar.constant 65472.0 : f32
+  %f16_min = scalar.constant -65472.0 : f32
+  %f16_max4 = vector.splat %f16_max : vector<4xf32>
+  %f16_min4 = vector.splat %f16_min : vector<4xf32>
+  %up_stage_offset = index.constant 1024 : offset
+  %wave_up_offset = index.add %wave_result_offset, %up_stage_offset : offset
+  %up_view = buffer.view %lds[%wave_up_offset] : buffer -> view<16x16xf32>
+  scf.for %step = [%c0 to %c8 step %c1] {
+    %fi = index.div %step, %c2 : index
+    %pj = index.rem %step, %c2 : index
+    %g_is1 = index.cmp eq, %step, %cf1 : index
+    %g_p1 = scf.select %g_is1, %acc02, %acc00 : vector<8xf32>
+    %g_is2 = index.cmp eq, %step, %cf2 : index
+    %g_p2 = scf.select %g_is2, %acc10, %g_p1 : vector<8xf32>
+    %g_is3 = index.cmp eq, %step, %cf3 : index
+    %g_p3 = scf.select %g_is3, %acc12, %g_p2 : vector<8xf32>
+    %g_is4 = index.cmp eq, %step, %cf4 : index
+    %g_p4 = scf.select %g_is4, %acc20, %g_p3 : vector<8xf32>
+    %g_is5 = index.cmp eq, %step, %cf5 : index
+    %g_p5 = scf.select %g_is5, %acc22, %g_p4 : vector<8xf32>
+    %g_is6 = index.cmp eq, %step, %cf6 : index
+    %g_p6 = scf.select %g_is6, %acc30, %g_p5 : vector<8xf32>
+    %g_is7 = index.cmp eq, %step, %cf7 : index
+    %g_p7 = scf.select %g_is7, %acc32, %g_p6 : vector<8xf32>
+    %u_is1 = index.cmp eq, %step, %cf1 : index
+    %u_p1 = scf.select %u_is1, %acc03, %acc01 : vector<8xf32>
+    %u_is2 = index.cmp eq, %step, %cf2 : index
+    %u_p2 = scf.select %u_is2, %acc11, %u_p1 : vector<8xf32>
+    %u_is3 = index.cmp eq, %step, %cf3 : index
+    %u_p3 = scf.select %u_is3, %acc13, %u_p2 : vector<8xf32>
+    %u_is4 = index.cmp eq, %step, %cf4 : index
+    %u_p4 = scf.select %u_is4, %acc21, %u_p3 : vector<8xf32>
+    %u_is5 = index.cmp eq, %step, %cf5 : index
+    %u_p5 = scf.select %u_is5, %acc23, %u_p4 : vector<8xf32>
+    %u_is6 = index.cmp eq, %step, %cf6 : index
+    %u_p6 = scf.select %u_is6, %acc31, %u_p5 : vector<8xf32>
+    %u_is7 = index.cmp eq, %step, %cf7 : index
+    %u_p7 = scf.select %u_is7, %acc33, %u_p6 : vector<8xf32>
+    vector.fragment.store<result> %g_p7, %result_view[%c0, %c0] shape [%m, %n] : vector<8xf32>, view<16x16xf32>
+    vector.fragment.store<result> %u_p7, %up_view[%c0, %c0] shape [%m, %n] : vector<8xf32>, view<16x16xf32>
+    kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+    %frag_row_offset = index.mul %fi, %c16 : index
+    %gate_col_offset = index.mul %pj, %c32 : index
+    %gate_tile_col = index.add %wave_col, %gate_col_offset : index
+    %gate_col_local = index.add %gate_tile_col, %publish_col : index
+    %gate_col = index.add %base_n, %gate_col_local : index
+    %up_col = index.add %gate_col, %c16 : index
+    %out_col0 = index.div %gate_col, %c2 : index
+    %out_col1 = index.add %out_col0, %publish_col : index
+    %out_col2 = index.sub %out_col1, %publish_col_half : index
+    %out_col = index.assume %out_col2 [lt(%out_col2, %n_half)] : index
+    scf.for %half = [%c0 to %c2 step %c1] {
+      %row_offset = index.mul %half, %c8 : index
+      %publish_row = index.add %publish_row0, %row_offset : index
+      %gate_values = vector.load %result_view[%publish_row, %publish_col] : view<16x16xf32> -> vector<4xf32>
+      %up_values = vector.load %up_view[%publish_row, %publish_col] : view<16x16xf32> -> vector<4xf32>
+      %gate_f32 = vector.addf %gate_values, %zero4 : vector<4xf32>
+      %up_f32 = vector.addf %up_values, %zero4 : vector<4xf32>
+      %gate_scaled0 = vector.addf %gate_f32, %zero4 : vector<4xf32>
+      %up_scaled0 = vector.addf %up_f32, %zero4 : vector<4xf32>
+      %row_in_wave = index.add %frag_row_offset, %publish_row : index
+      %row_local = index.add %wave_row, %row_in_wave : index
+      %out_row = index.add %base_m, %row_local : index
+      %writes = index.cmp ult, %out_row, %m_bounded : index
+      scf.if %writes {
+        %bounded = index.assume %out_row [lt(%out_row, %m_bounded)] : index
+        %g0 = vector.addf %gate_scaled0, %zero4 : vector<4xf32>
+        %u0 = vector.addf %up_scaled0, %zero4 : vector<4xf32>
+        %g1 = vector.addf %g0, %zero4 : vector<4xf32>
+        %u1 = vector.addf %u0, %zero4 : vector<4xf32>
+        %g = vector.addf %g1, %zero4 : vector<4xf32>
+        %u = vector.addf %u1, %zero4 : vector<4xf32>
+        %neg_g = vector.subf %zero4, %g : vector<4xf32>
+        %e = vector.expf<afn> %neg_g : vector<4xf32>
+        %den = vector.addf %one4, %e : vector<4xf32>
+        %sig = vector.divf %one4, %den : vector<4xf32>
+        %silu = vector.mulf %g, %sig : vector<4xf32>
+        %prod = vector.mulf %silu, %u : vector<4xf32>
+        // saturate: H3's products reach 5e4, and an f16 inf here becomes a NaN token scale downstream
+        vector.store %prod, %c_view[%bounded, %out_col] : vector<4xf32>, view<[%m_bounded]x[%n_half]xf32>
       }
     }
     kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
@@ -595,7 +723,12 @@ template.def<@h3.gemm_bf16_finish> @h3.gemm_bf16_finish_swiglu_swapped(%epilogue
         // saturate: H3's products reach 5e4, and an f16 inf here becomes a NaN token scale downstream
         %sat0 = vector.minnumf %prod, %f16_max4 : vector<4xf32>
         %sat = vector.maxnumf %sat0, %f16_min4 : vector<4xf32>
-        %narrow = vector.fptrunc %sat : vector<4xf32> to vector<4xf16>
+        // Clamp finite values only; invalid arithmetic must remain observable.
+        %range_inf = vector.constant inf : vector<4xf32>
+        %range_abs = vector.absf %prod : vector<4xf32>
+        %range_finite = vector.cmpf olt, %range_abs, %range_inf : vector<4xf32> -> vector<4xi1>
+        %range_checked = vector.select %range_finite, %sat, %prod : vector<4xf32>
+        %narrow = vector.fptrunc %range_checked : vector<4xf32> to vector<4xf16>
         vector.store %narrow, %c_view[%bounded, %out_col] : vector<4xf16>, view<[%m_bounded]x[%n_half]xf16>
       }
     }
@@ -1183,5 +1316,44 @@ kernel.def target(@h3_gemm_bf16_swiglu_256b_gs_gfx11) export("h3_gemm_bf16_swigl
   %has_bias = scalar.constant true : i1
   %epilogue = index.constant 3 : index
   template.apply<@h3.gemm_bf16>(%m_size, %a, %w, %c, %bias, %c, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %cfg_classes, %has_bias, %epilogue) : (index, buffer, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, i1, index)
+  kernel.return
+}
+
+amdgpu.target<gfx11-generic> @h3_gemm_bf16_swiglu_f32_256_gfx11 {subgroup_size = 32}
+
+config.decl @h3.gemm_bf16_swiglu_f32_256.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+
+config.decl @h3.gemm_bf16_swiglu_f32_256.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+
+config.decl @h3.gemm_bf16_swiglu_f32_256.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+
+config.decl @h3.gemm_bf16_swiglu_f32_256.m_group : %value: index where [range(%value, 1, 4)]
+
+kernel.def target(@h3_gemm_bf16_swiglu_f32_256_gfx11) export("h3_gemm_bf16_swiglu_f32_256") @h3_gemm_bf16_swiglu_f32_256(%m_size: index) {
+  %c1 = index.constant 1 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c128 = index.constant 128 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %n_size0 = config.get @h3.gemm_bf16_swiglu_f32_256.n_size : index
+  %m_rounded = index.add %m_size, %c255 : index
+  %m_tiles = index.div %m_rounded, %c256 : index
+  %m_group = config.get @h3.gemm_bf16_swiglu_f32_256.m_group : index
+  %m_group_less = index.sub %m_group, %c1 : index
+  %m_tiles3 = index.add %m_tiles, %m_group_less : index
+  %m_groups = index.div %m_tiles3, %m_group : index
+  %m_tiles_padded = index.mul %m_groups, %m_group : index
+  %n_tiles = index.div %n_size0, %c128 : index
+  kernel.launch.config workgroups(%n_tiles, %m_tiles_padded, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%m_size: index, %a: buffer, %w: buffer, %c: buffer) {
+  %cfg_k_size = config.get @h3.gemm_bf16_swiglu_f32_256.k_size : index
+  %cfg_n_size = config.get @h3.gemm_bf16_swiglu_f32_256.n_size : index
+  %cfg_k_stride = config.get @h3.gemm_bf16_swiglu_f32_256.k_stride : index
+  %cfg_m_group = config.get @h3.gemm_bf16_swiglu_f32_256.m_group : index
+  %cfg_classes = index.constant 1 : index
+  %has_bias = scalar.constant false : i1
+  %epilogue = index.constant 5 : index
+  template.apply<@h3.gemm_bf16>(%m_size, %a, %w, %c, %c, %c, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %cfg_classes, %has_bias, %epilogue) : (index, buffer, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, i1, index)
   kernel.return
 }

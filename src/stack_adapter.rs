@@ -153,7 +153,7 @@ impl AdapterRuntime {
                 ],
             )?;
             projections.push(Projection {
-                prepare: Prepare::build(
+                prepare: Prepare::build_with_input(
                     c,
                     stream,
                     if op == "attn.qkv_proj" || op == "mlp.fc1" {
@@ -166,12 +166,27 @@ impl AdapterRuntime {
                     d.eps,
                     d.classes,
                     ip,
+                    if op == "attn.out_proj" {
+                        ActivationType::F16
+                    } else {
+                        ActivationType::F32
+                    },
                 )?,
-                rank_prepare: Prepare::build(c, stream, "plain", "bf16", rank_width, d.eps, 1, rp)?,
-                down: Gemm::build(
+                rank_prepare: Prepare::build_with_input(
                     c,
                     stream,
                     "plain",
+                    "bf16",
+                    rank_width,
+                    d.eps,
+                    1,
+                    rp,
+                    ActivationType::F32,
+                )?,
+                down: Gemm::build(
+                    c,
+                    stream,
+                    "f32",
                     "bf16",
                     false,
                     true,
@@ -186,7 +201,7 @@ impl AdapterRuntime {
                 up: Gemm::build(
                     c,
                     stream,
-                    "plain",
+                    "f32",
                     "bf16",
                     false,
                     true,
@@ -230,10 +245,10 @@ impl AdapterRuntime {
             } else {
                 Some(stream.allocate(cap * gemm_pitch(FFN, 16) * 2)?)
             },
-            rank: stream.allocate(cap * max_rank_width * 2)?,
+            rank: stream.allocate(cap * max_rank_width * 4)?,
             rank_operand: stream.allocate(cap * gemm_pitch(max_rank_width, 16) * 2)?,
             base: stream.allocate(cap * 2 * FFN * 4)?,
-            delta: stream.allocate(cap * 2 * FFN * 2)?,
+            delta: stream.allocate(cap * 2 * FFN * 4)?,
             classes: d.classes,
         };
         c.flush(stream)?;
@@ -348,8 +363,8 @@ impl AdapterRuntime {
             &[self.base.binding(), self.delta.binding(), output, gate, cls],
             &[
                 rows * p.output * 4,
-                rows * p.output * 2,
-                rows * p.result_width * if p.mode == 2 { 4 } else { 2 },
+                rows * p.output * 4,
+                rows * p.result_width * if p.mode == 0 { 2 } else { 4 },
                 if p.mode == 2 {
                     self.classes * p.result_width * 4
                 } else {
@@ -620,7 +635,7 @@ mod tests {
                             std::fs::write(dir.join("output.f32"), &actual).unwrap();
                             for (name, view, bytes) in [
                                 ("attention.f16", stack.attn.binding(), rows * INNER * 2),
-                                ("hidden.f16", stack.gu_view(), rows * FFN * 2),
+                                ("hidden.f32", stack.gu_view(), rows * FFN * 4),
                             ] {
                                 std::fs::write(dir.join(name), read_view(&mut stream, view, bytes))
                                     .unwrap();
@@ -722,7 +737,7 @@ mod tests {
                     let original_values: Vec<f32> = (0..rows * input_width)
                         .map(|i| ((i * 17 % 127) as f32 - 63.0) / 64.0)
                         .collect();
-                    let original_bytes = if op == 0 || op == 2 {
+                    let original_bytes = if op != 1 {
                         bytemuck::cast_slice(&original_values).to_vec()
                     } else {
                         original_values
@@ -824,10 +839,8 @@ mod tests {
                                     sum += bfloat(&input, row * ip + k)
                                         * bfloat(a, r * input_width + k);
                                 }
-                                expected_rank[row * rank + offset + r] = bf16::from_f32(
-                                    f16::from_f32(sum.clamp(-65472.0, 65472.0)).to_f32(),
-                                )
-                                .to_f32();
+                                expected_rank[row * rank + offset + r] =
+                                    bf16::from_f32(sum).to_f32();
                                 actual_rank[row * rank + offset + r] =
                                     bfloat(&ranks, row * rp + offset + r);
                             }
@@ -839,7 +852,7 @@ mod tests {
                         &expected_rank,
                         &format!("{preset} {prefix} A"),
                     );
-                    let delta = read(&mut stream, &adapter.delta, rows * p.output * 2);
+                    let delta = read(&mut stream, &adapter.delta, rows * p.output * 4);
                     let mut expected = vec![0.0; rows * p.output];
                     let mut actual = expected.clone();
                     for row in 0..rows {
@@ -867,15 +880,13 @@ mod tests {
                                 }
                                 offset += spec.rank;
                             }
-                            expected[row * p.output + column] =
-                                f16::from_f32(sum.clamp(-65472.0, 65472.0)).to_f32();
-                            actual[row * p.output + column] = f16::from_le_bytes(
-                                delta[(row * p.output + column) * 2
-                                    ..(row * p.output + column) * 2 + 2]
+                            expected[row * p.output + column] = sum;
+                            actual[row * p.output + column] = f32::from_le_bytes(
+                                delta[(row * p.output + column) * 4
+                                    ..(row * p.output + column) * 4 + 4]
                                     .try_into()
                                     .unwrap(),
-                            )
-                            .to_f32();
+                            );
                         }
                     }
                     close(&actual, &expected, &format!("{preset} {prefix} B"));

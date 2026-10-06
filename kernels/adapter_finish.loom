@@ -1,5 +1,5 @@
 // Experimental low-rank side branch. Add before SwiGLU or residual gating.
-// The base projection and residual stay f32; only the low-rank branch narrows to f16.
+// Base, low-rank projections, SwiGLU products and residuals retain f32 range.
 amdgpu.target<gfx11-generic> @h3_adapter_finish_gfx11 {subgroup_size = 32}
 config.decl @h3.adapter_finish.width : %v: index where [range(%v, 128, 32768), mul(%v, 128)]
 config.decl @h3.adapter_finish.mode : %v: index where [range(%v, 0, 2)]
@@ -43,7 +43,7 @@ kernel.def target(@h3_adapter_finish_gfx11) export("h3_adapter_finish") @h3_adap
   %gg = buffer.assume.memory_space<global> %gate : buffer
   %cg = buffer.assume.memory_space<global> %cls : buffer
   %bv = buffer.view %bg[%off0] : buffer -> view<[%rows]x[%input_width]xf32>
-  %dv = buffer.view %dg[%off0] : buffer -> view<[%rows]x[%input_width]xf16>
+  %dv = buffer.view %dg[%off0] : buffer -> view<[%rows]x[%input_width]xf32>
   %out16 = buffer.view %og[%off0] : buffer -> view<[%rows]x[%width]xf16>
   %out32 = buffer.view %og[%off0] : buffer -> view<[%rows]x[%width]xf32>
   %gates = buffer.view %gg[%off0] : buffer -> view<[%classes]x[%width]xf32>
@@ -61,15 +61,13 @@ kernel.def target(@h3_adapter_finish_gfx11) export("h3_adapter_finish") @h3_adap
     %ic0 = scf.select %is_glu, %interleaved, %col : index
     %ic = index.assume %ic0 [lt(%ic0, %input_width)] : index
     %b = view.load %bv[%row, %ic] : view<[%rows]x[%input_width]xf32> -> f32
-    %d16 = view.load %dv[%row, %ic] : view<[%rows]x[%input_width]xf16> -> f16
-    %d = scalar.extf %d16 : f16 to f32
+    %d = view.load %dv[%row, %ic] : view<[%rows]x[%input_width]xf32> -> f32
     %sum = scalar.addf %b, %d : f32
     %value = scf.if %is_glu -> (f32) {
       %uc0 = index.add %ic, %c16 : index
       %uc = index.assume %uc0 [lt(%uc0, %input_width)] : index
       %ub = view.load %bv[%row, %uc] : view<[%rows]x[%input_width]xf32> -> f32
-      %ud16 = view.load %dv[%row, %uc] : view<[%rows]x[%input_width]xf16> -> f16
-      %ud = scalar.extf %ud16 : f16 to f32
+      %ud = view.load %dv[%row, %uc] : view<[%rows]x[%input_width]xf32> -> f32
       %up = scalar.addf %ub, %ud : f32
       %zero = scalar.constant 0.0 : f32
       %one = scalar.constant 1.0 : f32
@@ -93,12 +91,20 @@ kernel.def target(@h3_adapter_finish_gfx11) export("h3_adapter_finish") @h3_adap
       %updated = scalar.addf %old, %scaled : f32
       view.store %updated, %out32[%row, %col] : f32, view<[%rows]x[%width]xf32>
     } else {
+      scf.if %is_glu {
+        view.store %value, %out32[%row, %col] : f32, view<[%rows]x[%width]xf32>
+      } else {
       %maximum = scalar.constant 65472.0 : f32
       %minimum = scalar.constant -65472.0 : f32
       %upper = scalar.minnumf %value, %maximum : f32
       %bounded = scalar.maxnumf %upper, %minimum : f32
-      %narrow = scalar.fptrunc %bounded : f32 to f16
+      %inf = scalar.constant inf : f32
+      %abs = scalar.absf %value : f32
+      %finite = scalar.cmpf olt, %abs, %inf : f32
+      %checked = scf.select %finite, %bounded, %value : f32
+      %narrow = scalar.fptrunc %checked : f32 to f16
       view.store %narrow, %out16[%row, %col] : f16, view<[%rows]x[%width]xf16>
+      }
     }
   }
   kernel.return

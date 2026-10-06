@@ -6,7 +6,7 @@
 //! count and the QK^T width, and whether a projection needs a `prepare` at all follows from whether the
 //! kernel before it already wrote its operand at the right pitch.
 use crate::compile::{num, Cfg, Compiler};
-use crate::dispatch::{emit, ClassRows, Gemm, Prepare, Profile, Sink, Tile};
+use crate::dispatch::{emit, ActivationType, ClassRows, Gemm, Prepare, Profile, Sink, Tile};
 use crate::model::*;
 use crate::weights::Weights;
 use hrx::View;
@@ -227,6 +227,12 @@ impl Stack {
         tag: &str,
     ) -> Result<Self> {
         let elem = d.elem();
+        // Text/DiT/refiner products exceed f16 range. Decoder tiles retain their f16 ABI.
+        let ffn_storage = if elem == "f16" {
+            ActivationType::F16
+        } else {
+            ActivationType::F32
+        };
         let bits = d.wbits;
         let quant = quantised(elem);
 
@@ -347,7 +353,9 @@ impl Stack {
         // projection needs a prepare back whenever that pitch is padded — unless a decoder tile, which
         // writes the padded pitch itself.
         let direct_attn = elem == "f16";
-        let direct_down = elem == "f16" && (wide || fast || pitch(d.ffn) == d.ffn);
+        let direct_down = ffn_storage == ActivationType::F16
+            && elem == "f16"
+            && (wide || fast || pitch(d.ffn) == d.ffn);
         let prep_attn = if direct_attn {
             None
         } else {
@@ -365,7 +373,7 @@ impl Stack {
         let prep_down = if direct_down {
             None
         } else {
-            Some(Prepare::build(
+            Some(Prepare::build_with_input(
                 c,
                 stream,
                 "plain",
@@ -374,6 +382,7 @@ impl Stack {
                 1e-5,
                 1,
                 pitch(d.ffn),
+                ffn_storage,
             )?)
         };
 
@@ -420,7 +429,7 @@ impl Stack {
                 0,
             )?);
         }
-        let gemm_gu = Gemm::build(
+        let gemm_gu = Gemm::build_with_output(
             c,
             stream,
             "swiglu",
@@ -434,6 +443,7 @@ impl Stack {
             pitch(d.hidden),
             tile,
             pitch(d.ffn),
+            ffn_storage,
         )?;
         let gemm_out = Gemm::build(
             c,
@@ -681,7 +691,7 @@ impl Stack {
             d.inner()
         };
         let attn = stream.allocate(t * attn_width * 2)?;
-        let gu_bytes = t * if direct_down { pitch(d.ffn) } else { d.ffn } * 2;
+        let gu_bytes = t * if direct_down { pitch(d.ffn) } else { d.ffn } * ffn_storage.bytes();
         // QKV is dead after the attention join. Gate/up starts only after the
         // output projection and second normalization, so it can reuse that storage.
         let gu = if env_once("H3_REUSE_SCRATCH") == Some("1") && gu_bytes <= t * d.qkv() * 2 {

@@ -424,13 +424,29 @@ impl<'a> ClassRows<'a> {
     }
 }
 
+/// Storage at projection/preparation boundaries, independent of matrix operand precision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivationType {
+    F16,
+    F32,
+}
+impl ActivationType {
+    pub fn bytes(self) -> usize {
+        match self {
+            Self::F16 => 2,
+            Self::F32 => 4,
+        }
+    }
+}
+
 /// Produces a GEMM's A operand: `norm` and `lnorm` normalise and modulate the f32 residual stream,
-/// `plain` narrows an existing f16 row. The int8 forms also write a per-token scale; the float ones
+/// `plain` prepares an existing f16 or f32 row. The int8 forms also write a per-token scale; the float ones
 /// write rows and nothing else.
 pub struct Prepare {
     kernel: crate::compile::Kernel,
     lanes: usize,
     form: String,
+    input_type: ActivationType,
     elem: String,
     /// the extents the kernel was compiled from, kept so `run` can bound its bindings
     width: usize,
@@ -450,13 +466,62 @@ impl Prepare {
         classes: usize,
         out_stride: usize,
     ) -> Result<Self> {
-        // rows past 64 KB of f32 stage as f16 instead
-        let stem = if form == "plain" && quantised(elem) && width * 4 > 65536 {
-            "prepare_plain16_i8".to_string()
+        Self::build_with_input(
+            c,
+            stream,
+            form,
+            elem,
+            width,
+            eps,
+            classes,
+            out_stride,
+            if form == "plain" {
+                ActivationType::F16
+            } else {
+                ActivationType::F32
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_input(
+        c: &Compiler,
+        stream: &mut hrx::Stream,
+        form: &str,
+        elem: &str,
+        width: usize,
+        eps: f32,
+        classes: usize,
+        out_stride: usize,
+        input_type: ActivationType,
+    ) -> Result<Self> {
+        if form != "plain" && input_type != ActivationType::F32 {
+            return Err(crate::compile::Error::Io(
+                "normalization requires f32 input".into(),
+            ));
+        }
+        if form == "plain" && input_type == ActivationType::F32 && elem == "f16" {
+            return Err(crate::compile::Error::Io(
+                "f32 plain preparation requires quantized or bf16 operands".into(),
+            ));
+        }
+        let tiled = form == "plain" && quantised(elem) && width * 4 > 65536;
+        let stem = if tiled {
+            format!(
+                "prepare_plain_tiled{}_{}",
+                if input_type == ActivationType::F32 {
+                    "_f32"
+                } else {
+                    ""
+                },
+                elem
+            )
+        } else if form == "plain" && input_type == ActivationType::F32 {
+            format!("prepare_plain_f32_{elem}")
         } else {
             format!("prepare_{form}_{elem}")
         };
-        let lanes = lanes_for(width).ok_or_else(|| {
+        let lanes = (if tiled { Some(256) } else { lanes_for(width) }).ok_or_else(|| {
             crate::compile::Error::Io(format!("no prepare lane count for width {width}"))
         })?;
         let ns = format!("h3.{stem}.");
@@ -473,8 +538,8 @@ impl Prepare {
             format!("{ns}out_stride"),
             if out_stride != 0 { out_stride } else { width }.to_string(),
         ));
-        let module = if stem == "prepare_plain16_i8" {
-            stem.clone()
+        let module = if tiled {
+            "prepare_plain_tiled".into()
         } else {
             format!("prepare_{elem}_family")
         };
@@ -483,6 +548,7 @@ impl Prepare {
             kernel,
             lanes,
             form: form.into(),
+            input_type,
             elem: elem.into(),
             width,
             out_stride: if out_stride != 0 { out_stride } else { width },
@@ -530,9 +596,8 @@ impl Prepare {
         a_s: Option<View<'g>>,
     ) -> Result<()> {
         let t = tokens as usize;
-        // the norm forms read the f32 residual stream; `plain` narrows an f16 row that a GEMM
-        // already wrote
-        let in_bytes = if self.form == "plain" { 2 } else { 4 };
+        // Input storage is independent of the quantized/BF16 matrix operand format.
+        let in_bytes = self.input_type.bytes();
         let mut args = Args::new(x, t * self.width * in_bytes);
         if self.form != "plain" {
             let (weight, table, cls) =
@@ -573,7 +638,7 @@ pub struct Gemm {
     threads: u32,
     /// the extents the kernel was compiled from, kept so `run` can bound its bindings. The output
     /// is narrower than N in the SwiGLU forms, where the gate consumes half the columns, and it is
-    /// f32 only in the residual forms — every other form writes the f16 stream.
+    /// its storage width follows the explicitly selected output type.
     k_stride: usize,
     classes: usize,
     out_width: usize,
@@ -606,13 +671,81 @@ impl Gemm {
         tile: Tile,
         out_stride: usize,
     ) -> Result<Self> {
+        Self::build_with_output(
+            c,
+            stream,
+            mode,
+            elem,
+            bias,
+            gate_first,
+            k_size,
+            n_size,
+            tokens,
+            classes,
+            k_stride,
+            tile,
+            out_stride,
+            if mode == "resid" || mode == "f32" {
+                ActivationType::F32
+            } else {
+                ActivationType::F16
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_output(
+        c: &Compiler,
+        stream: &mut hrx::Stream,
+        mode: &str,
+        elem: &str,
+        bias: bool,
+        gate_first: bool,
+        k_size: usize,
+        n_size: usize,
+        tokens: usize,
+        classes: usize,
+        k_stride: usize,
+        tile: Tile,
+        out_stride: usize,
+        output_type: ActivationType,
+    ) -> Result<Self> {
+        if !matches!(mode, "plain" | "f32" | "resid" | "swiglu") {
+            return Err(crate::compile::Error::Io(format!(
+                "unsupported GEMM mode {mode}"
+            )));
+        }
+        let mode = match (mode, output_type) {
+            ("plain", ActivationType::F32) => "f32",
+            ("swiglu", ActivationType::F32) => "swiglu_f32",
+            ("resid" | "f32", ActivationType::F16) => {
+                return Err(crate::compile::Error::Io(
+                    "f32 GEMM requires f32 output".into(),
+                ))
+            }
+            (mode, _) => mode,
+        };
+        if output_type == ActivationType::F32
+            && mode != "resid"
+            && (tile != Tile::Plain || elem == "f16" || (mode == "f32" && bias))
+        {
+            return Err(crate::compile::Error::Io(
+                "unsupported f32 GEMM output variant".into(),
+            ));
+        }
+        if mode == "swiglu_f32"
+            && ((elem == "bf16" && (bias || !gate_first))
+                || (quantised(elem) && bias == gate_first))
+        {
+            return Err(crate::compile::Error::Io(
+                "unsupported f32 SwiGLU gate/bias layout".into(),
+            ));
+        }
+        let swiglu = mode.starts_with("swiglu");
         let (wide, fast) = (tile == Tile::Wide, tile == Tile::Fast);
         let resid = mode == "resid";
         if (wide || fast)
-            && (elem != "f16"
-                || !bias
-                || !n_size.is_multiple_of(256)
-                || (mode == "swiglu" && gate_first))
+            && (elem != "f16" || !bias || !n_size.is_multiple_of(256) || (swiglu && gate_first))
         {
             return Err(crate::compile::Error::Io(
                 "decoder GEMM requires the biased f16 family and N divisible by 256".into(),
@@ -641,11 +774,7 @@ impl Gemm {
                 format!("_{mode}")
             },
             if bias { "b" } else { "" },
-            if mode == "swiglu" && !gate_first {
-                "_gs"
-            } else {
-                ""
-            },
+            if swiglu && !gate_first { "_gs" } else { "" },
         );
         let ns = format!("h3.{stem}.");
         let mut cfg: Cfg = vec![
@@ -661,8 +790,8 @@ impl Gemm {
             format!("{ns}k_stride"),
             if k_stride != 0 { k_stride } else { k_size }.to_string(),
         ));
-        let mut out_width = if mode == "swiglu" { n_size / 2 } else { n_size };
-        if (wide || fast) && mode == "swiglu" {
+        let mut out_width = if swiglu { n_size / 2 } else { n_size };
+        if (wide || fast) && swiglu {
             let stride = if out_stride != 0 {
                 out_stride
             } else {
@@ -697,7 +826,7 @@ impl Gemm {
             k_stride: if k_stride != 0 { k_stride } else { k_size },
             classes,
             out_width,
-            out_bytes: if resid || mode == "f32" { 4 } else { 2 },
+            out_bytes: output_type.bytes(),
         })
     }
 
@@ -1437,8 +1566,8 @@ mod tests {
                 );
             }
         }
-        // the wide-row int8 plain form stages as f16
-        assert!(root.join("prepare_plain16_i8.loom").exists());
+        // The wide-row quantized form uses bounded f32 scratch.
+        assert!(root.join("prepare_plain_tiled.loom").exists());
     }
 
     #[test]

@@ -1958,8 +1958,8 @@ fn adapter_finish_adds_before_activation_and_preserves_f32_residuals() {
         let base: Vec<f32> = (0..rows * input_width)
             .map(|i| ((i % 17) as f32 - 8.0) / 8.0)
             .collect();
-        let delta: Vec<f16> = (0..rows * input_width)
-            .map(|i| f16::from_f32(((i % 7) as f32 - 3.0) / 16.0))
+        let delta: Vec<f32> = (0..rows * input_width)
+            .map(|i| ((i % 7) as f32 - 3.0) / 16.0)
             .collect();
         let gates: Vec<f32> = (0..2 * width)
             .map(|i| if i < width { 0.5 } else { -0.25 })
@@ -1972,7 +1972,7 @@ fn adapter_finish_adds_before_activation_and_preserves_f32_residuals() {
             if mode == 2 {
                 bytes(&initial)
             } else {
-                vec![0; rows * width * 2]
+                vec![0; rows * width * if mode == 0 { 2 } else { 4 }]
             },
             bytes(&gates),
             bytes(&cls),
@@ -1997,14 +1997,16 @@ fn adapter_finish_adds_before_activation_and_preserves_f32_residuals() {
                     col
                 };
                 let index = row * input_width + ic;
-                let mut expected = base[index] + delta[index].to_f32();
+                let mut expected = base[index] + delta[index];
                 if mode == 1 {
-                    let up = base[index + 16] + delta[index + 16].to_f32();
+                    let up = base[index + 16] + delta[index + 16];
                     expected = expected * (1.0 / (1.0 + (-expected).exp())) * up;
                 }
                 let i = row * width + col;
                 let actual = if mode == 2 {
                     expected = initial[i] + expected * gates[cls[row] as usize * width + col];
+                    f32::from_le_bytes(out[2][i * 4..i * 4 + 4].try_into().unwrap())
+                } else if mode == 1 {
                     f32::from_le_bytes(out[2][i * 4..i * 4 + 4].try_into().unwrap())
                 } else {
                     expected = f16::from_f32(expected).to_f32();
@@ -3035,4 +3037,348 @@ fn wide_bf16_preparation_does_not_need_large_lds() {
         let expected: Vec<_> = input.iter().map(|x| bf16::from_f32(x.to_f32())).collect();
         assert_eq!(&out[1][..width * 2], bytes(&expected));
     }
+}
+
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn wide_hadamard_preserves_finite_range() {
+    let mut h = Harness::new();
+    let (tokens, width, stride) = (2usize, 25600usize, 25664usize);
+    let mut x = vec![f16::ZERO; tokens * width];
+    for (row, amp) in [2048.0f32, 8192.0].into_iter().enumerate() {
+        for c in 0usize..256 {
+            let sign = if (0..4).filter(|&j| ((c >> (2 * j)) & 3) == 3).count() % 2 == 0 {
+                1.0
+            } else {
+                -1.0
+            };
+            x[row * width + c] = f16::from_f32(amp * sign);
+        }
+    }
+    let out = h.run_module(
+        "prepare_plain_tiled",
+        "prepare_plain_tiled_i8",
+        &cfg(&[("width", width), ("lanes", 64), ("out_stride", stride)]),
+        [tokens as u32, 1, 1],
+        64,
+        &[tokens as u64],
+        &[bytes(&x), vec![0; tokens * stride], vec![0; tokens * 4]],
+    );
+    let scales = floats(&out[2]);
+    eprintln!(
+        "FINITE INPUT Hadamard: expected scales {:?}, actual {:?}",
+        [32768.0 / 127.0, 131072.0 / 127.0],
+        scales
+    );
+    assert!(scales[0].is_finite());
+    assert!((scales[1] - 131072.0 / 127.0).abs() < 0.001);
+}
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn swiglu_preserves_f32_range() {
+    let mut h = Harness::new();
+    let (rows, k, n) = (1usize, 128usize, 128usize);
+    let out = h.run_module(
+        "gemm_packed_256",
+        "gemm_i8_swiglu_f32_256",
+        &cfg(&[
+            ("k_size", k),
+            ("n_size", n),
+            ("k_stride", k),
+            ("m_group", 1),
+        ]),
+        [1, 1, 1],
+        256,
+        &[rows as u64],
+        &[
+            vec![1u8; 256 * k],
+            vec![2u8; n * k],
+            bytes(&vec![2.0f32; n]),
+            bytes(&vec![1.0f32; 256]),
+            vec![0; n / 2 * 4],
+        ],
+    );
+    let got = floats(&out[4]);
+    eprintln!(
+        "FINITE SwiGLU: gate=512 up=512 expected product=262144 actual={}",
+        got[0]
+    );
+    assert!(got.iter().all(|&v| v == 262144.0));
+}
+
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn gemm_preserves_nonfinite_results() {
+    let mut h = Harness::new();
+    let (k, n) = (128usize, 128usize);
+    let out = h.run_module(
+        "gemm_packed_256",
+        "gemm_i8_256",
+        &cfg(&[
+            ("k_size", k),
+            ("n_size", n),
+            ("k_stride", k),
+            ("m_group", 1),
+        ]),
+        [1, 1, 1],
+        256,
+        &[1u64],
+        &[
+            vec![0u8; 256 * k],
+            vec![1u8; n * k],
+            bytes(&vec![1.0f32; n]),
+            bytes(&vec![f32::INFINITY; 256]),
+            vec![0; n * 2],
+        ],
+    );
+    let got = halves(&out[4], false);
+    eprintln!("Invalid scale preserved: zero integer dot * infinite scale gives {} in all {} output channels",got[0],got.len());
+    assert!(got.iter().all(|v| v.is_nan()));
+}
+
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn f32_feedforward_variants_and_adapter_finish_preserve_range() {
+    let mut h = Harness::new();
+    let (rows, capacity, k, n) = (257usize, 512usize, 128usize, 128usize);
+    for (module, stem, quant, bias) in [
+        ("gemm_packed_256", "gemm_i8_swiglu_f32_256b_gs", true, true),
+        ("gemm_bf16_family", "gemm_bf16_swiglu_f32_256", false, false),
+    ] {
+        let mut data = if quant {
+            vec![
+                vec![1; capacity * k],
+                vec![2; n * k],
+                bytes(&vec![2.0f32; n]),
+                bytes(&vec![1.0f32; capacity]),
+                vec![0; rows * n / 2 * 4],
+            ]
+        } else {
+            vec![
+                bytes(&vec![bf16::from_f32(2.0); capacity * k]),
+                bytes(&vec![bf16::from_f32(2.0); n * k]),
+                vec![0; rows * n / 2 * 4],
+            ]
+        };
+        let output = data.len() - 1;
+        if bias {
+            data.push(bytes(&vec![1.0f32; n]));
+        }
+        let out = h.run_module(
+            module,
+            stem,
+            &cfg(&[
+                ("k_size", k),
+                ("n_size", n),
+                ("k_stride", k),
+                ("m_group", 1),
+            ]),
+            [1, 2, 1],
+            256,
+            &[rows as u64],
+            &data,
+        );
+        let expected = if bias { 513.0 * 513.0 } else { 512.0 * 512.0 };
+        assert!(
+            floats(&out[output]).iter().all(|&v| v == expected),
+            "{stem}"
+        );
+    }
+    let width = 128;
+    let mut base = vec![0.0f32; 2 * width];
+    for i in 0..width {
+        base[(i / 16) * 32 + i % 16] = 512.0;
+        base[(i / 16) * 32 + i % 16 + 16] = if i % 2 == 0 { 512.0 } else { -512.0 };
+    }
+    let out = h.run(
+        "adapter_finish",
+        &cfg(&[("width", width), ("mode", 1), ("classes", 1)]),
+        [1, 1, 1],
+        256,
+        &[1],
+        &[
+            bytes(&base),
+            bytes(&vec![0.0f32; 2 * width]),
+            vec![0; width * 4],
+            vec![0; 4],
+            vec![0; 4],
+        ],
+    );
+    for (i, v) in floats(&out[2]).iter().enumerate() {
+        assert_eq!(*v, if i % 2 == 0 { 262144.0 } else { -262144.0 });
+    }
+}
+
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn f32_preparation_matches_dense_hadamard_and_marks_invalid_rows() {
+    let mut h = Harness::new();
+    let base = [
+        [1.0f32, 1.0, 1.0, -1.0],
+        [1.0, 1.0, -1.0, 1.0],
+        [1.0, -1.0, 1.0, 1.0],
+        [-1.0, 1.0, 1.0, 1.0],
+    ];
+    let matrix: Vec<f32> = (0usize..256 * 256)
+        .map(|i| {
+            (0..4)
+                .map(|b| base[((i / 256) >> (2 * b)) & 3][((i % 256) >> (2 * b)) & 3])
+                .product::<f32>()
+                / 16.0
+        })
+        .collect();
+    for width in [4352usize, 14336, 25600] {
+        let rows = 5;
+        let stride = width + 64;
+        let mut x = vec![0.0f32; rows * width];
+        for (i, v) in x[..width].iter_mut().enumerate() {
+            *v = ((i * 37 % 997) as f32 - 498.0) * 512.0;
+        }
+        x[2 * width] = f32::NAN;
+        x[3 * width + width - 1] = f32::INFINITY;
+        x[4 * width + 13] = f32::NEG_INFINITY;
+        for tiled in [false, true] {
+            if !tiled && width > 16384 {
+                continue;
+            }
+            let (module, stem) = if tiled {
+                ("prepare_plain_tiled", "prepare_plain_tiled_f32_i8")
+            } else {
+                ("prepare_i8_family", "prepare_plain_f32_i8")
+            };
+            let lanes = if tiled {
+                256
+            } else {
+                h3_hrx::model::lanes_for(width).unwrap()
+            };
+            let out = h.run_module(
+                module,
+                stem,
+                &cfg(&[("width", width), ("lanes", lanes), ("out_stride", stride)]),
+                [rows as u32, 1, 1],
+                lanes as u32,
+                &[rows as u64],
+                &[bytes(&x), vec![0; rows * stride], vec![0; rows * 4]],
+            );
+            let scales = floats(&out[2]);
+            let rotated: Vec<f32> = x[..width]
+                .chunks_exact(256)
+                .flat_map(|group| {
+                    (0..256)
+                        .map(|row| {
+                            (0..256)
+                                .map(|col| group[col] * matrix[row * 256 + col])
+                                .sum::<f32>()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let max = rotated.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            assert!(
+                (scales[0] - f64::from(max) / 127.0).abs() < 0.01,
+                "{stem} width={width}"
+            );
+            for (i, v) in rotated.iter().enumerate() {
+                let expected = (f64::from(*v) / scales[0])
+                    .round_ties_even()
+                    .clamp(-127.0, 127.0) as i8;
+                assert!(
+                    (out[1][i] as i8 as i16 - expected as i16).abs() <= 1,
+                    "{stem} code {i}"
+                );
+            }
+            assert!(scales[1].is_finite() && scales[1] > 0.0);
+            assert!(out[1][stride..2 * stride].iter().all(|&v| v == 0));
+            for row in 2..rows {
+                assert!(!scales[row].is_finite());
+                assert!(out[1][row * stride..(row + 1) * stride]
+                    .iter()
+                    .all(|&v| v == 0));
+            }
+        }
+    }
+    let x = [262144.0f32, -262144.0, 65536.0, -65536.0].repeat(64);
+    let out = h.run_module(
+        "prepare_bf16_family",
+        "prepare_plain_f32_bf16",
+        &cfg(&[("width", 256), ("lanes", 64), ("out_stride", 320)]),
+        [1, 1, 1],
+        64,
+        &[1],
+        &[bytes(&x), vec![0; 320 * 2]],
+    );
+    for (i, v) in x.iter().enumerate() {
+        assert_eq!(
+            bf16::from_le_bytes(out[1][i * 2..i * 2 + 2].try_into().unwrap()).to_f32(),
+            *v
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires gfx1151 and provisioned HRX"]
+fn f32_dispatch_rejects_half_sized_activation_bindings() {
+    use h3_hrx::dispatch::{ActivationType, Gemm, Prepare, Tile};
+    let mut stream = Stream::open().unwrap();
+    let c = h3_hrx::compile::Compiler::new(None, std::path::PathBuf::new());
+    let gemm = Gemm::build_with_output(
+        &c,
+        &mut stream,
+        "swiglu",
+        "i8",
+        false,
+        true,
+        128,
+        128,
+        1,
+        1,
+        128,
+        Tile::Plain,
+        0,
+        ActivationType::F32,
+    )
+    .unwrap();
+    let a = stream.allocate_zeroed(256 * 128).unwrap();
+    let w = stream.allocate_zeroed(128 * 128).unwrap();
+    let scale = stream.allocate_zeroed(256 * 4).unwrap();
+    let out = stream.allocate(64 * 2).unwrap();
+    assert!(gemm
+        .run(
+            &mut stream,
+            None,
+            "f32 output extent",
+            1,
+            a.binding(),
+            w.binding(),
+            Some((scale.binding(), scale.binding())),
+            out.binding(),
+            None,
+            None
+        )
+        .is_err());
+    let prep = Prepare::build_with_input(
+        &c,
+        &mut stream,
+        "plain",
+        "i8",
+        256,
+        1e-5,
+        1,
+        256,
+        ActivationType::F32,
+    )
+    .unwrap();
+    let half = stream.allocate(256 * 2).unwrap();
+    assert!(prep
+        .run(
+            &mut stream,
+            None,
+            "f32 input extent",
+            1,
+            half.binding(),
+            None,
+            a.binding(),
+            Some(scale.binding())
+        )
+        .is_err());
 }

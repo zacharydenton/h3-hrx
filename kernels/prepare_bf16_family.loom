@@ -362,3 +362,41 @@ kernel.def target(@h3_prepare_lnorm_bf16_gfx11) export("h3_prepare_lnorm_bf16") 
   template.apply<@h3.prepare_finish_bf16>(%chunks_per_lane, %lanes, %lane, %width_last, %out_last, %lds, %width, %q_global, %tokens_b, %out_stride, %row) : (index, index, index, index, index, buffer, index, buffer, index, index, index)
   kernel.return
 }
+
+amdgpu.target<gfx11-generic> @h3_prepare_plain_f32_bf16_gfx11 {subgroup_size = 32}
+
+config.decl @h3.prepare_plain_f32_bf16.width : %value: index where [range(%value, 256, 32768), mul(%value, 256)]
+
+config.decl @h3.prepare_plain_f32_bf16.lanes : %value: index where [range(%value, 32, 1024), mul(%value, 32)]
+
+config.decl @h3.prepare_plain_f32_bf16.out_stride : %value: index where [range(%value, 256, 65536), mul(%value, 64)]
+
+kernel.def target(@h3_prepare_plain_f32_bf16_gfx11) export("h3_prepare_plain_f32_bf16") @h3_prepare_plain_f32_bf16(%tokens: index) {
+  %c1 = index.constant 1 : index
+  %lanes = config.get @h3.prepare_plain_f32_bf16.lanes : index
+  kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%lanes, %c1, %c1) : index
+} launch(%tokens: index, %h: buffer, %q: buffer) {
+  %width = config.get @h3.prepare_plain_f32_bf16.width : index
+  %lanes = config.get @h3.prepare_plain_f32_bf16.lanes : index
+  %stride = config.get @h3.prepare_plain_f32_bf16.out_stride : index
+  %zero = index.constant 0 : offset
+  %c8 = index.constant 8 : index
+  %row0 = kernel.workgroup.id<x> : index
+  %tokens_b = index.assume %tokens [range(%tokens, 1, 1048576)] : index
+  %row = index.assume %row0 [lt(%row0, %tokens_b)] : index
+  %lane = kernel.workitem.id<x> : index
+  %first = index.mul %lane, %c8 : index
+  %step = index.mul %lanes, %c8 : index
+  %last = index.sub %width, %c8 : index
+  %input_global = buffer.assume.memory_space<global> %h : buffer
+  %output_global = buffer.assume.memory_space<global> %q : buffer
+  %input = buffer.view %input_global[%zero] : buffer -> view<[%tokens_b]x[%width]xf32>
+  %output = buffer.view %output_global[%zero] : buffer -> view<[%tokens_b]x[%stride]xbf16>
+  scf.for %i0 = [%first to %width step %step] {
+    %i = index.assume %i0 [le(%i0, %last), mul(%i0, 8)] : index
+    %a = vector.load %input[%row, %i] : view<[%tokens_b]x[%width]xf32> -> vector<8xf32>
+    %b = vector.fptrunc %a : vector<8xf32> to vector<8xbf16>
+    vector.store %b, %output[%row, %i] : vector<8xbf16>, view<[%tokens_b]x[%stride]xbf16>
+  }
+  kernel.return
+}

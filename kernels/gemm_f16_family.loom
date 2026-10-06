@@ -110,7 +110,12 @@ template.def<@h3.gemm_f16_finish> @h3.gemm_f16_finish_plain(%epilogue: index, %m
         %scaled = vector.addf %scaled1, %bias_values : vector<4xf32>
         %sat0 = vector.minnumf %scaled, %f16_max4 : vector<4xf32>
         %sat = vector.maxnumf %sat0, %f16_min4 : vector<4xf32>
-        %narrow = vector.fptrunc %sat : vector<4xf32> to vector<4xf16>
+        // Clamp finite values only; invalid arithmetic must remain observable.
+        %range_inf = vector.constant inf : vector<4xf32>
+        %range_abs = vector.absf %scaled : vector<4xf32>
+        %range_finite = vector.cmpf olt, %range_abs, %range_inf : vector<4xf32> -> vector<4xi1>
+        %range_checked = vector.select %range_finite, %sat, %scaled : vector<4xf32>
+        %narrow = vector.fptrunc %range_checked : vector<4xf32> to vector<4xf16>
         vector.store %narrow, %c_view[%bounded, %out_col] : vector<4xf16>, view<[%m_bounded]x[%n_size]xf16>
       }
     }
@@ -356,7 +361,12 @@ template.def<@h3.gemm_f16_finish> @h3.gemm_f16_finish_swiglu(%epilogue: index, %
         // saturate: H3's products reach 5e4, and an f16 inf here becomes a NaN token scale downstream
         %sat0 = vector.minnumf %prod, %f16_max4 : vector<4xf32>
         %sat = vector.maxnumf %sat0, %f16_min4 : vector<4xf32>
-        %narrow = vector.fptrunc %sat : vector<4xf32> to vector<4xf16>
+        // Clamp finite values only; invalid arithmetic must remain observable.
+        %range_inf = vector.constant inf : vector<4xf32>
+        %range_abs = vector.absf %prod : vector<4xf32>
+        %range_finite = vector.cmpf olt, %range_abs, %range_inf : vector<4xf32> -> vector<4xi1>
+        %range_checked = vector.select %range_finite, %sat, %prod : vector<4xf32>
+        %narrow = vector.fptrunc %range_checked : vector<4xf32> to vector<4xf16>
         vector.store %narrow, %c_view[%bounded, %out_col] : vector<4xf16>, view<[%m_bounded]x[%n_half]xf16>
       }
     }
@@ -481,7 +491,12 @@ template.def<@h3.gemm_f16_finish> @h3.gemm_f16_finish_swiglu_swapped(%epilogue: 
         // saturate: H3's products reach 5e4, and an f16 inf here becomes a NaN token scale downstream
         %sat0 = vector.minnumf %prod, %f16_max4 : vector<4xf32>
         %sat = vector.maxnumf %sat0, %f16_min4 : vector<4xf32>
-        %narrow = vector.fptrunc %sat : vector<4xf32> to vector<4xf16>
+        // Clamp finite values only; invalid arithmetic must remain observable.
+        %range_inf = vector.constant inf : vector<4xf32>
+        %range_abs = vector.absf %prod : vector<4xf32>
+        %range_finite = vector.cmpf olt, %range_abs, %range_inf : vector<4xf32> -> vector<4xi1>
+        %range_checked = vector.select %range_finite, %sat, %prod : vector<4xf32>
+        %narrow = vector.fptrunc %range_checked : vector<4xf32> to vector<4xf16>
         vector.store %narrow, %c_view[%bounded, %out_col] : vector<4xf16>, view<[%m_bounded]x[%n_half]xf16>
       }
     }

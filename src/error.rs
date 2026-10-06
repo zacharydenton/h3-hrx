@@ -35,9 +35,28 @@ pub fn other<T>(message: impl Into<String>) -> Result<T> {
     Err(Error::Other(message.into()))
 }
 
+/// Validate an existing host result without adding a device synchronization.
+pub(crate) fn finite_output(stage: &str, tensor: &str, values: &[f32]) -> Result<()> {
+    if let Some((index, value)) = values.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+        return other(format!("{stage}: non-finite {tensor}[{index}] = {value}"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_outputs_name_the_stage_tensor_and_first_index() {
+        finite_output("denoise", "video latents", &[0.0, 262144.0, -262144.0]).unwrap();
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let message = finite_output("denoise", "video latents", &[1.0, value, value])
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains("denoise: non-finite video latents[1]"));
+        }
+    }
 
     #[test]
     fn every_layer_converts_without_losing_its_message() {
