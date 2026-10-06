@@ -49,8 +49,10 @@ prepared exports and bindings.
 
 Weights use HRX's `allocate_from` to initialize and publish owned GPU buffers
 directly. Repacking uses at most 256 MiB of temporary host storage for row recipes;
-larger gathered tensors retain 16 MiB staging chunks. Source pages are prepared
-in merged intervals before packing and released after copying.
+larger gathered tensors retain 16 MiB staging chunks. Gathered tensors within that
+limit prepare and release their source pages in merged intervals.
+Packing arrays of at least 16 MiB uses two CPU workers writing disjoint row ranges
+of the same host buffer; smaller arrays use one worker.
 `Stream::read_blocking` waits for readback completion. Normal inference does not
 synchronize around every kernel; `H3_PROFILE=1` does, changing timing.
 

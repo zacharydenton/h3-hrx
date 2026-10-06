@@ -89,25 +89,56 @@ impl Recipe {
                 pitch_bytes,
                 segments,
             } => {
-                let mut out = vec![0u8; rows * pitch_bytes];
-                let mut row = 0usize;
-                for segment in segments {
-                    let entry = ck.at(&segment.tensor)?;
-                    let bytes = ck.bytes(entry);
-                    for i in 0..segment.rows {
-                        let src = (segment.row0 + i) * row_bytes;
-                        if src + row_bytes > bytes.len() {
-                            return layout(format!("a row run past {}", segment.tensor));
-                        }
-                        let dst = row * pitch_bytes;
-                        out[dst..dst + row_bytes].copy_from_slice(&bytes[src..src + row_bytes]);
-                        row += 1;
-                    }
-                }
+                let row: usize = segments.iter().map(|s| s.rows).sum();
                 if row != *rows {
                     return layout(format!(
                         "a recipe's segments add up to {row} rows, not {rows}"
                     ));
+                }
+                let mut out = vec![0u8; rows * pitch_bytes];
+                let pack = |out: &mut [u8], first: usize, last: usize| -> Result<()> {
+                    let mut row = 0;
+                    for segment in segments {
+                        let begin = first.max(row);
+                        let end = last.min(row + segment.rows);
+                        if begin < end {
+                            let entry = ck.at(&segment.tensor)?;
+                            let bytes = ck.bytes(entry);
+                            let from = (segment.row0 + begin - row) * row_bytes;
+                            let count = end - begin;
+                            if from + count * row_bytes > bytes.len() {
+                                return layout(format!("a row run past {}", segment.tensor));
+                            }
+                            let dst = (begin - first) * pitch_bytes;
+                            if row_bytes == pitch_bytes {
+                                out[dst..dst + count * row_bytes]
+                                    .copy_from_slice(&bytes[from..from + count * row_bytes]);
+                            } else {
+                                for i in 0..count {
+                                    let src = from + i * row_bytes;
+                                    let dst = dst + i * pitch_bytes;
+                                    out[dst..dst + row_bytes]
+                                        .copy_from_slice(&bytes[src..src + row_bytes]);
+                                }
+                            }
+                        }
+                        row += segment.rows;
+                    }
+                    Ok(())
+                };
+                if out.len() >= CHUNK && *rows >= 2 {
+                    // One extra worker, no extra staging. The split can fall inside a source run.
+                    let mid = rows / 2;
+                    let (first, second) = out.split_at_mut(mid * pitch_bytes);
+                    std::thread::scope(|scope| -> Result<()> {
+                        let worker = scope.spawn(|| pack(second, mid, *rows));
+                        let result = pack(first, 0, mid);
+                        let other = worker.join().expect("weight packing worker panicked");
+                        result?;
+                        other
+                    })?;
+                } else {
+                    pack(&mut out, 0, *rows)?;
                 }
                 Ok(out)
             }
@@ -273,6 +304,7 @@ impl Weights {
                 pitch_bytes,
                 segments,
             } => {
+                let mut release_runs = None;
                 let buffer = if segments.len() == 1 && pitch_bytes == row_bytes {
                     // HRX owns a published copy before the borrowed mapping can be released.
                     let segment = &segments[0];
@@ -291,8 +323,7 @@ impl Weights {
                     self.file.will_need(span);
                     initialize(span)?
                 } else if recipe.device_bytes() <= DIRECT_PACK_LIMIT {
-                    // Packing order may alternate distant 16-row runs. Prepare each merged
-                    // source interval once, in source row order, instead of faulting in that order.
+                    // Prepare each source interval once before gathering interleaved rows.
                     let mut runs = segments.clone();
                     runs.sort_unstable_by(|a, b| (&a.tensor, a.row0).cmp(&(&b.tensor, b.row0)));
                     let mut merged: Vec<Segment> = Vec::new();
@@ -306,7 +337,7 @@ impl Weights {
                             merged.push(run);
                         }
                     }
-                    for run in merged {
+                    for run in &merged {
                         let entry = self.file.at(&run.tensor)?;
                         let from = run.row0 * row_bytes;
                         self.file.prepare(
@@ -314,7 +345,9 @@ impl Weights {
                             &self.file.bytes(entry)[from..from + run.rows * row_bytes],
                         )?;
                     }
-                    initialize(&recipe.assemble(&self.file)?)?
+                    let buffer = initialize(&recipe.assemble(&self.file)?)?;
+                    release_runs = Some(merged);
+                    buffer
                 } else {
                     let buffer = stream
                         .allocate(recipe.device_bytes().max(1))
@@ -368,7 +401,8 @@ impl Weights {
                     buffer
                 };
                 // Direct initialization or HRX staging owns the bytes by this point.
-                for segment in segments {
+                // Merged releases also discard pages shared by neighboring source runs.
+                for segment in release_runs.as_deref().unwrap_or(segments) {
                     let entry = self.file.at(&segment.tensor)?;
                     let all = self.file.bytes(entry);
                     let from = segment.row0 * row_bytes;
@@ -1028,6 +1062,64 @@ mod tests {
             .unwrap();
         assert_eq!(out, vec![4, 5, 0, 1, 2, 3]);
         assert!(rows_permuted(&ck, "qkv", &[(2, 2)], 0).is_err());
+    }
+
+    #[test]
+    fn packing_preserves_overlapping_runs_and_padding() {
+        let segments = vec![
+            Segment {
+                tensor: "z".into(),
+                row0: 32,
+                rows: 17,
+            },
+            Segment {
+                tensor: "a".into(),
+                row0: 0,
+                rows: 31,
+            },
+            Segment {
+                tensor: "z".into(),
+                row0: 40,
+                rows: 17,
+            },
+        ];
+        let value = |row: u8, col: usize| row.wrapping_mul(31) ^ col as u8;
+        for width in [3, CHUNK / 64 + 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let data = |rows: std::ops::Range<u8>| {
+                rows.flat_map(|r| (0..width).map(move |c| value(r, c)))
+                    .collect()
+            };
+            let ck = checkpoint(
+                dir.path(),
+                &[
+                    ("z", "I8", vec![64, width], data(1..65)),
+                    ("a", "I8", vec![31, width], data(128..159)),
+                ],
+            );
+            // Exercise serial and parallel packing. The worker split falls inside a, with
+            // overlapping z runs and a destination order different from file/name order.
+            for pitch_bytes in [width, width + 5] {
+                let recipe = Recipe::Rows {
+                    rows: 65,
+                    row_bytes: width,
+                    pitch_bytes,
+                    segments: segments.clone(),
+                };
+                let out = recipe.assemble(&ck).unwrap();
+                assert_eq!(out.len(), 65 * pitch_bytes);
+                for (row, tag) in out
+                    .chunks_exact(pitch_bytes)
+                    .zip((33..50).chain(128..159).chain(41..58))
+                {
+                    assert!(row[..width]
+                        .iter()
+                        .enumerate()
+                        .all(|(col, byte)| *byte == value(tag, col)));
+                    assert!(row[width..].iter().all(|byte| *byte == 0));
+                }
+            }
+        }
     }
 
     #[test]
