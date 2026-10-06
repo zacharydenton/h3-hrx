@@ -32,14 +32,14 @@ pub fn plan(ck: &Checkpoint, out: &mut Table) -> Result<()> {
         widen_f32(ck, &[&f32v("latents_std", AUDIO_CH)?])?,
     );
 
-    decoder_conv(
+    packed_convolution(
         ck,
         out,
         "audio.dec_in_proj",
         "dec_in_proj",
         &[2048, AUDIO_CH as i64, 1],
     )?;
-    decoder_conv(
+    packed_convolution(
         ck,
         out,
         "audio.conv_pre",
@@ -65,14 +65,14 @@ pub fn plan(ck: &Checkpoint, out: &mut Table) -> Result<()> {
             let r = i * 3 + j;
             let src = format!("decoder.resblocks.{r}");
             for d in 0..3 {
-                decoder_conv(
+                packed_convolution(
                     ck,
                     out,
                     &format!("audio.res.{r}.c1.{d}"),
                     &format!("{src}.convs1.{d}"),
                     &[cout as i64, cout as i64, *resk as i64],
                 )?;
-                decoder_conv(
+                packed_convolution(
                     ck,
                     out,
                     &format!("audio.res.{r}.c2.{d}"),
@@ -128,7 +128,7 @@ pub fn plan(ck: &Checkpoint, out: &mut Table) -> Result<()> {
     encoder(ck, out)
 }
 
-/// Shared by the decoder's weight plan and dispatch: the layout must agree.
+/// Shared by the audio weight plan and dispatch: the layout must agree.
 pub(crate) fn packed_conv(cin: usize, cout: usize) -> bool {
     cin >= 32 && cout >= 32 && cout.is_multiple_of(8)
 }
@@ -148,7 +148,7 @@ fn pack_output_channels(bytes: &[u8], outputs: usize, reduction: usize, tile: us
 }
 
 /// Replace the flat recipe, retaining one device copy and every FP32 bit.
-fn decoder_conv(
+fn packed_convolution(
     ck: &Checkpoint,
     out: &mut Table,
     name: &str,
@@ -313,25 +313,23 @@ fn encoder(ck: &Checkpoint, out: &mut Table) -> Result<()> {
                 format!("aenc.b{i}.r{r}.act0"),
                 widen_f32(ck, &[&alpha(&format!("{q}.0.alpha"), dim)?])?,
             );
-            flat(
+            packed_convolution(
                 ck,
                 out,
                 &format!("aenc.b{i}.r{r}.c1"),
                 &format!("{q}.1"),
                 &[dim as i64, dim as i64, 7],
-                None,
             )?;
             out.insert(
                 format!("aenc.b{i}.r{r}.act1"),
                 widen_f32(ck, &[&alpha(&format!("{q}.2.alpha"), dim)?])?,
             );
-            flat(
+            packed_convolution(
                 ck,
                 out,
                 &format!("aenc.b{i}.r{r}.c2"),
                 &format!("{q}.3"),
                 &[dim as i64, dim as i64, 1],
-                None,
             )?;
         }
         out.insert(

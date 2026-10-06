@@ -281,11 +281,10 @@ fn audio_convolution(c: &mut Criterion) {
             } else {
                 ksize / 2 * dilation
             };
-            for tiled in [false, true] {
-                if down && tiled {
-                    continue; // The four-sample kernel requires stride one.
+            for layout in ["scalar", "four_samples", "packed_channels"] {
+                if down && layout != "scalar" {
+                    continue; // The tiled kernels require stride one.
                 }
-                let layout = if tiled { "four_samples" } else { "scalar" };
                 group.bench_function(
                     format!("{layout}/{cin}x{cout}x{len}/k{ksize}_d{dilation}_s{step}"),
                     |b| {
@@ -293,8 +292,12 @@ fn audio_convolution(c: &mut Criterion) {
                         let mut stream =
                             Stream::open().unwrap().with_memory_budget(manager.budget());
                         let compiler = compiler();
-                        let build = |stream: &mut Stream, tiled: bool| {
-                            let stem = if tiled { "conv1d4_f32" } else { "conv1d_s_f32" };
+                        let build = |stream: &mut Stream, layout: &str| {
+                            let stem = match layout {
+                                "packed_channels" => "conv1d_block_f32",
+                                "four_samples" => "conv1d4_f32",
+                                _ => "conv1d_s_f32",
+                            };
                             let mut config = vec![
                                 ("cin", cin),
                                 ("cout", cout),
@@ -302,7 +305,7 @@ fn audio_convolution(c: &mut Criterion) {
                                 ("dilation", dilation),
                                 ("pad", pad),
                             ];
-                            if tiled {
+                            if layout != "scalar" {
                                 config.extend([
                                     ("accumulate", 0),
                                     ("len_bound", len.max(256).next_power_of_two()),
@@ -322,8 +325,8 @@ fn audio_convolution(c: &mut Criterion) {
                                 .get(stream, stem, &format!("h3_{stem}"), &config)
                                 .unwrap()
                         };
-                        let reference = build(&mut stream, false);
-                        let kernel = build(&mut stream, tiled);
+                        let reference = build(&mut stream, "scalar");
+                        let kernel = build(&mut stream, layout);
                         compiler.flush(&mut stream).unwrap();
                         let values = |count| {
                             (0..count)
@@ -331,39 +334,57 @@ fn audio_convolution(c: &mut Criterion) {
                                 .collect::<Vec<_>>()
                         };
                         let x = upload(&mut stream, bytemuck::cast_slice(&values(cin * len)));
-                        let w = upload(
-                            &mut stream,
-                            bytemuck::cast_slice(&values(cout * cin * ksize)),
-                        );
+                        let weights = values(cout * cin * ksize);
+                        let w = upload(&mut stream, bytemuck::cast_slice(&weights));
+                        let packed = (layout == "packed_channels").then(|| {
+                            let mut packed = Vec::with_capacity(weights.len());
+                            for group in weights.chunks(8 * cin * ksize) {
+                                for tap in 0..cin * ksize {
+                                    for channel in 0..8 {
+                                        packed.push(group[channel * cin * ksize + tap]);
+                                    }
+                                }
+                            }
+                            upload(&mut stream, bytemuck::cast_slice(&packed))
+                        });
                         let bias = upload(&mut stream, bytemuck::cast_slice(&values(cout)));
                         let out = stream.allocate(cout * out_len * 4).unwrap();
-                        let run =
-                            |stream: &mut Stream, kernel: &h3_hrx::compile::Kernel, tiled: bool| {
-                                let scalars = [out_len as u32, len as u32];
-                                h3_hrx::dispatch::emit(
-                                    &mut Sink::Stream(stream),
-                                    kernel,
-                                    None,
-                                    "audio convolution",
-                                    [out_len.div_ceil(256) as u32, cout as u32, 1],
-                                    [if tiled { 64 } else { 256 }, 1, 1],
-                                    &scalars[..if tiled { 1 } else { 2 }],
-                                    &[x.binding(), w.binding(), bias.binding(), out.binding()],
-                                    &[
-                                        cin * len * 4,
-                                        cout * cin * ksize * 4,
-                                        cout * 4,
-                                        cout * out_len * 4,
-                                    ],
-                                )
-                                .unwrap();
-                                stream.synchronize().unwrap();
+                        let run = |stream: &mut Stream,
+                                   kernel: &h3_hrx::compile::Kernel,
+                                   layout: &str,
+                                   w: &Buffer| {
+                            let tiled = layout != "scalar";
+                            let (span, outputs) = if layout == "packed_channels" {
+                                (128, cout / 8)
+                            } else {
+                                (256, cout)
                             };
-                        run(&mut stream, &reference, false);
+                            let scalars = [out_len as u32, len as u32];
+                            h3_hrx::dispatch::emit(
+                                &mut Sink::Stream(stream),
+                                kernel,
+                                None,
+                                "audio convolution",
+                                [out_len.div_ceil(span) as u32, outputs as u32, 1],
+                                [if tiled { 64 } else { 256 }, 1, 1],
+                                &scalars[..if tiled { 1 } else { 2 }],
+                                &[x.binding(), w.binding(), bias.binding(), out.binding()],
+                                &[
+                                    cin * len * 4,
+                                    cout * cin * ksize * 4,
+                                    cout * 4,
+                                    cout * out_len * 4,
+                                ],
+                            )
+                            .unwrap();
+                            stream.synchronize().unwrap();
+                        };
+                        run(&mut stream, &reference, "scalar", &w);
                         let expected = check_f32(&mut stream, &out);
-                        run(&mut stream, &kernel, tiled);
+                        let w = packed.as_ref().unwrap_or(&w);
+                        run(&mut stream, &kernel, layout, w);
                         assert_eq!(check_f32(&mut stream, &out), expected);
-                        b.iter(|| run(&mut stream, &kernel, tiled));
+                        b.iter(|| run(&mut stream, &kernel, layout, w));
                         assert_eq!(check_f32(&mut stream, &out), expected);
                     },
                 );

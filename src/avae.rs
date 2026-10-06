@@ -829,13 +829,13 @@ impl AudioVae {
                     )?;
                     let hoisted_1 = w(stream, &format!("{p}c1.w"), dim * dim * 7)?;
                     let hoisted_2 = w(stream, &format!("{p}c1.b"), dim)?;
-                    conv_s(
+                    conv4(
                         c,
                         stream,
                         prof,
                         "aenc res conv7",
-                        (dim, dim, 7, dil, 3 * dil, 1),
-                        len,
+                        (dim, dim, 7, dil, 3 * dil),
+                        false,
                         len,
                         y.binding(),
                         hoisted_1.binding(),
@@ -855,13 +855,15 @@ impl AudioVae {
                     )?;
                     let hoisted_1 = w(stream, &format!("{p}c2.w"), dim * dim)?;
                     let hoisted_2 = w(stream, &format!("{p}c2.b"), dim)?;
-                    conv_s(
+                    // The encoder adds its skip after the dot. Keep the separate
+                    // axpy: conv4's accumulate mode adds it before the first FMA.
+                    conv4(
                         c,
                         stream,
                         prof,
                         "aenc res conv1",
-                        (dim, dim, 1, 1, 0, 1),
-                        len,
+                        (dim, dim, 1, 1, 0),
+                        false,
                         len,
                         y.binding(),
                         hoisted_1.binding(),
