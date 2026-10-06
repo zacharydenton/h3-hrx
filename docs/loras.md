@@ -83,8 +83,8 @@ with the DiT on demand and reopened with it after residency eviction.
 
 ## Validation
 
-`scripts/test.sh --adapters` requires the base DiT, both pinned Turbo adapters,
-and the Orbit revision above in the cache. It checks the actual A/B products
+`cargo test --lib stack::adapter::tests::` resolves the base DiT, both pinned Turbo
+adapters and the Orbit revision above through the model cache. It checks the actual A/B products
 against independent CPU sums and checks eager execution against graph replay
 for both DiT and refiner stacks. A mixed, partial adapter case exercises signed
 strengths, overlapping projections, different ranks, and the base fallback.

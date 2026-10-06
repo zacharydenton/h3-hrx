@@ -387,7 +387,7 @@ mod tests {
             ("Four", crate::adapter::TurboPreset::Four),
             ("Eight", crate::adapter::TurboPreset::Eight),
         ] {
-            let path = preset.resolve(true).unwrap();
+            let path = preset.resolve(false).unwrap();
             // Safety: cached test artifacts remain immutable.
             cases.push((
                 name,
@@ -397,7 +397,6 @@ mod tests {
         let path = crate::models::Resolver::new()
             .repository("pablodawson", "MiniMax-H3-360-Orbit-LoRA")
             .revision(Some("5ddbc2dbbe95edbbdaf5017c3e934b1d01791697".into()))
-            .offline(true)
             .find("minimax_h3_flf2v_lora_v1.safetensors")
             .unwrap();
         // Safety: cached test artifacts remain immutable.
@@ -418,7 +417,7 @@ mod tests {
             crate::adapter::Adapter::open_loras(&[
                 crate::adapter::Lora::new(&path, 0.5),
                 crate::adapter::Lora::new(
-                    crate::adapter::TurboPreset::Four.resolve(true).unwrap(),
+                    crate::adapter::TurboPreset::Four.resolve(false).unwrap(),
                     -0.125,
                 ),
             ])
@@ -459,7 +458,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires idle gfx1151, base checkpoint and cached Turbo and Orbit adapters"]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires idle gfx1151, base checkpoint and cached Turbo and Orbit adapters"
+    )]
     fn real_adapted_stacks_match_eager_and_recorded_execution() {
         assert!(
             std::env::var_os("H3_ADAPTER_BLOCK_FIXTURE").is_none()
@@ -469,7 +471,6 @@ mod tests {
         let c = Compiler::new(None, std::path::PathBuf::new());
         let mut stream = hrx::Stream::open().unwrap();
         let path = crate::models::Resolver::new()
-            .offline(true)
             .find(crate::models::DIT_FL2VA)
             .unwrap();
         // Safety: these cached fixtures remain immutable throughout the test.
@@ -667,12 +668,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires idle gfx1151, base checkpoint and cached Turbo and Orbit adapters"]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires idle gfx1151, base checkpoint and cached Turbo and Orbit adapters"
+    )]
     fn real_low_rank_branches_match_independent_cpu_products() {
         let c = Compiler::new(None, std::path::PathBuf::new());
         let mut stream = hrx::Stream::open().unwrap();
         let path = crate::models::Resolver::new()
-            .offline(true)
             .find(crate::models::DIT_FL2VA)
             .unwrap();
         // Safety: these cached fixtures remain immutable throughout the test.

@@ -6,4 +6,5 @@ __pycache__/
 *.log
 
 target/
-.cargo/
+.cargo/*
+!.cargo/config.toml

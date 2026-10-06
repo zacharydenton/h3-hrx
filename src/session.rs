@@ -954,9 +954,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires gfx1151 and cached FL2VA/Ref2VA checkpoints"]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires gfx1151 and cached FL2VA/Ref2VA checkpoints"
+    )]
     fn automatic_dit_selection_follows_requests_across_residency_policies() {
-        let resolver = crate::models::Resolver::new().offline(true);
+        let resolver = crate::models::Resolver::new();
         let base = resolver.find(crate::models::DIT_FL2VA).unwrap();
         let reference = resolver.find(crate::models::DIT_REF2VA).unwrap();
         let manager = hrx::residency::ResidencyManager::new(80 << 30).unwrap();
@@ -1030,7 +1033,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an idle gfx1151 and the DiT/text encoder checkpoints"]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires an idle gfx1151 and the DiT/text encoder checkpoints"
+    )]
     fn stage_scoped_denoise_releases_models_and_recovers_after_cancellation() {
         let ids = crate::Tokenizer::new()
             .unwrap()
@@ -1124,7 +1130,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an idle gfx1151 and the DiT/text encoder checkpoints"]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires an idle gfx1151 and the DiT/text encoder checkpoints"
+    )]
     fn observing_and_forcing_full_cache_evaluations_preserve_the_trajectory() {
         use crate::{CachePolicy, CacheThresholds};
         let ids = crate::Tokenizer::new()

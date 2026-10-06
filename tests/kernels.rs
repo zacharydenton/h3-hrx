@@ -1,5 +1,5 @@
 //! Native GPU regressions against independent scalar CPU oracles.
-//! Run `cargo test --test kernels -- --ignored --test-threads=1` on gfx1151.
+//! Run `cargo test --test kernels -- --test-threads=1` on gfx1151.
 use half::{bf16, f16};
 use hrx::{Buffer, Constants, Stream};
 use std::path::Path;
@@ -56,8 +56,13 @@ impl Harness {
         let baseline = std::env::var_os("H3_KERNEL_BASELINE")
             .filter(|_| module != stem)
             .map(|dir| {
-                let source = std::fs::read_to_string(Path::new(&dir).join(format!("{stem}.loom")))
-                    .expect("baseline kernel source");
+                let source_path = Path::new(&dir).join(format!("{stem}.loom"));
+                let source_path = if source_path.is_file() {
+                    source_path
+                } else {
+                    Path::new(&dir).join(format!("{module}.loom"))
+                };
+                let source = std::fs::read_to_string(source_path).expect("baseline kernel source");
                 let mut old = hrx::loom::Specialization::new(&symbol);
                 old.replace_config(request.configuration().clone());
                 let old_path = self.compiler.module(&source).compile(&old).unwrap();
@@ -167,7 +172,10 @@ fn cfg(v: &[(&'static str, usize)]) -> Vec<(&'static str, String)> {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn groupnorm_silu_handles_zero_and_small_variance() {
     let mut h = Harness::new();
     let mut config = cfg(&[
@@ -209,7 +217,10 @@ fn groupnorm_silu_handles_zero_and_small_variance() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn attention_preserves_the_upper_tile_softmax_maximum() {
     let mut h = Harness::new();
     for (stem, waves) in [
@@ -260,7 +271,10 @@ fn attention_preserves_the_upper_tile_softmax_maximum() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn audio_convolution_matches_f64_with_padding_residuals_and_guards() {
     let mut h = Harness::new();
     for n in [1usize, 63, 64, 65, 127, 128, 129, 255, 256, 257, 769] {
@@ -341,7 +355,10 @@ fn audio_convolution_matches_f64_with_padding_residuals_and_guards() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn float_matmul_addresses_rows_past_32768() {
     let mut h = Harness::new();
     for (m, k, n) in [(40000usize, 7usize, 9usize), (65, 96, 257)] {
@@ -370,7 +387,10 @@ fn float_matmul_addresses_rows_past_32768() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn vision_bf16_matmuls_match_rounded_operands_and_epilogues() {
     let mut h = Harness::new();
     let (m, k, n) = (65usize, 128usize, 64usize);
@@ -444,7 +464,10 @@ fn vision_bf16_matmuls_match_rounded_operands_and_epilogues() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn float_preparation_normalizes_large_values_and_respects_padded_pitch() {
     let mut h = Harness::new();
     for width in [256usize, 2048, 5376] {
@@ -526,7 +549,10 @@ fn float_preparation_normalizes_large_values_and_respects_padded_pitch() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn rotary_qk_norm_matches_cpu_for_all_head_layouts_and_copies_v() {
     let mut h = Harness::new();
     for (stem, d, rot) in [
@@ -625,7 +651,10 @@ fn rotary_qk_norm_matches_cpu_for_all_head_layouts_and_copies_v() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn quantized_gemms_match_integer_dot_products_bias_and_residual_classes() {
     let mut h = Harness::new();
     for bits in [4usize, 8] {
@@ -746,7 +775,10 @@ fn quantized_gemms_match_integer_dot_products_bias_and_residual_classes() {
 /// workgroup of `16 * waves` query rows per head, `q`/`k`/`v` contiguous `[capacity][stride]` f16
 /// with zero headroom past `tokens`, and `gqa8c` is the text encoder's causal 8-query-per-kv layout.
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn attention_matches_scaled_dot_product_for_the_shipped_layouts() {
     let mut h = Harness::new();
     for (stem, d, waves, heads, gqa, causal) in [
@@ -911,7 +943,10 @@ fn prepared_qk(
 /// they multiply back in. Ties may round either way, so a handful of differing words is expected;
 /// a wrong rotation, packing or scale is not.
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn prepare_qk_int8_rotates_quantises_and_packs_the_attention_operands() {
     let mut h = Harness::new();
     let (tokens, heads, d) = (37usize, 4usize, 128usize);
@@ -970,7 +1005,10 @@ fn prepare_qk_int8_rotates_quantises_and_packs_the_attention_operands() {
 /// attention its own operands define: the integer dot product scaled by both rows' scales, softmax,
 /// then V in f16. Comparing against exact attention would measure the quantisation, not the kernel.
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn int8_qk_attention_matches_the_attention_its_operands_define() {
     let mut h = Harness::new();
     let (heads, d) = (4usize, 128usize);
@@ -1102,7 +1140,10 @@ fn int8_qk_attention_matches_the_attention_its_operands_define() {
 /// tokens. Check long key loops, partial final tiles and both query-wave halves
 /// against scalar attention; the short cases above cover at most three key tiles.
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn head_major_int8_attention_handles_long_reference_sequences() {
     use rand::{Rng, SeedableRng};
     let mut h = Harness::new();
@@ -1205,7 +1246,10 @@ fn head_major_int8_attention_handles_long_reference_sequences() {
 /// arrive as stored floats with no per-row scale, so the reference rounds through the stored width
 /// and accumulates in f64.
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn float_gemms_match_rounded_operands_across_modes_and_epilogues() {
     let mut h = Harness::new();
     for bf in [false, true] {
@@ -1332,7 +1376,10 @@ fn float_gemms_match_rounded_operands_across_modes_and_epilogues() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn packed_attention_families_preserve_wave_layouts_and_skip_decisions() {
     let mut h = Harness::new();
     for bits in [4usize, 8] {
@@ -1471,7 +1518,10 @@ fn packed_attention_families_preserve_wave_layouts_and_skip_decisions() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn convolution_family_matches_causal_reflected_gather_and_residual() {
     let mut h = Harness::new();
     for taps in [1usize, 3] {
@@ -1589,7 +1639,10 @@ fn convolution_family_matches_causal_reflected_gather_and_residual() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn quantized_preparation_matches_group_rotation_and_packing() {
     let mut h = Harness::new();
     for bits in [4usize, 8] {
@@ -1710,7 +1763,10 @@ fn quantized_preparation_matches_group_rotation_and_packing() {
 /// recording that dropped an edge would let them run together and the last write would not be the
 /// last one to land. Both arms start from the same input and are compared byte for byte.
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn a_recorded_chain_replays_to_what_dispatching_it_produces() {
     use h3_hrx::compile::Compiler;
     use h3_hrx::dispatch::{Prepare, Sink};
@@ -1799,7 +1855,10 @@ fn a_recorded_chain_replays_to_what_dispatching_it_produces() {
 /// Three disjoint branches read a shared producer and feed one consumer. Reuse
 /// the recording with different bytes to catch missing producer or fan-in edges.
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn recorded_branches_feed_their_consumer_on_every_replay() {
     use h3_hrx::compile::Compiler;
     use h3_hrx::dispatch::{Prepare, Sink};
@@ -1883,7 +1942,10 @@ fn recorded_branches_feed_their_consumer_on_every_replay() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned Loom"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned Loom"
+)]
 fn adapter_finish_adds_before_activation_and_preserves_f32_residuals() {
     let mut h = Harness::new();
     let (rows, width) = (3usize, 128usize);
@@ -1956,7 +2018,10 @@ fn adapter_finish_adds_before_activation_and_preserves_f32_residuals() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned Loom"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned Loom"
+)]
 fn adapter_f32_gemms_preserve_values_above_f16_range() {
     let mut h = Harness::new();
     let (rows, k, n, stride) = (17usize, 128usize, 128usize, 192usize);
@@ -2009,7 +2074,10 @@ fn adapter_f32_gemms_preserve_values_above_f16_range() {
 /// Fusion must preserve the FP16 boundary after RoPE, every INT8 code/scale,
 /// and transposed V including padded rows. The separate kernels have CPU oracles above.
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn fused_qkv_operands_are_byte_identical_to_separate_preparation() {
     let mut h = Harness::new();
     for (tokens, heads) in [(3usize, 2usize), (129, 56)] {
@@ -2112,7 +2180,10 @@ fn fused_qkv_operands_are_byte_identical_to_separate_preparation() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX; probes the historical compiler workaround"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX; probes the historical compiler workaround"
+)]
 fn subgroup_shuffle_preparation_matches_lds_repeatedly() {
     let mut h = Harness::new();
     let (tokens, heads, capacity) = (257usize, 17usize, 512usize);
@@ -2165,7 +2236,10 @@ fn subgroup_shuffle_preparation_matches_lds_repeatedly() {
 /// Reused projection scratch is not initially zero. Transposing across the
 /// complete capacity must overwrite every poisoned tail element with zero.
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn transposed_values_clear_reused_capacity() {
     let mut h = Harness::new();
     for tokens in [1usize, 31, 32, 33, 129, 4096, 4097] {
@@ -2199,7 +2273,10 @@ fn transposed_values_clear_reused_capacity() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn transposed_audio_convolution_matches_f64_with_holes_tails_and_guards() {
     let mut h = Harness::new();
     for n in [1usize, 2, 5, 25, 63, 64, 65, 127, 128, 129] {
@@ -2287,7 +2364,10 @@ fn transposed_audio_convolution_matches_f64_with_holes_tails_and_guards() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn prefetched_audio_upsampling_preserves_fmas_edges_and_guards() {
     let mut h = Harness::new();
     for (ci, co, taps, stride, pad, n) in [
@@ -2372,7 +2452,10 @@ fn prefetched_audio_upsampling_preserves_fmas_edges_and_guards() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn prefetched_audio_convolution_preserves_fmas_padding_and_residuals() {
     let mut h = Harness::new();
     for (ci, co, taps, dilation, pad, n) in [
@@ -2459,7 +2542,10 @@ fn prefetched_audio_convolution_preserves_fmas_padding_and_residuals() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn channel_lanes_preserve_audio_convolution_fmas_and_edges() {
     let mut h = Harness::new();
     for (ci, co, taps, dilation, pad, n) in [
@@ -2563,7 +2649,10 @@ fn channel_lanes_preserve_audio_convolution_fmas_and_edges() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn audio_snake_fir_preserves_phases_padding_and_silence() {
     let mut h = Harness::new();
     // FP32 Kaiser-sinc coefficients used by the audio decoder.
@@ -2709,7 +2798,10 @@ fn audio_snake_fir_preserves_phases_padding_and_silence() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn narrow_audio_prefetch_preserves_padding_residuals_and_tails() {
     let mut h = Harness::new();
     for (ci, co, taps, dilation, pad, n) in [
@@ -2783,7 +2875,10 @@ fn narrow_audio_prefetch_preserves_padding_residuals_and_tails() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn seven_tap_audio_convolution_preserves_ordered_fp32_dots() {
     let mut h = Harness::new();
     for (ci, co, n, dilation) in [
@@ -2860,7 +2955,7 @@ fn seven_tap_audio_convolution_preserves_ordered_fp32_dots() {
 }
 
 #[test]
-#[ignore = "requires gfx1151"]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires gfx1151")]
 fn world_attention_matches_directed_cpu_oracle() {
     let mut h = Harness::new();
     for waves in [4usize, 8] {
@@ -2953,7 +3048,10 @@ fn world_attention_matches_directed_cpu_oracle() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn wide_bf16_preparation_does_not_need_large_lds() {
     let mut h = Harness::new();
     for width in [5120usize, 25600] {
@@ -2974,7 +3072,10 @@ fn wide_bf16_preparation_does_not_need_large_lds() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn wide_hadamard_preserves_finite_range() {
     let mut h = Harness::new();
     let (tokens, width, stride) = (2usize, 25600usize, 25664usize);
@@ -3008,7 +3109,10 @@ fn wide_hadamard_preserves_finite_range() {
     assert!((scales[1] - 131072.0 / 127.0).abs() < 0.001);
 }
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn swiglu_preserves_f32_range() {
     let mut h = Harness::new();
     let (rows, k, n) = (1usize, 128usize, 128usize);
@@ -3041,7 +3145,10 @@ fn swiglu_preserves_f32_range() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn gemm_preserves_nonfinite_results() {
     let mut h = Harness::new();
     let (k, n) = (128usize, 128usize);
@@ -3071,7 +3178,10 @@ fn gemm_preserves_nonfinite_results() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn f32_feedforward_variants_and_adapter_finish_preserve_range() {
     let mut h = Harness::new();
     let (rows, capacity, k, n) = (257usize, 512usize, 128usize, 128usize);
@@ -3144,7 +3254,10 @@ fn f32_feedforward_variants_and_adapter_finish_preserve_range() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn f32_preparation_matches_dense_hadamard_and_marks_invalid_rows() {
     let mut h = Harness::new();
     let base = [
@@ -3250,7 +3363,10 @@ fn f32_preparation_matches_dense_hadamard_and_marks_invalid_rows() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and provisioned HRX"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn f32_dispatch_rejects_half_sized_activation_bindings() {
     use h3_hrx::dispatch::{ActivationType, Gemm, Prepare, Tile};
     let mut stream = Stream::open().unwrap();

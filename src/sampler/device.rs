@@ -115,7 +115,10 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires gfx1151 and the packaged Loom compiler"]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires gfx1151 and the packaged Loom compiler"
+    )]
     fn resident_euler_matches_cpu_across_steps_and_strided_heads() -> Result<()> {
         let mut stream = hrx::Stream::open()?;
         let compiler = Compiler::new(None, "");

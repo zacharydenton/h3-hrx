@@ -2,7 +2,7 @@
 """Parity against the reference implementation: does this host compute what MiniMax's does?
 
 The host subprocess adapter, prompt presentation, reference implementation, and checks
-are in this file. It is deliberately not part of `scripts/test.sh`: it needs the checkpoints, a GPU,
+are in this file. It is deliberately separate from `cargo test`: it needs the checkpoints, a GPU,
 and for the gate a directory of dumps produced by a native ComfyUI checkout using `scripts/comfy_dump.py`.
 Run it before a release, not on every change.
 

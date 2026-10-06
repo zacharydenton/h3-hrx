@@ -12,13 +12,14 @@ API; language adapters belong in consuming applications.
 From the repository root:
 
 ```sh
-scripts/test.sh --cpu
-scripts/test.sh --gpu
+cargo test
+cargo bench
 ```
 
-The CPU tier runs formatting, Clippy and workspace tests. GPU tests require
-`gfx1151` and a provisioned HRX bundle. Checkpoint-backed and parity checks are
-listed in [test coverage](docs/testing.md).
+Both commands include GPU workloads and require `gfx1151` and a provisioned HRX
+bundle. Checkpoints resolve through the standard Hub cache. Tests run serially
+by default. CPU-only CI and independent reference checks are described in
+[test coverage](docs/testing.md).
 
 Use [Criterion benchmarks](docs/performance.md) for performance work. Keep generated
 reports and baselines under `target/`; commit benchmark code, not results.

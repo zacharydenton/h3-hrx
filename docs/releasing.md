@@ -5,7 +5,9 @@
 Run from a clean checkout with a current stable Rust toolchain:
 
 ```sh
-bash scripts/test.sh --cpu
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --no-default-features --features cli,prompt-generation
 cargo check --locked --no-default-features
 cargo check --locked --manifest-path clients/rust/Cargo.toml
 cargo check --locked --manifest-path clients/rustler/Cargo.toml
@@ -19,8 +21,7 @@ tokenizer are included and the package builds.
 On Strix Halo with the native bundle, checkpoints and reference dumps available:
 
 ```sh
-bash scripts/test.sh --full
-bash scripts/test.sh --adapters
+cargo test
 python3 scripts/parity.py gate --require
 ```
 

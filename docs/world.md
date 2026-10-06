@@ -179,9 +179,9 @@ changed schedules. The integration test changes actions and returns to the
 original schedule in one stage-scoped session:
 
 ```sh
-scripts/test.sh --cpu
-cargo test --test kernels world_attention_matches_directed_cpu_oracle -- --ignored
-cargo test --test world world_changes_actions_and_reuses_a_session -- --ignored
+cargo test
+cargo test --test kernels world_attention_matches_directed_cpu_oracle
+cargo test --test world world_changes_actions_and_reuses_a_session
 ```
 
 The integration test needs cached base models and the pinned adapter. Numerical kernel agreement and action-sensitive latents do not establish

@@ -289,6 +289,6 @@ format rejection, temporal selection, CLI parsing, and atomic writes. Hardware
 checks additionally exercise native creation and generation equivalence:
 
 ```sh
-scripts/test.sh --cpu
-cargo test --release --test refmod -- --ignored --test-threads=1
+cargo test
+cargo test --release --test refmod -- --test-threads=1
 ```

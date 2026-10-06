@@ -1681,7 +1681,10 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires gfx1151; no model checkpoints or Loom compiler"]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires gfx1151; no model checkpoints or Loom compiler"
+    )]
     fn growing_sequence_storage_invalidates_its_recording() {
         let device = hrx::Device::open(0).unwrap();
         let mut stream = device.stream().unwrap();

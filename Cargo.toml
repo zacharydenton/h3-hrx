@@ -28,22 +28,46 @@ doc = false
 required-features = ["cli"]
 
 [features]
-default = ["cli", "prompt-generation"]
+default = ["cli", "prompt-generation", "gpu-tests"]
 # Disable default features when consuming only the library.
 cli = ["dep:anyhow", "dep:clap"]
 prompt-generation = ["dep:reqwest", "dep:base64", "dep:png", "dep:regex"]
-# GPU benchmarks require gfx1151 and a provisioned HRX bundle.
-bench-gpu = []
+# Native hardware tests run by default. CPU-only CI disables default features.
+gpu-tests = []
 
 [[bench]]
 name = "kernels"
 harness = false
-required-features = ["bench-gpu"]
 
 [[bench]]
 name = "models"
 harness = false
-required-features = ["bench-gpu"]
+
+[[bench]]
+name = "host"
+harness = false
+
+[[bench]]
+name = "stages"
+harness = false
+
+[[bench]]
+name = "lifecycle"
+harness = false
+
+[[bench]]
+name = "pipeline"
+harness = false
+required-features = ["cli"]
+
+[[bench]]
+name = "memory"
+harness = false
+required-features = ["cli"]
+
+[[example]]
+name = "cache_calibrate"
+test = true
 
 [dependencies]
 hrx = { package = "hrx-rs", version = "0.8.7" }
@@ -73,4 +97,7 @@ criterion = { version = "0.8.2", default-features = false, features = ["cargo_be
 libm = "0.2"
 
 [profile.release]
+opt-level = 2
+
+[profile.test]
 opt-level = 2

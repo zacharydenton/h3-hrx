@@ -364,7 +364,10 @@ mod tests {
     /// would turn a kernel that builds perfectly well into a handle that can never be resolved and
     /// cannot say why.
     #[test]
-    #[ignore = "requires gfx1151 and provisioned HRX"]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires gfx1151 and provisioned HRX"
+    )]
     fn a_failed_batch_still_builds_the_requests_behind_it() {
         let mut stream = hrx::Stream::open().expect("stream");
         let compiler = Compiler::new(None, "");
@@ -391,7 +394,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the provisioned Loom compiler"]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires the provisioned Loom compiler"
+    )]
     fn a_built_cache_rejects_a_different_stream_target() {
         let compiler = Compiler::new(None, "");
         let first = hrx::Target::new("gfx1151").unwrap();

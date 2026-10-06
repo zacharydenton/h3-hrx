@@ -16,17 +16,19 @@ fn all_keyboard_states_match_pinned_upstream() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and cached base/world checkpoints"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and cached base/world checkpoints"
+)]
 fn world_changes_actions_and_reuses_a_session() {
     use h3_hrx::{
         media_context::{Frame, Media, MediaEntry},
         Config, Keyframe, Noise, PreparedPresentation, ResidencyPolicy, Session, SessionOptions,
         Tokenizer, WorldRequest,
     };
-    let base = h3_hrx::models::Resolver::new().offline(true);
+    let base = h3_hrx::models::Resolver::new();
     let adapter = h3_hrx::models::Resolver::new()
         .repository("DANNY621", "H3-World")
-        .offline(true)
         .revision(Some(h3_hrx::world::ADAPTER_REVISION.into()))
         .find(h3_hrx::world::ADAPTER_FILE)
         .unwrap();
@@ -227,15 +229,17 @@ fn world_session_rejects_invalid_canvas_and_resume_overrides_before_models() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and cached base/world checkpoints; runs serially under a 28 GiB cap"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and cached base/world checkpoints; runs serially under a 28 GiB cap"
+)]
 fn world_rollout_decodes_and_resumes() {
     use h3_hrx::{
         Config, ResidencyPolicy, Session, SessionOptions, Tokenizer, WorldRequest, WorldState,
     };
-    let resolver = h3_hrx::models::Resolver::new().offline(true);
+    let resolver = h3_hrx::models::Resolver::new();
     let adapter = h3_hrx::models::Resolver::new()
         .repository("DANNY621", "H3-World")
-        .offline(true)
         .revision(Some(h3_hrx::world::ADAPTER_REVISION.into()))
         .find(h3_hrx::world::ADAPTER_FILE)
         .unwrap();

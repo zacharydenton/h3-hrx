@@ -72,7 +72,10 @@ fn check(got: String, want: &str, case: &str) {
 /// Spatial blends and minimum-clip padding were corrected against ComfyUI on
 /// 2026-10-02; see docs/testing.md and tests/fixtures/tiles for the oracle.
 #[test]
-#[ignore = "requires gfx1151, provisioned HRX and the video VAE checkpoint"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151, provisioned HRX and the video VAE checkpoint"
+)]
 fn video_decode_is_byte_stable_across_the_tilings() {
     const CASES: &[(i32, i32, i32, &str)] = &[
         (
@@ -121,7 +124,6 @@ fn video_decode_is_byte_stable_across_the_tilings() {
     let mut stream = hrx::Stream::open().expect("stream");
     let c = compiler();
     let path = h3_hrx::models::Resolver::new()
-        .offline(true)
         .find(h3_hrx::models::VIDEO_VAE)
         .expect("cached video VAE");
     // Safety: this test does not write to the checkpoint while it is mapped.
@@ -146,7 +148,10 @@ fn video_decode_is_byte_stable_across_the_tilings() {
 /// Both directions of the audio VAE, at the lengths that exercise its padding: one latent, one
 /// sample, a length on and a length just past the 800-sample hop, and a long clip.
 #[test]
-#[ignore = "requires gfx1151, provisioned HRX and the audio VAE checkpoint"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151, provisioned HRX and the audio VAE checkpoint"
+)]
 fn audio_conversions_are_byte_stable_at_the_boundaries() {
     const DECODES: &[(usize, &str)] = &[
         (
@@ -211,7 +216,6 @@ fn audio_conversions_are_byte_stable_at_the_boundaries() {
     let mut stream = hrx::Stream::open().expect("stream");
     let c = compiler();
     let path = h3_hrx::models::Resolver::new()
-        .offline(true)
         .find(h3_hrx::models::AUDIO_VAE)
         .expect("cached audio VAE");
     // Safety: this test does not write to the checkpoint while it is mapped.
@@ -255,7 +259,10 @@ fn audio_conversions_are_byte_stable_at_the_boundaries() {
 /// One session for all of them: opening it maps and uploads the DiT and the text encoder, which is
 /// most of the cost, and every case after the first reuses them.
 #[test]
-#[ignore = "requires gfx1151, provisioned HRX and the DiT and text encoder checkpoints"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151, provisioned HRX and the DiT and text encoder checkpoints"
+)]
 fn denoising_is_byte_stable_across_samplers() {
     /// name, canvas, frames, steps, sampler, cache threshold, and the digests of the two latents.
     type Case = (

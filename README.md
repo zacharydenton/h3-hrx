@@ -68,13 +68,14 @@ classifier-free guidance. Use `h3 --help` for all flags.
 
 ## Benchmarks
 
-Run GPU benchmarks with Criterion:
+Run the complete Criterion suite:
 
 ```sh
-cargo bench --locked --features bench-gpu --bench kernels
+cargo bench
 ```
 
-See [benchmark workloads and baseline comparisons](docs/performance.md).
+See [host, stage, full-render, lifecycle and memory benchmarks](docs/performance.md)
+for workload profiles and baseline comparisons.
 Results stay in `target/criterion/` and are not committed.
 
 ## Library and development
@@ -91,7 +92,7 @@ h3-hrx = { path = "../h3-hrx", default-features = false }
 `cargo doc --no-deps --open` builds the API reference.
 
 ```sh
-bash scripts/test.sh --cpu
+cargo test
 ```
 
 See [contributing](CONTRIBUTING.md), [test coverage](docs/testing.md),

@@ -267,11 +267,14 @@ fn constructors_reject_invalid_inputs() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and cached video/audio VAE checkpoints"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and cached video/audio VAE checkpoints"
+)]
 fn creation_round_trip_matches_direct_encodes() {
     use h3_hrx::refmod::{AudioInput, CreateOptions, ImageInput};
     use h3_hrx::{Clip, Config, Session};
-    let resolver = h3_hrx::models::Resolver::new().offline(true);
+    let resolver = h3_hrx::models::Resolver::new();
     let config = Config {
         video_vae: Some(resolver.find(h3_hrx::models::VIDEO_VAE).unwrap()),
         audio_vae: Some(resolver.find(h3_hrx::models::AUDIO_VAE).unwrap()),
@@ -373,7 +376,10 @@ fn creation_round_trip_matches_direct_encodes() {
 }
 
 #[test]
-#[ignore = "requires idle gfx1151 and cached ref2va/text encoder checkpoints"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires idle gfx1151 and cached ref2va/text encoder checkpoints"
+)]
 fn loaded_bundle_denoises_identically_to_direct_references() {
     use h3_hrx::{
         Config, DenoiseParams, Noise, ResidencyPolicy, Sampler, Session, SessionOptions, Tokenizer,
@@ -407,7 +413,7 @@ fn loaded_bundle_denoises_identically_to_direct_references() {
             frames: 19,
         },
     ];
-    let resolver = h3_hrx::models::Resolver::new().offline(true);
+    let resolver = h3_hrx::models::Resolver::new();
     let config = Config {
         dit: Some(resolver.find(h3_hrx::models::DIT_REF2VA).unwrap()),
         te: Some(resolver.find(h3_hrx::models::TE).unwrap()),
@@ -546,11 +552,14 @@ fn standalone_audio_round_trips_without_visual_members() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and the cached audio VAE checkpoint"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and the cached audio VAE checkpoint"
+)]
 fn audio_creation_preserves_channels_across_chunks_and_truncation() {
     use h3_hrx::refmod::{AudioInput, CreateOptions};
     use h3_hrx::{Config, Session};
-    let resolver = h3_hrx::models::Resolver::new().offline(true);
+    let resolver = h3_hrx::models::Resolver::new();
     let config = Config {
         audio_vae: Some(resolver.find(h3_hrx::models::AUDIO_VAE).unwrap()),
         video_vae: Some("/absent/video_vae".into()),
@@ -595,10 +604,13 @@ fn audio_creation_preserves_channels_across_chunks_and_truncation() {
 }
 
 #[test]
-#[ignore = "requires gfx1151 and cached video/audio VAE checkpoints"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and cached video/audio VAE checkpoints"
+)]
 fn effective_refmod_reconstruction_accepts_image_stack_and_audio_grids() {
     use h3_hrx::{Config, Session};
-    let resolver = h3_hrx::models::Resolver::new().offline(true);
+    let resolver = h3_hrx::models::Resolver::new();
     let config = Config {
         video_vae: Some(resolver.find(h3_hrx::models::VIDEO_VAE).unwrap()),
         audio_vae: Some(resolver.find(h3_hrx::models::AUDIO_VAE).unwrap()),
@@ -669,13 +681,16 @@ fn effective_refmod_reconstruction_accepts_image_stack_and_audio_grids() {
 }
 
 #[test]
-#[ignore = "requires idle gfx1151 and cached ref2va/text encoder checkpoints"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires idle gfx1151 and cached ref2va/text encoder checkpoints"
+)]
 fn presented_video_uses_the_second_temporal_frame_in_generation() {
     use h3_hrx::{
         media_context::{Frame, Media, MediaEntry},
         Config, DenoiseParams, Noise, PreparedPresentation, Session, Tokenizer,
     };
-    let resolver = h3_hrx::models::Resolver::new().offline(true);
+    let resolver = h3_hrx::models::Resolver::new();
     let config = Config {
         dit: Some(resolver.find(h3_hrx::models::DIT_REF2VA).unwrap()),
         te: Some(resolver.find(h3_hrx::models::TE).unwrap()),

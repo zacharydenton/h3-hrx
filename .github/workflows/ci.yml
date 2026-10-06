@@ -26,7 +26,10 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: Formatting, lint, and CPU tests
-        run: bash scripts/test.sh --cpu
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+          cargo test --locked --workspace --no-default-features --features cli,prompt-generation
       - name: Library without CLI dependencies
         run: cargo check --locked --no-default-features
       - name: Rust consumer

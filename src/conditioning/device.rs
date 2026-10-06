@@ -148,7 +148,10 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires gfx1151 and the packaged Loom compiler"]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires gfx1151 and the packaged Loom compiler"
+    )]
     fn projections_match_cpu_tables_bit_for_bit() -> Result<()> {
         let mut stream = hrx::Stream::open()?;
         let compiler = Compiler::new(None, "");

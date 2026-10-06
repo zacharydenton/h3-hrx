@@ -896,10 +896,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires gfx1151 and cached video/audio VAEs; capped at 8 GiB"]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires gfx1151 and cached video/audio VAEs; capped at 8 GiB"
+    )]
     fn native_refmod_prompt_uses_vaes_and_returns_matching_presentation() {
         use crate::refmod::{ApplyOptions, RefMod, RefModMember};
-        let resolver = crate::models::Resolver::new().offline(true);
+        let resolver = crate::models::Resolver::new();
         let budget = hrx::residency::ResidencyManager::new(8 * 1024 * 1024 * 1024).unwrap();
         let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
             memory_budget: Some(budget.budget()),

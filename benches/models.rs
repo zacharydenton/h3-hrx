@@ -1,4 +1,5 @@
-//! Warm checkpoint-backed workloads. Set H3_BENCH_MODELS to an immutable Hub snapshot.
+//! Warm checkpoint-backed workloads using the standard model cache.
+mod support;
 use criterion::{criterion_group, criterion_main, Bencher, Criterion};
 use h3_hrx::{
     compile::Compiler,
@@ -13,16 +14,9 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
+use support::checkpoint;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-fn checkpoint(relative: &str) -> PathBuf {
-    let root = std::env::var_os("H3_BENCH_MODELS")
-        .expect("set H3_BENCH_MODELS to a local Comfy-Org/MiniMax-H3 snapshot; benchmarks never download weights");
-    let path = PathBuf::from(root).join(relative);
-    assert!(path.is_file(), "missing checkpoint {}", path.display());
-    path
-}
 
 fn audio(b: &mut Bencher) -> Result<()> {
     let config = Config {

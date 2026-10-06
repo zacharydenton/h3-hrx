@@ -1,67 +1,166 @@
 # Benchmarks
 
-Benchmarks use [Criterion](https://criterion-rs.github.io/book/). GPU workloads
-require AMD Strix Halo (`gfx1151`), a provisioned HRX bundle and an idle GPU.
-Compilation, weight loading and initial warmup happen before measurement.
+The [Criterion](https://criterion-rs.github.io/book/) suite covers host preparation, individual model stages, complete
+renders, loading, eviction, and sampled peak memory. Run `cargo bench` for the
+whole suite. Cargo runs benchmark executables sequentially; use an idle machine.
+Results and baselines belong in ignored `target/criterion/`, never in Git.
+
+## Targets and coverage
+
+| Target | Coverage |
+| --- | --- |
+| `host` | Short/long tokenization, mixed-media presentation, image resizing, RefMod loading/strength/copies, packed sequence layout |
+| `kernels` | FP32 Hadamard preparation, INT8/BF16 GEMMs with FP32 outputs, cached/rotating weights, eager/graph dispatch |
+| `models` | Resident one-block DiT eager/graph comparison and short audio roundtrip |
+| `stages` | Complete text encoder plus token refiner, vision tower, video encode/decode, audio encode/decode, complete 50-block denoising trajectories with Euler and ResMultistep |
+| `lifecycle` | Mapping/planning each checkpoint, representative tensor packing and completed uploads, forced audio eviction/reload |
+| `pipeline` | Complete text, first/last-frame, image/audio reference, video/audio reference, RefMod, LoRA, Turbo and World renders; cache observation/reuse; WAV and H.264/AAC output; fresh CLI processes |
+| `memory` | Complete text and reference renders under stage-scoped and budgeted residency, measuring sampled peak reservations and process RSS separately |
+
+Video stage cases cross spatial tile overlaps horizontally and vertically and
+use 5/22/39/56 frames across temporal chunks. Audio cases cover the 800-sample
+hop and 255/256/257 latent-frame boundaries, plus a full 124-frame soundtrack.
+The 480p/768p profiles add their full-size vision and video-decoder workloads.
+
+## Requirements and quick checks
+
+`host` needs only the Rust toolchain. Other targets require gfx1151 and a
+provisioned HRX bundle. No feature flags, wrapper scripts or environment variables
+are required:
 
 ```sh
-cargo bench --locked --features bench-gpu --bench kernels
+cargo bench
 ```
 
-| Benchmark | Workload | Timed boundary |
-| --- | --- | --- |
-| `prepare_f32_i8` | FP32 Hadamard preparation at 14,336 and 25,600 columns | Dispatch and GPU completion |
-| `gemm` | INT8/BF16 matrices, FP32 projection and SwiGLU output | Dispatch and GPU completion; cached or rotating weights exceeding 64 MiB |
-| `dispatch_256` | 256 ordered FP16 preparation launches | Eager submission or recorded graph replay, through GPU completion |
-| `audio/roundtrip/3200` | Warm session encode/decode, 3,200 stereo samples per channel | Complete API calls, including transfers, allocation and output disposal |
-| `dit_stack` | One resident DiT block, 256 or 2,048 tokens | Eager forward or graph replay through completion; input reset and readback excluded |
+FL2VA, Ref2VA, Qwen3-VL, both VAEs and pinned adapters resolve through the standard
+Hugging Face cache. Missing files are downloaded during setup, outside timing.
+`H3_BENCH_MODELS` optionally overrides the base-model snapshot directory.
+Keep checkpoint files immutable during a run. `pipeline` and `memory` require the `cli` feature
+(enabled by default), FFmpeg with libx264/AAC, and ffprobe. They reuse the CLI's
+actual WAV writer and muxer. Temporary media is removed after each workload.
 
-Kernel inputs are deterministic synthetic data. Preparation includes values
-above FP16 range. Model benchmarks use real weights and deterministic synthetic
-inputs. Setup checks finite output; replay checks run outside timing. These are
-performance checks, not independent numerical oracles; run the
-[correctness tests](testing.md) before interpreting a speedup.
-
-## Checkpoint-backed workloads
-
-Set `H3_BENCH_MODELS` to an immutable local Comfy-Org/MiniMax-H3 snapshot containing
-the audio VAE and FL2VA DiT files at their published relative paths. Benchmarks
-never download weights. Audio and DiT run separately within a 32 GiB allocation
-budget; keep the snapshot unchanged until the process exits.
+List cases before running them. Filters apply before model loading; `--list`
+works without checkpoints or a GPU. `--test` checks the selected workload with
+one measured iteration and any setup/validation runs, without a timing report:
 
 ```sh
-export H3_BENCH_MODELS=/path/to/models--Comfy-Org--MiniMax-H3/snapshots/REVISION
-cargo bench --locked --features bench-gpu --bench models
+cargo bench --locked --bench stages -- --list
+cargo bench --locked --bench pipeline -- --list
+cargo bench --locked --bench host -- --test
+cargo bench --locked --bench stages -- video_decode --test
+cargo bench --locked --bench lifecycle -- --test
+cargo bench --locked --bench pipeline -- text/res_multistep/warm_session --test
+cargo bench --locked --bench pipeline -- cli/ --test
 ```
 
-Use a filter to select a workload. Listing names does not open the GPU or load
-checkpoints. `--test` executes each selected workload once without collecting a
-statistical report:
+## Workload profiles and overrides
+
+| `H3_BENCH_PROFILE` | Canvas | Frames | Sigma points / model evaluations |
+| --- | --- | --- | --- |
+| `smoke` (default) | 64×64 | 5 | 4 / 3 |
+| `480p` | 864×480 | 124 | 21 / 20 |
+| `768p` | 1344×768 | 124 | 21 / 20 |
+
+Smoke exercises the complete network, including every DiT layer and all selected
+stages, at a small sequence length. Use production profiles for performance
+claims. Criterion requires at least ten samples: full-size renders can take
+hours per workload. The default command includes every variant; filters are
+available for focused work.
 
 ```sh
-cargo bench --locked --features bench-gpu --bench kernels -- --list
-cargo bench --locked --features bench-gpu --bench kernels -- prepare_f32_i8 --test
-cargo bench --locked --features bench-gpu --bench models -- audio --test
+H3_BENCH_PROFILE=480p cargo bench --locked --bench pipeline -- text/res_multistep/warm_session
+H3_BENCH_PROFILE=768p cargo bench --locked --bench stages -- denoise/
+H3_GRAPH=1 cargo bench --locked --bench pipeline -- text/res_multistep/warm_session
+H3_BENCH_ATTN=f16 cargo bench --locked --bench stages -- denoise/
 ```
 
-## Comparing revisions
-
-Save a baseline before editing, then compare with the same hardware, toolchain,
-inputs and runtime environment:
+`H3_BENCH_ATTN` selects `i8` (default), `f16`, or experimental `i4` attention.
+`H3_GRAPH` is read once by the runtime: compare it in separate processes.
+Case names include attention, graph mode and the allocation budget to keep
+incompatible baselines separate. `H3_BENCH_BUDGET_GIB` defaults to 64 for the new
+stage/render/lifecycle/memory suite; the earlier `models` microbenchmarks retain
+their fixed 32 GiB budget.
+`H3_BENCH_RESIDENCY` selects `budgeted` (default), `retain`, or `stage-scoped` for
+stage and API render benchmarks. A reused stage-scoped session reloads weights
+between stages; its name records that policy. CLI cases always use stage-scoped
+residency. Budgeted runs can evict idle models, but cannot evict a pinned DiT
+while loading the text encoder for another prompt: 32 GiB is insufficient for
+that retained pair. Use stage-scoped ownership for a 32 GiB complete render:
 
 ```sh
-cargo bench --locked --features bench-gpu --bench kernels -- --save-baseline before
+H3_BENCH_RESIDENCY=stage-scoped H3_BENCH_BUDGET_GIB=32 cargo bench --locked --bench pipeline -- text/res_multistep/warm_session --test
+```
+
+Keep enough physical memory available for the chosen budget; the budget is a
+ceiling, not host or device offloading.
+
+`lora` defaults to the pinned Orbit adapter; `H3_BENCH_LORA` can override it.
+`world` defaults to the pinned H3-World adapter; `H3_BENCH_WORLD_ADAPTER` can
+override it. World uses Euler and a left-pan schedule. Turbo resolves the pinned
+four/eight-step adapters. Turbo always uses its trained 1344×768×124
+configuration and four/eight evaluations, even with the smoke profile.
+
+Cache cases use at least eight evaluations so the middle steps exercise the
+reuse policy. `forced_reuse` deliberately uses very large thresholds to measure
+that execution path; it is not a quality-qualified cache preset.
+
+## Measurement boundaries
+
+- **Stages:** setup and initial warmup excluded; API work, allocations, transfers
+  and completed host output included. The denoising stage includes prompt
+  conditioning and sampling, but excludes VAE decode and media encoding.
+- **Warm render:** same session and runtime across samples. Each iteration
+  tokenizes/presents inputs, encodes selected references, conditions, samples,
+  decodes both modalities, writes WAV, and finishes H.264/AAC muxing.
+- **Cold session:** the same render plus session construction, model loading,
+  packing/uploads, and session teardown on each iteration. Compiler and OS
+  filesystem caches remain available; this is not a disk-cache flush.
+- **Cold CLI process:** process startup through successful output completion,
+  including actual reference-file decoding, tokenizer/session construction and
+  teardown. Compilation of the Rust binary is outside timing.
+- **Lifecycle:** checkpoint mapping/plan construction, host packing, and packing
+  plus completed upload are separate cases. Upload uses a fresh weight owner to
+  prevent a cached lookup from replacing the transfer. Eviction timing includes
+  applying pressure, releasing it, and reloading/decoding the audio model.
+
+Replay digests, finite checks and ffprobe validation run outside latency timing.
+Model inputs are deterministic synthetic fixtures; full rendering uses seed 7.
+Native output replay is checked for exact equality. Encoded frame counts follow
+the production muxer's `-shortest` behavior: rounded audio can trim a partial
+final video-frame interval (the five-frame smoke render encodes four frames).
+These checks complement the
+[independent correctness tests](testing.md); they do not establish visual quality.
+Keep `H3_PROFILE` and stage tracing disabled during timing runs.
+
+## Memory
+
+```sh
+cargo bench --locked --bench memory -- text/res_multistep/StageScoped/sampled_peak_reservations --test
+cargo bench --locked --bench memory -- sampled_peak_reservations
+```
+
+These are Criterion measurements in **MiB/render**, using a fresh session per
+iteration. A separate sampling thread reads the residency manager's reservations
+and Linux `/proc/self/status` RSS every 2 ms while the complete render runs.
+Shorter allocation spikes may be missed. Reservations include native GPU buffers
+and loader reservations; RSS covers the current process and excludes FFmpeg child
+processes. RSS includes pre-existing process memory. These views overlap on UMA
+and must not be summed. They are separate from latency runs because sampling
+adds overhead. Session teardown must return reservations to zero.
+
+## Baselines
+
+```sh
+cargo bench --locked --bench pipeline -- text/res_multistep/warm_session --save-baseline before
 # Make the change and run correctness tests.
-cargo bench --locked --features bench-gpu --bench kernels -- --baseline before
+cargo bench --locked --bench pipeline -- text/res_multistep/warm_session --baseline before
 ```
 
-Criterion stores reports and baselines under `target/criterion/`, which is ignored
-by Git. Keep results, logs, comparison videos and timing tables out of the repo.
-The default is ten samples, a one-second warmup and a three-second measurement
-window; Criterion may extend sampling for slow workloads. Use `--sample-size`,
-`--warm-up-time` and `--measurement-time` for longer runs.
+Keep hardware, checkpoints, adapter files, profile, budget and runtime options
+fixed. Defaults are ten samples, one second of warmup and a three-second target
+measurement window; slow cases necessarily exceed that window. Criterion's
+`--sample-size`, `--warm-up-time` and `--measurement-time` control longer runs.
 
-These workloads do not measure complete generation, cold loading or peak memory.
-Use identical model inputs and complete outputs when evaluating those costs.
-Keep `H3_PROFILE` and stage tracing disabled during benchmarks; use
-`examples/profile_audio.rs` and `H3_STAGE_TRACE=1` separately for diagnosis.
+The suite covers the local inference and media pipeline. External prompt/LLM
+services, network downloads, disk-cache eviction and long World save/resume
+rollouts are outside these benchmarks.

@@ -1,17 +1,29 @@
 # Native test coverage
 
-Run commands from the repository root. GPU tests are ignored by default and
-require working hardware when explicitly selected.
+Run `cargo test` from the repository root. It includes host, compiler, GPU,
+full-model, adapter, RefMod and World tests, plus the Rust cache-calibration tests.
+It requires gfx1151, the HRX bundle and enough memory for the full models.
+Checkpoints and pinned adapters resolve through the standard Hugging Face cache;
+missing files are downloaded. The test profile is optimized and repository Cargo
+configuration runs tests serially so model allocations do not overlap.
 
-| Command | Needs | Coverage |
-| --- | --- | --- |
-| `scripts/test.sh --cpu` | Rust toolchain | Formatting, Clippy, workspace tests |
-| `scripts/test.sh --gpu` | gfx1151 and HRX bundle | CPU tier plus kernel, conditioning, sampler and graph checks |
-| `scripts/test.sh --full` | Base/Ref2VA checkpoints and pinned world adapter | GPU tier plus pipeline digests, session lifecycle, RefMod and world tests |
-| `scripts/test.sh --adapters` | Base DiT, both Turbo adapters and [Orbit LoRA](loras.md) | GPU tier plus low-rank projection and adapted eager/graph tests |
+Only subprocess fixtures and the externally driven parity dump remain ignored;
+their parent tests/tools invoke them explicitly. Native validation needs no Python.
+Independent Torch/ComfyUI references remain separate because they require another
+implementation and its fixtures.
 
-Native tests use HRX directly and need no Python. Optional independent model
-references use Python, Torch and cached checkpoints.
+For a CPU-only machine or CI, explicitly disable the default `gpu-tests` feature:
+
+```sh
+cargo test --workspace --no-default-features --features cli,prompt-generation
+```
+
+Formatting and linting remain ordinary Cargo commands:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
 
 ## Kernel and host coverage
 
@@ -47,7 +59,7 @@ execution and actual residual reuse. Run the same differential cases through
 graphs with:
 
 ```sh
-H3_GRAPH=1 cargo test --locked --test differentials --release -- --ignored --test-threads=1
+H3_GRAPH=1 cargo test --locked --test differentials --release -- --test-threads=1
 ```
 
 A digest change is a numerical change. Before updating expected values, compare
@@ -73,7 +85,7 @@ applicable, diffusers.
 For an independent whole-block adapter check:
 
 ```sh
-H3_ADAPTER_BLOCK_FIXTURE=build/adapter-blocks scripts/test.sh --adapters
+H3_ADAPTER_BLOCK_FIXTURE=build/adapter-blocks cargo test --lib stack::adapter::tests::
 python3 scripts/adapter_block_reference.py build/adapter-blocks
 ```
 
@@ -85,23 +97,14 @@ input. Use a Python environment with the dependencies of the reference tool.
 
 Production Loom modules share schedules across compatible exports. To compare
 an arithmetic-preserving change, snapshot a baseline with matching bindings and
-configuration, then make one source file per export for the test harness:
+configuration. The harness accepts both family modules and individual exports:
 
 ```sh
 # Set BASELINE_COMMIT to the commit before your change.
 mkdir -p build/kernel-baseline
 git archive "$BASELINE_COMMIT" kernels | tar -x -C build/kernel-baseline
 export H3_KERNEL_BASELINE="$PWD/build/kernel-baseline/kernels"
-python3 - <<'PY'
-import os, re
-from pathlib import Path
-root = Path(os.environ['H3_KERNEL_BASELINE'])
-for path in list(root.glob('*.loom')):
-    source = path.read_text()
-    for name in re.findall(r'export\("h3_(\w+)"\)', source):
-        (root / f'{name}.loom').write_text(source)
-PY
-cargo test --locked --test kernels --release -- --ignored --test-threads=1 --nocapture
+cargo test --locked --test kernels --release -- --test-threads=1 --nocapture
 ```
 
 The harness compares every binding byte-for-byte before its CPU-oracle check.
@@ -124,10 +127,10 @@ RefMod checks cover strengths, disabled members, copy sharing, ordering,
 original sources, capability preflight and media budgets.
 
 ```sh
-cargo test --locked --lib --release prompt::tests::native_refmod_ -- --ignored --test-threads=1
-cargo test --release --test refmod effective_refmod_reconstruction -- --ignored --test-threads=1
-cargo test --release --test refmod presented_video -- --ignored --test-threads=1
-python3 scripts/test_cache_calibrate.py
+cargo test --locked --lib --release prompt::tests::native_refmod_ -- --test-threads=1
+cargo test --release --test refmod effective_refmod_reconstruction -- --test-threads=1
+cargo test --release --test refmod presented_video -- --test-threads=1
+cargo test --example cache_calibrate
 ```
 
 Hardware checks reconstruct visual/audio members and verify that changing a
@@ -142,5 +145,5 @@ left/right/left requests in one session. Rollout tests cover persistence,
 branching, last-frame handoff, seed/frame accounting, rollback and writer locks.
 
 `world_rollout_decodes_and_resumes` runs two decoded segments through a budgeted
-session. These tests are in the full tier and require the pinned world adapter.
+session. These tests run by default and require the pinned world adapter.
 See [world validation](world.md#validation) for visual qualification guidance.

@@ -1,6 +1,9 @@
 //! Compiler qualification that does not open a GPU.
 #[test]
-#[ignore = "requires the provisioned Loom compiler; no GPU required"]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires the provisioned Loom compiler; no GPU required"
+)]
 fn reflected_convolution_proves_nonnegative_gather_rows() -> hrx::Result<()> {
     let compiler = hrx::loom::Compiler::resolve(None)?;
     for (frames, height, width) in [(3usize, 6usize, 6usize), (1, 256, 256)] {

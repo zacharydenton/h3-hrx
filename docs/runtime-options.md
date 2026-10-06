@@ -81,7 +81,7 @@ session teardown.
 
 The experimental `SessionOptions::turbo` path keeps the existing INT8 base and
 adds BF16 low-rank branches. Adapters resolve through the standard Hugging Face
-Hub cache at pinned revisions. Use `scripts/test.sh --adapters` to validate
+Hub cache at pinned revisions. Use `cargo test --lib stack::adapter::tests::` to validate
 cached adapters.
 
 Four/eight-evaluation presets require 1344×768, 124 frames, Euler, and video/audio
@@ -115,7 +115,7 @@ intrusive kernel profiler. Host submission timestamps can overlap GPU work;
 release events follow synchronization.
 
 Use [Criterion benchmarks](performance.md) for repeatable timing comparisons.
-`scripts/cache_calibrate.py` reads a captured stage trace from `--cache-observe`
+`cargo run --example cache_calibrate -- TRACE` reads a captured stage trace from `--cache-observe`
 and proposes cache thresholds to evaluate on the same inputs.
 
 Developer switches `H3_FUSED_OPERANDS=1` and `H3_REUSE_SCRATCH=1` enable pending
