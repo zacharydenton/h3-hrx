@@ -259,136 +259,151 @@ fn audio_qkv(c: &mut Criterion) {
 fn audio_convolution(c: &mut Criterion) {
     let mut group = c.benchmark_group("audio_encoder_conv_f32");
     // Full-soundtrack encoder shapes, including dilation, stride and partial tiles.
-    for (cin, len, stride) in [
+    let levels = [
         (64usize, 165600usize, 2usize),
         (128, 82800, 4),
         (256, 20700, 4),
         (512, 5175, 5),
         (1024, 1035, 5),
-    ] {
-        for (ksize, dilation, step) in [
+    ];
+    let residuals = levels.into_iter().flat_map(|(cin, len, stride)| {
+        [
             (1, 1, 1),
             (7, 1, 1),
             (7, 3, 1),
             (7, 9, 1),
             (2 * stride, 1, stride),
+        ]
+        .map(move |(ksize, dilation, step)| (cin, len, ksize, dilation, step))
+    });
+    let projections = [1, 4, 207, 500].map(|len| (2048, len, 3, 1, 1));
+    for (cin, len, ksize, dilation, step) in residuals.chain(projections) {
+        let down = step > 1;
+        let cout = if down { 2 * cin } else { cin };
+        let out_len = len / step;
+        let pad = if down {
+            step.div_ceil(2)
+        } else {
+            ksize / 2 * dilation
+        };
+        for layout in [
+            "scalar",
+            "four_samples",
+            "packed_channels",
+            "packed_prefetch",
+            "packed_k3",
         ] {
-            let down = step > 1;
-            let cout = if down { 2 * cin } else { cin };
-            let out_len = len / step;
-            let pad = if down {
-                step.div_ceil(2)
-            } else {
-                ksize / 2 * dilation
-            };
-            for layout in ["scalar", "four_samples", "packed_channels"] {
-                if down && layout != "scalar" {
-                    continue; // The tiled kernels require stride one.
-                }
-                group.bench_function(
-                    format!("{layout}/{cin}x{cout}x{len}/k{ksize}_d{dilation}_s{step}"),
-                    |b| {
-                        let manager = hrx::residency::ResidencyManager::new(1 << 30).unwrap();
-                        let mut stream =
-                            Stream::open().unwrap().with_memory_budget(manager.budget());
-                        let compiler = compiler();
-                        let build = |stream: &mut Stream, layout: &str| {
-                            let stem = match layout {
-                                "packed_channels" => "conv1d_block_f32",
-                                "four_samples" => "conv1d4_f32",
-                                _ => "conv1d_s_f32",
-                            };
-                            let mut config = vec![
-                                ("cin", cin),
-                                ("cout", cout),
-                                ("ksize", ksize),
-                                ("dilation", dilation),
-                                ("pad", pad),
-                            ];
-                            if layout != "scalar" {
-                                config.extend([
-                                    ("accumulate", 0),
-                                    ("len_bound", len.max(256).next_power_of_two()),
-                                ]);
-                            } else {
-                                config.extend([
-                                    ("stride", step),
-                                    ("in_bound", len.max(256).next_power_of_two()),
-                                    ("out_bound", out_len.max(256).next_power_of_two()),
-                                ]);
-                            }
-                            let config = config
-                                .into_iter()
-                                .map(|(key, value)| (format!("h3.{stem}.{key}"), value.to_string()))
-                                .collect();
-                            compiler
-                                .get(stream, stem, &format!("h3_{stem}"), &config)
-                                .unwrap()
+            if down && layout != "scalar" {
+                continue; // The tiled kernels require stride one.
+            }
+            if matches!(layout, "packed_prefetch" | "packed_k3") && ksize != 3 {
+                continue; // Compare the projection's short-window dispatch choices.
+            }
+            group.bench_function(
+                format!("{layout}/{cin}x{cout}x{len}/k{ksize}_d{dilation}_s{step}"),
+                |b| {
+                    let manager = hrx::residency::ResidencyManager::new(1 << 30).unwrap();
+                    let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                    let compiler = compiler();
+                    let build = |stream: &mut Stream, layout: &str| {
+                        let stem = match layout {
+                            "packed_channels" => "conv1d_block_f32",
+                            "packed_prefetch" => "conv1d_prefetch_f32",
+                            "packed_k3" => "conv1d_k3_f32",
+                            "four_samples" => "conv1d4_f32",
+                            _ => "conv1d_s_f32",
                         };
-                        let reference = build(&mut stream, "scalar");
-                        let kernel = build(&mut stream, layout);
-                        compiler.flush(&mut stream).unwrap();
-                        let values = |count| {
-                            (0..count)
-                                .map(|i| ((i * 37 % 101) as f32 - 50.) / 200.)
-                                .collect::<Vec<_>>()
-                        };
-                        let x = upload(&mut stream, bytemuck::cast_slice(&values(cin * len)));
-                        let weights = values(cout * cin * ksize);
-                        let w = upload(&mut stream, bytemuck::cast_slice(&weights));
-                        let packed = (layout == "packed_channels").then(|| {
-                            let mut packed = Vec::with_capacity(weights.len());
-                            for group in weights.chunks(8 * cin * ksize) {
-                                for tap in 0..cin * ksize {
-                                    for channel in 0..8 {
-                                        packed.push(group[channel * cin * ksize + tap]);
-                                    }
+                        let mut config = vec![
+                            ("cin", cin),
+                            ("cout", cout),
+                            ("ksize", ksize),
+                            ("dilation", dilation),
+                            ("pad", pad),
+                        ];
+                        if layout != "scalar" {
+                            config.extend([
+                                ("accumulate", 0),
+                                ("len_bound", len.max(256).next_power_of_two()),
+                            ]);
+                        } else {
+                            config.extend([
+                                ("stride", step),
+                                ("in_bound", len.max(256).next_power_of_two()),
+                                ("out_bound", out_len.max(256).next_power_of_two()),
+                            ]);
+                        }
+                        let config = config
+                            .into_iter()
+                            .map(|(key, value)| (format!("h3.{stem}.{key}"), value.to_string()))
+                            .collect();
+                        compiler
+                            .get(stream, stem, &format!("h3_{stem}"), &config)
+                            .unwrap()
+                    };
+                    let reference = build(&mut stream, "scalar");
+                    let kernel = build(&mut stream, layout);
+                    compiler.flush(&mut stream).unwrap();
+                    let values = |count| {
+                        (0..count)
+                            .map(|i| ((i * 37 % 101) as f32 - 50.) / 200.)
+                            .collect::<Vec<_>>()
+                    };
+                    let x = upload(&mut stream, bytemuck::cast_slice(&values(cin * len)));
+                    let weights = values(cout * cin * ksize);
+                    let w = upload(&mut stream, bytemuck::cast_slice(&weights));
+                    let packed = layout.starts_with("packed_").then(|| {
+                        let mut packed = Vec::with_capacity(weights.len());
+                        for group in weights.chunks(8 * cin * ksize) {
+                            for tap in 0..cin * ksize {
+                                for channel in 0..8 {
+                                    packed.push(group[channel * cin * ksize + tap]);
                                 }
                             }
-                            upload(&mut stream, bytemuck::cast_slice(&packed))
-                        });
-                        let bias = upload(&mut stream, bytemuck::cast_slice(&values(cout)));
-                        let out = stream.allocate(cout * out_len * 4).unwrap();
-                        let run = |stream: &mut Stream,
-                                   kernel: &h3_hrx::compile::Kernel,
-                                   layout: &str,
-                                   w: &Buffer| {
-                            let tiled = layout != "scalar";
-                            let (span, outputs) = if layout == "packed_channels" {
-                                (128, cout / 8)
-                            } else {
-                                (256, cout)
-                            };
-                            let scalars = [out_len as u32, len as u32];
-                            h3_hrx::dispatch::emit(
-                                &mut Sink::Stream(stream),
-                                kernel,
-                                None,
-                                "audio convolution",
-                                [out_len.div_ceil(span) as u32, outputs as u32, 1],
-                                [if tiled { 64 } else { 256 }, 1, 1],
-                                &scalars[..if tiled { 1 } else { 2 }],
-                                &[x.binding(), w.binding(), bias.binding(), out.binding()],
-                                &[
-                                    cin * len * 4,
-                                    cout * cin * ksize * 4,
-                                    cout * 4,
-                                    cout * out_len * 4,
-                                ],
-                            )
-                            .unwrap();
-                            stream.synchronize().unwrap();
+                        }
+                        upload(&mut stream, bytemuck::cast_slice(&packed))
+                    });
+                    let bias = upload(&mut stream, bytemuck::cast_slice(&values(cout)));
+                    let out = stream.allocate(cout * out_len * 4).unwrap();
+                    let run = |stream: &mut Stream,
+                               kernel: &h3_hrx::compile::Kernel,
+                               layout: &str,
+                               w: &Buffer| {
+                        let tiled = layout != "scalar";
+                        let (span, outputs) = match layout {
+                            "packed_channels" => (128, cout / 8),
+                            "packed_prefetch" => (64, cout / 8),
+                            "packed_k3" => (8, cout / 8),
+                            _ => (256, cout),
                         };
-                        run(&mut stream, &reference, "scalar", &w);
-                        let expected = check_f32(&mut stream, &out);
-                        let w = packed.as_ref().unwrap_or(&w);
-                        run(&mut stream, &kernel, layout, w);
-                        assert_eq!(check_f32(&mut stream, &out), expected);
-                        b.iter(|| run(&mut stream, &kernel, layout, w));
-                        assert_eq!(check_f32(&mut stream, &out), expected);
-                    },
-                );
-            }
+                        let scalars = [out_len as u32, len as u32];
+                        h3_hrx::dispatch::emit(
+                            &mut Sink::Stream(stream),
+                            kernel,
+                            None,
+                            "audio convolution",
+                            [out_len.div_ceil(span) as u32, outputs as u32, 1],
+                            [if tiled { 64 } else { 256 }, 1, 1],
+                            &scalars[..if tiled { 1 } else { 2 }],
+                            &[x.binding(), w.binding(), bias.binding(), out.binding()],
+                            &[
+                                cin * len * 4,
+                                cout * cin * ksize * 4,
+                                cout * 4,
+                                cout * out_len * 4,
+                            ],
+                        )
+                        .unwrap();
+                        stream.synchronize().unwrap();
+                    };
+                    run(&mut stream, &reference, "scalar", &w);
+                    let expected = check_f32(&mut stream, &out);
+                    let w = packed.as_ref().unwrap_or(&w);
+                    run(&mut stream, &kernel, layout, w);
+                    assert_eq!(check_f32(&mut stream, &out), expected);
+                    b.iter(|| run(&mut stream, &kernel, layout, w));
+                    assert_eq!(check_f32(&mut stream, &out), expected);
+                },
+            );
         }
     }
     group.finish();

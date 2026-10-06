@@ -931,13 +931,13 @@ impl AudioVae {
             )?;
             let hoisted_1 = w(stream, "aenc.conv_out.w", 2048 * 2048 * 3)?;
             let hoisted_2 = w(stream, "aenc.conv_out.b", 2048)?;
-            conv_s(
+            conv4(
                 c,
                 stream,
                 prof,
                 "aenc conv_out",
-                (2048, 2048, 3, 1, 1, 1),
-                len,
+                (2048, 2048, 3, 1, 1),
+                false,
                 len,
                 y.binding(),
                 hoisted_1.binding(),

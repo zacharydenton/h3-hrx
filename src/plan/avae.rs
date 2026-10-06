@@ -350,13 +350,12 @@ fn encoder(ck: &Checkpoint, out: &mut Table) -> Result<()> {
         "aenc.act_out".into(),
         widen_f32(ck, &[&alpha("encoder.block.6.alpha", dim)?])?,
     );
-    flat(
+    packed_convolution(
         ck,
         out,
         "aenc.conv_out",
         "encoder.block.7",
         &[dim as i64, dim as i64, 3],
-        None,
     )?;
 
     for n in ["norm1", "norm2", "norm3"] {

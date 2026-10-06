@@ -167,6 +167,8 @@ residual convolutions, dilations 1/3/9, and stride 2/4/5 downsampling. Scalar,
 four-sample and packed-channel kernels are compared at the same shapes where
 supported, with exact output checks before and after timing. These cases use
 synthetic weights and a 1 GiB allocation cap, without loading checkpoints.
+The final 2048-channel projection also compares packed prefetch and three-tap
+kernels at 1/4/207/500 latent frames, including the short-window dispatch choices.
 
 ## Memory
 
