@@ -72,8 +72,13 @@ fn run(binary: &str, args: &[&str], offline: &str) -> (Output, Vec<String>) {
 fn hub_offline_environment_prevents_requests_even_without_the_cli_flag() {
     for value in ["1", "on", "Yes", "TRUE"] {
         let (output, requests) = run(
-            env!("CARGO_BIN_EXE_h3-dev"),
-            &["resolve", "vae/missing.safetensors"],
+            std::env::current_exe().unwrap().to_str().unwrap(),
+            &[
+                "--ignored",
+                "--exact",
+                "resolve_missing_model",
+                "--nocapture",
+            ],
             value,
         );
         assert!(!output.status.success());
@@ -86,14 +91,24 @@ fn hub_offline_environment_prevents_requests_even_without_the_cli_flag() {
         assert!(message.contains("downloading is off"), "{message}");
     }
     let (_, requests) = run(
-        env!("CARGO_BIN_EXE_h3-dev"),
-        &["resolve", "vae/missing.safetensors"],
+        std::env::current_exe().unwrap().to_str().unwrap(),
+        &[
+            "--ignored",
+            "--exact",
+            "resolve_missing_model",
+            "--nocapture",
+        ],
         "0",
     );
     assert_eq!(requests.len(), 1, "online resolution must reach the stub");
     let (_, requests) = run(
-        env!("CARGO_BIN_EXE_h3-dev"),
-        &["resolve", "--offline", "vae/missing.safetensors"],
+        std::env::current_exe().unwrap().to_str().unwrap(),
+        &[
+            "--ignored",
+            "--exact",
+            "resolve_missing_model_offline",
+            "--nocapture",
+        ],
         "0",
     );
     assert!(requests.is_empty());
@@ -146,4 +161,23 @@ fn removed_model_directory_flag_is_rejected() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--models'"));
     assert!(requests.is_empty());
+}
+
+#[test]
+#[ignore = "subprocess fixture with isolated cache environment"]
+fn resolve_missing_model() {
+    let error = h3_hrx::models::Resolver::new()
+        .find("vae/missing.safetensors")
+        .unwrap_err();
+    panic!("{error}");
+}
+
+#[test]
+#[ignore = "subprocess fixture with isolated cache environment"]
+fn resolve_missing_model_offline() {
+    let error = h3_hrx::models::Resolver::new()
+        .offline(true)
+        .find("vae/missing.safetensors")
+        .unwrap_err();
+    panic!("{error}");
 }

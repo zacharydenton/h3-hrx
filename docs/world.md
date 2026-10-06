@@ -189,38 +189,3 @@ paper-level visual quality or exact parity with the authors' BF16 CUDA pipeline;
 the base weights here are quantized. For visual qualification, hold the image,
 seed and sampler fixed and compare still/forward, opposing pans, slow/fast pans,
 and a reversal after latent interval 15. Preserve the `.world.json` records.
-
-### Recorded runs, 2026-10-03
-
-Linux/gfx1151, HRX 0.8.7, quantized FL2VA and the released rank-32 adapter.
-The 64×64×5 left/right/left regression passed exact repeatability. Visual runs
-used the authors' first-frame image, 320×192, 50 Euler evaluations, shifts 12/3,
-and a 28 GiB native allocation ceiling:
-
-| Run | Frames | Seed | Wall time | Cumulative background flow x |
-| --- | ---: | ---: | ---: | ---: |
-| Pan left | 22 | 2 | 528 s | +55.66 px |
-| Pan right | 22 | 2 | 528 s | −17.37 px |
-| Session: initial left pan | 22 | 2 | 580 s | +55.56 px |
-| Session: resumed right pan | 22 | 3 | 586 s | −54.81 px |
-| Left-fast, then right-fast at frame 51 | 124 | 2 | 630 s | +85.27 px before; −60.76 px after |
-
-Flow used Farneback on grayscale frames (`0.5,3,15,3,5,1.2,0`), averaged over
-background crop `[12:85,12:308]` and summed across transitions. Positive flow
-corresponds to a left camera pan. The reversal's second sum includes entry into
-frame 51.
-
-Save/resume preserved the scene, observation hashes and cursor (frame 42, next
-seed 4). The resumed first compressed frame differed from its input by 4.82 RGB8
-levels on average. Scene continuity was visually plausible over two segments;
-it does not establish long-horizon consistency. The reversal clip showed
-subject ghosting and lighting artifacts.
-
-The 832×480×124 run was stopped after its first evaluation and produced no
-completed clip. Full-size quality and upstream BF16 numerical parity remain
-unqualified. These runs also precede the FP32 feed-forward fixes.
-
-[Full measurement record](https://github.com/zacharydenton/h3-hrx/blob/3399b13/docs/world.md#observed-validation-2026-10-03)
-includes memory observations and provenance. Local artifacts are under
-`target/world-smoke/`, `target/world-rollout-smoke/` and
-`target/world-temporal-smoke/`.

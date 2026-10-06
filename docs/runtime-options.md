@@ -81,8 +81,8 @@ session teardown.
 
 The experimental `SessionOptions::turbo` path keeps the existing INT8 base and
 adds BF16 low-rank branches. Adapters resolve through the standard Hugging Face
-Hub cache at pinned revisions; `h3-dev inspect-adapter --offline turbo-768p-4`
-validates the cached four-evaluation checkpoint without opening the GPU.
+Hub cache at pinned revisions. Use `scripts/test.sh --adapters` to validate
+cached adapters.
 
 Four/eight-evaluation presets require 1344×768, 124 frames, Euler, and video/audio
 shifts 6/3. They support text or one first-frame keyframe. The corresponding sigma
@@ -114,13 +114,10 @@ rows, sigma arrays, cache decisions, and model release. It does not enable the
 intrusive kernel profiler. Host submission timestamps can overlap GPU work;
 release events follow synchronization.
 
-`scripts/optimization_benchmark.py` records source/binary/prompt identity,
-complete process time, and separate GPU-residency, process-PSS, and system-memory
-views. These UMA views overlap and must not be added.
+Use [Criterion benchmarks](performance.md) for repeatable timing comparisons.
+`scripts/cache_calibrate.py` reads a captured stage trace from `--cache-observe`
+and proposes cache thresholds to evaluate on the same inputs.
 
-`h3-dev tune-gemm` screens groups 2/3/4/8 at the actual 38,048/40,047-row shapes
-using four real layer weights, exact output checks, warmup, and alternating
-measurements. `h3-dev compile-probes` checks the operand/attention experiments
-without opening the GPU. Developer switches `H3_FUSED_OPERANDS=1` and
-`H3_REUSE_SCRATCH=1` enable pending operand-fusion and scratch-lifetime experiments;
-neither changes the default until its parity and timing gates pass.
+Developer switches `H3_FUSED_OPERANDS=1` and `H3_REUSE_SCRATCH=1` enable pending
+operand-fusion and scratch-lifetime experiments; neither changes the default
+until its parity and timing gates pass.

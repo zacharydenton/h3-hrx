@@ -54,48 +54,11 @@ A digest change is a numerical change. Before updating expected values, compare
 with an independent reference and document why the new result is correct.
 Historical validation is not rerun automatically by the CPU suite.
 
-### Decoder and reference checks
-
-The October 2 spatial-compositor and five-frame lookahead fixes reduced a
-320×320×22 ComfyUI comparison from 0.462 to 0.167 RGB8 RMSE. Other same-latent
-checks at 39/56/73 frames stayed below 0.19 RMSE with maximum error 3; stereo
-audio at 65/255/256/257 latent frames differed by less than 9e-7 per sample.
-
-The library's October 3 checkpoint-selection fix is tested against explicit
-Ref2VA and across all residency policies. A two-image/audio reference case at
-320×320×124, seed 7 and 20 ResMultistep evaluations used identical noise and
-shared text embeddings with ComfyUI `a7169322`:
-
-| Native checkpoint | Video latent cosine | Audio latent cosine |
-| --- | ---: | ---: |
-| Previous FL2VA default | 0.991144 | 0.726789 |
-| Corrected Ref2VA selection | 0.999855 | 0.981867 |
-
-That synthetic comparison did not reproduce the reported flashing blocks.
-Precision and reference-augmentation RNG differences remain comparison limits.
-
-### Periodic artifacts and FP32 range
-
-The saved 384×256×56 portrait/voice clip reproduces frame-17/34 pulses in both
-ComfyUI's FP16 decoder (`a7169322`) and MiniMax's original FP32 decoder
-(`42ed227e`). Native RGB8 RMSE was 0.1985 against ComfyUI and 0.1469 against the
-original decoder. Tracing confirmed matching chunk trimming and blending;
-a repeated-static-frame control also had smaller periodic reconstruction changes.
-These results exclude the conversion and FP16 decoder precision as explanations
-for this clip, but do not establish denoiser parity. The
-[comparison record](benchmarks/20261004-refmod-flicker.json) retains measurements
-and source hashes.
-
-The October 6 FP32 feed-forward fixes preserve activations reaching 287,332,
-remove FP16 Hadamard scratch and stop clamps from masking NaN/Inf. The real
-replay produced finite latents under a 32 GiB budget. Fixed baseline latents
-decode byte-identically; the temporal pulses remain. See the
-[FP32 validation record](benchmarks/20261006-fp32-feedforward.json).
-
 ## Independent model references
 
 `scripts/parity.py` is separate from the native suite. It uses cached checkpoints
-and does not download them during validation. Install `numpy` and
+and invokes the ignored `tests/parity_dump.rs` fixture test through Cargo. It does
+not download checkpoints during validation. Install `numpy` and
 `huggingface_hub`; model-based references additionally need Torch and, where
 applicable, diffusers.
 
@@ -106,11 +69,6 @@ applicable, diffusers.
 | `python3 scripts/parity.py te` | Released Qwen3-VL layers; cached `text_encoder/` weights (~62 GB) |
 | `python3 scripts/parity.py convert` | ConvRot weight conversion against released weights; no GPU |
 | `python3 scripts/parity.py vae` | FP16 native decoder against diffusers and the released VAE (~10 GB) |
-
-Recorded checks reached 0.99865 cosine after 50 DiT blocks, 0.99995 after 50 text
-layers, and over 62.5 dB decoder PSNR at 384×320×22. All 200 quantized tensors
-passed the conversion norm check within 1.1e-4. These historical measurements
-include quantization differences and apply to their tested inputs and versions.
 
 For an independent whole-block adapter check:
 
@@ -150,24 +108,8 @@ The harness compares every binding byte-for-byte before its CPU-oracle check.
 Use a filtered test if only some exports have a compatible baseline. Intentional
 precision changes need independent validation instead of byte equality.
 
-```sh
-H3_KERNEL_TIMING=1 cargo test --locked --test kernels --release preparation -- --ignored --test-threads=1
-cargo run --release --bin h3-dev -- compare-gemm "$H3_KERNEL_BASELINE"
-cargo run --release --bin h3-dev -- compare-vision "$H3_KERNEL_BASELINE"
-cargo run --release --bin h3-dev -- compare-decode \
-  "$H3_KERNEL_BASELINE" "$VAE_CHECKPOINT" "$LATENTS_F32" 480 864 22
-```
-
-Timings use alternating resident runs with output checks. `compare-gemm` accepts
-an export-name filter and tests repeated weights plus a ring exceeding 64 MiB.
-`H3_COMPARE_BATCHES=40` extends its default ten pairs. The decoder example expects
-little-endian FP32 latents shaped `[24,7,30,54]`; its baseline must contain the
-module filenames selected by the current host. `H3_BASELINE_LOOM_LIBRARY` selects
-a different baseline compiler. Measure on an idle CPU/GPU.
-
-The [September consolidation measurements](https://github.com/zacharydenton/h3-hrx/blob/3399b13/docs/testing.md#comparing-kernel-families)
-retain old compiler hashes and timing data. Compiler regression probes remain
-under `experiments/`, including the
+Use [Criterion](performance.md) for timing comparisons. Compiler regression probes
+remain under `experiments/`, including the
 [VOPD reproduction](../experiments/vision_gelu_vopd/README.md).
 
 ## Optional prompt generation and reference presentation
@@ -185,7 +127,7 @@ original sources, capability preflight and media budgets.
 cargo test --locked --lib --release prompt::tests::native_refmod_ -- --ignored --test-threads=1
 cargo test --release --test refmod effective_refmod_reconstruction -- --ignored --test-threads=1
 cargo test --release --test refmod presented_video -- --ignored --test-threads=1
-python3 scripts/test_optimization_benchmark.py
+python3 scripts/test_cache_calibrate.py
 ```
 
 Hardware checks reconstruct visual/audio members and verify that changing a
@@ -201,5 +143,4 @@ branching, last-frame handoff, seed/frame accounting, rollback and writer locks.
 
 `world_rollout_decodes_and_resumes` runs two decoded segments through a budgeted
 session. These tests are in the full tier and require the pinned world adapter.
-See [world validation](world.md#validation) for observed action response and
-remaining visual-quality limits.
+See [world validation](world.md#validation) for visual qualification guidance.

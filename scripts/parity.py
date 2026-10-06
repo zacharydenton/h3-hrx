@@ -60,7 +60,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 # --------------------------------------------------------------------------------------------------
-# The host, through h3-dev parity-dump
+# The host, through the parity_dump integration test
 # --------------------------------------------------------------------------------------------------
 
 def model_path(relative: str) -> Path:
@@ -95,24 +95,15 @@ def official_path(component: str, explicit: str | None) -> Path:
 
 DIT_FILE = "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"
 
-DUMP = ROOT / "target/release/h3-dev"
-
-
 class H3Error(RuntimeError):
     pass
 
 
-def host_command(command: str) -> list[str]:
-    if not DUMP.is_file():
-        raise H3Error(f"{DUMP} is missing; cargo build --release --bin h3-dev")
-    return [str(DUMP), "parity-dump", command]
-
-
 def host(command: str, out: Path, dumps: Path | None = None, env: dict | None = None, **flags) -> Path:
-    """Run one `h3-dev parity-dump` command. Python never links the library: it writes the inputs as files,
+    """Run the native parity fixture test. Python never links the library: it writes the inputs as files,
     the host writes its artefacts as files, and everything below reads them back. There is no
     foreign-function boundary here to drift out of step with the crate."""
-    argv = host_command(command) + ["--out", str(out)]
+    argv = [command, "--out", str(out.resolve())]
     for key, value in flags.items():
         if value is None:
             continue
@@ -124,7 +115,12 @@ def host(command: str, out: Path, dumps: Path | None = None, env: dict | None = 
         environment["H3_DUMP_BLOCKS"] = str(dumps)
         environment["H3_DUMP_CALL"] = "0"
     out.mkdir(parents=True, exist_ok=True)
-    done = subprocess.run(argv, capture_output=True, text=True, env=environment)
+    environment["H3_PARITY_ARGS"] = json.dumps(argv)
+    environment["HF_HUB_OFFLINE"] = "1"
+    done = subprocess.run(
+        ["cargo", "test", "--locked", "--release", "--test", "parity_dump", "--",
+         "--ignored", "--exact", "parity_dump", "--nocapture"],
+        cwd=ROOT, capture_output=True, text=True, env=environment)
     if done.returncode:
         raise H3Error((done.stderr or done.stdout).strip() or f"{command} exited {done.returncode}")
     return out
@@ -132,11 +128,9 @@ def host(command: str, out: Path, dumps: Path | None = None, env: dict | None = 
 
 def host_shape(height: int, width: int, frames: int) -> dict:
     """The model's own sizing, so nothing here reimplements the 17n+5 snapping or the /16 grids."""
-    argv = host_command("shape") + ["--height", str(height), "--width", str(width), "--frames", str(frames)]
-    done = subprocess.run(argv, capture_output=True, text=True)
-    if done.returncode:
-        raise H3Error((done.stderr or done.stdout).strip())
-    return json.loads(done.stdout)
+    with tempfile.TemporaryDirectory() as directory:
+        out = host("shape", Path(directory), height=height, width=width, frames=frames)
+        return json.loads((out / "shape.json").read_text())
 
 
 def read_f32(path: Path, width: int | None = None) -> np.ndarray:
@@ -726,7 +720,7 @@ def stack_te(depths):
         got = {d: dumped(tmp, "te", f"blk_{d - 1:02d}", TEXT_DIM) for d in depths}
         x0 = dumped(tmp, "te", "h_in", TEXT_DIM)
     if not cache.exists():
-        print(f"SKIP: no {cache} (the transformers reference: see docs/archive/notes.md, the text encoder)"); return True
+        print(f"SKIP: no {cache} (the transformers reference: see docs/testing.md)"); return True
     want = torch.load(cache)   # [layers + 1][tokens][5120] bf16 hidden states from transformers on the same ids
     ok = True
     for d in sorted(depths):

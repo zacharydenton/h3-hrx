@@ -5,13 +5,7 @@
 //! checks need — token ids, refined text rows, latents, decoded frames, and the per-block dumps
 //! `H3_DUMP_BLOCKS` writes. Python reads these files without linking the model library.
 //!
-//!   parity_dump shape   --height H --width W --frames F
-//!   parity_dump text    --prompt P --out DIR
-//!   parity_dump encode  --pixels F --height H --width W --out DIR
-//!   parity_dump decode  --latents F --height H --width W --frames F --out DIR
-//!   parity_dump denoise --prompt P --height H --width W --frames F --steps N --seed S
-//!                       [--sampler euler|res_multistep] [--noise-video F --noise-audio F]
-//!                       [--keyframe F --keyframe-latents F --keyframe-latent-t N] --out DIR
+//! Invoked by the Python reference tool through `H3_PARITY_ARGS` (a JSON argument array).
 //!
 //! Scalars go to `<out>/shape.json` so Python needs no arithmetic of its own; everything else is
 //! little-endian f32 except `ids.i32` and `frames.rgb`.
@@ -164,8 +158,13 @@ fn params(a: &Args) -> DenoiseParams {
     }
 }
 
-pub fn run(args: Vec<String>) {
-    let argv = args;
+#[test]
+#[ignore = "invoked by scripts/parity.py with explicit fixtures"]
+fn parity_dump() {
+    let argv: Vec<String> = serde_json::from_str(
+        &std::env::var("H3_PARITY_ARGS").expect("scripts/parity.py supplies H3_PARITY_ARGS"),
+    )
+    .unwrap();
     let Some(command) = argv.first().cloned() else {
         fail("a command is required: shape, text, encode, decode or denoise");
     };
@@ -179,7 +178,7 @@ pub fn run(args: Vec<String>) {
 
     match command.as_str() {
         // Sizes, so Python needs none of the model's arithmetic.
-        "shape" => print!("{}", shape_json(&params(&a))),
+        "shape" => write(&out(), "shape.json", shape_json(&params(&a)).as_bytes()),
 
         // The refined text rows, and the `te_*` dumps when H3_DUMP_BLOCKS is set.
         "text" => {

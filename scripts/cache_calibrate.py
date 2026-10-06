@@ -1,6 +1,6 @@
 """Propose at most two conservative cache trials from a complete observation run.
 
-Input: optimization_benchmark's *.stages.json. Predictions replay the policy on
+Input: stderr captured with H3_STAGE_TRACE=1 and --cache-observe. Predictions replay the policy on
 an uncached history; a cached trajectory can diverge and must be rendered/reviewed.
 """
 import argparse
@@ -8,6 +8,12 @@ import hashlib
 import json
 import math
 from pathlib import Path
+
+
+def parse_events(log):
+    # Progress callbacks and the test harness can prefix an event line.
+    return [json.loads(line.partition('H3_STAGE ')[2])
+            for line in log.splitlines() if 'H3_STAGE {' in line]
 
 
 def quantile(values, p):
@@ -53,11 +59,11 @@ def proposals(report):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stages', type=Path)
+    parser.add_argument('trace', type=Path)
     args = parser.parse_args()
-    source = args.stages.read_bytes()
+    source = args.trace.read_bytes()
     try:
-        trials = proposals(json.loads(source))
+        trials = proposals({'events': parse_events(source.decode())})
     except (ValueError, KeyError, TypeError) as e:
         parser.error(str(e))
     print(json.dumps({'observation_sha256': hashlib.sha256(source).hexdigest(), 'trials': trials,

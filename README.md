@@ -66,22 +66,16 @@ classifier-free guidance. Use `h3 --help` for all flags.
 | Action-controlled clips, save/resume and branching | [H3-World](docs/world.md) |
 | WAV-only output and still frames | [Audio and stills](docs/tricks.md) |
 
-## Performance
+## Benchmarks
 
-Recorded on Strix Halo at 1344×768, 124 frames and 20 evaluations, with cached
-checkpoints. Times include loading, conditioning, sampling, decoding and output.
+Run GPU benchmarks with Criterion:
 
-| Configuration | End to end | Steady median/evaluation |
-| --- | ---: | ---: |
-| h3-hrx | 35 min 59 s | 103.9 s |
-| ComfyUI · PyTorch BF16 attention | 4 h 3 min 53 s | 721.3 s |
-| ComfyUI · Comfy Kitchen INT8 attention | 43 min 33 s | 121.7 s |
+```sh
+cargo bench --locked --features bench-gpu --bench kernels
+```
 
-These September 2026 runs precede the FP32 feed-forward fixes. A later
-stage-scoped run peaked at 27.20 GiB GPU residency, with unchanged latents;
-its colder startup raised total time to 38 min 02 s. There is one complete
-trajectory per configuration, and equal seeds across engines use different noise.
-See [conditions, memory measurements and numerical limits](docs/performance.md).
+See [benchmark workloads and baseline comparisons](docs/performance.md).
+Results stay in `target/criterion/` and are not committed.
 
 ## Library and development
 
@@ -102,7 +96,7 @@ bash scripts/test.sh --cpu
 
 See [contributing](CONTRIBUTING.md), [test coverage](docs/testing.md),
 [runtime options](docs/runtime-options.md), [HRX integration](docs/shared-hrx.md),
-[release checks](docs/releasing.md), and the [research archive](docs/archive/README.md).
+and [release checks](docs/releasing.md).
 
 ## License and credits
 

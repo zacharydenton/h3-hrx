@@ -15,9 +15,13 @@ homepage = "https://github.com/zacharydenton/h3-hrx"
 keywords = ["loom", "hrx", "minimax", "video-generation", "strix-halo"]
 categories = ["science", "multimedia::video", "multimedia::audio", "command-line-utilities"]
 default-run = "h3"
-exclude = ["/clients", "/experiments", "/docs/archive", "/docs/media", "/.github"]
+exclude = ["/clients", "/experiments", "/docs/media", "/.github"]
+
+[lib]
+bench = false
 
 [[bin]]
+bench = false
 name = "h3"
 path = "src/bin/h3/main.rs"
 doc = false
@@ -28,11 +32,18 @@ default = ["cli", "prompt-generation"]
 # Disable default features when consuming only the library.
 cli = ["dep:anyhow", "dep:clap"]
 prompt-generation = ["dep:reqwest", "dep:base64", "dep:png", "dep:regex"]
-# One stage of the pipeline at a time, for comparing against a reference or a previous kernel.
-[[bin]]
-name = "h3-dev"
-path = "src/bin/h3-dev/main.rs"
-doc = false
+# GPU benchmarks require gfx1151 and a provisioned HRX bundle.
+bench-gpu = []
+
+[[bench]]
+name = "kernels"
+harness = false
+required-features = ["bench-gpu"]
+
+[[bench]]
+name = "models"
+harness = false
+required-features = ["bench-gpu"]
 
 [dependencies]
 hrx = { package = "hrx-rs", version = "0.8.7" }
@@ -58,6 +69,7 @@ png = { version = "0.18", optional = true }
 regex = { version = "1", optional = true }
 
 [dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 libm = "0.2"
 
 [profile.release]

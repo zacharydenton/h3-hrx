@@ -20,6 +20,9 @@ The CPU tier runs formatting, Clippy and workspace tests. GPU tests require
 `gfx1151` and a provisioned HRX bundle. Checkpoint-backed and parity checks are
 listed in [test coverage](docs/testing.md).
 
+Use [Criterion benchmarks](docs/performance.md) for performance work. Keep generated
+reports and baselines under `target/`; commit benchmark code, not results.
+
 ## Changes and bug reports
 
 Explain the behavior changed and how it was checked. For numerical bugs, include

@@ -120,56 +120,6 @@ impl Harness {
                     "baseline mismatch: {stem}, binding {i}, config {cfg:?}"
                 );
             }
-            if std::env::var_os("H3_KERNEL_TIMING").is_some() {
-                let mut graphs = Vec::new();
-                for (k, c) in [(&old, &old_constants), (&kernel, &constants)] {
-                    let mut graph = self.stream.graph().unwrap();
-                    // Every repetition writes the same bindings, so they are chained: this times
-                    // the kernel back to back, not a hundred and twenty-eight copies at once.
-                    let mut previous = None;
-                    for _ in 0..128 {
-                        let after = previous.as_slice();
-                        // Safety: the same validated bindings as the numerical comparison.
-                        previous = Some(unsafe {
-                            graph
-                                .dispatch(after, k, grid, [threads, 1, 1], c, &bindings)
-                                .unwrap()
-                        });
-                    }
-                    graphs.push(graph.finish().unwrap());
-                }
-                for graph in &mut graphs {
-                    self.stream.launch(graph).unwrap();
-                }
-                self.stream.synchronize().unwrap();
-                let mut times = [Vec::new(), Vec::new()];
-                for batch in 0..10 {
-                    for order in 0..2 {
-                        let version = (batch + order) % 2;
-                        for (buffer, bytes) in buffers.iter().zip(data) {
-                            self.stream.upload(buffer.binding(), bytes).unwrap();
-                        }
-                        self.stream.synchronize().unwrap();
-                        let start = std::time::Instant::now();
-                        for _ in 0..8 {
-                            self.stream.launch(&mut graphs[version]).unwrap();
-                        }
-                        self.stream.synchronize().unwrap();
-                        times[version].push(start.elapsed().as_secs_f64());
-                    }
-                }
-                for values in &mut times {
-                    values.sort_by(f64::total_cmp);
-                }
-                let old = (times[0][4] + times[0][5]) / 2.;
-                let new = (times[1][4] + times[1][5]) / 2.;
-                eprintln!(
-                    "timing {stem}: ratio={:.5} old_us={:.3} new_us={:.3} config={cfg:?}",
-                    new / old,
-                    old * 1e6 / 1024.,
-                    new * 1e6 / 1024.
-                );
-            }
         }
         result
     }

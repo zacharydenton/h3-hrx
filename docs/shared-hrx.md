@@ -64,11 +64,8 @@ contents can change in the same allocations. Dependencies order scratch reuse.
 Q preparation, K preparation and V transpose branch from their producer and
 feed attention directly.
 
-Graphs remain opt-in. `h3-dev dispatch-cost` compares eager and recorded execution
-with identical kernels and allocations, output checks, warmups and alternating
-timed batches. Its completed wall times include submission and waiting. Historical
-measurements did not establish a full-model speedup; details are in the
-[September integration record](https://github.com/zacharydenton/h3-hrx/blob/3399b13/docs/shared-hrx.md#performance-evidence).
+Graphs remain opt-in. [Criterion benchmarks](performance.md) compare eager and
+recorded dispatch and DiT execution, including submission and completion waits.
 
 ## Session ownership
 
@@ -78,5 +75,5 @@ budget and residency manager. See [session lifecycle](runtime-options.md) for
 cancellation, eviction and callback constraints.
 
 [Rustler](../clients/README.md) workers own their sessions and accept jobs through
-a bounded queue. The Python parity tools invoke `h3-dev parity-dump`; neither
+a bounded queue. The Python parity tools invoke an ignored Rust fixture test; neither
 integration adds a Python or Rustler dependency to the inference library.
