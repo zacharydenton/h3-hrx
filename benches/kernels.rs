@@ -195,6 +195,88 @@ fn attention_preparation(c: &mut Criterion) {
     group.finish();
 }
 
+fn quantized_attention(c: &mut Criterion) {
+    use h3_hrx::dispatch::{emit, Profile};
+    use h3_hrx::model::{HEADS, INNER};
+    let mut group = c.benchmark_group("attention_i8qkhm");
+    for tokens in [1usize, 129, 256, 257, 2048, 4096, 4097, 8192] {
+        group.throughput(Throughput::Elements((4 * tokens * tokens * INNER) as u64));
+        group.bench_function(BenchmarkId::from_parameter(tokens), |b| {
+            let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+            let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+            let compiler = compiler();
+            let capacity = (tokens + 16).div_ceil(128) * 128;
+            let stem = "attention_i8qkhm_mha8_k64_lds_f16_wmma";
+            let cfg = [
+                ("q_stride", INNER.to_string()),
+                ("kv_stride", INNER.to_string()),
+                ("out_stride", INNER.to_string()),
+                ("tokens", tokens.to_string()),
+                ("token_capacity", capacity.to_string()),
+                ("scale", "1.0".into()),
+            ]
+            .into_iter()
+            .map(|(key, value)| (format!("h3.{stem}.{key}"), value))
+            .collect();
+            let kernel = compiler
+                .get(&mut stream, stem, &format!("h3_{stem}"), &cfg)
+                .unwrap();
+            compiler.flush(&mut stream).unwrap();
+            let q = upload(&mut stream, &operand(capacity * INNER, "i8", 3));
+            let k = upload(&mut stream, &operand(capacity * INNER, "i8", 7));
+            let scales = upload(
+                &mut stream,
+                bytemuck::cast_slice(&vec![1.0f32 / 128.0; capacity * HEADS]),
+            );
+            // V is channel-major, matching the runtime's transposed operand.
+            let values: Vec<_> = (0..capacity * INNER)
+                .map(|i| f16::from_f32(((i * 37 % 997) as f32 - 498.0) / 512.0))
+                .collect();
+            let v = upload(&mut stream, bytemuck::cast_slice(&values));
+            let out = stream.allocate_zeroed(tokens * INNER * 2).unwrap();
+            let bindings = [
+                q.binding(),
+                scales.binding(),
+                k.binding(),
+                scales.binding(),
+                v.binding(),
+                out.binding(),
+            ];
+            let required = bindings.map(|view| view.len());
+            let mut profile = Profile::from_env();
+            let mut run = |stream: &mut Stream| {
+                emit(
+                    &mut Sink::Stream(stream),
+                    &kernel,
+                    Some(&mut profile),
+                    "attention",
+                    [tokens.div_ceil(128) as u32, HEADS as u32, 1],
+                    [256, 1, 1],
+                    &[tokens as u32, HEADS as u32],
+                    &bindings,
+                    &required,
+                )
+                .unwrap();
+                stream.synchronize().unwrap();
+            };
+            run(&mut stream);
+            let mut expected = vec![0; tokens * INNER * 2];
+            stream.read_blocking(out.binding(), &mut expected).unwrap();
+            assert!(expected
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|&v| f16::from_le_bytes(v).is_finite()));
+            assert!(expected.iter().any(|&v| v != 0), "empty attention output");
+            b.iter(|| run(&mut stream));
+            let mut actual = vec![0; expected.len()];
+            stream.read_blocking(out.binding(), &mut actual).unwrap();
+            assert_eq!(actual, expected);
+        });
+    }
+    group.finish();
+}
+
 fn attention_output_preparation(c: &mut Criterion) {
     use h3_hrx::dispatch::{emit, Profile};
     use h3_hrx::model::{gemm_pitch, INNER};
@@ -769,6 +851,6 @@ criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10).warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3));
-    targets = preparation, attention_preparation, attention_output_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
+    targets = preparation, attention_preparation, quantized_attention, attention_output_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
 }
 criterion_main!(benches);

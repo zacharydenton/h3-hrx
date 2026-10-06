@@ -166,6 +166,10 @@ through 4,096 tokens, plus wider 25,600-value rows. It supports the same HRX
 profiling and allocation cap, with direct readback outside timing.
 `prepare_qk_i8` cases cover token-major and head-major operands at 1, 257, 2,048
 and 8,192 tokens with the same allocation cap and HRX profiling support.
+`attention_i8qkhm` runs the DiT attention kernel with all 56 heads at 1–8,192
+tokens, including partial query and key tiles. It uses head-major INT8 Q/K,
+transposed FP16 V, a 512 MiB allocation cap, and direct output checks outside
+timing. HRX profiling is available for these cases too.
 `transpose_v_f16` covers 1, 257, 2,048 and 8,192 tokens, checking exact half bits
 and zeroed padding after transposing across reused capacity.
 `prepare_attention_output_i8` compares 128/224/448-thread workgroups for the
