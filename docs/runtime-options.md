@@ -1,4 +1,4 @@
-# Session lifecycle and experimental acceleration
+# Runtime options
 
 The `h3` CLI releases completed model stages by default. Conditioning runs with
 the text encoder, sampling retains the full DiT, and final decoding loads the
@@ -6,8 +6,8 @@ VAEs after releasing the DiT. A stream fence precedes each release. No per-layer
 weight eviction occurs during sampling. Use `--residency retain` to keep models
 resident within the process.
 
-`Session::new(Config)` retains
-models for subsequent requests. Choose stage-scoped ownership explicitly:
+`Session::new(Config)` retains models for subsequent requests. Choose
+stage-scoped ownership explicitly:
 
 ```rust,no_run
 use h3_hrx::{Config, ResidencyPolicy, Session, SessionOptions};
@@ -23,8 +23,8 @@ let mut session = unsafe {
 ```
 
 Input images/audio can be encoded before sampling. Stage-scoped encode and decode
-calls release their finished VAE units after fencing. Cancellation releases completed stage owners
-and permits a later request on the same session. An unsuccessful stream fence
+calls release their finished VAE units after fencing. Cancellation releases
+completed stage owners and permits a later request on the same session. A failed fence
 retains allocations that may still be in flight.
 
 ## Shared allocation budgets
@@ -46,7 +46,6 @@ is no per-layer paging. CLI callers can choose an explicit ceiling:
 h3 --residency budgeted --memory-budget-mib 81920 --prompt "a red fox in snow"
 ```
 
-The ceiling is a caller choice, not an estimate of every workload's requirements.
 Library callers select `ResidencyPolicy::Budgeted` with `Session::new_in` and a
 live `ResidencyManager`-backed budget. Cache units retain their original private
 stream identity; they are not shared mutable models across sessions. Completed
@@ -69,15 +68,14 @@ it while holding the lane. Nested sessions in the same context return `Busy`.
 Admission also returns `Busy` when the context's submission capacity is full.
 Cancellation, ordinary errors and panics all fence before releasing the lane;
 an uncertain fence quarantines the entire owner and prevents session reuse.
-This is synchronous stage scheduling, not asynchronous per-layer submission.
-`profile_report()` now returns `Result<Option<String>>`, so admission or device
-failures are reported rather than discarded.
+`profile_report()` returns `Result<Option<String>>` and propagates admission
+or device failures.
 
 The pinned-checkpoint replay (`examples/qualify_session.rs`, budgeted mode)
 matches the frozen audio/video encode, decode and denoise outputs byte-for-byte.
 It also checks caller-thread progress, deferred competing compute, cancellation/
 retry, pressure eviction/reload of all four units, and zero retained budget after
-session teardown. These are correctness checks, not a claim of faster generation.
+session teardown.
 
 ## Turbo qualification
 
@@ -93,8 +91,7 @@ all fifty DiT blocks and both refiner blocks. They reject unsupported checkpoint
 attention, reference, and cache combinations before loading models.
 
 The CLI presets remain hidden during numerical and perceptual qualification.
-The base preset, default sampler, and default evaluation count are unchanged.
-Do not infer quality equivalence or a measured speedup from the evaluation count.
+Quality and end-to-end speed remain unqualified.
 
 ## Cache qualification
 
@@ -106,10 +103,9 @@ and consecutive skips are forbidden. Nonfinite metrics force full computation.
 Caching remains off by default and cannot be combined with Turbo.
 
 The legacy positive `DenoiseParams::cache_threshold` maps one value to all three
-thresholds under the hardened policy. Its old early/consecutive-skip behavior is
-intentionally removed. Explicit policies cannot be combined with a positive
-legacy threshold. Thresholds require calibration against saved noise, motion,
-and audio before a public CLI preset is recommended.
+thresholds under the hardened policy. Explicit policies cannot be combined with
+a positive legacy threshold. Calibrate thresholds against saved noise, motion
+and audio before using them as a preset.
 
 ## Reproducible diagnostics
 

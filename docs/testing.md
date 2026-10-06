@@ -1,350 +1,205 @@
 # Native test coverage
 
-Choose checks for the hardware and cached checkpoints available:
+Run commands from the repository root. GPU tests are ignored by default and
+require working hardware when explicitly selected.
 
-| | needs | runs |
+| Command | Needs | Coverage |
 | --- | --- | --- |
-| `scripts/test.sh --cpu` | nothing | formatting, Clippy, the unit tests |
-| `scripts/test.sh --gpu` | gfx1151 and a provisioned HRX | the above, plus `tests/kernels.rs` and the resident Euler and conditioning tests |
-| `scripts/test.sh --full` | the base checkpoints as well | the above, plus session lifecycle/cache tests and `tests/differentials.rs` |
-| `scripts/test.sh --adapters` | the DiT, both pinned Turbo adapters, and the [Orbit LoRA](loras.md) | the GPU tier plus real low-rank projection, partial/mixed adapter, and adapted eager/graph block tests |
+| `scripts/test.sh --cpu` | Rust toolchain | Formatting, Clippy, workspace tests |
+| `scripts/test.sh --gpu` | gfx1151 and HRX bundle | CPU tier plus kernel, conditioning, sampler and graph checks |
+| `scripts/test.sh --full` | Base/Ref2VA checkpoints and pinned world adapter | GPU tier plus pipeline digests, session lifecycle, RefMod and world tests |
+| `scripts/test.sh --adapters` | Base DiT, both Turbo adapters and [Orbit LoRA](loras.md) | GPU tier plus low-rank projection and adapted eager/graph tests |
 
-The native tests compile through `hrx::loom::Compiler`, upload owned buffers,
-dispatch through `hrx::Stream`, and read results back through HRX staging. They
-are ignored by default; explicitly running them requires working hardware and
-the provisioned native bundle. No Python or Torch dependency is involved.
+Native tests use HRX directly and need no Python. Optional independent model
+references use Python, Torch and cached checkpoints.
 
-Native RefMod prompt preparation has CPU coverage for effective strengths,
-disabled members, copy sharing, label order, metadata filtering, capability
-preflight and host media limits. The full tier also exercises real image/video
-and audio VAE reconstruction against a local mock prompt endpoint with an 8 GiB
-model allocation cap, verifying mixed raw/RefMod ordering and the returned H3
-presentation. Run that focused check with:
+## Kernel and host coverage
 
-```sh
-cargo test --locked --lib --release prompt::tests::native_refmod_ -- --ignored --test-threads=1
-```
+`tests/kernels.rs` compares GPU output against scalar CPU oracles for:
 
-For the optional independent Turbo and Orbit block reference, export six fixtures with
-`H3_ADAPTER_BLOCK_FIXTURE=build/adapter-blocks scripts/test.sh --adapters`, then
-run `scripts/adapter_block_reference.py build/adapter-blocks` using the native
-Comfy checkout's Python environment. That diagnostic uses Torch on the CPU and
-the original checkpoint tensor order. It checks QKV, attention, the complete
-block, and the remaining projections with identical attention input; it is
-separate from installing or running h3. See the
-[qualification results](benchmarks/20260915-optimization/implementation.md).
+- GroupNorm/SiLU, RMSNorm, LayerNorm, rotary Q/K normalization and V copying.
+- FP16/BF16 GEMMs, INT4/INT8 GEMMs, bias, residual gates, SwiGLU ordering and
+  padded inputs crossing workgroup boundaries.
+- FP32 feed-forward range, wide Hadamard preparation, quantization scales,
+  invalid rows and activation binding sizes.
+- BF16 vision projections with bias, residual scaling and both GELU variants.
+- Causal/grouped and packed attention, skip decisions, directed world routing,
+  ragged rows and head-major INT8 sequences through 8193 tokens.
+- Audio convolution, upsampling and Snake FIR phases, with padding, dilation,
+  residuals, output guards and ordered FP32 accumulation.
+- Video convolution with causal time padding and reflected spatial padding.
+- Graph replay, fused operand preparation and reused padded capacity.
 
-The standard-library benchmark parser and cache calibration checks run with
-`python scripts/test_optimization_benchmark.py`.
+Host tests cover shapes, checkpoint layouts, sampling, tokenization, dispatch
+bounds, model selection, cancellation, residency and prompt preparation. The
+[ComfyUI tile fixtures](../tests/fixtures/tiles/README.md) exercise complete
+spatial composition, including intersecting/triple overlaps and temporal lookahead.
 
-The CPU tile tests include [golden samples from ComfyUI](../tests/fixtures/tiles/README.md).
-They exercise the decoder's complete spatial compositor, including intersecting
-and triple overlaps. Checking an isolated blend ramp does not catch using raw
-neighbours in place of previously composited pixels. The temporal tests also
-require the minimum five-frame clip to decode seven latent tokens (five repeats
-for lookahead), then trim the extra seventeen output frames.
+Coverage is incomplete for large-token INT4 and FP16 head-major attention,
+wide/fast/fused decoder GEMMs, and several small layout kernels. Passing these
+cases does not establish arbitrary-shape correctness or full-model parity.
 
 ## Whole-pipeline digests
 
-`tests/differentials.rs` covers video decodes across the decoder's tilings,
-audio conversions at their padding boundaries, and four uncached denoising
-trajectories over both samplers. It compares each result's SHA-256 against a
-constant in the file. Cache tests separately require observation/forced-full
-execution to preserve both latent streams, and check an eligible actual skip.
+`tests/differentials.rs` compares deterministic video/audio decodes and denoising
+trajectories against recorded SHA-256 digests. Cache tests check forced-full
+execution and actual residual reuse. Run the same differential cases through
+graphs with:
 
-These are the checks that catch what types cannot: a recorded graph missing an edge, a stage moved
-to another stream, a path that resolves to the wrong tree. Inputs are generated from a seed by a
-generator written out in the test, so nothing is stored; the outputs would be gigabytes and a digest
-compares them exactly as well.
+```sh
+H3_GRAPH=1 cargo test --locked --test differentials --release -- --ignored --test-threads=1
+```
 
-`H3_GRAPH=1 cargo test --test differentials --release -- --ignored --test-threads=1` runs the same cases through the
-recorded graphs, which is how the recordings are known to be faithful.
+A digest change is a numerical change. Before updating expected values, compare
+with an independent reference and document why the new result is correct.
+Historical validation is not rerun automatically by the CPU suite.
 
-The 2026-10-02 decoder digest update corrects spatial overlap compositing and
-five-frame lookahead padding. Against ComfyUI `a7169322`, a 320×320, 22-frame
-saved-latent decode improved from 0.462 to 0.167 RGB8 RMSE; the corrected 64×64,
-five-frame decode differed by at most one RGB8 level. The independent compositor
-fixture covers the blend logic without model or precision differences. The
-256×512×39 and 512×256×22 decoder digests remain unchanged.
-The additional diffusers check could not run: the cached original VAE index is
-present but its weight shards are missing. Current ComfyUI supplies the independent
-oracle for this update; diffusers 0.40.0 still uses the old raw-neighbour compositor.
+### Decoder and reference checks
 
-The 2026-10-03 RefMod follow-up found a separate library checkpoint-selection
-bug: `Config::dit = None` always loaded FL2VA, while the CLI selected Ref2VA for
-reference requests. The GPU RefMod equivalence test now compares automatic
-selection with explicit Ref2VA, in addition to loaded versus direct references.
-It failed against the previous library implementation and now passes byte for
-byte for video and audio. A session lifecycle test
-checks switching in both directions under retaining, stage-scoped and budgeted
-residency, and verifies that an explicit checkpoint still wins.
+The October 2 spatial-compositor and five-frame lookahead fixes reduced a
+320×320×22 ComfyUI comparison from 0.462 to 0.167 RGB8 RMSE. Other same-latent
+checks at 39/56/73 frames stayed below 0.19 RMSE with maximum error 3; stereo
+audio at 65/255/256/257 latent frames differed by less than 9e-7 per sample.
 
-Additional same-latent ComfyUI comparisons covered 39 frames at 320×320 and
-56/73 frames at 64×96. RGB8 RMSE stayed below 0.19 with maximum error 3, without
-large error spikes at the 17-frame chunk boundaries. Stereo audio decodes at
-65/255/256/257 latent frames differed by less than 9e-7 per sample. These checks
-bound decoder differences; they do not establish that a particular reported
-flashing artifact has been reproduced.
+The library's October 3 checkpoint-selection fix is tested against explicit
+Ref2VA and across all residency policies. A two-image/audio reference case at
+320×320×124, seed 7 and 20 ResMultistep evaluations used identical noise and
+shared text embeddings with ComfyUI `a7169322`:
 
-A longer synthetic RefMod comparison used two encoded images plus stereo audio,
-320×320×124 frames, seed 7, 20 ResMultistep evaluations and caching off. Its 4435
-packed tokens exercise the default INT8 head-major attention path. Both native
-runs used the corrected decoder; only checkpoint selection changed. ComfyUI
-`a7169322` used Ref2VA, identical starting noise and shared native Ref2VA text
-embeddings. Final latent cosine similarities against ComfyUI were:
+| Native checkpoint | Video latent cosine | Audio latent cosine |
+| --- | ---: | ---: |
+| Previous FL2VA default | 0.991144 | 0.726789 |
+| Corrected Ref2VA selection | 0.999855 | 0.981867 |
 
-| Native checkpoint selection | Video | Audio |
-| --- | --- | --- |
-| Previous default, FL2VA | 0.991144 | 0.726789 |
-| Corrected automatic selection, Ref2VA | 0.999855 | 0.981867 |
+That synthetic comparison did not reproduce the reported flashing blocks.
+Precision and reference-augmentation RNG differences remain comparison limits.
 
-Every corrected video latent frame exceeded 0.99975 cosine similarity. Sampled
-frames and temporal-change diagnostics did not isolate the reported flashing
-blocks. This establishes close agreement for this synthetic case, not a
-reproduction of the original failure. Native FP16/INT8 versus ComfyUI BF16/PyTorch
-arithmetic and different reference-augmentation RNGs remain comparison limits.
+### Periodic artifacts and FP32 range
 
-A failed assertion reports the actual and expected digests. Before updating an expected digest
-for an intentional numerical change, validate the new output independently with
-`scripts/parity.py` against diffusers, then edit the constant explicitly.
+The saved 384×256×56 portrait/voice clip reproduces frame-17/34 pulses in both
+ComfyUI's FP16 decoder (`a7169322`) and MiniMax's original FP32 decoder
+(`42ed227e`). Native RGB8 RMSE was 0.1985 against ComfyUI and 0.1469 against the
+original decoder. Tracing confirmed matching chunk trimming and blending;
+a repeated-static-frame control also had smaller periodic reconstruction changes.
+These results exclude the conversion and FP16 decoder precision as explanations
+for this clip, but do not establish denoiser parity. The
+[comparison record](benchmarks/20261004-refmod-flicker.json) retains measurements
+and source hashes.
 
-The GPU suite compares independent scalar CPU references against:
+The October 6 FP32 feed-forward fixes preserve activations reaching 287,332,
+remove FP16 Hadamard scratch and stop clamps from masking NaN/Inf. The real
+replay produced finite latents under a 32 GiB budget. Fixed baseline latents
+decode byte-identically; the temporal pulses remain. See the
+[FP32 validation record](benchmarks/20261006-fp32-feedforward.json).
 
-- GroupNorm and SiLU at zero, small and normal variance.
-- Four experimental 32-key attention layouts with the softmax maximum in the upper key tile.
-- The attention stems the host actually selects — `mha`, `mha8`, `mha64`, `mha648`, `mha64t32` and
-  the text encoder's causal `gqa8c` — against scaled dot-product attention in f64.
-- `prepare_qk_i8`: the Hadamard rotation, int8 quantisation, packing and scales that the int8
-  attention consumes, and `attention_i8qk_mha` against the attention those operands define.
-- The head-major INT8 attention path at 4096, 4097 and 8193 tokens: sampled
-  outputs against scalar CPU attention, partial final tiles, finite outputs
-  throughout and identical results across three launches.
-- Scalar and four-output audio convolutions at eleven boundary lengths, with
-  padding, dilation, residual accumulation and untouched output guards.
-- Float32 matrix multiplication past the former 32,768-row limit.
-- BF16 vision matmul with bias, residual scaling, tanh GELU and erf GELU.
-- RMSNorm, LayerNorm and plain FP16/BF16 preparation at three widths, including
-  large inputs, per-row classes and padded output strides.
-- All three rotary Q/K normalization layouts, including grouped heads and exact V copying.
-- INT4/INT8 production GEMM families, bias, residual classes, SwiGLU ordering
-  and padded input strides on kernels that support them.
-- The f16 and BF16 GEMM families across all three modes and both epilogues.
-- Packed INT4/INT8 attention with four and eight waves, including the INT4 skip decisions.
-- INT4/INT8 preparation against a dense Hadamard reference, including scales and packing.
-- Video convolution with causal time padding, reflected spatial padding, strides,
-  residual addition and untouched output guards.
+## Independent model references
 
-Workspace unit tests cover model shapes, checkpoint layouts, CPU sampling,
-tokenization, compiler/source behavior and dispatch bounds.
-The Rust and Rustler examples are workspace members under `clients/`.
+`scripts/parity.py` is separate from the native suite. It uses cached checkpoints
+and does not download them during validation. Install `numpy` and
+`huggingface_hub`; model-based references additionally need Torch and, where
+applicable, diffusers.
 
-Loom sources are maintained directly. Python generators, reference model
-implementations, wrappers and one-off studies are retired. Historical reports
-remain historical; they are not automatically revalidated by this suite.
-Two checks are anchored genuinely upstream, against the weights MiniMax released
-and the implementation diffusers ships, rather than against ComfyUI's conversion
-or a reimplementation of either.
+| Command | Reference / requirement |
+| --- | --- |
+| `python3 scripts/parity.py gate --require` | Full-model gate against ComfyUI dumps from `scripts/comfy_dump.py`; missing fixtures fail |
+| `python3 scripts/parity.py dit` | Released unquantized BF16 blocks; cached `transformer/` weights (~62 GB), one layer resident at a time |
+| `python3 scripts/parity.py te` | Released Qwen3-VL layers; cached `text_encoder/` weights (~62 GB) |
+| `python3 scripts/parity.py convert` | ConvRot weight conversion against released weights; no GPU |
+| `python3 scripts/parity.py vae` | FP16 native decoder against diffusers and the released VAE (~10 GB) |
 
-`python3 scripts/parity.py dit` runs the host's packed rows through the released
-**unquantized bf16** blocks, one block resident at a time so it costs about a
-gigabyte rather than sixty-two. The host runs ComfyUI's int8 ConvRot conversion of
-those same weights, so the agreement is the quantisation and this implementation
-together: 0.99999 after one block and 0.99865 after all fifty (text 0.9992, audio
-0.9996, video 0.9971). It needs the released `transformer/`, a 62 GB download.
+Recorded checks reached 0.99865 cosine after 50 DiT blocks, 0.99995 after 50 text
+layers, and over 62.5 dB decoder PSNR at 384×320×22. All 200 quantized tensors
+passed the conversion norm check within 1.1e-4. These historical measurements
+include quantization differences and apply to their tested inputs and versions.
 
-`python3 scripts/parity.py te` walks the host's embedding rows through the
-released bf16 Qwen3-VL, the 50 of 64 decoder layers MiniMax-H3 reads before taking
-the unnormalised hidden state: 0.99995 after fifty. One layer resident at a time.
-It needs the released `text_encoder/`, a 62 GB download.
+For an independent whole-block adapter check:
 
-`python3 scripts/parity.py convert` answers the tensor-level question the other
-two cannot: whether ComfyUI's int8 ConvRot conversion carries the weights MiniMax
-released. The conversion rotates within 256-channel groups, quantises, and
-reorders rows for the kernels, so the stored numbers are deliberately not the
-released ones — but a rotation is orthogonal, so row norms survive it, and
-compared as a multiset they survive the reordering too. All 200 quantised tensors
-agree to 1.1e-4; the 150 attention projections keep their rows in place, so their
-group norms match as well, while the SwiGLU projections are the same weights
-permuted. It needs no GPU.
+```sh
+H3_ADAPTER_BLOCK_FIXTURE=build/adapter-blocks scripts/test.sh --adapters
+python3 scripts/adapter_block_reference.py build/adapter-blocks
+```
 
-`python3 scripts/parity.py vae` is the other end: the host's tiled f16 decoder against diffusers' `AutoencoderKLMiniMaxH3` reading the
-weights MiniMax released, rather than against ComfyUI's conversion or a
-reimplementation. It measures the f16 narrowing plus whatever the Loom decoder
-does differently, and clears 62.5 dB PSNR at 384x320x22. It needs `diffusers`,
-`torch` and the released VAE in diffusers layout (the Hugging Face cache or
-`--official DIR`); no
-transformer, so it costs 10 GB rather than 62.
-
-The parity tools use Python with `numpy` and `huggingface_hub` for array and
-cache access; install them with `python3 -m pip install numpy huggingface_hub`.
-They reuse the standard Hugging Face cache and do not download missing
-checkpoints during validation.
-
-Whole-model parity lives in `scripts/parity.py`, outside this suite and outside
-`scripts/test.sh`: it needs the checkpoints, a device and dumps produced by a native
-ComfyUI checkout using `scripts/comfy_dump.py`, and it takes about eleven minutes.
-Run `python3 scripts/parity.py gate --require` before a release. This suite
-establishes the numerical cases above; that script establishes full-model parity.
-
-Still uncovered here, in rough order of how much they matter: the large-token int4 and
-FP16 head-major attention variants (`attention_i4qkl*`, `attention_i4qksl*`,
-`attention_mha64hm32`), and an independent CPU oracle for `prepare_qk_i8hm`;
-the wide and fast decoder GEMMs; the fused decoder QKV GEMM; `norm_mod_f32`; and
-the smaller shape kernels (`layernorm_f32`, `layernorm_f16_f32`, `transpose_f16`,
-`transpose_f32`, `gn_stats_f16`, `prepare_plain16_i8`, `conv1d_s_f32`,
-`rope2d_qkv_f16`, `matmul_bias_f16_wmma_af16_cf16`). The resident Euler sampler is checked bit-for-bit
-against the CPU as a unit test, and its five reference denoise cases were compared
-byte-for-byte against the host sampler it replaced; neither check is in a committed
-harness, so re-run the comparison by hand when that path changes.
+The second command uses Torch on the CPU with original tensor order. It compares
+QKV, attention, complete blocks and projections supplied with native attention
+input. Use a Python environment with the dependencies of the reference tool.
 
 ## Comparing kernel families
 
-Production sources use native Loom templates and specialization. The packed
-256×128 GEMMs share INT4/INT8 bodies through schema providers and required
-unrolling. Float GEMMs share their multiply loop across plain, residual, and
-both SwiGLU orderings within each native element type; preparation shares its
-narrowing or Hadamard/packing finish. Four/eight-wave attention,
-head-64/head-128 rotary normalization and residual video convolution also share
-bodies. The host selects a module and export explicitly; removed filenames have
-no aliases or fallback lookup.
-
-Across both passes, 52 sources become 15 modules, removing 10,086 Loom lines.
-Tile geometry, LDS staging, prefetch and exported binding/configuration contracts
-remain the same. Separate families retain different native element types and
-specialized wide/fast/fused schedules. Vision bias, tanh GELU, and erf GELU
-now share a BF16 module. That step required the
-[VOPD compiler fix](../experiments/vision_gelu_vopd/README.md), which is included
-in the pinned native bundle.
-
-To reproduce the comparison, extract the pre-consolidation sources:
+Production Loom modules share schedules across compatible exports. To compare
+an arithmetic-preserving change, snapshot a baseline with matching bindings and
+configuration, then make one source file per export for the test harness:
 
 ```sh
+# Set BASELINE_COMMIT to the commit before your change.
 mkdir -p build/kernel-baseline
-git archive 62f837d kernels | tar -x -C build/kernel-baseline
+git archive "$BASELINE_COMMIT" kernels | tar -x -C build/kernel-baseline
 export H3_KERNEL_BASELINE="$PWD/build/kernel-baseline/kernels"
-cargo test --test kernels -- --ignored --test-threads=1 --nocapture
-H3_KERNEL_TIMING=1 cargo test --test kernels preparation -- --ignored --test-threads=1 --nocapture
-cargo run --release --bin h3-dev -- compare-gemm "$H3_KERNEL_BASELINE"
-cargo run --release --bin h3-dev -- compare-vision "$H3_KERNEL_BASELINE"
+python3 - <<'PY'
+import os, re
+from pathlib import Path
+root = Path(os.environ['H3_KERNEL_BASELINE'])
+for path in list(root.glob('*.loom')):
+    source = path.read_text()
+    for name in re.findall(r'export\("h3_(\w+)"\)', source):
+        (root / f'{name}.loom').write_text(source)
+PY
+cargo test --locked --test kernels --release -- --ignored --test-threads=1 --nocapture
 ```
 
-The test harness compares every binding bit-for-bit before the independent CPU
-oracle check. Optional timings use ten alternating pairs of resident sequences.
-`compare_gemm` checks decoder-sized matrices with both repeated weights and a
-ring exceeding 64 MiB; its optional second argument filters export names.
-`H3_COMPARE_BATCHES=40` extends its default ten paired batches when investigating
-small differences. Run timings with both CPU and GPU idle: they share memory
-bandwidth on this device. Investigate repeatable slowdowns above 2%.
-
-For a resident decoder comparison, group the original independent exports into
-the new module filenames in the **baseline fixture only**:
+The harness compares every binding byte-for-byte before its CPU-oracle check.
+Use a filtered test if only some exports have a compatible baseline. Intentional
+precision changes need independent validation instead of byte equality.
 
 ```sh
-for module in kernels/*_family.loom kernels/gemm_packed_256.loom; do
-  sed -n 's/.*export("h3_\([^"]*\)").*/\1/p' "$module" |
-    while IFS= read -r entry; do cat "$H3_KERNEL_BASELINE/$entry.loom"; done |
-    awk '!/^amdgpu.target/ || !seen[$0]++' > "$H3_KERNEL_BASELINE/$(basename "$module")"
-done
+H3_KERNEL_TIMING=1 cargo test --locked --test kernels --release preparation -- --ignored --test-threads=1
+cargo run --release --bin h3-dev -- compare-gemm "$H3_KERNEL_BASELINE"
+cargo run --release --bin h3-dev -- compare-vision "$H3_KERNEL_BASELINE"
 cargo run --release --bin h3-dev -- compare-decode \
   "$H3_KERNEL_BASELINE" "$VAE_CHECKPOINT" "$LATENTS_F32" 480 864 22
 ```
 
-Latents are little-endian f32 in `[24, 7, 30, 54]` order for that shape. The
-diagnostic loads both decoders once, warms each, alternates ten timed pairs and
-requires identical decoded RGB for every pair. By default it compares source
-changes with the same host and compiler. Set `H3_BASELINE_LOOM_LIBRARY` to the
-previous compiler shared library to include a compiler upgrade in the comparison.
-Neither mode replaces whole-model parity testing.
+Timings use alternating resident runs with output checks. `compare-gemm` accepts
+an export-name filter and tests repeated weights plus a ring exceeding 64 MiB.
+`H3_COMPARE_BATCHES=40` extends its default ten pairs. The decoder example expects
+little-endian FP32 latents shaped `[24,7,30,54]`; its baseline must contain the
+module filenames selected by the current host. `H3_BASELINE_LOOM_LIBRARY` selects
+a different baseline compiler. Measure on an idle CPU/GPU.
 
-The first consolidation pass on gfx1151 passed all 15 kernel tests with bitwise
-baseline comparison, plus the two resident conditioning/sampler tests. The 480×864,
-22-frame decoder comparison produced identical RGB in all ten pairs: median
-4.542 s before and 4.544 s after (+0.05%). Decoder-sized GEMM comparisons covered
-120 export/shape/cache cases; extending the noisy INT4 SwiGLU cases to 40 pairs
-left no repeatable slowdown above 2%. These measurements used native bundle
-`750f265ce4fd6a194fbac12a795c96cb19cc9ed3696fd5123c5edd5589a4cd05`, compiler SHA-256
-`a2902bba66bec779d95d15f6bac573072c1940dccd34215663c9a59842941dfa`, on 2026-09-09.
-
-The second pass uses bundle
-`34591d78d625f9c696657820d04615f3f55a134010a9354c0e455a4c2e60caa0`, compiler SHA-256
-`74a0c9dc5f387e89b85a3cd9d2000644dc0e20a0657d9fe79dfcd627ff5ecdb6`.
-All 15 GPU kernel tests pass again, including every float GEMM export and all
-three shared vision epilogues, with bitwise baseline and CPU-oracle checks.
-Workspace tests, formatting and Clippy pass. The compiler's available fixture
-corpus passed 550 suites in that historical bundle; its validation record is
-preserved in Git history. Current compiler validation lives in
-[HRX](https://github.com/zacharydenton/hrx-rs/blob/main/patches/loom/README.md).
-
-Resource checks across 36 float export/shape combinations retain the same VGPR
-counts, 55,296 bytes of LDS, no scratch memory, and 64 static WMMA instructions.
-SGPR counts are unchanged except unbiased SwiGLU, which drops from 24 to 22.
-
-Second-pass resident timings on 2026-09-09 compare original sources with shared
-modules using the same corrected compiler. Every case checks bitwise output:
-
-| Family | Shape/cache cases | Candidate time change |
-| --- | ---: | ---: |
-| Vision bias / GELU / erf GELU | 30 | −2.56% to +1.20% |
-| FP16 GEMM | 36 | −1.08% to +0.43% |
-| BF16 GEMM | 36 | −0.39% to +1.54% |
-
-Vision and FP16 use ten paired batches; BF16 uses forty. Competing memory-heavy
-jobs caused larger BF16 outliers in earlier runs. The table uses the final full
-BF16 run with its plain exports rechecked as a group after competing GPU work
-ended. No slowdown above 2% repeated. These are source-consolidation comparisons,
-not peak-throughput measurements.
-
-The resident 480×864, 22-frame decoder also produces identical RGB in all ten
-pairs when comparing the original sources and previous bundle's compiler with
-the new sources and compiler. Median times were 4.884 s before and 4.862 s after
-(−0.44%). One baseline execution took 31.533 s on the shared machine, so this
-run establishes output equivalence and gives only a coarse timing check; it
-does not establish an end-to-end speedup.
+The [September consolidation measurements](https://github.com/zacharydenton/h3-hrx/blob/3399b13/docs/testing.md#comparing-kernel-families)
+retain old compiler hashes and timing data. Compiler regression probes remain
+under `experiments/`, including the
+[VOPD reproduction](../experiments/vision_gelu_vopd/README.md).
 
 ## Optional prompt generation and reference presentation
 
-The CPU suite uses local HTTP stubs for the two-stage prompt processor, repair
-limits, multimodal payloads, endpoint errors and credential redaction. A CLI test
-runs `h3 prompt` against an empty offline model cache and verifies stdout and saved
-provenance. No live LLM service is needed. Feature checks include a library without
-default features, a CLI without `prompt-generation`, and the endpoint-enabled library.
+CPU tests use local HTTP stubs for prompt formatting, repair limits, multimodal
+payloads, endpoint errors and credential redaction. CLI tests run against an
+empty offline model cache. No live LLM service is required.
 
-Pinned ComfyUI fixtures in `tests/fixtures/presentation` independently check video
-temporal patches, token IDs, odd-frame padding, timestamps and modality tags.
-The explicit presentation API follows Qwen3-VL's 0.5 normalization; existing
-`Session::denoise` image preprocessing stays unchanged.
+Pinned [presentation fixtures](../tests/fixtures/presentation/README.md) check
+video patches, token IDs, odd-frame padding, timestamps and modality tags.
+RefMod checks cover strengths, disabled members, copy sharing, ordering,
+original sources, capability preflight and media budgets.
 
 ```sh
+cargo test --locked --lib --release prompt::tests::native_refmod_ -- --ignored --test-threads=1
 cargo test --release --test refmod effective_refmod_reconstruction -- --ignored --test-threads=1
 cargo test --release --test refmod presented_video -- --ignored --test-threads=1
+python3 scripts/test_optimization_benchmark.py
 ```
 
-The first GPU test reconstructs strength-adjusted visual/audio members and checks
-single-frame, stacked and ordinary video grids. The second performs generation
-with video/audio references and confirms that changing the second temporal frame
-changes the result. These tests establish wiring and local numerical behavior;
-they do not establish prompt quality or full-model parity with the proprietary
-Context-IR service. Evaluate the configured endpoint separately on text, keyframes,
-identity references, voices, video motion and RefMod bundles using fixed generation
-settings and explicit instruction-preservation review.
+Hardware checks reconstruct visual/audio members and verify that changing a
+presented video frame changes generation. They validate wiring and numerical
+behavior; prompt quality needs evaluation with the configured endpoint.
 
 ## H3-World
 
-`tests/world.rs` checks all 512 keyboard states and tokenization against pinned
-upstream fixtures, plus Pillow cover-resize fixtures and CLI validation.
-`world_attention_matches_directed_cpu_oracle` in `tests/kernels.rs` exercises
-both masked FP16 launch sizes, padding and changed routing against a CPU oracle.
-Run `cargo test --test world world_changes_actions_and_reuses_a_session -- --ignored`
-with the base and pinned world adapter cached to compare left/right/left requests
-in one stage-scoped session. This test validates action-sensitive latents and
-repeatability, not directional video quality. `scripts/test.sh --full` includes this
-test and therefore also requires the pinned world adapter in the cache. See
-[world generation](world.md).
+`tests/world.rs` checks all 512 keyboard states against pinned upstream tokens,
+resize fixtures and CLI validation. GPU tests cover directed attention and
+left/right/left requests in one session. Rollout tests cover persistence,
+branching, last-frame handoff, seed/frame accounting, rollback and writer locks.
 
-World rollout CPU tests cover lossless checkpoint round trips, exact last-frame
-handoff, seed/frame accounting, branching, failure/cancellation rollback,
-corrupt and oversized input rejection, command parsing and exclusive state
-writers. `world_rollout_decodes_and_resumes` exercises two decoded segments
-through a budgeted session and resumes the second from a serialized observation.
-These verify the continuation mechanism; they do not establish long-horizon
-scene or physics consistency.
+`world_rollout_decodes_and_resumes` runs two decoded segments through a budgeted
+session. These tests are in the full tier and require the pinned world adapter.
+See [world validation](world.md#validation) for observed action response and
+remaining visual-quality limits.

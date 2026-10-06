@@ -1,8 +1,8 @@
 # RefMods
 
 RefMods store encoded image and audio references for reuse during generation.
-Creation uses the native H3 VAEs. Loading needs no source media or VAE encoding.
-The output decoders still need their respective VAEs when producing video/audio.
+Creation uses the H3 VAEs. Loading reuses the stored latents; output decoding
+still needs the video/audio VAEs.
 
 Only current embedded-metadata standalone v4 and bundle v5 safetensors files are
 supported. Legacy sidecars, older format versions, and LoRA hybrid containers
@@ -70,9 +70,9 @@ blend toward a blurred latent using upstream constant-strength semantics. Copies
 repeat reference blocks and increase attention cost, while sharing host latent
 storage. The optional total token limit counts selected members and copies.
 
-Refmods are appended after raw image/audio references in file/member order.
-Active refmods select ref2va weights by default. `--dit` and `--base-weights`
-retain their usual meaning; Turbo cannot use active refmods. Pre-encoded visual
+RefMods follow raw references in file/member order and select Ref2VA by default.
+`--dit` and `--base-weights` override model selection; Turbo cannot use active RefMods.
+Pre-encoded visual
 members have no original pixels to send through the vision tower, so no picture
 placeholders or prompt text are inserted. Describe the desired subjects and
 sounds explicitly in the prompt; member descriptions are printed as hints.
@@ -99,24 +99,16 @@ h3 --base-weights --first-frame opening.png \
   --out clip.mp4
 ```
 
-This keeps the first frame on the target timeline at frame zero and appends
-RefMod blocks separately. References do not replace the keyframe or shift its
-anchor away from the target's first frame. With upstream presentation, both the
-first frame and RefMod visuals reach H3's text/vision encoder. Endpoint rewriting
-uses the six-section reference format and distinguishes keyframe composition
+The keyframe anchors frame zero; RefMods supply separate reference blocks.
+Upstream presentation sends both keyframe and reference visuals to the encoder.
+Endpoint rewriting uses the six-section reference format and distinguishes keyframe composition
 from the RefMod's requested identity, appearance or sound. Supply the manifest's
 actual labels when writing a prompt manually; stacks use `<Video N>` labels.
 For a bundle containing audio, endpoint prompting also needs `--prompt-audio`.
 
-The community [combined I2V/reference node](https://github.com/BigStationW/ComfyUi-MiniMax-H3-Image-And-Reference-To-Video)
-uses separate keyframe and reference payloads plus joint vision presentation;
-its author recommends hybrid weights. A separate [same-input checkpoint comparison](https://www.reddit.com/r/StableDiffusion/comments/1vr5ezm/minimax_h3_multiple_reference_images_working/)
-reports extra references working with stock FL2VA. That comparison uses raw
-images, not stored RefMods; applying it to RefMods follows from their use of the
-same reference-block mechanism. Reference fidelity with stock FL2VA is not
-guaranteed by that single example, and this project's combined path has CPU
-regression coverage, not a new GPU quality comparison. RefMod tokens still add
-attention work; choosing FL2VA does not remove that cost.
+The combined path has CPU regression coverage; reference fidelity with stock
+FL2VA still needs visual qualification. RefMod tokens add attention work with
+either checkpoint.
 
 ## Upstream presentation
 
@@ -193,9 +185,7 @@ remain unchanged, and originals are never VAE-encoded.
 
 Unmapped active members still use VAE reconstruction. When every active member
 has an original source, endpoint `h3 prompt` needs no H3 checkpoints or GPU.
-Normal video generation still needs its model and output decoder. File decoding,
-resizing and endpoint media serialization remain; the skipped step is latent-to-
-pixel VAE reconstruction. Source decoding is bounded by the shared
+Video generation still needs its model and output decoder. Source decoding is bounded by the shared
 `--refmod-media-budget-mib` limit (default 1024 MiB), excluding codec subprocess
 memory, models and endpoint payloads. Oversized sources fail rather than truncate.
 
@@ -223,12 +213,11 @@ For originals, pass decoded `RefModSource` values to
 `refmod::entries_from_sources` assembles fully supplied references without a
 session. Both return the same ordered `MediaEntry` list for prompting and H3
 presentation. `PreparedRefMod::indexed_members()` exposes stable original member
-numbers, including copies. Filesystem decoding remains a CLI concern.
+numbers, including copies.
 For endpoint prompting in one call, use
 `PromptGenerator::generate_refmods_with_sources(None, request, &sources)` when
 all active members have originals, or pass `Some(&mut session)` for partial
-coverage. The result includes the prompt and matching H3 presentation; see the
-[Rust original-media example](prompting.md#native-rust-refmod-prompting).
+coverage. See the [Rust original-media example](prompting.md#native-rust-refmod-prompting).
 
 With `Config::dit = None` and the default `base_weights: false`, `Session::denoise`
 selects Ref2VA whenever its reference list is nonempty. Set `base_weights: true`

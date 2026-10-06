@@ -1,18 +1,16 @@
 # Writing prompts for H3
 
-H3 was trained on structured prompts, not free-form sentences. MiniMax publishes the format it expects as a
-skill in the model repository, [`skills/h3-prompt-writing`](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills/h3-prompt-writing);
-`references/base-en.txt` covers the text and keyframe modes and `references/ref-en.txt` the full-reference one.
-This page is the short version plus the prompt behind the clip at the top of the README. Without `--generate-prompt`, the prompt is passed to the text encoder verbatim,
-on stdin or after `-p`. Optional endpoint-based rewriting validates the generated format.
+H3 expects structured prompts. MiniMax's
+[prompt-writing guide](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills/h3-prompt-writing)
+covers text/keyframe modes in `references/base-en.txt` and reference mode in
+`references/ref-en.txt`. Supply text on stdin or with `-p`; h3 passes it verbatim
+unless `--generate-prompt` is enabled.
 
 ## Optional prompt generation
 
-The default CLI includes a custom processor that follows MiniMax's published
-[base](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md)
-and [reference](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md)
-guides. It is not the proprietary MiniMax Context-IR service. It first analyzes
-reference evidence, then rewrites your instruction into the appropriate H3 format.
+The optional processor analyzes reference media, then writes an H3 prompt through
+a configured endpoint. It follows MiniMax's format guides; it is not the
+proprietary Context-IR service.
 
 Configure an OpenAI-compatible Chat Completions endpoint. The URL includes its
 API prefix; the client appends `/chat/completions`:
@@ -73,10 +71,9 @@ stop before denoising, without silently truncating references or reverting to th
 original instruction. Long video presentations can exhaust the 4096-token budget:
 use shorter/smaller references or a smaller canvas, then rerun.
 
-The endpoint has a 300-second request timeout and no automatic HTTP retries.
-Generation uses two successful endpoint requests, or three when repair is needed.
-There is no built-in model download, model choice, or claim of official Context-IR
-quality. Assess instruction preservation and video quality with your chosen model.
+Requests have a 300-second timeout and no automatic HTTP retries. Prompt generation
+uses two endpoint calls, or three if format repair is needed. Evaluate instruction
+preservation and output quality with your chosen model.
 
 ### Native Rust RefMod prompting
 
@@ -121,61 +118,17 @@ fail before contacting the endpoint. Pass `Some(&mut session)` to reconstruct
 unmapped members through the VAEs. Original media changes presentation only;
 use the same RefMods, ordering and preparation options for latent conditioning.
 
-With the `prompt-generation` feature, `PromptGenerator::generate_refmods` accepts
-prepared RefMods directly. It decodes their effective image/video/audio latents
-through the local VAEs, calls the configured endpoint, and returns the final prompt
-plus its matching `PreparedPresentation`. Original source files are unnecessary.
-The CLI uses the same native reconstruction method, `Session::refmod_entries`.
+`PromptGenerator::generate_refmods(&mut session, request)` reconstructs every
+active member through the local VAEs before calling the endpoint. Both methods
+return the prompt and matching `PreparedPresentation`; pass that presentation and
+the same prepared references to `Session::denoise_presented`.
 
-```rust,no_run
-use h3_hrx::{Config, DenoiseParams, ResidencyPolicy, Session, SessionOptions, shape_for};
-use h3_hrx::prompt::{EndpointConfig, PromptGenerator, RefModPromptRequest};
-use h3_hrx::refmod::{ApplyOptions, RefMod, RefModPresentationOptions};
-# fn main() -> Result<(), Box<dyn std::error::Error>> {
-let file = RefMod::load("character-with-voice.safetensors")?;
-let mods = [file.prepare(ApplyOptions::default())?];
-let mut endpoint = EndpointConfig::new(
-    "http://localhost:8000/v1".into(), "your-multimodal-model".into(),
-);
-endpoint.images = true;
-endpoint.audio = true;
-let generator = PromptGenerator::new(endpoint)?;
-let budget = hrx::residency::ResidencyManager::new(8 * 1024 * 1024 * 1024)?;
-let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
-    memory_budget: Some(budget.budget()),
-    ..Default::default()
-})?;
-// Safety: checkpoint files remain unchanged while the session exists.
-let mut session = unsafe { Session::new_in(Config::default(), SessionOptions {
-    residency: ResidencyPolicy::StageScoped,
-    ..Default::default()
-}, &context) }?;
-let params = DenoiseParams::default();
-let shape = shape_for(params.height, params.width, params.frames).ok_or("invalid output shape")?;
-let generated = generator.generate_refmods(&mut session, RefModPromptRequest {
-    instruction: "The referenced character greets the viewer",
-    entries: &[], // Optional raw media goes before RefMod members.
-    refmods: &mods,
-    shape: &shape,
-    presentation: RefModPresentationOptions::default(),
-})?;
-println!("{}", generated.prompt.text);
-let references: Vec<_> = mods.iter().flat_map(|m| m.references()).collect();
-// In an inference session with enough memory for H3, pass generated.presentation
-// and these same references to Session::denoise_presented.
-# let _ = references;
-# Ok(()) }
-```
-
-The 8 GiB model allocation cap above is for small-reference prompt preparation;
-full H3 inference needs a larger budget. Reconstruction defaults to a conservative
-1 GiB host float-media budget and synthetic 24 fps playback. Set
-`RefModPresentationOptions::{max_media_bytes, fps}` explicitly to change those
-limits (CLI: `--refmod-media-budget-mib` and `--reference-fps`). The host media budget excludes model weights, GPU scratch, encoded HTTP
-payloads and the later vision presentation. Copies share decoded buffers; disabled
-members need neither decoding nor endpoint media support. Capability and media
-budget failures stop before reconstruction. Keep the prepared RefMods and their
-ordering unchanged when using the returned presentation for inference.
+`RefModPresentationOptions::{max_media_bytes, fps}` controls the host float-media
+budget (default 1 GiB) and reconstructed playback rate (default 24 fps). Copies
+share decoded buffers; disabled members are skipped. The host budget excludes
+GPU allocations and serialized endpoint payloads. See
+[RefMod presentation](refmods.md#upstream-presentation) and
+[session memory budgets](runtime-options.md#shared-allocation-budgets).
 
 ## The three fields
 
@@ -228,9 +181,9 @@ For the target video, at 0.00 seconds into the target video, <Picture 1> (from [
   "beautiful" or "epic". `Cinematic` is the exception: it is one of the named styles and belongs in the opening
   clause of `[Shot 1]`.
 
-## The README clip
+## Cliff rider example
 
-The prompt is [cliff_rider_768p.txt](prompts/cliff_rider_768p.txt), and this reproduces the clip:
+This single-shot example separates wind and hooves from its orchestral score:
 
 ```sh
 h3 --width 1344 --height 768 --frames 124 --steps 31 --seed 7 \
@@ -238,8 +191,3 @@ h3 --width 1344 --height 768 --frames 124 --steps 31 --seed 7 \
 ```
 
 ![cliff rider](media/cliff_rider_768p_strip.jpg)
-
-It is a single 5-second shot with no dialogue, so it carries no speaker IDs; the wind and hooves are diegetic
-and the brass and timpani are not. Measured 2026-09-07 on the Radeon 8060S with `H3_PROFILE=1`: 101.8 s per
-evaluation, steady across the last ten of the 30 evaluations, and 82.8 s to decode. That is one run, and the
-decode figure has no second sample; [the decoder report](archive/vae-30s.md) has the decoder's own measurements and method.

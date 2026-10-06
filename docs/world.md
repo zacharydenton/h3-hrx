@@ -7,12 +7,9 @@ description, and a recorded action schedule. `h3 world-session` adds continued
 interaction: generate a segment, observe its result, choose the next controls,
 and resume from the last decoded frame.
 
-The paper itself uses fixed-horizon, bidirectional generation and identifies
-persistent world state and real-time interaction as future work (section 5).
-Our continuation layer is an application extension of that released model.
-It retains the current RGB observation, not a recurrent hidden state, 3D scene,
-physics engine, motion history, or memory of objects outside the view. Continuity
-can drift across segments; each step still requires full diffusion inference.
+Continuation is an application extension: each segment starts from the last RGB
+observation and requires full diffusion inference. It carries no recurrent world
+state or off-screen memory, so continuity can drift across segments.
 
 ```sh
 h3 world --first-frame garage.png \
@@ -193,95 +190,37 @@ the base weights here are quantized. For visual qualification, hold the image,
 seed and sampler fixed and compare still/forward, opposing pans, slow/fast pans,
 and a reversal after latent interval 15. Preserve the `.world.json` records.
 
-On a shared machine, inspect available RAM before starting. For example,
-`--memory-budget-mib 28672` caps this session's native allocations at 28 GiB;
-leave additional space for host staging and other processes. The integration
-test uses the same native allocation ceiling and runs its requests serially.
+### Recorded runs, 2026-10-03
 
-### Observed validation, 2026-10-03
+Linux/gfx1151, HRX 0.8.7, quantized FL2VA and the released rank-32 adapter.
+The 64×64×5 left/right/left regression passed exact repeatability. Visual runs
+used the authors' first-frame image, 320×192, 50 Euler evaluations, shifts 12/3,
+and a 28 GiB native allocation ceiling:
 
-On Linux/gfx1151 (AMD Strix Halo, 128 GiB shared RAM), HRX 0.8.7 and
-Rust 1.95.0-nightly, the CPU suite passed 204 tests including doctests. The
-native masked-attention oracle passed both launch sizes. The full-model
-64×64, five-frame, one-evaluation left/right/left regression passed, including
-exact repeatability, in 848 seconds with stage-scoped residency.
+| Run | Frames | Seed | Wall time | Cumulative background flow x |
+| --- | ---: | ---: | ---: | ---: |
+| Pan left | 22 | 2 | 528 s | +55.66 px |
+| Pan right | 22 | 2 | 528 s | −17.37 px |
+| Session: initial left pan | 22 | 2 | 580 s | +55.56 px |
+| Session: resumed right pan | 22 | 3 | 586 s | −54.81 px |
+| Left-fast, then right-fast at frame 51 | 124 | 2 | 630 s | +85.27 px before; −60.76 px after |
 
-Two visual smoke runs used the authors' `examples/first_frame.png`, seed 2,
-320×192, 22 frames, 50 Euler evaluations, default 12/3 shifts, the quantized
-FL2VA base, and the released adapter. Both produced video with sound:
+Flow used Farneback on grayscale frames (`0.5,3,15,3,5,1.2,0`), averaged over
+background crop `[12:85,12:308]` and summed across transitions. Positive flow
+corresponds to a left camera pan. The reversal's second sum includes entry into
+frame 51.
 
-| Control | Wall time | Minimum system RAM available | Cumulative background flow x |
-| --- | ---: | ---: | ---: |
-| pan-left | 528 s | 11.15 GiB | +55.66 px |
-| pan-right | 528 s | 11.47 GiB | −17.37 px |
+Save/resume preserved the scene, observation hashes and cursor (frame 42, next
+seed 4). The resumed first compressed frame differed from its input by 4.82 RGB8
+levels on average. Scene continuity was visually plausible over two segments;
+it does not establish long-horizon consistency. The reversal clip showed
+subject ghosting and lighting artifacts.
 
-These runs were serial with a 28 GiB native allocation ceiling. The garage
-remained visually coherent and the opposite flow signs matched the requested
-camera directions; pan magnitudes were asymmetric. Flow used OpenCV 5 Farneback
-on successive grayscale frames (`0.5,3,15,3,5,1.2,0`), averaging the upper
-background crop `[12:85,12:308]`, then summing across transitions. Positive
-background motion corresponds to a left camera pan.
+The 832×480×124 run was stopped after its first evaluation and produced no
+completed clip. Full-size quality and upstream BF16 numerical parity remain
+unqualified. These runs also precede the FP32 feed-forward fixes.
 
-An 832×480, 124-frame run successfully loaded and sampled under the same cap,
-with at least 10.26 GiB available, but was interrupted after the initial
-144-second evaluation because of runtime on the shared GPU. It did not produce
-a completed clip. Full-size quality, still/forward, speed changes,
-and upstream BF16 numerical parity remain unqualified. The short opposing-pan
-checks establish native action response, not reproduction of the paper's results.
-
-Local smoke artifacts and provenance are under `target/world-smoke/`; they are
-build artifacts, not checked-in media. Reproduce the small run by adding
-`--width 320 --height 192 --frames 22 --memory-budget-mib 28672` to the example
-above, using `pan-left` and `pan-right` with seed 2.
-
-### Continued-session validation, 2026-10-03
-
-The extended CPU suite passes 210 tests, including state persistence, branching,
-failure rollback, writer locking and optional endpoint scene preparation. Builds without default features, both with
-and without the CLI, also pass.
-
-A real `world-session` run generated a 320×192, 22-frame left pan, exited, then
-resumed in a new process and generated a right pan from its saved observation.
-Both used 50 Euler evaluations and the same scene description; the seeds were
-2 then 3. The scene and character remained visually consistent across the handoff.
-
-| Segment | Wall time | Minimum system RAM available | Cumulative background flow x |
-| --- | ---: | ---: | ---: |
-| Initial left pan | 580 s | 11.33 GiB | +55.56 px |
-| Resumed right pan | 586 s | 9.74 GiB | −54.81 px |
-
-Both ran serially with a 28 GiB native ceiling. A monitor would stop only our
-process if available system RAM stayed below 6 GiB; no stop was triggered. The
-second segment's recorded input SHA-256 matches the first segment's checkpoint.
-The saved observations match their lossless PNGs exactly. The final cursor is
-frame 42 with next seed 4; the checkpoint is about 185 KB. The resumed clip's
-first compressed video frame differs from its input observation by a mean of
-4.82 RGB8 levels, so the model handoff is not pixel-exact. Flow used the same
-settings and crop described above.
-
-Artifacts, contact sheets, provenance and resource records are in
-`target/world-rollout-smoke/`. This checks continued action response and
-save/resume behavior over two segments, not persistent off-screen state or
-long-horizon consistency. The separate ignored `world_rollout_decodes_and_resumes`
-regression uses a 64×64, five-frame case and is included in `scripts/test.sh --full`.
-
-### Temporal reversal validation, 2026-10-03
-
-A 320×192, 124-frame clip used the paper's 37 action intervals: left-fast for
-the first 15 intervals (RGB frames 0–50), then right-fast for the remaining 22
-(frames 51–123). With seed 2 and 50 Euler evaluations, cumulative background
-flow was **+85.27 px before the switch and −60.76 px afterward**, using the
-same Farneback settings and background crop. The transition into frame 51 is
-included in the second sum. The requested reversal is visible in the video.
-
-The run completed in 630 seconds with a 28 GiB native ceiling and at least
-10.17 GiB of system RAM available. An earlier 26 GiB attempt was rejected by
-the allocation budget during conditioning; it did not sample a clip. The
-successful retry began after available RAM recovered, with the 6 GiB guard
-unchanged. Artifacts and both resource records are in
+[Full measurement record](https://github.com/zacharydenton/h3-hrx/blob/3399b13/docs/world.md#observed-validation-2026-10-03)
+includes memory observations and provenance. Local artifacts are under
+`target/world-smoke/`, `target/world-rollout-smoke/` and
 `target/world-temporal-smoke/`.
-
-This demonstrates within-segment action timing on the native path. The reduced
-resolution clip also shows subject ghosting and lighting artifacts. It is not
-a visual-quality reproduction of the authors' 832×480 BF16 results, and does not
-remove the full-size or numerical-parity qualification limits above.

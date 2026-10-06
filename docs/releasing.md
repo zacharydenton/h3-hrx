@@ -1,29 +1,8 @@
 # Releasing h3-hrx
 
-## Identity and discovery
-
-- Repository and Cargo package: `h3-hrx`.
-- CLI: `h3`; Rust library: `h3_hrx`; diagnostics: `h3-dev`.
-- Tagline: **MiniMax H3 video and audio generation on AMD Strix Halo, powered by Loom and HRX.**
-- Repository: <https://github.com/zacharydenton/h3-hrx>.
-
-GitHub topics:
-
-```text
-loom, hrx, strix-halo, amd, minimax-h3, hailuo, video-generation,
-audio-generation, text-to-video, image-to-video, generative-ai,
-diffusion-models, gpu-computing, inference, comfyui
-```
-
-Cargo keywords live in `Cargo.toml`. Keep the package description, README
-tagline, CLI help, and GitHub description consistent. Use Strix Halo in
-prominent copy; Radeon 8060S and `gfx1151` identify the tested device in
-technical requirements. Describe benchmark results as recorded measurements
-with their dimensions, precision, hardware, and timing boundaries.
-
 ## Validation
 
-From the repository root, using a current stable Rust toolchain:
+Run from a clean checkout with a current stable Rust toolchain:
 
 ```sh
 bash scripts/test.sh --cpu
@@ -34,25 +13,22 @@ RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 cargo package --locked
 ```
 
-`cargo package` verifies that the packaged source builds, including the embedded
-Loom kernels and tokenizer. Use `--allow-dirty` only for local preparation;
-build the final package from a clean commit. Client examples and historical
-experiments are not part of the published crate. CPU CI runs the checks above.
+CPU CI runs these checks. Packaging verifies that the embedded kernels and
+tokenizer are included and the package builds.
 
-On the supported Strix Halo system, with the native bundle and checkpoints:
+On Strix Halo with the native bundle, checkpoints and reference dumps available:
 
 ```sh
 bash scripts/test.sh --full
+bash scripts/test.sh --adapters
 python3 scripts/parity.py gate --require
 ```
 
-The parity gate also needs ComfyUI reference dumps. See
-[test coverage](testing.md) and `scripts/comfy_dump.py`; missing fixtures are
-a failed gate. Python is used for this optional reference-validation tooling,
-not for inference. Record the commit, toolchain, native bundle, GPU, and results.
-Do not describe CPU-only validation as a fully validated model release.
+The parity gate needs ComfyUI dumps from `scripts/comfy_dump.py`; missing fixtures
+fail the gate. See [test coverage](testing.md) for dependencies and limits.
+Record the commit, toolchain, native bundle, GPU and results.
 
-Install the final package and run the README example on the supported hardware:
+Install and run a complete clip before publishing:
 
 ```sh
 cargo install --locked --path . --bin h3
@@ -63,13 +39,11 @@ h3 --width 864 --height 480 --frames 124 --steps 31 --seed 7 \
 
 ## Publication
 
-Confirm the intended version, Apache-2.0 code license, separate model terms,
-bundled-asset attribution, README links, and package contents. Review tracked
-files and Git history for credentials and private data before making the
-repository public. Keep scratch renders, checkpoints, and local configuration out of the repository.
-Curated showcase clips belong under `docs/media/`, with their prompts and settings
-documented; they are excluded from the source package.
+Check the version, package contents, README links, Apache-2.0 code license,
+separate model terms and [asset attribution](../assets/README.md).
+Keep checkpoints, scratch renders and local configuration out of the package.
+Curated media belongs in `docs/media/`, with settings in the showcase.
 
-Prepare release notes with supported hardware, limitations, and actual validation
-results. Publishing a crate, creating a release tag, and changing repository
-visibility are separate release actions after preparation and validation.
+Release notes should state supported hardware, remaining limitations and the
+checks actually run. Publishing a crate and creating a release tag are separate
+actions from preparing and validating the source.

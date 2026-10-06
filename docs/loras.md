@@ -30,8 +30,8 @@ model architectures and naming conventions are not translated.
 The original quantized base weights remain intact. Native BF16 branches evaluate
 the weighted low-rank updates in the original weight basis before the projection's
 activation or residual gate. Multiple adapters concatenate their ranks, giving
-the sum of their updates with the native FP16/BF16 rounding boundaries. Ranks are
-padded for the kernels; the combined rank per projection is limited to 32,768.
+the sum of their updates. Rank projections, deltas and SwiGLU products retain
+FP32 range; matrix operands narrow to BF16. Ranks are padded for the kernels; the combined rank per projection is limited to 32,768.
 Missing projections use their original base path. Files must remain unchanged
 for the lifetime of a session. Custom LoRAs cannot be combined with a Turbo preset.
 

@@ -118,4 +118,4 @@ comparison method are recorded in the [native 768p evaluation](benchmarks/202609
 
 The original [cliff-rider demo](https://github.com/user-attachments/assets/41a98dcf-48f0-4328-a0f4-7f17119243e6)
 uses 1344×768 and 30 evaluations; its prompt and settings are in the
-[prompt guide](prompting.md#the-readme-clip).
+[prompt guide](prompting.md#cliff-rider-example).
