@@ -157,8 +157,10 @@ H3_PROFILE=device H3_COMPILE_REPORT_DIR=target/h3-reports cargo bench --bench ke
 ```
 
 GEMM cases include DiT QKV, FFN and down-projection dimensions at 256 and 2,048
-rows. They use the runtime's operand pitches, direct buffer initialization and
-a 512 MiB GPU allocation budget. Setup and output readback stay outside timing.
+rows. Residual down projections also cover 4,096 rows, with cached and rotating
+weights; their residual is reset outside timing before each iteration. Cases use
+the runtime's operand pitches, direct buffer initialization and a 512 MiB GPU
+allocation budget. Setup and output readback stay outside timing.
 `prepare_qk_i8` cases cover token-major and head-major operands at 1, 257, 2,048
 and 8,192 tokens with the same allocation cap and HRX profiling support.
 `transpose_v_f16` covers 1, 257, 2,048 and 8,192 tokens, checking exact half bits

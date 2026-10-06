@@ -1009,6 +1009,92 @@ fn hadamard(i: usize, j: usize) -> f64 {
     }
 }
 
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
+fn dit_down_projection_matches_integer_dots_with_a_partial_tile() {
+    use h3_hrx::dispatch::{Classes, Gemm, Tile};
+    use h3_hrx::model::{gemm_pitch, FFN, HID};
+    let manager = hrx::residency::ResidencyManager::new(256 << 20).unwrap();
+    let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+    let compiler =
+        h3_hrx::compile::Compiler::new(None, Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels"));
+    let (m, stride) = (257usize, gemm_pitch(FFN, 8));
+    let op = Gemm::build(
+        &compiler,
+        &mut stream,
+        "resid",
+        "i8",
+        false,
+        true,
+        FFN,
+        HID,
+        m,
+        2,
+        stride,
+        Tile::Plain,
+        0,
+    )
+    .unwrap();
+    compiler.flush(&mut stream).unwrap();
+    let a: Vec<i8> = (0..m * stride).map(|i| (i * 37 % 15) as i8 - 7).collect();
+    let w: Vec<i8> = (0..HID * stride).map(|i| (i * 13 % 17) as i8 - 8).collect();
+    let residual: Vec<f32> = (0..m * HID + 16)
+        .map(|i| (i % 17) as f32 / 16.0 - 0.5)
+        .collect();
+    let gates: Vec<f32> = (0..2 * HID)
+        .map(|i| if i < HID { 0.5 } else { -0.25 })
+        .collect();
+    let aq = stream.allocate_from(&bytes(&a)).unwrap();
+    let wq = stream.allocate_from(&bytes(&w)).unwrap();
+    let ws = stream
+        .allocate_from(&bytes(&vec![1.0f32 / 64.0; HID]))
+        .unwrap();
+    let as_ = stream
+        .allocate_from(&bytes(&vec![1.0f32 / 32.0; m]))
+        .unwrap();
+    let gate = stream.allocate_from(&bytes(&gates)).unwrap();
+    let out = stream.allocate_from(&bytes(&residual)).unwrap();
+    let mut classes = Classes::zeroed(&mut stream, m).unwrap();
+    classes
+        .write(
+            &mut stream,
+            &(0..m).map(|i| (i % 2) as i32).collect::<Vec<_>>(),
+            2,
+        )
+        .unwrap();
+    op.run(
+        &mut stream,
+        None,
+        "down projection",
+        m as u32,
+        aq.binding(),
+        wq.binding(),
+        Some((ws.binding(), as_.binding())),
+        out.binding(),
+        Some((gate.binding(), classes.all())),
+        None,
+    )
+    .unwrap();
+    let mut actual = vec![0.0f32; residual.len()];
+    stream
+        .read_blocking(out.binding(), bytemuck::cast_slice_mut(&mut actual))
+        .unwrap();
+    for row in [0, 1, 127, 255, 256] {
+        for col in [0, 1, 63, 64, 127, 128, HID - 1] {
+            let dot: i32 = (0..FFN)
+                .map(|k| i32::from(a[row * stride + k]) * i32::from(w[col * stride + k]))
+                .sum();
+            let expected =
+                residual[row * HID + col] + dot as f32 / 2048.0 * gates[(row % 2) * HID + col];
+            assert_eq!(actual[row * HID + col], expected, "row={row} col={col}");
+        }
+    }
+    assert_eq!(&actual[m * HID..], &residual[m * HID..]);
+}
+
 /// What `prepare_qk_i8` is defined to produce: per (token, head) mean-subtract, rotate by the
 /// Hadamard, quantise to int8 against the row maximum, pack four codes per word, and report the
 /// scale the attention kernel multiplies back in. Returns (packed words, scales, integer codes).

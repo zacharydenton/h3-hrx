@@ -294,8 +294,10 @@ fn gemm(c: &mut Criterion) {
                     ("f32", m, HID, QKV),
                     ("swiglu", m, HID, 2 * FFN),
                     ("f32", m, FFN, HID),
+                    ("resid", m, FFN, HID),
                 ]);
             }
+            shapes.push(("resid", 4096, FFN, HID));
         }
         for (mode, m, k, n) in shapes {
             for rotating in [false, true] {
@@ -337,6 +339,11 @@ fn gemm(c: &mut Criterion) {
                     let as_ = upload(&mut stream, bytemuck::cast_slice(&vec![0.01f32; m]));
                     let width = if mode == "swiglu" { n / 2 } else { n };
                     let out = stream.allocate_zeroed(m * width * 4).unwrap();
+                    let residual = (mode == "resid").then(|| {
+                        let gate = upload(&mut stream, bytemuck::cast_slice(&vec![0.75f32; n]));
+                        let classes = h3_hrx::dispatch::Classes::zeroed(&mut stream, m).unwrap();
+                        (gate, classes)
+                    });
                     let mut profile = h3_hrx::dispatch::Profile::from_env();
                     let mut run = |stream: &mut Stream, index: usize| {
                         gemm.run(
@@ -348,7 +355,9 @@ fn gemm(c: &mut Criterion) {
                             ring[index].binding(),
                             (elem == "i8").then(|| (ws.binding(), as_.binding())),
                             out.binding(),
-                            None,
+                            residual
+                                .as_ref()
+                                .map(|(gate, classes)| (gate.binding(), classes.all())),
                             None,
                         )
                         .unwrap();
@@ -357,10 +366,26 @@ fn gemm(c: &mut Criterion) {
                     run(&mut stream, 0);
                     let expected = check_f32(&mut stream, &out);
                     let mut index = 0;
-                    b.iter(|| {
-                        run(&mut stream, index);
-                        index = (index + 1) % count;
-                    });
+                    if mode == "resid" {
+                        b.iter_custom(|iterations| {
+                            let mut elapsed = Duration::ZERO;
+                            for _ in 0..iterations {
+                                // Restore the residual outside timing, as in the block benchmark.
+                                stream.fill(out.binding(), 0).unwrap();
+                                stream.synchronize().unwrap();
+                                let start = std::time::Instant::now();
+                                run(&mut stream, index);
+                                elapsed += start.elapsed();
+                                index = (index + 1) % count;
+                            }
+                            elapsed
+                        });
+                    } else {
+                        b.iter(|| {
+                            run(&mut stream, index);
+                            index = (index + 1) % count;
+                        });
+                    }
                     assert_eq!(check_f32(&mut stream, &out), expected);
                 });
             }
