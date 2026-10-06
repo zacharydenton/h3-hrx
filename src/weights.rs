@@ -771,6 +771,9 @@ pub fn conv3d_taps(
     if taps != 27 && taps != 9 {
         return layout("conv3d_taps: taps must be 27 or 9");
     }
+    if cout == 0 || cin == 0 || entry.shape != [cout, cin, 3, 3, 3] {
+        return layout("conv3d_taps: expected nonempty [Cout,Cin,3,3,3] weights");
+    }
     let (cin_pad, cout_pad) = (up(cin, 8), up(cout, 64));
     let k = up(taps * cin_pad, 32);
     let name = name.to_string();
@@ -779,24 +782,18 @@ pub fn conv3d_taps(
         build: Box::new(move |ck| {
             let src = ck.bytes(ck.at(&name)?);
             let mut out = vec![0u8; cout_pad * k * 2];
-            for oc in 0..cout {
-                for ic in 0..cin {
-                    for t in 0..3 {
-                        if taps == 9 && t != 2 {
-                            continue;
-                        }
-                        for y in 0..3 {
-                            for x in 0..3 {
-                                let tap = if taps == 27 {
-                                    (t * 3 + y) * 3 + x
-                                } else {
-                                    y * 3 + x
-                                };
-                                let from = ((((oc * cin + ic) * 3 + t) * 3 + y) * 3 + x) * 2;
-                                let to = (oc * k + tap * cin_pad + ic) * 2;
-                                out[to..to + 2].copy_from_slice(&src[from..from + 2]);
-                            }
-                        }
+            // Walk destination channels contiguously instead of maintaining 27 strided
+            // store streams. Two-byte arrays preserve every FP16 bit without conversion.
+            for (source, dest) in src
+                .as_chunks::<2>()
+                .0
+                .chunks_exact(cin * 27)
+                .zip(out.as_chunks_mut::<2>().0.chunks_exact_mut(k))
+            {
+                let first = 27 - taps;
+                for (tap, row) in dest[..taps * cin_pad].chunks_exact_mut(cin_pad).enumerate() {
+                    for (to, from) in row[..cin].iter_mut().zip(source.chunks_exact(27)) {
+                        *to = from[first + tap];
                     }
                 }
             }
@@ -891,6 +888,42 @@ mod tests {
             .iter()
             .map(|c| f32::from_le_bytes(*c))
             .collect()
+    }
+
+    #[test]
+    fn convolution_packing_preserves_bits_taps_and_padding() {
+        for (cout, cin) in [(1, 3), (24, 64), (65, 33), (64, 512), (64, 1024)] {
+            let dir = tempfile::tempdir().unwrap();
+            // Include every half bit pattern, including signed zero and NaN payloads.
+            let source = (0..cout * cin * 27)
+                .flat_map(|i| (i as u16).wrapping_mul(257).to_le_bytes())
+                .collect::<Vec<_>>();
+            let ck = checkpoint(
+                dir.path(),
+                &[("w", "F16", vec![cout, cin, 3, 3, 3], source.clone())],
+            );
+            for taps in [9, 27] {
+                let cp = up(cin, 8);
+                let k = up(taps * cp, 32);
+                let mut expected = vec![0; up(cout, 64) * k * 2];
+                for o in 0..cout {
+                    for i in 0..cin {
+                        for tap in 0..taps {
+                            let from = ((o * cin + i) * 27 + 27 - taps + tap) * 2;
+                            let to = (o * k + tap * cp + i) * 2;
+                            expected[to..to + 2].copy_from_slice(&source[from..from + 2]);
+                        }
+                    }
+                }
+                let actual = conv3d_taps(&ck, "w", cout, cin, taps)
+                    .unwrap()
+                    .assemble(&ck)
+                    .unwrap();
+                assert_eq!(actual, expected, "cout={cout} cin={cin} taps={taps}");
+            }
+            assert!(conv3d_taps(&ck, "w", cout + 1, cin, 27).is_err());
+            assert!(conv3d_taps(&ck, "w", cout, cin, 1).is_err());
+        }
     }
 
     #[test]

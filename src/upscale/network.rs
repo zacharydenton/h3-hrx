@@ -145,6 +145,13 @@ impl Upscaler {
                     if e.shape.len() == 5 && !name.contains("dwconv") {
                         let (co, ci, kt, kh, kw) =
                             (e.shape[0], e.shape[1], e.shape[2], e.shape[3], e.shape[4]);
+                        if (kt, kh, kw) == (3, 3, 3) {
+                            recipes.insert(
+                                name.clone(),
+                                crate::weights::conv3d_taps(ck, name, co, ci, 27)?,
+                            );
+                            continue;
+                        }
                         let cp = ci.div_ceil(8) * 8;
                         let op = co.div_ceil(64) * 64;
                         let k = (cp * kt * kh * kw).div_ceil(32) * 32;

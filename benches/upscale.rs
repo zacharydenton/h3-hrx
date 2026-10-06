@@ -173,8 +173,48 @@ fn upscale(c: &mut Criterion) {
         );
     }
 }
-criterion_group! {name=benches;config=support::criterion();targets=components,upscale}
+criterion_group! {name=benches;config=support::criterion();targets=packing,components,upscale}
 criterion_main!(benches);
+
+fn packing(c: &mut Criterion) {
+    let mut group = c.benchmark_group("upscale/pack");
+    for name in [
+        "conv_in.weight",
+        "in_blocks.0.in_layers.2.weight",
+        "conv_out.weight",
+    ] {
+        group.bench_function(name, |b| {
+            let path = h3_hrx::models::Resolver::new()
+                .repository("LBH-123-AI", "Minimax_h3_latent_Upscaler")
+                .find(CHECKPOINT)
+                .unwrap();
+            // SAFETY: benchmark checkpoints remain immutable throughout the run.
+            let ck = unsafe { h3_hrx::checkpoint::Checkpoint::open(path) }.unwrap();
+            let entry = ck.at(name).unwrap();
+            let (co, ci) = (entry.shape[0], entry.shape[1]);
+            let recipe = h3_hrx::weights::conv3d_taps(&ck, name, co, ci, 27).unwrap();
+            let cp = ci.div_ceil(8) * 8;
+            let k = (27 * cp).div_ceil(32) * 32;
+            let src = ck.bytes(entry);
+            let mut expected = vec![0; recipe.device_bytes()];
+            for o in 0..co {
+                for i in 0..ci {
+                    for tap in 0..27 {
+                        let from = ((o * ci + i) * 27 + tap) * 2;
+                        let to = (o * k + tap * cp + i) * 2;
+                        expected[to..to + 2].copy_from_slice(&src[from..from + 2]);
+                    }
+                }
+            }
+            support::measure(
+                b,
+                || recipe.assemble(&ck).unwrap(),
+                |out| assert_eq!(*out, expected),
+            );
+        });
+    }
+    group.finish();
+}
 
 fn components(c: &mut Criterion) {
     use half::f16;
