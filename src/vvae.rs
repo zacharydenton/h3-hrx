@@ -83,6 +83,73 @@ impl Grid {
             }
         }
     }
+
+    /// Unpack decoder tokens `[ft][h][w][3][4][16][16]` into float pixels
+    /// `[3][ft*4][h*16][w*16]`, resizing and overwriting `frames`.
+    pub fn unpatchify(&self, patches: &[half::f16], frames: &mut Vec<f32>) {
+        let (ftt, fh, fw) = self.frames();
+        frames.resize(3 * ftt * fh * fw, 0.0);
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("f16c") {
+            // SAFETY: the runtime check establishes the function's CPU feature requirement.
+            unsafe { self.unpatchify_f16c(patches, frames) };
+            return;
+        }
+        self.unpatchify_rows(patches, frames, |src, dst| src.convert_to_f32_slice(dst));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "f16c")]
+    unsafe fn unpatchify_f16c(&self, patches: &[half::f16], frames: &mut [f32]) {
+        use std::arch::x86_64::{_mm256_cvtph_ps, _mm256_storeu_ps, _mm_loadu_si128};
+
+        self.unpatchify_rows(
+            patches,
+            frames,
+            |src: &[half::f16; 16], dst: &mut [f32; 16]| {
+                // SAFETY: each array has 16 elements. Each unaligned load/store covers eight,
+                // and the caller has established F16C support before entering this function.
+                unsafe {
+                    for i in [0, 8] {
+                        let packed = _mm_loadu_si128(src.as_ptr().add(i).cast());
+                        _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_cvtph_ps(packed));
+                    }
+                }
+            },
+        );
+    }
+
+    // Keep row traversal shared while inlining the conversion into the selected CPU path.
+    #[inline(always)]
+    fn unpatchify_rows(
+        &self,
+        patches: &[half::f16],
+        frames: &mut [f32],
+        mut convert: impl FnMut(&[half::f16; VAE_PS], &mut [f32; VAE_PS]),
+    ) {
+        let (ftt, fh, fw) = self.frames();
+        for t in 0..self.ft {
+            for ch in 0..3 {
+                for pt in 0..VAE_PT {
+                    for y in 0..self.h {
+                        for py in 0..VAE_PS {
+                            for x in 0..self.w {
+                                let tok = ((t * self.h + y) * self.w + x) * VAE_OUT;
+                                let src = tok + ((ch * VAE_PT + pt) * VAE_PS + py) * VAE_PS;
+                                let dst = ((ch * ftt + t * VAE_PT + pt) * fh + y * VAE_PS + py)
+                                    * fw
+                                    + x * VAE_PS;
+                                convert(
+                                    patches[src..src + VAE_PS].try_into().unwrap(),
+                                    (&mut frames[dst..dst + VAE_PS]).try_into().unwrap(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The stack's dimensions. Fixed by the checkpoint, spelled out once.
@@ -418,29 +485,7 @@ impl VideoVae {
             bytes_mut(&mut out16[..n * VAE_OUT]),
         )?;
 
-        // unpatchify: token (t, y, x) holds [3][4][16][16]
-        let (ftt, fh, fw) = grid.frames();
-        frames.clear();
-        frames.resize(3 * ftt * fh * fw, 0.0);
-        for t in 0..grid.ft {
-            for y in 0..grid.h {
-                for x in 0..grid.w {
-                    let tok = ((t * grid.h + y) * grid.w + x) * VAE_OUT;
-                    for ch in 0..3 {
-                        for pt in 0..VAE_PT {
-                            for py in 0..VAE_PS {
-                                let src = tok + ((ch * VAE_PT + pt) * VAE_PS + py) * VAE_PS;
-                                let dst = ((ch * ftt + t * VAE_PT + pt) * fh + y * VAE_PS + py)
-                                    * fw
-                                    + x * VAE_PS;
-                                out16[src..src + VAE_PS]
-                                    .convert_to_f32_slice(&mut frames[dst..dst + VAE_PS]);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        grid.unpatchify(out16, frames);
         Ok(())
     }
 
@@ -1206,6 +1251,51 @@ fn bytes_mut(v: &mut [half::f16]) -> &mut [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpatchify_preserves_half_bits_and_overwrites_reused_frames() {
+        let mut frames = Vec::new();
+        for (ft, h, w) in [(1, 1, 1), (2, 3, 5), (7, 16, 16), (1, 2, 3), (0, 4, 4)] {
+            let grid = Grid { ft, h, w };
+            // Cycle through every half bit pattern, including signed zero, subnormals,
+            // infinities and NaNs. The scalar conversion defines the expected float bits.
+            let patches: Vec<_> = (0..grid.voxels() * VAE_OUT)
+                .map(|i| half::f16::from_bits((i as u16).wrapping_mul(37) ^ (i >> 16) as u16))
+                .collect();
+            for pass in 0..2 {
+                frames.fill(9.0);
+                if pass == 0 {
+                    grid.unpatchify(&patches, &mut frames);
+                } else {
+                    grid.unpatchify_rows(&patches, &mut frames, |src, dst| {
+                        src.convert_to_f32_slice(dst)
+                    });
+                }
+                let (nf, height, width) = grid.frames();
+                assert_eq!(frames.len(), 3 * nf * height * width);
+                for c in 0..3 {
+                    for f in 0..nf {
+                        for y in 0..height {
+                            for x in 0..width {
+                                let token =
+                                    ((f / VAE_PT * h + y / VAE_PS) * w + x / VAE_PS) * VAE_OUT;
+                                let offset = ((c * VAE_PT + f % VAE_PT) * VAE_PS + y % VAE_PS)
+                                    * VAE_PS
+                                    + x % VAE_PS;
+                                let expected = patches[token + offset].to_f32();
+                                let actual = frames[((c * nf + f) * height + y) * width + x];
+                                assert_eq!(
+                                    actual.to_bits(),
+                                    expected.to_bits(),
+                                    "{grid:?}, channel {c}, frame {f}, ({y}, {x})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn decoder_input_matches_scalar_projection_and_preserves_padding() {

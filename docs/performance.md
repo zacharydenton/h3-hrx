@@ -121,6 +121,10 @@ that execution path; it is not a quality-qualified cache preset.
 
 ## Measurement boundaries
 
+- **Video decoder output:** `video_decoder_output` measures FP16 conversion and
+  unpacking into channel-major float frames, from single tokens through a full
+  7×16×16 tile. `reused` keeps the output allocation across calls, as tiled decoding
+  does; `fresh` includes allocating it. GPU readback is excluded.
 - **Video decoder input:** `video_decoder_input` measures the host 24×24
   post-quant projection and FP16 conversion into reused staging rows. Cases range
   from single voxels through a full 7×16×16 decode tile. Allocation, latent

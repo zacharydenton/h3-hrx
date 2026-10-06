@@ -177,5 +177,31 @@ fn video_decoder_input(c: &mut Criterion) {
     }
     group.finish();
 }
-criterion_group! { name = benches; config = support::criterion(); targets = host, rotary, video_decoder_input }
+fn video_decoder_output(c: &mut Criterion) {
+    use h3_hrx::{model::VAE_OUT, vvae::Grid};
+
+    let mut group = c.benchmark_group("video_decoder_output");
+    for (ft, h, w) in [(1, 1, 1), (2, 4, 4), (7, 8, 16), (7, 16, 16)] {
+        let grid = Grid { ft, h, w };
+        let patches: Vec<_> = support::values(grid.voxels() * VAE_OUT, 0.5)
+            .into_iter()
+            .map(half::f16::from_f32)
+            .collect();
+        group.throughput(Throughput::Elements(patches.len() as u64));
+        group.bench_function(format!("{ft}x{h}x{w}/reused"), |b| {
+            let mut frames = Vec::new();
+            grid.unpatchify(&patches, &mut frames);
+            b.iter(|| grid.unpatchify(black_box(&patches), black_box(&mut frames)))
+        });
+        group.bench_function(format!("{ft}x{h}x{w}/fresh"), |b| {
+            b.iter(|| {
+                let mut frames = Vec::new();
+                grid.unpatchify(black_box(&patches), &mut frames);
+                frames
+            })
+        });
+    }
+    group.finish();
+}
+criterion_group! { name = benches; config = support::criterion(); targets = host, rotary, video_decoder_input, video_decoder_output }
 criterion_main!(benches);
