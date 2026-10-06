@@ -699,12 +699,12 @@ impl Stack {
         } else {
             Some(stream.allocate(gu_bytes)?)
         };
-        stream.fill(fused.slice(0, t * d.qkv() * 2), 0)?;
-        stream.fill(attn.slice(0, t * attn_width * 2), 0)?;
+        crate::transfer::fill(stream, fused.slice(0, t * d.qkv() * 2), 0)?;
+        crate::transfer::fill(stream, attn.slice(0, t * attn_width * 2), 0)?;
         if let Some((q, k, v)) = &qkv_split {
-            stream.fill(q.slice(0, t * d.inner() * 2), 0)?;
-            stream.fill(k.slice(0, t * d.kv_inner() * 2), 0)?;
-            stream.fill(v.slice(0, t * d.kv_inner() * 2), 0)?;
+            crate::transfer::fill(stream, q.slice(0, t * d.inner() * 2), 0)?;
+            crate::transfer::fill(stream, k.slice(0, t * d.kv_inner() * 2), 0)?;
+            crate::transfer::fill(stream, v.slice(0, t * d.kv_inner() * 2), 0)?;
         }
 
         let int_qk = if qk_int {
@@ -721,10 +721,10 @@ impl Stack {
             } else {
                 Some(stream.allocate_zeroed(vt_bytes)?)
             };
-            stream.fill(qi.slice(0, t * d.heads * code_bytes), 0)?;
-            stream.fill(ki.slice(0, t * d.heads * code_bytes), 0)?;
-            stream.fill(qs.slice(0, t * d.heads * 4), 0)?;
-            stream.fill(ks.slice(0, t * d.heads * 4), 0)?;
+            crate::transfer::fill(stream, qi.slice(0, t * d.heads * code_bytes), 0)?;
+            crate::transfer::fill(stream, ki.slice(0, t * d.heads * code_bytes), 0)?;
+            crate::transfer::fill(stream, qs.slice(0, t * d.heads * 4), 0)?;
+            crate::transfer::fill(stream, ks.slice(0, t * d.heads * 4), 0)?;
             Some(IntQk {
                 qi,
                 ki,

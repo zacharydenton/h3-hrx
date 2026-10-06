@@ -193,9 +193,10 @@ impl VideoVae {
 
         // the output norm's (scale, shift) table: no scale, the checkpoint's bias as the shift
         let norm_table = stream.allocate(2 * VAE_HID * 4)?;
-        stream.fill(norm_table.slice(0, VAE_HID * 4), 0)?;
+        crate::transfer::fill(stream, norm_table.slice(0, VAE_HID * 4), 0)?;
         let bias = self.weights.at(stream, "vae.norm_out.b", VAE_HID * 4)?;
-        stream.copy(
+        crate::transfer::copy(
+            stream,
             norm_table.slice(VAE_HID * 4, VAE_HID * 4),
             bias.slice(0, VAE_HID * 4),
         )?;
@@ -289,7 +290,7 @@ impl VideoVae {
         }
 
         stream.upload(b.in16.binding(), as_bytes_f16(&b.stage_in))?;
-        stream.fill(b.x.slice(0, nt * VAE_HID * 4), 0)?;
+        crate::transfer::fill(stream, b.x.slice(0, nt * VAE_HID * 4), 0)?;
 
         let w_in = weights.at(stream, "vae.proj_in.w", VAE_HID * VAE_KIN * 2)?;
         let b_in = weights.at(stream, "vae.proj_in.b", VAE_HID * 4)?;
@@ -307,7 +308,8 @@ impl VideoVae {
         )?;
         // the four register tokens follow the voxels, then a zero cls row
         let reg = weights.at(stream, "vae.register_tokens", VAE_REG * VAE_HID * 4)?;
-        stream.copy(
+        crate::transfer::copy(
+            stream,
             b.x.slice(n * VAE_HID * 4, VAE_REG * VAE_HID * 4),
             reg.slice(0, VAE_REG * VAE_HID * 4),
         )?;

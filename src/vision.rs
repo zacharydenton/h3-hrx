@@ -177,7 +177,7 @@ fn embed_frames(
     stream.upload(lam.binding(), crate::vvae::as_bytes(&ones))?;
     // the rows past `n` are read by the attention and never written, so they start at zero
     for b in [&q16, &k16, &v16] {
-        stream.fill(b.slice(0, cap * VHEADS * VHDP * 2), 0)?;
+        crate::transfer::fill(stream, b.slice(0, cap * VHEADS * VHDP * 2), 0)?;
     }
 
     let ans = "h3.attention_mha_lds_f16_wmma.";

@@ -190,7 +190,7 @@ impl Dit {
             cos.binding(),
             crate::vvae::as_bytes(&vec![1.0f32; n * ROPE_HALF]),
         )?;
-        stream.fill(sin.slice(0, n * ROPE_HALF * 4), 0)?;
+        crate::transfer::fill(stream, sin.slice(0, n * ROPE_HALF * 4), 0)?;
         self.refiner = Some(Refiner {
             stack,
             tokens: n,
@@ -1202,7 +1202,8 @@ impl Dit {
                 self.inject_references(stream, prof, &lay, refs, kfs, p.seed, &mut in32)?;
                 let seq = self.seq.as_ref().expect("sized above");
                 let b = self.blocks.as_ref().expect("built above");
-                stream.copy(
+                crate::transfer::copy(
+                    stream,
                     b.text_copy.slice(0, lr * HID * 4),
                     seq.x.slice(0, lr * HID * 4),
                 )?;
@@ -1210,7 +1211,8 @@ impl Dit {
                 let seq = self.seq.as_ref().expect("sized above");
                 let b = self.blocks.as_ref().expect("built above");
                 // the blocks update x in place, so the text and reference rows are restored each step
-                stream.copy(
+                crate::transfer::copy(
+                    stream,
                     seq.x.slice(0, lr * HID * 4),
                     b.text_copy.slice(0, lr * HID * 4),
                 )?;
@@ -1665,7 +1667,7 @@ impl Dit {
                 if change.skip { "cached" } else { "full" }
             );
         }
-        stream.copy(cb.prev.slice(0, n * 4), seq.x.slice(0, n * 4))?;
+        crate::transfer::copy(stream, cb.prev.slice(0, n * 4), seq.x.slice(0, n * 4))?;
         if change.skip {
             axpy(
                 c,
@@ -1679,7 +1681,7 @@ impl Dit {
                 x,
             )?;
         } else {
-            stream.copy(cb.xb0.slice(0, n * 4), seq.x.slice(0, n * 4))?;
+            crate::transfer::copy(stream, cb.xb0.slice(0, n * 4), seq.x.slice(0, n * 4))?;
             // The host decision stays outside the recording. A miss replays
             // the same suffix; a hit only adds the cached residual.
             b.stack.forward_cached(
@@ -1695,7 +1697,7 @@ impl Dit {
                 None,
             )?;
             // the residual of blocks 1..49, which a skipped step adds instead of running them
-            stream.copy(cb.resid.slice(0, n * 4), seq.x.slice(0, n * 4))?;
+            crate::transfer::copy(stream, cb.resid.slice(0, n * 4), seq.x.slice(0, n * 4))?;
             axpy(
                 c,
                 stream,

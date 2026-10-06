@@ -557,14 +557,18 @@ impl AudioVae {
                 chan = cout;
                 let plane = chan * len;
                 let d = self.dec.as_ref().expect("sized above");
-                stream.copy(d.h.slice(0, plane * 4), d.r.slice(0, plane * 4))?;
-                stream.fill(d.acc.slice(0, plane * 4), 0)?;
+                crate::transfer::copy(stream, d.h.slice(0, plane * 4), d.r.slice(0, plane * 4))?;
+                crate::transfer::fill(stream, d.acc.slice(0, plane * 4), 0)?;
 
                 // three AMP blocks, averaged rather than summed
                 for (j, &kk) in RES_K.iter().enumerate() {
                     let r = i * 3 + j;
                     let d = self.dec.as_ref().expect("sized above");
-                    stream.copy(d.hj.slice(0, plane * 4), d.h.slice(0, plane * 4))?;
+                    crate::transfer::copy(
+                        stream,
+                        d.hj.slice(0, plane * 4),
+                        d.h.slice(0, plane * 4),
+                    )?;
                     for (dl, &dil) in RES_DIL.iter().enumerate() {
                         let act1 = format!("audio.res.{r}.act.{}.", 2 * dl);
                         let act2 = format!("audio.res.{r}.act.{}.", 2 * dl + 1);
