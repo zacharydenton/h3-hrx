@@ -323,6 +323,68 @@ fn packed_fp32_projection_preserves_ordered_dots_and_guards() {
     not(feature = "gpu-tests"),
     ignore = "requires gfx1151 and provisioned HRX"
 )]
+fn strided_audio_convolution_preserves_ordered_dots_and_guards() {
+    let manager = hrx::residency::ResidencyManager::new(1 << 30).unwrap();
+    let mut h = Harness::new();
+    h.stream = h.stream.with_memory_budget(manager.budget());
+    for len in [1usize, 63, 64, 65, 255, 256, 257, 1023, 1024, 1025, 1285] {
+        for stride in [1usize, 2, 4, 5] {
+            let (ci, co) = (3, 5);
+            let taps = if stride == 1 { 3 } else { 2 * stride };
+            let dilation = if stride == 1 { 3 } else { 1 };
+            let pad = if stride == 1 { 3 } else { stride.div_ceil(2) };
+            let out_len = (len / stride).max(1);
+            let x = values(ci * len, 0.25);
+            let w = values(co * ci * taps, 0.03);
+            let bias = values(co, 0.01);
+            let mut expected = vec![113f32; co * out_len + 64];
+            for o in 0..co {
+                for t in 0..out_len {
+                    let mut acc = bias[o];
+                    for c in 0..ci {
+                        for tap in 0..taps {
+                            let j = (t * stride + tap * dilation) as isize - pad as isize;
+                            if (0..len as isize).contains(&j) {
+                                acc = w[(o * ci + c) * taps + tap]
+                                    .mul_add(x[c * len + j as usize], acc);
+                            }
+                        }
+                    }
+                    expected[o * out_len + t] = acc;
+                }
+            }
+            let out = h.run(
+                "conv1d_s_f32",
+                &cfg(&[
+                    ("cin", ci),
+                    ("cout", co),
+                    ("ksize", taps),
+                    ("dilation", dilation),
+                    ("pad", pad),
+                    ("stride", stride),
+                    ("in_bound", len.max(256).next_power_of_two()),
+                    ("out_bound", out_len.max(256).next_power_of_two()),
+                ]),
+                [out_len.div_ceil(256) as u32, co as u32, 1],
+                256,
+                &[out_len as u64, len as u64],
+                &[
+                    bytes(&x),
+                    bytes(&w),
+                    bytes(&bias),
+                    bytes(&vec![113f32; co * out_len + 64]),
+                ],
+            );
+            assert_eq!(out[3], bytes(&expected), "length {len}, stride {stride}");
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn audio_convolution_matches_f64_with_padding_residuals_and_guards() {
     let mut h = Harness::new();
     for n in [1usize, 63, 64, 65, 127, 128, 129, 255, 256, 257, 769] {

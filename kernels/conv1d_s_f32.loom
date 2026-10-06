@@ -1,6 +1,7 @@
 // Strided 1-D convolution on f32 [channels][len] planes (the audio encoder's DAC stack):
 //   out[o][n] = b[o] + sum_i sum_k w[o][i*ksize + k] * x[i][n*stride + k*dilation - pad]
 // One lane per output sample of one output channel; taps outside [0, in_len) contribute zero.
+// Interior samples check padding once and unroll taps, preserving channel/tap FMA order.
 amdgpu.target<gfx11-generic> @h3_conv1d_s_f32_gfx11 {subgroup_size = 32}
 
 config.decl @h3.conv1d_s_f32.cin : %value: index where [range(%value, 1, 4096)]
@@ -62,31 +63,61 @@ kernel.def target(@h3_conv1d_s_f32_gfx11) export("h3_conv1d_s_f32") @h3_conv1d_s
     %nn = index.assume %n [lt(%n, %out_b)] : index
     %bias = view.load %b_view[%o] : view<[%cout]xf32> -> f32
     %origin = index.mul %nn, %stride : index
-    %acc = scf.for %i = [%c0 to %cin step %c1](%acc_i = %bias : f32) -> (f32) {
-      %ii = index.assume %i [lt(%i, %cin)] : index
-      %row = index.mul %ii, %ksize : index
-      %acc_k = scf.for %k = [%c0 to %ksize step %c1](%acc_kk = %acc_i : f32) -> (f32) {
-        %kk = index.assume %k [lt(%k, %ksize)] : index
-        %tap0 = index.add %row, %kk : index
-        %tap = index.assume %tap0 [lt(%tap0, %taps)] : index
-        %reach = index.mul %kk, %dilation : index
-        %src_plus = index.add %origin, %reach : index
-        %ge = index.cmp uge, %src_plus, %pad : index
-        %src_raw = index.sub %src_plus, %pad : index
-        %lt = index.cmp ult, %src_raw, %in_b : index
-        %valid = scalar.andi %ge, %lt : i1
-        %next = scf.if %valid -> (f32) {
+    %last_tap = index.sub %ksize, %c1 : index
+    %last_reach = index.mul %last_tap, %dilation : index
+    %last_plus = index.add %origin, %last_reach : index
+    %limit = index.add %in_b, %pad : index
+    %left = index.cmp uge, %origin, %pad : index
+    %right = index.cmp ult, %last_plus, %limit : index
+    %interior = scalar.andi %left, %right : i1
+    %acc = scf.if %interior -> (f32) {
+      %fast = scf.for %i = [%c0 to %cin step %c1](%acc_i = %bias : f32) -> (f32) {
+        %ii = index.assume %i [lt(%i, %cin)] : index
+        %row = index.mul %ii, %ksize : index
+        %acc_k = scf.for %k = [%c0 to %ksize step %c1](%acc_kk = %acc_i : f32) -> (f32) unroll {
+          %kk = index.assume %k [lt(%k, %ksize)] : index
+          %tap0 = index.add %row, %kk : index
+          %tap = index.assume %tap0 [lt(%tap0, %taps)] : index
+          %reach = index.mul %kk, %dilation : index
+          %src_plus = index.add %origin, %reach : index
+          %src_raw = index.sub %src_plus, %pad : index
           %src = index.assume %src_raw [range(%src_raw, 0, 4194304), lt(%src_raw, %in_b)] : index
           %wv = view.load %w_view[%o, %tap] : view<[%cout]x[%taps]xf32> -> f32
           %xv = view.load %x_view[%ii, %src] : view<[%cin]x[%in_b]xf32> -> f32
           %fma = scalar.fmaf %wv, %xv, %acc_kk : f32
           scf.yield %fma : f32
-        } else {
-          scf.yield %acc_kk : f32
         }
-        scf.yield %next : f32
+        scf.yield %acc_k : f32
       }
-      scf.yield %acc_k : f32
+      scf.yield %fast : f32
+    } else {
+      %edge = scf.for %i = [%c0 to %cin step %c1](%acc_i = %bias : f32) -> (f32) {
+        %ii = index.assume %i [lt(%i, %cin)] : index
+        %row = index.mul %ii, %ksize : index
+        %acc_k = scf.for %k = [%c0 to %ksize step %c1](%acc_kk = %acc_i : f32) -> (f32) {
+          %kk = index.assume %k [lt(%k, %ksize)] : index
+          %tap0 = index.add %row, %kk : index
+          %tap = index.assume %tap0 [lt(%tap0, %taps)] : index
+          %reach = index.mul %kk, %dilation : index
+          %src_plus = index.add %origin, %reach : index
+          %ge = index.cmp uge, %src_plus, %pad : index
+          %src_raw = index.sub %src_plus, %pad : index
+          %lt = index.cmp ult, %src_raw, %in_b : index
+          %valid = scalar.andi %ge, %lt : i1
+          %next = scf.if %valid -> (f32) {
+            %src = index.assume %src_raw [range(%src_raw, 0, 4194304), lt(%src_raw, %in_b)] : index
+            %wv = view.load %w_view[%o, %tap] : view<[%cout]x[%taps]xf32> -> f32
+            %xv = view.load %x_view[%ii, %src] : view<[%cin]x[%in_b]xf32> -> f32
+            %fma = scalar.fmaf %wv, %xv, %acc_kk : f32
+            scf.yield %fma : f32
+          } else {
+            scf.yield %acc_kk : f32
+          }
+          scf.yield %next : f32
+        }
+        scf.yield %acc_k : f32
+      }
+      scf.yield %edge : f32
     }
     view.store %acc, %out_view[%o, %nn] : f32, view<[%cout]x[%out_b]xf32>
   }

@@ -213,7 +213,10 @@ fn audio_conversions_are_byte_stable_at_the_boundaries() {
             "6911f3a6383e5fdb8892fa54fb6dbbd530011ca418ce827ab3247bb94c5430d2",
         ),
     ];
-    let mut stream = hrx::Stream::open().expect("stream");
+    let manager = hrx::residency::ResidencyManager::new(4 << 30).expect("audio budget");
+    let mut stream = hrx::Stream::open()
+        .expect("stream")
+        .with_memory_budget(manager.budget());
     let c = compiler();
     let path = h3_hrx::models::Resolver::new()
         .find(h3_hrx::models::AUDIO_VAE)
