@@ -3393,18 +3393,21 @@ fn tiled_preparation_matches_single_pass_across_formats() {
                     vec![0xa5; rows * 4],
                 ];
                 let mut expected = None;
-                for tiled in [false, true] {
-                    let (module, stem, lanes) = if tiled {
+                for (tiled, lanes) in [
+                    (false, h3_hrx::model::lanes_for(width).unwrap()),
+                    (true, 64),
+                    (true, 256),
+                    (true, 1024),
+                ] {
+                    let (module, stem) = if tiled {
                         (
                             "prepare_plain_tiled".into(),
                             format!("prepare_plain_tiled{suffix}_i{bits}"),
-                            256,
                         )
                     } else {
                         (
                             format!("prepare_i{bits}_family"),
                             format!("prepare_plain{suffix}_i{bits}"),
-                            h3_hrx::model::lanes_for(width).unwrap(),
                         )
                     };
                     let out = h.run_module(
@@ -3417,7 +3420,7 @@ fn tiled_preparation_matches_single_pass_across_formats() {
                         &data,
                     );
                     if let Some(expected) = &expected {
-                        assert_eq!(&out[1..], expected, "{stem}, width={width}");
+                        assert_eq!(&out[1..], expected, "{stem}, width={width}, lanes={lanes}");
                     } else {
                         expected = Some(out[1..].to_vec());
                     }

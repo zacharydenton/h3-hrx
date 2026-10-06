@@ -179,7 +179,7 @@ template.def<@h3.prepare_plain_tiled> @h3_prepare_plain_tiled(%tokens: index, %h
     view.store %o3, %x_view[%i3] : f32, view<4096xf32>
   }
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-  scf.for %t_j = [%c0 to %tile_quads_per_lane step %c1] {
+  %tile_max = scf.for %t_j = [%c0 to %tile_quads_per_lane step %c1](%prev_max = %max_prev : f32) -> (f32) {
     %t_lane_step = index.mul %t_j, %lanes : index
     %t0 = index.add %t_lane_step, %lane : index
     %t = index.assume %t0 [lt(%t0, %tile_quads)] : index
@@ -207,28 +207,37 @@ template.def<@h3.prepare_plain_tiled> @h3_prepare_plain_tiled(%tokens: index, %h
     %o1 = scalar.subf %s01, %d23 : f32
     %o2 = scalar.addf %d01, %s23 : f32
     %o3 = scalar.subf %s23, %d01 : f32
-    view.store %o0, %x_view[%base] : f32, view<4096xf32>
-    view.store %o1, %x_view[%i1] : f32, view<4096xf32>
-    view.store %o2, %x_view[%i2] : f32, view<4096xf32>
-    view.store %o3, %x_view[%i3] : f32, view<4096xf32>
+    // Reduce the first pass's final butterfly in registers; only the second needs LDS output.
+    %next_max = scf.if %first -> (f32) {
+      %abs0 = scalar.absf %o0 : f32
+      %finite0 = scalar.cmpf olt, %abs0, %inf : f32
+      %checked0 = scf.select %finite0, %abs0, %inf : f32
+      %max0 = scalar.maxnumf %prev_max, %checked0 : f32
+      %abs1 = scalar.absf %o1 : f32
+      %finite1 = scalar.cmpf olt, %abs1, %inf : f32
+      %checked1 = scf.select %finite1, %abs1, %inf : f32
+      %max1 = scalar.maxnumf %max0, %checked1 : f32
+      %abs2 = scalar.absf %o2 : f32
+      %finite2 = scalar.cmpf olt, %abs2, %inf : f32
+      %checked2 = scf.select %finite2, %abs2, %inf : f32
+      %max2 = scalar.maxnumf %max1, %checked2 : f32
+      %abs3 = scalar.absf %o3 : f32
+      %finite3 = scalar.cmpf olt, %abs3, %inf : f32
+      %checked3 = scf.select %finite3, %abs3, %inf : f32
+      %max3 = scalar.maxnumf %max2, %checked3 : f32
+      scf.yield %max3 : f32
+    } else {
+      view.store %o0, %x_view[%base] : f32, view<4096xf32>
+      view.store %o1, %x_view[%i1] : f32, view<4096xf32>
+      view.store %o2, %x_view[%i2] : f32, view<4096xf32>
+      view.store %o3, %x_view[%i3] : f32, view<4096xf32>
+      scf.yield %prev_max : f32
+    }
+    scf.yield %next_max : f32
   }
-  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-
-
-      // The second pass already has the row scale; only quantize its transformed tiles.
-      %tile_max = scf.if %first -> (f32) {
-        %local_max = scf.for %j = [%c0 to %tile_chunks step %c1](%prev = %max_prev : f32) -> (f32) {
-          %step = index.mul %j, %lanes : index
-          %local = index.add %step, %lane : index
-          %v = view.load %x_view[%local] : view<4096xf32> -> f32
-          %abs = scalar.absf %v : f32
-          %finite = scalar.cmpf olt, %abs, %inf : f32
-          %checked = scf.select %finite, %abs, %inf : f32
-          %next = scalar.maxnumf %prev, %checked : f32
-          scf.yield %next : f32
-        }
-        scf.yield %local_max : f32
+      scf.if %first {
       } else {
+        kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
         scf.for %word = [%lane to %words step %lanes] {
           %local0 = index.mul %word, %packed : index
           %col0 = index.add %base, %local0 : index
@@ -255,7 +264,6 @@ template.def<@h3.prepare_plain_tiled> @h3_prepare_plain_tiled(%tokens: index, %h
             view.store %encoded, %qw[%row, %out] : i32, view<[%tokens_b]x[%out_words]xi32>
           }
         }
-        scf.yield %max_prev : f32
       }
       kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
       scf.yield %tile_max : f32
