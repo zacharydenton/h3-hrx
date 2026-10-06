@@ -38,6 +38,51 @@ impl Grid {
     pub fn frames(&self) -> (usize, usize, usize) {
         (self.ft * VAE_PT, self.h * VAE_PS, self.w * VAE_PS)
     }
+
+    /// Apply the decoder's 24×24 post-quant projection to channel-major latents.
+    ///
+    /// `weight` is row-major and `bias` has 24 entries. `out` holds one FP16 row
+    /// of stride [`VAE_KIN`] per voxel. Padding after channel 24 is left untouched;
+    /// the decoder initializes it to zero when allocating its staging buffer.
+    pub fn prepare_decoder_input(
+        &self,
+        z: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        out: &mut [half::f16],
+    ) {
+        let n = self.voxels();
+        // Vectorize across voxels, never across the channel reduction: every lane keeps
+        // the original FP32 addition order and narrows only after the final channel.
+        const LANES: usize = 32;
+        let full = n / LANES * LANES;
+        for v in (0..full).step_by(LANES) {
+            for o in 0..LATENT_CH {
+                let mut acc = [bias[o]; LANES];
+                for i in 0..LATENT_CH {
+                    let input = &z[i * n + v..i * n + v + LANES];
+                    let w = weight[o * LATENT_CH + i];
+                    for lane in 0..LANES {
+                        acc[lane] += w * input[lane];
+                    }
+                }
+                let mut narrowed = [half::f16::ZERO; LANES];
+                narrowed.convert_from_f32_slice(&acc);
+                for lane in 0..LANES {
+                    out[(v + lane) * VAE_KIN + o] = narrowed[lane];
+                }
+            }
+        }
+        for v in full..n {
+            for o in 0..LATENT_CH {
+                let mut acc = bias[o];
+                for i in 0..LATENT_CH {
+                    acc += weight[o * LATENT_CH + i] * z[i * n + v];
+                }
+                out[v * VAE_KIN + o] = half::f16::from_f32(acc);
+            }
+        }
+    }
 }
 
 /// The stack's dimensions. Fixed by the checkpoint, spelled out once.
@@ -278,16 +323,7 @@ impl VideoVae {
             ..
         } = self;
         let b = built.as_mut().expect("built above");
-        let in16 = &mut b.stage_in;
-        for v in 0..n {
-            for o in 0..LATENT_CH {
-                let mut acc = pq_b[o];
-                for i in 0..LATENT_CH {
-                    acc += pq_w[o * LATENT_CH + i] * z[i * n + v];
-                }
-                in16[v * VAE_KIN + o] = half::f16::from_f32(acc);
-            }
-        }
+        grid.prepare_decoder_input(z, pq_w, pq_b, &mut b.stage_in);
 
         stream.upload(b.in16.binding(), as_bytes_f16(&b.stage_in))?;
         crate::transfer::fill(stream, b.x.slice(0, nt * VAE_HID * 4), 0)?;
@@ -1165,4 +1201,118 @@ pub fn as_bytes_f16(v: &[half::f16]) -> &[u8] {
 
 fn bytes_mut(v: &mut [half::f16]) -> &mut [u8] {
     bytemuck::cast_slice_mut(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoder_input_matches_scalar_projection_and_preserves_padding() {
+        let values = |n, seed| {
+            (0..n)
+                .map(|i| ((i * 37 + seed) % 257) as f32 / 113.0 - 1.0)
+                .collect::<Vec<_>>()
+        };
+        let weight = values(LATENT_CH * LATENT_CH, 17);
+        let bias = values(LATENT_CH, 29);
+        for n in [0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 127, 1792] {
+            let grid = Grid { ft: 1, h: 1, w: n };
+            let z = values(n * LATENT_CH, 43);
+            let guard = half::f16::from_bits(0x3555);
+            let mut actual = vec![guard; (n + 2) * VAE_KIN];
+            let mut expected = actual.clone();
+            for v in 0..n {
+                for o in 0..LATENT_CH {
+                    let mut sum = bias[o];
+                    for i in 0..LATENT_CH {
+                        sum += weight[o * LATENT_CH + i] * z[i * n + v];
+                    }
+                    expected[(v + 1) * VAE_KIN + o] = half::f16::from_f32(sum);
+                }
+            }
+            // Include guards on both sides, nonzero row padding, and a second call over
+            // reused storage. Compare half bits, including signed zero.
+            for _ in 0..2 {
+                grid.prepare_decoder_input(
+                    &z,
+                    &weight,
+                    &bias,
+                    &mut actual[VAE_KIN..(n + 1) * VAE_KIN],
+                );
+                assert_eq!(as_bytes_f16(&actual), as_bytes_f16(&expected), "{n} voxels");
+            }
+        }
+    }
+
+    #[test]
+    fn decoder_input_keeps_fp32_accumulation_order_without_fma() {
+        let grid = Grid { ft: 1, h: 1, w: 33 };
+        let n = grid.voxels();
+        let mut z = vec![0.0; LATENT_CH * n];
+        for (i, value) in [4097.0, 16_777_216.0, 1.0, -16_777_216.0]
+            .into_iter()
+            .enumerate()
+        {
+            z[i * n..(i + 1) * n].fill(value);
+        }
+        let mut weight = vec![0.0; LATENT_CH * LATENT_CH];
+        let mut bias = vec![0.0; LATENT_CH];
+        // A fused multiply-add would produce one; the separate FP32 operations produce zero.
+        weight[0] = 4097.0;
+        bias[0] = -16_785_408.0;
+        // Reordering this reduction can retain the one instead of rounding it away.
+        weight[LATENT_CH + 1..LATENT_CH + 4].fill(1.0);
+        let mut out = vec![half::f16::ZERO; n * VAE_KIN];
+        grid.prepare_decoder_input(&z, &weight, &bias, &mut out);
+        assert!(out.iter().all(|v| v.to_bits() == 0));
+    }
+
+    #[test]
+    fn decoder_input_preserves_half_conversion_at_rounding_boundaries() {
+        let grid = Grid { ft: 1, h: 1, w: 33 };
+        let n = grid.voxels();
+        let z = vec![0.0; LATENT_CH * n];
+        let weight = vec![0.0; LATENT_CH * LATENT_CH];
+        let bias = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            1.0 + 1.0 / 2048.0,
+            -1.0 - 1.0 / 2048.0,
+            65504.0,
+            -65504.0,
+            65520.0,
+            -65520.0,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            2.0f32.powi(-24),
+            -2.0f32.powi(-24),
+            2.0f32.powi(-25),
+            -2.0f32.powi(-25),
+            f32::MAX,
+            -f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::from_bits(0xffc1_2345),
+            1.0004882,
+            1.0004884,
+        ];
+        let mut out = vec![half::f16::ZERO; n * VAE_KIN];
+        grid.prepare_decoder_input(&z, &weight, &bias, &mut out);
+        for v in 0..n {
+            for o in 0..LATENT_CH {
+                let mut sum = bias[o];
+                for _ in 0..LATENT_CH {
+                    sum += 0.0;
+                }
+                assert_eq!(
+                    out[v * VAE_KIN + o].to_bits(),
+                    half::f16::from_f32(sum).to_bits()
+                );
+            }
+        }
+    }
 }

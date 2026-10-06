@@ -121,6 +121,10 @@ that execution path; it is not a quality-qualified cache preset.
 
 ## Measurement boundaries
 
+- **Video decoder input:** `video_decoder_input` measures the host 24×24
+  post-quant projection and FP16 conversion into reused staging rows. Cases range
+  from single voxels through a full 7×16×16 decode tile. Allocation, latent
+  normalization and GPU uploads are excluded.
 - **Host rotary tables:** `rotary/dit` includes allocation and construction of both
   tables, from a prebuilt packed layout and inverse frequencies. Cases cover the
   smoke grid, 480p/768p clips, references with a keyframe, and a 15-second 2x grid.

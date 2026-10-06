@@ -150,5 +150,32 @@ fn rotary(c: &mut Criterion) {
     }
     group.finish();
 }
-criterion_group! { name = benches; config = support::criterion(); targets = host, rotary }
+fn video_decoder_input(c: &mut Criterion) {
+    use h3_hrx::{
+        model::{LATENT_CH, VAE_KIN},
+        vvae::Grid,
+    };
+
+    let weight = support::values(LATENT_CH * LATENT_CH, 0.2);
+    let bias = support::values(LATENT_CH, 0.1);
+    let mut group = c.benchmark_group("video_decoder_input");
+    for (ft, h, w) in [(1, 1, 1), (1, 1, 7), (2, 4, 4), (7, 8, 16), (7, 16, 16)] {
+        let grid = Grid { ft, h, w };
+        let z = support::values(LATENT_CH * grid.voxels(), 0.5);
+        let mut out = vec![half::f16::ZERO; grid.voxels() * VAE_KIN];
+        group.throughput(Throughput::Elements(grid.voxels() as u64));
+        group.bench_function(format!("{ft}x{h}x{w}"), |b| {
+            b.iter(|| {
+                grid.prepare_decoder_input(
+                    black_box(&z),
+                    black_box(&weight),
+                    black_box(&bias),
+                    black_box(&mut out),
+                );
+            })
+        });
+    }
+    group.finish();
+}
+criterion_group! { name = benches; config = support::criterion(); targets = host, rotary, video_decoder_input }
 criterion_main!(benches);
