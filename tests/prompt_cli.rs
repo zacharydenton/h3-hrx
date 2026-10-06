@@ -264,8 +264,10 @@ fn original_refmod_images_prompt_without_models_and_keep_copy_labels() {
     let mut pixels = vec![0; decoder.output_buffer_size().unwrap()];
     let info = decoder.next_frame(&mut pixels).unwrap();
     assert!(pixels[..info.buffer_size()]
-        .chunks_exact(3)
-        .all(|p| p == [255, 0, 0]));
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .all(|p| *p == [255, 0, 0]));
     let record: Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("prompt.txt.json")).unwrap())
             .unwrap();

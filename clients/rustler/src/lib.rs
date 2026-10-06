@@ -139,7 +139,13 @@ fn encode_audio(
 }
 fn float_binary<'a>(env: Env<'a>, values: &[f32]) -> Binary<'a> {
     let mut bytes = rustler::OwnedBinary::new(values.len() * 4).expect("binary allocation");
-    for (dst, value) in bytes.as_mut_slice().chunks_exact_mut(4).zip(values) {
+    for (dst, value) in bytes
+        .as_mut_slice()
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(values)
+    {
         dst.copy_from_slice(&value.to_le_bytes());
     }
     bytes.release(env)

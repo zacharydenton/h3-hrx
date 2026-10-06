@@ -108,8 +108,8 @@ fn strength_matches_upstream_and_copies_borrow_storage() {
     };
     assert_eq!(visual.as_ptr(), copy.as_ptr());
     let v = expected.tensor("visual_strength").unwrap();
-    for (&got, want) in visual.iter().zip(v.data().chunks_exact(2)) {
-        let want = half::f16::from_le_bytes(want.try_into().unwrap()).to_f32();
+    for (&got, want) in visual.iter().zip(v.data().as_chunks::<2>().0.iter()) {
+        let want = half::f16::from_le_bytes(*want).to_f32();
         assert!((got - want).abs() <= 0.001, "{got} != {want}");
     }
     let Reference::Audio { latents: audio, .. } = refs[2] else {
@@ -118,8 +118,10 @@ fn strength_matches_upstream_and_copies_borrow_storage() {
     let a = expected.tensor("audio_strength").unwrap();
     let want = a
         .data()
-        .chunks_exact(4)
-        .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|x| f32::from_le_bytes(*x))
         .collect::<Vec<_>>();
     for s in 0..2 {
         for c in 0..32 {
@@ -532,8 +534,11 @@ fn spatial_strength_matches_upstream_on_nondivisible_pooling_grid() {
         .unwrap()
         .tensor("irregular_strength")
         .unwrap();
-    for (&got, want) in latents.iter().zip(expected.data().chunks_exact(2)) {
-        let want = half::f16::from_le_bytes(want.try_into().unwrap()).to_f32();
+    for (&got, want) in latents
+        .iter()
+        .zip(expected.data().as_chunks::<2>().0.iter())
+    {
+        let want = half::f16::from_le_bytes(*want).to_f32();
         assert!((got - want).abs() <= 0.001, "{got} != {want}");
     }
 }

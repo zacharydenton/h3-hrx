@@ -151,7 +151,7 @@ pub fn decode_source_audio(path: &Path, budget: usize) -> Result<Vec<f32>> {
     }
     let n = raw.len() / 8;
     let mut samples = vec![0.0; n * 2];
-    for (i, pair) in raw.chunks_exact(8).enumerate() {
+    for (i, pair) in raw.as_chunks::<8>().0.iter().enumerate() {
         samples[i] = f32::from_le_bytes(pair[..4].try_into().unwrap());
         samples[n + i] = f32::from_le_bytes(pair[4..].try_into().unwrap());
     }

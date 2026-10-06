@@ -191,8 +191,10 @@ fn released_checkpoint_upscales_a_bounded_clip() {
         let input = h3_hrx::Latents {
             video: if size == 32 {
                 include_bytes!("fixtures/upscale/input.f32")
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
                     .collect()
             } else {
                 (0..24 * 2 * 8 * 8)
@@ -212,8 +214,10 @@ fn released_checkpoint_upscales_a_bounded_clip() {
         assert_eq!(output.latents.audio, input.audio);
         assert!(output.latents.video.iter().all(|v| v.is_finite()));
         let expected = expected
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect::<Vec<_>>();
         let rmse = (output
             .latents

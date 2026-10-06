@@ -3701,7 +3701,9 @@ fn f32_preparation_matches_dense_hadamard_and_marks_invalid_rows() {
                 }
             }
             let rotated: Vec<f32> = x[..width]
-                .chunks_exact(256)
+                .as_chunks::<256>()
+                .0
+                .iter()
                 .flat_map(|group| {
                     (0..256)
                         .map(|row| {
@@ -3939,8 +3941,10 @@ fn upscale_groupnorm_centered_variance_handles_large_offsets() {
             &[bytes(&input), bytes(&vec![0.0f32; 64])],
         );
         let got = stats[1]
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect::<Vec<_>>();
         for g in 0..32 {
             let data = (0..rows)

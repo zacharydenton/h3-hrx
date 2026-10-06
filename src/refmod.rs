@@ -445,16 +445,22 @@ impl PreparedRefMod {
 fn decode(dtype: Dtype, bytes: &[u8]) -> Result<Vec<f32>> {
     match dtype {
         Dtype::F32 => Ok(bytes
-            .chunks_exact(4)
-            .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|x| f32::from_le_bytes(*x))
             .collect()),
         Dtype::F16 => Ok(bytes
-            .chunks_exact(2)
-            .map(|x| f16::from_le_bytes(x.try_into().unwrap()).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|x| f16::from_le_bytes(*x).to_f32())
             .collect()),
         Dtype::BF16 => Ok(bytes
-            .chunks_exact(2)
-            .map(|x| bf16::from_le_bytes(x.try_into().unwrap()).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|x| bf16::from_le_bytes(*x).to_f32())
             .collect()),
         _ => invalid(format!("refmod: unsupported dtype {dtype:?}")),
     }

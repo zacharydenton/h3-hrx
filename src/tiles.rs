@@ -319,12 +319,12 @@ mod tests {
             })
             .unwrap();
             let expected = tensors.tensor(case["name"].as_str().unwrap()).unwrap();
-            let mut expected = expected.data().chunks_exact(4);
+            let mut expected = expected.data().as_chunks::<4>().0.iter();
             for cf in 0..6 {
                 for y in case["ys"].as_array().unwrap() {
                     for x in case["xs"].as_array().unwrap() {
                         let (y, x) = (y.as_u64().unwrap() as usize, x.as_u64().unwrap() as usize);
-                        let want = f32::from_le_bytes(expected.next().unwrap().try_into().unwrap());
+                        let want = f32::from_le_bytes(*expected.next().unwrap());
                         let got = out[(cf * h + y) * w + x];
                         assert!(
                             (got - want).abs() < 5e-5,

@@ -54,12 +54,17 @@ pub fn pil_bilinear(rgb: &[u8], sw: i32, sh: i32, dw: i32, dh: i32) -> Vec<f32> 
         .chunks_exact(swz * 3)
         .zip(horiz.chunks_exact_mut(dwz * 3))
     {
-        for ((lo, hi, w), pixel) in horizontal_weights.iter().zip(dest.chunks_exact_mut(3)) {
+        for ((lo, hi, w), pixel) in horizontal_weights
+            .iter()
+            .zip(dest.as_chunks_mut::<3>().0.iter_mut())
+        {
             let mut acc = [0.0f64; 3];
-            for (weight, input) in w
-                .iter()
-                .zip(source[*lo as usize * 3..*hi as usize * 3].chunks_exact(3))
-            {
+            for (weight, input) in w.iter().zip(
+                source[*lo as usize * 3..*hi as usize * 3]
+                    .as_chunks::<3>()
+                    .0
+                    .iter(),
+            ) {
                 for c in 0..3 {
                     acc[c] += weight * input[c] as f64;
                 }

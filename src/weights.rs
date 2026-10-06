@@ -792,7 +792,7 @@ pub fn conv3d_taps(
             {
                 let first = 27 - taps;
                 for (tap, row) in dest[..taps * cin_pad].chunks_exact_mut(cin_pad).enumerate() {
-                    for (to, from) in row[..cin].iter_mut().zip(source.chunks_exact(27)) {
+                    for (to, from) in row[..cin].iter_mut().zip(source.as_chunks::<27>().0.iter()) {
                         *to = from[first + tap];
                     }
                 }

@@ -29,8 +29,10 @@ struct Block {
 fn values(ck: &Checkpoint, name: &str) -> crate::weights::Result<Vec<f32>> {
     let bytes = crate::weights::widen_f32(ck, &[name])?.assemble(ck)?;
     Ok(bytes
-        .chunks_exact(4)
-        .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|v| f32::from_le_bytes(*v))
         .collect())
 }
 fn architecture(ck: &Checkpoint) -> Result<(usize, [Vec<Block>; 2], usize)> {
@@ -665,8 +667,8 @@ impl Upscaler {
         let mut result = vec![f16::ZERO; rows * 64];
         let mut bytes = vec![0u8; result.len() * 2];
         s.read_blocking(tmp.slice(0, bytes.len()), &mut bytes)?;
-        for (v, b) in result.iter_mut().zip(bytes.chunks_exact(2)) {
-            *v = f16::from_le_bytes(b.try_into().unwrap());
+        for (v, b) in result.iter_mut().zip(bytes.as_chunks::<2>().0.iter()) {
+            *v = f16::from_le_bytes(*b);
         }
         Ok(result)
     }
