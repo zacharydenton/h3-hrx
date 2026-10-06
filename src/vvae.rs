@@ -628,11 +628,19 @@ pub fn decode_temporal(
                 0
             };
             for f in 0..take {
-                for q in 0..plane {
-                    for ch in 0..3 {
-                        let v = chunk[(ch * src_ft + frames.start + f) * plane + q];
-                        write(((*decoded + f) * plane + q) * 3 + ch, v, ch);
-                    }
+                // Slice each source plane once per frame so the pixel loop needs
+                // neither channel-offset arithmetic nor source bounds checks.
+                let start = (frames.start + f) * plane;
+                let stride = src_ft * plane;
+                let red = &chunk[start..start + plane];
+                let green = &chunk[stride + start..stride + start + plane];
+                let blue = &chunk[2 * stride + start..2 * stride + start + plane];
+                let base = (*decoded + f) * plane * 3;
+                for (q, ((&r, &g), &b)) in red.iter().zip(green).zip(blue).enumerate() {
+                    let index = base + q * 3;
+                    write(index, r, 0);
+                    write(index + 1, g, 1);
+                    write(index + 2, b, 2);
                 }
             }
             *decoded += nf;
