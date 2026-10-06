@@ -113,6 +113,9 @@ pub fn fit(width: i32, height: i32, canvas_width: i32, canvas_height: i32) -> (i
 /// H3-World cover resize with Lanczos-3 followed by a centered crop.
 /// Intermediate RGB8 rounding follows PIL's two-pass image resizing.
 pub fn world_first_frame(rgb: &[u8], sw: i32, sh: i32, dw: i32, dh: i32) -> Vec<f32> {
+    if dw == 0 || dh == 0 {
+        return Vec::new();
+    }
     let scale = (dw as f64 / sw as f64).max(dh as f64 / sh as f64);
     let rw = (sw as f64 * scale).round_ties_even() as usize;
     let rh = (sh as f64 * scale).round_ties_even() as usize;
@@ -141,32 +144,45 @@ pub fn world_first_frame(rgb: &[u8], sw: i32, sh: i32, dw: i32, dh: i32) -> Vec<
         }
         (lo, weights)
     };
-    let mut horizontal = vec![0u8; rw * sh as usize * 3];
-    for x in 0..rw {
-        let (lo, weights) = coeff(sw as usize, rw, x);
-        for y in 0..sh as usize {
-            for c in 0..3 {
-                let v: f64 = weights
-                    .iter()
-                    .enumerate()
-                    .map(|(i, w)| w * rgb[(y * sw as usize + lo + i) * 3 + c] as f64)
-                    .sum();
-                horizontal[(y * rw + x) * 3 + c] = v.round().clamp(0.0, 255.0) as u8;
+    let left = (rw - dw as usize) / 2;
+    let top = (rh - dh as usize) / 2;
+    let columns: Vec<_> = (0..dw as usize)
+        .map(|x| coeff(sw as usize, rw, x + left))
+        .collect();
+    let rows: Vec<_> = (0..dh as usize)
+        .map(|y| coeff(sh as usize, rh, y + top))
+        .collect();
+    // Keep every source row touched by the vertical filter, including its
+    // Lanczos halo, but omit resized columns and rows discarded by the crop.
+    let first = rows.iter().map(|(lo, _)| *lo).min().unwrap();
+    let end = rows.iter().map(|(lo, w)| lo + w.len()).max().unwrap();
+    let stride = dw as usize * 3;
+    let mut horizontal = vec![0u8; (end - first) * stride];
+    for (x, (lo, weights)) in columns.iter().enumerate() {
+        for y in first..end {
+            let mut pixel = [0.0f64; 3];
+            for (i, w) in weights.iter().enumerate() {
+                let at = (y * sw as usize + lo + i) * 3;
+                for c in 0..3 {
+                    pixel[c] += w * rgb[at + c] as f64;
+                }
+            }
+            for (c, v) in pixel.into_iter().enumerate() {
+                horizontal[(y - first) * stride + x * 3 + c] = v.round().clamp(0.0, 255.0) as u8;
             }
         }
     }
     let mut out = vec![0.0; dw as usize * dh as usize * 3];
-    let left = (rw - dw as usize) / 2;
-    let top = (rh - dh as usize) / 2;
-    for y in 0..dh as usize {
-        let (lo, weights) = coeff(sh as usize, rh, y + top);
+    for (y, (lo, weights)) in rows.iter().enumerate() {
         for x in 0..dw as usize {
-            for c in 0..3 {
-                let v: f64 = weights
-                    .iter()
-                    .enumerate()
-                    .map(|(i, w)| w * horizontal[((lo + i) * rw + x + left) * 3 + c] as f64)
-                    .sum();
+            let mut pixel = [0.0f64; 3];
+            for (i, w) in weights.iter().enumerate() {
+                let at = (lo + i - first) * stride + x * 3;
+                for c in 0..3 {
+                    pixel[c] += w * horizontal[at + c] as f64;
+                }
+            }
+            for (c, v) in pixel.into_iter().enumerate() {
                 out[(y * dw as usize + x) * 3 + c] = v.round().clamp(0.0, 255.0) as f32 / 255.0;
             }
         }

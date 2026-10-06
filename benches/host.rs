@@ -59,6 +59,17 @@ fn host(c: &mut Criterion) {
             b.iter(|| h3_hrx::resize::pil_bilinear(black_box(&rgb), sw, sh, dw, dh))
         });
     }
+    for (name, sw, sh, dw, dh) in [
+        ("1080p_to_480p", 1920, 1080, 864, 480),
+        ("portrait_to_landscape", 1080, 1920, 864, 480),
+        ("landscape_to_portrait", 1920, 1080, 480, 864),
+        ("upscale", 320, 240, 864, 480),
+    ] {
+        c.bench_function(&format!("world_resize/{name}"), |b| {
+            let rgb: Vec<_> = (0..sw * sh * 3).map(|i| (i % 251) as u8).collect();
+            b.iter(|| h3_hrx::resize::world_first_frame(black_box(&rgb), sw, sh, dw, dh))
+        });
+    }
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/refmod/combined.safetensors");
     c.bench_function("refmod/load", |b| {

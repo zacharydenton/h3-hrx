@@ -161,6 +161,77 @@ fn first_frame_matches_pillow_cover_resize() {
 }
 
 #[test]
+fn cropped_first_frame_preserves_original_output_bits() {
+    // SHA-256 of little-endian f32 output from the full-intermediate resizer at
+    // 6e5fd55. Keep the Pillow fixture check above as the independent reference.
+    for (sw, sh, dw, dh, digest) in [
+        (
+            1920,
+            1080,
+            864,
+            480,
+            "817a013c07804d1251a02beee3bee8de1b1147c9d8449258bf1af766408c6d88",
+        ),
+        (
+            1080,
+            1920,
+            864,
+            480,
+            "cfb3f03b3860b7572b4a7920c6dfba72f46a479d3b8b98b735a1d1ee85365cd8",
+        ),
+        (
+            1920,
+            1080,
+            480,
+            864,
+            "1c8dd2ff92ab9b2a1e27c6cb1b1b3e50b858a4bdc77320854e326f138796d2d3",
+        ),
+        (
+            320,
+            240,
+            864,
+            480,
+            "4e43189c1777f032f54224e765bbdc2597e44d415578e75324467d74e2d086ee",
+        ),
+        (
+            37,
+            53,
+            64,
+            32,
+            "46d11f416b4d43772e2710c3d402423cb03fd9760bab2964ca6b71147a32782f",
+        ),
+        (
+            64,
+            32,
+            64,
+            32,
+            "639a7182e105bb318e5a768ad0f84c118e1078d55f92340525f028850ff941a6",
+        ),
+        (
+            1,
+            1,
+            7,
+            3,
+            "91c5ecb35447065e657e788040834cfa79c673982763c3f12a232e204af9bbda",
+        ),
+        (
+            17,
+            9,
+            1,
+            1,
+            "ec9c7696d467e355478810ede56bf36398f7bdaf446aaaeaa24679db37b95218",
+        ),
+    ] {
+        let input: Vec<_> = (0..sw * sh * 3)
+            .map(|i| ((i * 37 + i / 7) % 256) as u8)
+            .collect();
+        let output = h3_hrx::resize::world_first_frame(&input, sw, sh, dw, dh);
+        let bytes: Vec<_> = output.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(hrx::bundle::digest(&bytes), digest, "{sw}x{sh}->{dw}x{dh}");
+    }
+}
+
+#[test]
 #[cfg(feature = "cli")]
 fn world_cli_rejects_invalid_requests_before_loading_models() {
     let binary = env!("CARGO_BIN_EXE_h3");
