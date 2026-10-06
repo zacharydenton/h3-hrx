@@ -1010,7 +1010,7 @@ fn run(mut cli: Cli) -> Result<()> {
             eprint!("\r  step {step}/{steps}  {seconds:5.1} s");
         }
         let _ = std::io::Write::flush(&mut std::io::stderr());
-        false // true would cancel
+        h3_hrx::Control::Continue
     };
     let latents = if let Some(world) = &world {
         session.denoise_world(

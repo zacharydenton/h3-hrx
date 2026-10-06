@@ -121,7 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let completion = graph.submit().unwrap();
                 assert!(!completion.is_complete());
                 competing = Some(completion);
-                true
+                h3_hrx::Control::Cancel
             }),
         );
         assert!(matches!(cancelled, Err(h3_hrx::Error::Cancelled)));

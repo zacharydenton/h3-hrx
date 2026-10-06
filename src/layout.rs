@@ -394,6 +394,18 @@ impl Schedule {
             .collect();
         Self { sigmas, timesteps }
     }
+
+    /// Make the step after `completed` steps the last: it lands at sigma zero.
+    /// A step to zero takes the model's estimate of the clean latents, so a run
+    /// cut short decodes sharp rather than as its noisy intermediate. Nothing
+    /// changes when that step is already the last.
+    pub fn finish_after(&mut self, completed: usize) {
+        if completed + 1 < self.timesteps.len() {
+            self.timesteps.truncate(completed + 1);
+            self.sigmas.truncate(completed + 1);
+            self.sigmas.push(0.0);
+        }
+    }
 }
 
 /// The frame count the model actually produces: the next `17n + 5`.
@@ -504,6 +516,25 @@ mod tests {
         assert!(shape_for(480, 864, 0).is_none()); // no frames
         assert!(shape_for(MAX_SIDE + 32, 864, 124).is_none());
         assert!(shape_for(480, 864, MAX_FRAMES + 1).is_none());
+    }
+
+    #[test]
+    fn finishing_lands_the_next_step_at_zero() {
+        let full = Schedule::new(30, 3.0);
+        let mut cut = Schedule::new(30, 3.0);
+        // Ten steps done; the eleventh goes from sigma 10 to zero.
+        cut.finish_after(10);
+        assert_eq!(cut.timesteps, full.timesteps[..11]);
+        assert_eq!(cut.sigmas[..11], full.sigmas[..11]);
+        assert_eq!(cut.sigmas.len(), 12);
+        assert_eq!(cut.sigmas[11], 0.0);
+        let last = full.timesteps.len();
+        for completed in [last - 1, last] {
+            let mut unchanged = Schedule::new(30, 3.0);
+            unchanged.finish_after(completed);
+            assert_eq!(unchanged.sigmas, full.sigmas);
+            assert_eq!(unchanged.timesteps, full.timesteps);
+        }
     }
 
     #[test]

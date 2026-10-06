@@ -6,7 +6,7 @@
 use crate::avae::AudioVae;
 use crate::compile::Compiler;
 use crate::dispatch::Profile;
-use crate::dit::{DenoiseParams, Dit, Keyframe, Latents, Noise, Reference};
+use crate::dit::{Control, DenoiseParams, Dit, Keyframe, Latents, Noise, Reference};
 use crate::error::{invalid, Result};
 use crate::layout::{shape_for, Shape};
 use crate::te::TextEncoder;
@@ -243,7 +243,7 @@ impl Session {
     }
 
     /// Denoise on the shared compute lane. The borrowed progress callback runs
-    /// on the calling thread; returning true cancels after draining native work.
+    /// on the calling thread and answers a `Control` after each step.
     #[allow(clippy::too_many_arguments)]
     pub fn denoise(
         &mut self,
@@ -252,7 +252,7 @@ impl Session {
         noise: Noise<'_>,
         refs: &[Reference<'_>],
         kfs: &[Keyframe<'_>],
-        progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
+        progress: Option<&mut dyn FnMut(usize, usize, f64) -> Control>,
     ) -> Result<Latents> {
         self.validate(ids, p, noise, refs, kfs)?;
         self.scheduled(|state| state.denoise(ids, p, noise, refs, kfs, progress, None, None))
@@ -267,7 +267,7 @@ impl Session {
         noise: Noise<'_>,
         refs: &[Reference<'_>],
         kfs: &[Keyframe<'_>],
-        progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
+        progress: Option<&mut dyn FnMut(usize, usize, f64) -> Control>,
     ) -> Result<Latents> {
         let sh = self.validate(presentation.ids(), p, noise, refs, kfs)?;
         if presentation.ids().len() > sh.text_rows_max as usize {
@@ -297,7 +297,7 @@ impl Session {
         p: &DenoiseParams,
         noise: Noise<'_>,
         first_frame: &Keyframe<'_>,
-        progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
+        progress: Option<&mut dyn FnMut(usize, usize, f64) -> Control>,
     ) -> Result<Latents> {
         let kfs = std::slice::from_ref(first_frame);
         let shape = self.validate(presentation.ids(), p, noise, &[], kfs)?;
@@ -688,7 +688,7 @@ impl State {
         noise: Noise<'_>,
         refs: &[Reference<'_>],
         kfs: &[Keyframe<'_>],
-        progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
+        progress: Option<&mut dyn FnMut(usize, usize, f64) -> Control>,
         visuals: Option<&[crate::media_context::VisualBlock]>,
         world: Option<&crate::WorldRequest>,
     ) -> Result<Latents> {
@@ -1090,7 +1090,13 @@ mod tests {
                 Noise::default(),
                 &[],
                 &[],
-                Some(&mut |_, _, _| cancel),
+                Some(&mut |_, _, _| {
+                    if cancel {
+                        Control::Cancel
+                    } else {
+                        Control::Continue
+                    }
+                }),
             );
             let state = session.native.state().unwrap();
             assert!(state.te.is_none() && state.dit.is_none());

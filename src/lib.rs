@@ -78,7 +78,8 @@ mod trace;
 
 pub use cache::{CachePolicy, CacheThresholds};
 pub use dit::{
-    Attention, DenoiseParams, Keyframe, LatentGrid, Latents, Noise, Presented, Reference, Sampler,
+    Attention, Control, DenoiseParams, Keyframe, LatentGrid, Latents, Noise, Presented, Reference,
+    Sampler,
 };
 pub use error::{Error, Result};
 pub use layout::{shape_for, Shape};

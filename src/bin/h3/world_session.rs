@@ -375,7 +375,7 @@ impl Driver<'_> {
         let mut progress = |done, total, _| {
             eprint!("\rsegment {}: {done}/{total} evaluations", state.segments());
             let _ = std::io::stderr().flush();
-            false
+            h3_hrx::Control::Continue
         };
         let segment =
             self.session

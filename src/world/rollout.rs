@@ -299,7 +299,7 @@ impl Session {
         state: &mut WorldState,
         tokenizer: &Tokenizer,
         actions: &ActionSchedule,
-        progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
+        progress: Option<&mut dyn FnMut(usize, usize, f64) -> crate::dit::Control>,
     ) -> Result<WorldSegment> {
         let digest = self.world_adapter_identity()?;
         if state

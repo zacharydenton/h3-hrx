@@ -316,6 +316,23 @@ pub enum Sampler {
     ResMultistep,
 }
 
+/// What a denoising progress callback wants after a step. The callback is
+/// given the steps done, the steps the run will take and the seconds spent.
+///
+/// `Finish` keeps the work done so far: the next step lands both schedules at
+/// sigma zero and is the last, so the latents are the model's estimate of the
+/// clean clip from where the run had got to, ready to decode as usual.
+/// `Cancel` stops with `Error::Cancelled` after draining native work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    /// Take the next step.
+    Continue,
+    /// Make the next step the last, landing at zero.
+    Finish,
+    /// Stop with `Error::Cancelled`.
+    Cancel,
+}
+
 /// What a run asks for. The shifts and the sampler are the schedule's, the threshold the step cache's.
 #[derive(Clone, Copy, Debug)]
 pub struct DenoiseParams {
@@ -799,7 +816,7 @@ impl Dit {
         noise: Noise<'_>,
         refs: &[Reference<'_>],
         kfs: &[Keyframe<'_>],
-        progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
+        progress: Option<&mut dyn FnMut(usize, usize, f64) -> Control>,
     ) -> Result<Latents> {
         crate::cache::CachePolicy::Off
             .validate(p.cache_threshold)
@@ -966,7 +983,7 @@ impl Dit {
         noise: Noise<'_>,
         refs: &[Reference<'_>],
         kfs: &[Keyframe<'_>],
-        mut progress: Option<&mut dyn FnMut(usize, usize, f64) -> bool>,
+        mut progress: Option<&mut dyn FnMut(usize, usize, f64) -> Control>,
         cache_policy: crate::cache::CachePolicy,
     ) -> Result<Latents> {
         self.check_stream(stream)?;
@@ -1063,8 +1080,8 @@ impl Dit {
                 .upload(stream, &arows, &vrows)?;
         }
 
-        let sv = crate::layout::Schedule::new(p.steps, shift_v);
-        let sa = crate::layout::Schedule::new(p.steps, shift_a);
+        let mut sv = crate::layout::Schedule::new(p.steps, shift_v);
+        let mut sa = crate::layout::Schedule::new(p.steps, shift_a);
         crate::trace::event("schedule", || {
             use crate::cache::CachePolicy;
             let (mode, thresholds) = match cache_policy {
@@ -1101,7 +1118,8 @@ impl Dit {
         // Retain the curve independently across the mutable block execution below.
         let curve = self.cond.as_ref().expect("ready").curve.clone();
 
-        for step in 0..sv.timesteps.len() {
+        let mut step = 0;
+        while step < sv.timesteps.len() {
             // the four timestep embeddings: video, audio, and the two conditioning classes, which
             // sit at least at the augmentation timestep so a reference never reads as fully denoised
             let tv = crate::conditioning::temb(&curve, sv.timesteps[step]);
@@ -1233,14 +1251,20 @@ impl Dit {
                 if !res {
                     stream.synchronize()?;
                 }
-                if cb(
+                match cb(
                     step + 1,
                     sv.timesteps.len(),
                     started.elapsed().as_secs_f64(),
                 ) {
-                    return Err(crate::error::Error::Cancelled);
+                    Control::Continue => {}
+                    Control::Finish => {
+                        sv.finish_after(step + 1);
+                        sa.finish_after(step + 1);
+                    }
+                    Control::Cancel => return Err(crate::error::Error::Cancelled),
                 }
             }
+            step += 1;
         }
 
         if let Some(c) = cache.as_ref() {
