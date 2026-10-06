@@ -161,6 +161,9 @@ rows. Residual down projections also cover 4,096 rows, with cached and rotating
 weights; their residual is reset outside timing before each iteration. Cases use
 the runtime's operand pitches, direct buffer initialization and a 512 MiB GPU
 allocation budget. Setup and output readback stay outside timing.
+`prepare_f32_i8` covers tiny rows, the tiled FFN dispatch boundary, and batches
+through 4,096 tokens, plus wider 25,600-value rows. It supports the same HRX
+profiling and allocation cap, with direct readback outside timing.
 `prepare_qk_i8` cases cover token-major and head-major operands at 1, 257, 2,048
 and 8,192 tokens with the same allocation cap and HRX profiling support.
 `transpose_v_f16` covers 1, 257, 2,048 and 8,192 tokens, checking exact half bits

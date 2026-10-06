@@ -39,6 +39,7 @@ fn preparation(c: &mut Criterion) {
         (256, 14336),
         (256, 25600),
         (2048, 14336),
+        (4096, 14336),
     ] {
         group.throughput(Throughput::Elements((tokens * width) as u64));
         group.bench_function(
@@ -66,11 +67,12 @@ fn preparation(c: &mut Criterion) {
                 let x = upload(&mut stream, bytemuck::cast_slice(&input));
                 let out = stream.allocate_zeroed(tokens * width).unwrap();
                 let scales = stream.allocate_zeroed(tokens * 4).unwrap();
-                let run = |stream: &mut Stream| {
+                let mut profile = h3_hrx::dispatch::Profile::from_env();
+                let mut run = |stream: &mut Stream| {
                     prepare
                         .run(
                             stream,
-                            None,
+                            Some(&mut profile),
                             "bench",
                             tokens as u32,
                             x.binding(),
@@ -82,21 +84,13 @@ fn preparation(c: &mut Criterion) {
                     stream.synchronize().unwrap();
                 };
                 run(&mut stream);
-                let expected = stream
-                    .read(out.binding())
-                    .unwrap()
-                    .wait(&mut stream)
-                    .unwrap();
+                let mut expected = vec![0; tokens * width];
+                stream.read_blocking(out.binding(), &mut expected).unwrap();
                 let expected_scales = check_f32(&mut stream, &scales);
                 b.iter(|| run(&mut stream));
-                assert_eq!(
-                    stream
-                        .read(out.binding())
-                        .unwrap()
-                        .wait(&mut stream)
-                        .unwrap(),
-                    expected
-                );
+                let mut actual = vec![0; expected.len()];
+                stream.read_blocking(out.binding(), &mut actual).unwrap();
+                assert_eq!(actual, expected);
                 assert_eq!(check_f32(&mut stream, &scales), expected_scales);
             },
         );

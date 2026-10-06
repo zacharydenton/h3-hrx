@@ -3359,6 +3359,74 @@ fn wide_hadamard_preserves_finite_range() {
     assert!(scales[0].is_finite());
     assert!((scales[1] - 131072.0 / 127.0).abs() < 0.001);
 }
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
+fn tiled_preparation_matches_single_pass_across_formats() {
+    let mut h = Harness::new();
+    for width in [4352usize, 14336] {
+        let (rows, stride) = (5usize, width + 64);
+        let mut input = vec![0.0f32; rows * width];
+        for (i, value) in input[..width].iter_mut().enumerate() {
+            *value = ((i * 37 % 101) as f32 - 50.0) * 128.0;
+            if i >= width - 256 {
+                *value *= 4.0; // Put the largest values in the partial final tile.
+            }
+        }
+        input[2 * width] = f32::NAN;
+        input[4 * width - 1] = f32::INFINITY;
+        input[4 * width + 13] = f32::NEG_INFINITY;
+        for bits in [4, 8] {
+            for f32_input in [false, true] {
+                let suffix = if f32_input { "_f32" } else { "" };
+                let encoded = if f32_input {
+                    bytes(&input)
+                } else {
+                    bytes(&input.iter().copied().map(f16::from_f32).collect::<Vec<_>>())
+                };
+                let data = [
+                    encoded,
+                    vec![0xa5; rows * stride * bits / 8],
+                    vec![0xa5; rows * 4],
+                ];
+                let mut expected = None;
+                for tiled in [false, true] {
+                    let (module, stem, lanes) = if tiled {
+                        (
+                            "prepare_plain_tiled".into(),
+                            format!("prepare_plain_tiled{suffix}_i{bits}"),
+                            256,
+                        )
+                    } else {
+                        (
+                            format!("prepare_i{bits}_family"),
+                            format!("prepare_plain{suffix}_i{bits}"),
+                            h3_hrx::model::lanes_for(width).unwrap(),
+                        )
+                    };
+                    let out = h.run_module(
+                        &module,
+                        &stem,
+                        &cfg(&[("width", width), ("lanes", lanes), ("out_stride", stride)]),
+                        [rows as u32, 1, 1],
+                        lanes as u32,
+                        &[rows as u64],
+                        &data,
+                    );
+                    if let Some(expected) = &expected {
+                        assert_eq!(&out[1..], expected, "{stem}, width={width}");
+                    } else {
+                        expected = Some(out[1..].to_vec());
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 #[cfg_attr(
     not(feature = "gpu-tests"),

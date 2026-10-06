@@ -215,17 +215,19 @@ template.def<@h3.prepare_plain_tiled> @h3_prepare_plain_tiled(%tokens: index, %h
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
 
-      %tile_max = scf.for %j = [%c0 to %tile_chunks step %c1](%prev = %max_prev : f32) -> (f32) {
-        %step = index.mul %j, %lanes : index
-        %local = index.add %step, %lane : index
-        %v = view.load %x_view[%local] : view<4096xf32> -> f32
-        %abs = scalar.absf %v : f32
-        %finite = scalar.cmpf olt, %abs, %inf : f32
-        %checked = scf.select %finite, %abs, %inf : f32
-        %next = scalar.maxnumf %prev, %checked : f32
-        scf.yield %next : f32
-      }
-      scf.if %first {
+      // The second pass already has the row scale; only quantize its transformed tiles.
+      %tile_max = scf.if %first -> (f32) {
+        %local_max = scf.for %j = [%c0 to %tile_chunks step %c1](%prev = %max_prev : f32) -> (f32) {
+          %step = index.mul %j, %lanes : index
+          %local = index.add %step, %lane : index
+          %v = view.load %x_view[%local] : view<4096xf32> -> f32
+          %abs = scalar.absf %v : f32
+          %finite = scalar.cmpf olt, %abs, %inf : f32
+          %checked = scf.select %finite, %abs, %inf : f32
+          %next = scalar.maxnumf %prev, %checked : f32
+          scf.yield %next : f32
+        }
+        scf.yield %local_max : f32
       } else {
         scf.for %word = [%lane to %words step %lanes] {
           %local0 = index.mul %word, %packed : index
@@ -253,14 +255,20 @@ template.def<@h3.prepare_plain_tiled> @h3_prepare_plain_tiled(%tokens: index, %h
             view.store %encoded, %qw[%row, %out] : i32, view<[%tokens_b]x[%out_words]xi32>
           }
         }
+        scf.yield %max_prev : f32
       }
       kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
       scf.yield %tile_max : f32
     }
-    %maximum = kernel.workgroup.reduce<maxnumf> %max_all : f32
-    %normal = scalar.mulf %maximum, %sixteenth : f32
-    %safe_max = scalar.maxnumf %normal, %tiny : f32
-    %new_scale = scalar.divf %safe_max, %qmax : f32
+    %new_scale = scf.if %first -> (f32) {
+      %maximum = kernel.workgroup.reduce<maxnumf> %max_all : f32
+      %normal = scalar.mulf %maximum, %sixteenth : f32
+      %safe_max = scalar.maxnumf %normal, %tiny : f32
+      %computed = scalar.divf %safe_max, %qmax : f32
+      scf.yield %computed : f32
+    } else {
+      scf.yield %scale : f32
+    }
     scf.yield %new_scale : f32
   }
   %is_first = index.cmp eq, %lane, %c0 : index
