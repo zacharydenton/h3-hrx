@@ -10,7 +10,7 @@ Results and baselines belong in ignored `target/criterion/`, never in Git.
 | Target | Coverage |
 | --- | --- |
 | `host` | Short/long tokenization, mixed-media presentation, image resizing, RefMod loading/strength/copies, packed sequence layout |
-| `kernels` | FP32 Hadamard preparation, INT8/BF16 GEMMs with FP32 outputs, cached/rotating weights, eager/graph dispatch |
+| `kernels` | FP32 Hadamard preparation, INT8/BF16 GEMMs with FP32 outputs including DiT projection dimensions, cached/rotating weights, eager/graph dispatch |
 | `models` | Resident one-block DiT eager/graph comparison and short audio roundtrip |
 | `stages` | Complete text encoder plus token refiner, vision tower, video encode/decode, audio encode/decode, complete 50-block denoising trajectories with Euler and ResMultistep |
 | `lifecycle` | Mapping/planning, tensor packing and completed uploads, block loading throughput, cold-file loading, forced audio eviction/reload |
@@ -153,7 +153,12 @@ Collect diagnostics separately from Criterion latency samples:
 
 ```sh
 H3_PROFILE=device H3_COMPILE_REPORT_DIR=target/h3-reports cargo bench --bench stages -- audio_encode/165600 --test 2>target/h3-profile.log
+H3_PROFILE=device H3_COMPILE_REPORT_DIR=target/h3-reports cargo bench --bench kernels -- gemm/i8/swiglu/cached/2048x5376x28672 --test 2>target/h3-gemm-profile.log
 ```
+
+GEMM cases include DiT QKV, FFN and down-projection dimensions at 256 and 2,048
+rows. They use the runtime's operand pitches, direct buffer initialization and
+a 512 MiB GPU allocation budget. Setup and output readback stay outside timing.
 
 `H3_PROFILE=device` uses HRX's owned graphs and device-clock markers. Each
 `H3_GPU_PROFILE` JSON line records the stage, symbol, launch geometry, scalar

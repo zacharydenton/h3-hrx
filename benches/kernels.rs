@@ -16,13 +16,12 @@ fn compiler() -> Compiler {
 }
 
 fn upload(stream: &mut Stream, bytes: &[u8]) -> Buffer {
-    let buffer = stream.allocate(bytes.len()).unwrap();
-    stream.upload_blocking(buffer.binding(), bytes).unwrap();
-    buffer
+    stream.allocate_from(bytes).unwrap()
 }
 
 fn check_f32(stream: &mut Stream, buffer: &Buffer) -> Vec<u8> {
-    let bytes = stream.read(buffer.binding()).unwrap().wait(stream).unwrap();
+    let mut bytes = vec![0; buffer.binding().len()];
+    stream.read_blocking(buffer.binding(), &mut bytes).unwrap();
     assert!(bytes
         .as_chunks::<4>()
         .0
@@ -119,15 +118,26 @@ fn operand(count: usize, elem: &str, seed: usize) -> Vec<u8> {
 fn gemm(c: &mut Criterion) {
     let mut group = c.benchmark_group("gemm");
     for elem in ["i8", "bf16"] {
-        for (mode, n) in [("f32", 6144usize), ("swiglu", 16384)] {
+        let mut shapes = vec![("f32", 2048, 2048, 6144), ("swiglu", 2048, 2048, 16384)];
+        if elem == "i8" {
+            use h3_hrx::model::{FFN, HID, QKV};
+            for m in [256, 2048] {
+                shapes.extend([
+                    ("f32", m, HID, QKV),
+                    ("swiglu", m, HID, 2 * FFN),
+                    ("f32", m, FFN, HID),
+                ]);
+            }
+        }
+        for (mode, m, k, n) in shapes {
             for rotating in [false, true] {
-                let (m, k) = (2048usize, 2048usize);
                 let storage = if rotating { "rotating" } else { "cached" };
                 group.throughput(Throughput::Elements((2 * m * k * n) as u64));
                 group.bench_function(format!("{elem}/{mode}/{storage}/{m}x{k}x{n}"), |b| {
-                    let mut stream = Stream::open().unwrap();
+                    let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+                    let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
                     let compiler = compiler();
-                    let stride = k + 64;
+                    let stride = h3_hrx::model::gemm_pitch(k, h3_hrx::model::elem_bits(elem));
                     let gemm = Gemm::build_with_output(
                         &compiler,
                         &mut stream,
@@ -159,10 +169,11 @@ fn gemm(c: &mut Criterion) {
                     let as_ = upload(&mut stream, bytemuck::cast_slice(&vec![0.01f32; m]));
                     let width = if mode == "swiglu" { n / 2 } else { n };
                     let out = stream.allocate_zeroed(m * width * 4).unwrap();
-                    let run = |stream: &mut Stream, index: usize| {
+                    let mut profile = h3_hrx::dispatch::Profile::from_env();
+                    let mut run = |stream: &mut Stream, index: usize| {
                         gemm.run(
                             stream,
-                            None,
+                            Some(&mut profile),
                             "bench",
                             m as u32,
                             a.binding(),
