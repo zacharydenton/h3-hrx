@@ -1,6 +1,6 @@
 //! Generate video frames and audio through the h3-hrx library.
 //! Run with `cargo run -p h3-hrx-example --release -- "prompt" [frames] [steps] [out]`.
-use h3_hrx::{Config, DenoiseParams, Noise, Session, Tokenizer};
+use h3_hrx::{Config, Control, DenoiseParams, Noise, Session, Tokenizer};
 use std::io::Write;
 
 fn main() {
@@ -46,7 +46,7 @@ fn main() {
 
     let mut show = |step: usize, steps: usize, seconds: f64| {
         eprintln!("  step {step}/{steps}  {seconds:.1} s");
-        false // true cancels
+        Control::Continue
     };
     let latents = session
         .denoise(&ids, &p, Noise::default(), &[], &[], Some(&mut show))
@@ -77,8 +77,6 @@ fn write_wav(path: &str, samples: &[f32], n: usize) {
     w.write_all(b"RIFF").unwrap();
     w.write_all(&(36 + bytes).to_le_bytes()).unwrap();
     w.write_all(b"WAVEfmt ").unwrap();
-    // each field at its own width: packing format and channels into one u32 wrote format 2,
-    // channels 1, which is neither what the payload is nor readable
     w.write_all(&16u32.to_le_bytes()).unwrap(); // fmt chunk size
     w.write_all(&1u16.to_le_bytes()).unwrap(); // PCM
     w.write_all(&2u16.to_le_bytes()).unwrap(); // stereo

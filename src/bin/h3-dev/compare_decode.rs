@@ -1,24 +1,23 @@
 //! Compare resident decoders using two explicit source directories and identical latents.
-//! compare_decode BASELINE_DIR CHECKPOINT LATENTS HEIGHT WIDTH FRAMES
+//! h3-dev compare-decode BASELINE_DIR CHECKPOINT LATENTS HEIGHT WIDTH FRAMES
 //! Baseline modules contain the original exports, grouped into the current module files.
 //! H3_BASELINE_LOOM_LIBRARY optionally compares a compiler upgrade as well.
 use h3_hrx::{compile::Compiler, dispatch::Profile, layout::shape_for, vvae::VideoVae};
 use std::{path::Path, time::Instant};
 
 pub fn run(args: Vec<String>) {
-    let a: Vec<String> = std::iter::once("h3-dev".to_string()).chain(args).collect();
     assert_eq!(
-        a.len(),
-        7,
+        args.len(),
+        6,
         "BASELINE_DIR CHECKPOINT LATENTS HEIGHT WIDTH FRAMES"
     );
     let shape = shape_for(
-        a[4].parse().unwrap(),
-        a[5].parse().unwrap(),
-        a[6].parse().unwrap(),
+        args[3].parse().unwrap(),
+        args[4].parse().unwrap(),
+        args[5].parse().unwrap(),
     )
     .unwrap();
-    let input = std::fs::read(&a[3]).unwrap();
+    let input = std::fs::read(&args[2]).unwrap();
     assert!(input.len().is_multiple_of(4));
     let latents: Vec<_> = input
         .as_chunks::<4>()
@@ -35,12 +34,15 @@ pub fn run(args: Vec<String>) {
     let baseline_exe = std::env::var_os("H3_BASELINE_LOOM_LIBRARY")
         .map(std::path::PathBuf::from)
         .or_else(|| exe.clone());
-    let compilers = [Compiler::new(baseline_exe, &a[1]), Compiler::new(exe, root)];
+    let compilers = [
+        Compiler::new(baseline_exe, &args[0]),
+        Compiler::new(exe, root),
+    ];
     let mut stream = hrx::Stream::open().unwrap();
     // Safety: caller-owned checkpoint, which is not modified during this comparison.
     let mut vaes = [
-        unsafe { VideoVae::open(&mut stream, &a[2]).unwrap() },
-        unsafe { VideoVae::open(&mut stream, &a[2]).unwrap() },
+        unsafe { VideoVae::open(&mut stream, &args[1]).unwrap() },
+        unsafe { VideoVae::open(&mut stream, &args[1]).unwrap() },
     ];
     let mut profile = Profile::default();
     let bytes = shape.frames as usize * shape.lat_h as usize * 16 * shape.lat_w as usize * 16 * 3;

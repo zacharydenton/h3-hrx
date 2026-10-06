@@ -1,8 +1,7 @@
 # Notes
 
-Every decision and every measurement, won or lost, in order. The sibling repos'
-conventions apply: ship only the measured-best configuration; losing variants go to
-`experiments/` with their number here.
+Historical decisions and measurements. Retired variants referenced under
+`experiments/` are available in Git history.
 
 Several of the measurement scripts named below — the `ab_*`, `ablate_*` and `*_study`
 tools — were removed once the questions they were written for were settled. The numbers

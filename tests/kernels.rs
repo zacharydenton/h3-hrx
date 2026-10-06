@@ -679,127 +679,111 @@ fn rotary_qk_norm_matches_cpu_for_all_head_layouts_and_copies_v() {
 fn quantized_gemms_match_integer_dot_products_bias_and_residual_classes() {
     let mut h = Harness::new();
     for bits in [4usize, 8] {
-        for tile in [128usize, 256] {
-            for biased in [false, true] {
-                if tile == 128 && (bits == 8 || biased) {
-                    continue;
-                }
-                for mode in ["plain", "resid", "swiglu"] {
-                    for pad in [0usize, 128] {
-                        if tile == 128 && pad != 0 {
-                            continue;
-                        }
-                        // Padded cases cross the 256-row workgroup boundary.
-                        let (m, k, n) = (if pad == 0 { 17usize } else { 257 }, 128usize, 128usize);
-                        let stride = k + pad;
-                        let a: Vec<i8> =
-                            (0..m * stride).map(|i| ((i * 3 % 15) as i8) - 7).collect();
-                        let w: Vec<i8> =
-                            (0..n * stride).map(|i| ((i * 7 % 15) as i8) - 7).collect();
-                        let pack = |v: &[i8]| -> Vec<u8> {
-                            if bits == 8 {
-                                v.iter().map(|&x| x as u8).collect()
-                            } else {
-                                v.as_chunks::<2>()
-                                    .0
-                                    .iter()
-                                    .map(|x| (x[0] as u8 & 15) | ((x[1] as u8 & 15) << 4))
-                                    .collect()
-                            }
-                        };
-                        let ws = vec![0.01f32; n];
-                        let scales = vec![0.02f32; m];
-                        let bias = values(n, 0.1);
-                        let residual = values(m * n, 0.5);
-                        let gates = values(2 * n, 0.3);
-                        let classes: Vec<i32> = (0..m).map(|i| (i % 2) as i32).collect();
-                        let full: Vec<f64> = (0..m * n)
-                            .map(|i| {
-                                let (r, c) = (i / n, i % n);
-                                let dot = (0..k)
-                                    .map(|j| a[r * stride + j] as i32 * w[c * stride + j] as i32)
-                                    .sum::<i32>();
-                                dot as f64 * ws[c] as f64 * scales[r] as f64
-                                    + if biased { bias[c] as f64 } else { 0. }
-                            })
-                            .collect();
-                        let mut stem = format!(
-                            "gemm_i{bits}{}{}{}{}",
-                            if mode == "plain" {
-                                ""
-                            } else if mode == "resid" {
-                                "_resid"
-                            } else {
-                                "_swiglu"
-                            },
-                            if tile == 256 { "_256" } else { "" },
-                            if biased { "b" } else { "" },
-                            if biased && mode == "swiglu" {
-                                "_gs"
-                            } else {
-                                ""
-                            }
-                        );
-                        let mut config = cfg(&[
-                            ("k_size", k),
-                            ("n_size", n),
-                            ("k_stride", stride),
-                            ("m_group", 1),
-                        ]);
-                        let mut data = vec![pack(&a), pack(&w), bytes(&ws), bytes(&scales)];
-                        let want = if mode == "resid" {
-                            config.push(("classes", "2".into()));
-                            data.extend([bytes(&residual), bytes(&gates), bytes(&classes)]);
-                            full.iter()
-                                .enumerate()
-                                .map(|(i, &x)| {
-                                    residual[i] as f64
-                                        + gates[classes[i / n] as usize * n + i % n] as f64 * x
-                                })
-                                .collect::<Vec<_>>()
-                        } else if mode == "swiglu" {
-                            data.push(vec![0; m * n]);
-                            (0..m * n / 2)
-                                .map(|i| {
-                                    let (r, c) = (i / (n / 2), i % (n / 2));
-                                    let a = full[r * n + (c / 16) * 32 + c % 16];
-                                    let b = full[r * n + (c / 16) * 32 + c % 16 + 16];
-                                    if biased {
-                                        b / (1. + (-b).exp()) * a
-                                    } else {
-                                        a / (1. + (-a).exp()) * b
-                                    }
-                                })
+        for biased in [false, true] {
+            for mode in ["plain", "resid", "swiglu"] {
+                for pad in [0usize, 128] {
+                    // Padded cases cross the 256-row workgroup boundary.
+                    let (m, k, n) = (if pad == 0 { 17usize } else { 257 }, 128usize, 128usize);
+                    let stride = k + pad;
+                    let a: Vec<i8> = (0..m * stride).map(|i| ((i * 3 % 15) as i8) - 7).collect();
+                    let w: Vec<i8> = (0..n * stride).map(|i| ((i * 7 % 15) as i8) - 7).collect();
+                    let pack = |v: &[i8]| -> Vec<u8> {
+                        if bits == 8 {
+                            v.iter().map(|&x| x as u8).collect()
+                        } else {
+                            v.as_chunks::<2>()
+                                .0
+                                .iter()
+                                .map(|x| (x[0] as u8 & 15) | ((x[1] as u8 & 15) << 4))
                                 .collect()
-                        } else {
-                            data.push(vec![0; m * n * 2]);
-                            full
-                        };
-                        if biased {
-                            data.push(bytes(&bias));
                         }
-                        let out = h.run_module(
-                            if tile == 256 {
-                                "gemm_packed_256"
-                            } else {
-                                &stem
-                            },
-                            &stem,
-                            &config,
-                            [1, m.div_ceil(tile) as u32, 1],
-                            256,
-                            &[m as u64],
-                            &data,
-                        );
-                        let got = if mode == "resid" {
-                            floats(&out[4])
+                    };
+                    let ws = vec![0.01f32; n];
+                    let scales = vec![0.02f32; m];
+                    let bias = values(n, 0.1);
+                    let residual = values(m * n, 0.5);
+                    let gates = values(2 * n, 0.3);
+                    let classes: Vec<i32> = (0..m).map(|i| (i % 2) as i32).collect();
+                    let full: Vec<f64> = (0..m * n)
+                        .map(|i| {
+                            let (r, c) = (i / n, i % n);
+                            let dot = (0..k)
+                                .map(|j| a[r * stride + j] as i32 * w[c * stride + j] as i32)
+                                .sum::<i32>();
+                            dot as f64 * ws[c] as f64 * scales[r] as f64
+                                + if biased { bias[c] as f64 } else { 0. }
+                        })
+                        .collect();
+                    let stem = format!(
+                        "gemm_i{bits}{}_256{}{}",
+                        if mode == "plain" {
+                            ""
+                        } else if mode == "resid" {
+                            "_resid"
                         } else {
-                            halves(&out[4], false)
-                        };
-                        eprintln!("checking {stem} with padding {pad}");
-                        close(&got, &want, 2e-3, 2e-3);
-                        stem.clear();
+                            "_swiglu"
+                        },
+                        if biased { "b" } else { "" },
+                        if biased && mode == "swiglu" {
+                            "_gs"
+                        } else {
+                            ""
+                        }
+                    );
+                    let mut config = cfg(&[
+                        ("k_size", k),
+                        ("n_size", n),
+                        ("k_stride", stride),
+                        ("m_group", 1),
+                    ]);
+                    let mut data = vec![pack(&a), pack(&w), bytes(&ws), bytes(&scales)];
+                    let want = if mode == "resid" {
+                        config.push(("classes", "2".into()));
+                        data.extend([bytes(&residual), bytes(&gates), bytes(&classes)]);
+                        full.iter()
+                            .enumerate()
+                            .map(|(i, &x)| {
+                                residual[i] as f64
+                                    + gates[classes[i / n] as usize * n + i % n] as f64 * x
+                            })
+                            .collect::<Vec<_>>()
+                    } else if mode == "swiglu" {
+                        data.push(vec![0; m * n]);
+                        (0..m * n / 2)
+                            .map(|i| {
+                                let (r, c) = (i / (n / 2), i % (n / 2));
+                                let a = full[r * n + (c / 16) * 32 + c % 16];
+                                let b = full[r * n + (c / 16) * 32 + c % 16 + 16];
+                                if biased {
+                                    b / (1. + (-b).exp()) * a
+                                } else {
+                                    a / (1. + (-a).exp()) * b
+                                }
+                            })
+                            .collect()
+                    } else {
+                        data.push(vec![0; m * n * 2]);
+                        full
+                    };
+                    if biased {
+                        data.push(bytes(&bias));
                     }
+                    let out = h.run_module(
+                        "gemm_packed_256",
+                        &stem,
+                        &config,
+                        [1, m.div_ceil(256) as u32, 1],
+                        256,
+                        &[m as u64],
+                        &data,
+                    );
+                    let got = if mode == "resid" {
+                        floats(&out[4])
+                    } else {
+                        halves(&out[4], false)
+                    };
+                    eprintln!("checking {stem} with padding {pad}");
+                    close(&got, &want, 2e-3, 2e-3);
                 }
             }
         }

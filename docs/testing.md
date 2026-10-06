@@ -126,7 +126,7 @@ The GPU suite compares independent scalar CPU references against:
 - RMSNorm, LayerNorm and plain FP16/BF16 preparation at three widths, including
   large inputs, per-row classes and padded output strides.
 - All three rotary Q/K normalization layouts, including grouped heads and exact V copying.
-- INT4/INT8 GEMM families, both tile sizes, bias, residual classes, SwiGLU ordering
+- INT4/INT8 production GEMM families, bias, residual classes, SwiGLU ordering
   and padded input strides on kernels that support them.
 - The f16 and BF16 GEMM families across all three modes and both epilogues.
 - Packed INT4/INT8 attention with four and eight waves, including the INT4 skip decisions.

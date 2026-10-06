@@ -1,5 +1,5 @@
 //! Paired resident GEMM comparisons against a source snapshot.
-//! cargo run --release --example compare_gemm -- BASELINE_DIR [FILTER]
+//! cargo run --release --bin h3-dev -- compare-gemm BASELINE_DIR [FILTER]
 //! Weights rotate through more than 64 MiB as well as repeatedly using one matrix.
 //! H3_COMPARE_BATCHES sets the number of paired timing batches (default 10, even and >= 2).
 use half::{bf16, f16};
@@ -53,9 +53,8 @@ fn median(v: &mut [f64]) -> f64 {
     (v[v.len() / 2 - 1] + v[v.len() / 2]) / 2.
 }
 pub fn run(args: Vec<String>) {
-    let args: Vec<String> = std::iter::once("h3-dev".to_string()).chain(args).collect();
-    let baseline = Path::new(args.get(1).expect("BASELINE_DIR [FILTER]"));
-    let filter = args.get(2).map(String::as_str).unwrap_or("");
+    let baseline = Path::new(args.first().expect("BASELINE_DIR [FILTER]"));
+    let filter = args.get(1).map(String::as_str).unwrap_or("");
     let batches: usize = std::env::var("H3_COMPARE_BATCHES")
         .map(|v| v.parse().expect("H3_COMPARE_BATCHES must be an integer"))
         .unwrap_or(10);

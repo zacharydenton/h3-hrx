@@ -832,7 +832,6 @@ impl Gemm {
 
     /// `(tokens, a_q, w_q[, w_s, a_s], out[, gate, cls][, bias])` — the float operands carry no scales.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
         stream: &mut hrx::Stream,
@@ -1075,7 +1074,6 @@ impl GroupNormSilu {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,

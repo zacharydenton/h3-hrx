@@ -24,60 +24,37 @@ mod verify_upload;
 mod vision_embed;
 
 fn main() {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let command = if args.is_empty() {
-        String::new()
+    let mut args = std::env::args().skip(1);
+    let command = args.next().unwrap_or_default();
+    let commands = [
+        ("audio-vae", audio_vae::run as fn(Vec<String>)),
+        ("compare-decode", compare_decode::run),
+        ("compare-gemm", compare_gemm::run),
+        ("compare-vision", compare_vision::run),
+        ("compile-probes", compile_probes::run),
+        ("decode-video", decode_video::run),
+        ("denoise-cases", denoise_cases::run),
+        ("dispatch-cost", dispatch_cost::run),
+        ("encode-video", encode_video::run),
+        ("inspect-adapter", inspect_adapter::run),
+        ("parity-dump", parity_dump::run),
+        ("resolve", resolve::run),
+        ("text-in", text_in::run),
+        ("tune-gemm", tune_gemm::run),
+        ("two-sessions", two_sessions::run),
+        ("verify-gemm", verify_gemm::run),
+        ("verify-send", verify_send::run),
+        ("verify-stack-kernels", verify_stack_kernels::run),
+        ("verify-upload", verify_upload::run),
+        ("vision-embed", vision_embed::run),
+    ];
+    if let Some((_, run)) = commands.iter().find(|(name, _)| *name == command) {
+        run(args.collect());
     } else {
-        args.remove(0)
-    };
-    match command.as_str() {
-        "audio-vae" => audio_vae::run(args),
-        "compare-decode" => compare_decode::run(args),
-        "compare-gemm" => compare_gemm::run(args),
-        "compile-probes" => compile_probes::run(args),
-        "compare-vision" => compare_vision::run(args),
-        "decode-video" => decode_video::run(args),
-        "denoise-cases" => denoise_cases::run(args),
-        "dispatch-cost" => dispatch_cost::run(args),
-        "encode-video" => encode_video::run(args),
-        "inspect-adapter" => inspect_adapter::run(args),
-        "parity-dump" => parity_dump::run(args),
-        "resolve" => resolve::run(args),
-        "text-in" => text_in::run(args),
-        "tune-gemm" => tune_gemm::run(args),
-        "two-sessions" => two_sessions::run(args),
-        "verify-gemm" => verify_gemm::run(args),
-        "verify-send" => verify_send::run(args),
-        "verify-stack-kernels" => verify_stack_kernels::run(args),
-        "verify-upload" => verify_upload::run(args),
-        "vision-embed" => vision_embed::run(args),
-        other => {
-            eprintln!("h3-dev: unknown command {other:?}\n\ncommands:");
-            for name in [
-                "audio-vae",
-                "compare-decode",
-                "compare-gemm",
-                "compile-probes",
-                "compare-vision",
-                "decode-video",
-                "denoise-cases",
-                "dispatch-cost",
-                "encode-video",
-                "inspect-adapter",
-                "parity-dump",
-                "resolve",
-                "text-in",
-                "tune-gemm",
-                "two-sessions",
-                "verify-gemm",
-                "verify-send",
-                "verify-stack-kernels",
-                "verify-upload",
-                "vision-embed",
-            ] {
-                eprintln!("  {name}");
-            }
-            std::process::exit(2);
+        eprintln!("h3-dev: unknown command {command:?}\n\ncommands:");
+        for (name, _) in commands {
+            eprintln!("  {name}");
         }
+        std::process::exit(2);
     }
 }

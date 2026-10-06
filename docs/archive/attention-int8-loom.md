@@ -79,6 +79,6 @@ OPENBLAS_NUM_THREADS=4 python3 tools/bench_attention_i8.py 37723 \
   --rounds 3 --repeat 3 --wait-idle --output build/attention30/loom-final
 ```
 
-The generator uses the checked-in 32-key transposed template under
-`experiments/`. Intermediate scheduling variants and their measurements remain
-locally under `build/attention30/prototypes` and `build/attention30`.
+The retired generator and its 32-key transposed template are available in Git
+history. Intermediate measurements were stored locally under
+`build/attention30/prototypes` and `build/attention30`.

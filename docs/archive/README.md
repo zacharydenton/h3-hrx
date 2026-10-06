@@ -6,6 +6,9 @@ paths, and references to untracked benchmark artifacts. Use the
 [setup guide](../setup.md) for current installation instructions and the
 [performance summary](../performance.md) for the recorded production results.
 
+Retired kernel variants and generators are available in Git history. The
+`experiments/` directory keeps only compiler probes and GPU regression fixtures.
+
 | Report | Scope |
 | --- | --- |
 | [Development notes](notes.md) | Chronological implementation and numerical investigations |
