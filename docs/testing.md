@@ -148,8 +148,9 @@ branching, last-frame handoff, seed/frame accounting, rollback and writer locks.
 session. These tests run by default and require the pinned world adapter.
 See [world validation](world.md#validation) for visual qualification guidance.
 
-The upscaler tests cover the released 3D checkpoint against a small upstream
-FP16 fixture, temporal chunk blending, scalar convolution/normalization
+The upscaler tests cover the complete upstream node at two spatial sizes,
+including its per-channel input/output transforms and FP16 rounding boundaries,
+temporal chunk blending, scalar convolution/normalization
 oracles, ER-SDE with explicit noise, and two-pass generation with RefMods,
 fixed audio, target-grid keyframes and cancellation recovery. They run through
 `cargo test`; CPU-only builds skip hardware tests. Fixtures need no Python.

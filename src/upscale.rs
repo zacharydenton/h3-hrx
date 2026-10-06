@@ -1,5 +1,6 @@
 //! Learned spatial upscaling of normalized H3 video latents.
 mod network;
+mod normalization;
 use crate::{error::invalid, Result, Shape};
 pub use network::{Upscaler, CHECKPOINT};
 

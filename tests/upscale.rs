@@ -148,7 +148,12 @@ fn learned_network_runs_all_layers_preserves_identity_and_blends_chunks() {
             .unwrap();
         assert_eq!(out.size(), (64, 64));
         assert_eq!(out.latent_t, shape.latent_t);
-        assert!(values.iter().all(|v| (*v - 0.25).abs() < 1e-6));
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/upscale/normalization.json")).unwrap();
+        for (ch, plane) in values.chunks_exact(out.latent_t as usize * 16).enumerate() {
+            let expected = expected["constant_quarter"][ch].as_f64().unwrap() as f32;
+            assert!(plane.iter().all(|v| (*v - expected).abs() < 1e-6));
+        }
     }
     stream.synchronize().unwrap();
 }
@@ -172,46 +177,63 @@ fn released_checkpoint_upscales_a_bounded_clip() {
         )
     }
     .unwrap();
-    let shape = h3_hrx::shape_for(32, 32, 5).unwrap();
-    let input = h3_hrx::Latents {
-        video: include_bytes!("fixtures/upscale/input.f32")
+    for (size, expected) in [
+        (
+            32,
+            include_bytes!("fixtures/upscale/node-output.f32").as_slice(),
+        ),
+        (
+            128,
+            include_bytes!("fixtures/upscale/node-spatial-output.f32").as_slice(),
+        ),
+    ] {
+        let shape = h3_hrx::shape_for(size, size, 5).unwrap();
+        let input = h3_hrx::Latents {
+            video: if size == 32 {
+                include_bytes!("fixtures/upscale/input.f32")
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                    .collect()
+            } else {
+                (0..24 * 2 * 8 * 8)
+                    .map(|i| (i % 103) as f32 / 51.0 - 1.0)
+                    .collect()
+            },
+            audio: vec![0.125; 64 * shape.audio_t as usize],
+        };
+        let settings = UpscaleSettings {
+            target: UpscaleTarget::Scale(2.0),
+            ..Default::default()
+        };
+        let output = session
+            .upscale_latents(&input, &shape, &settings, None)
+            .unwrap();
+        assert_eq!(output.shape.size(), (size * 2, size * 2));
+        assert_eq!(output.latents.audio, input.audio);
+        assert!(output.latents.video.iter().all(|v| v.is_finite()));
+        let expected = expected
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-            .collect(),
-        audio: vec![0.125; 64 * shape.audio_t as usize],
-    };
-    let settings = UpscaleSettings {
-        target: UpscaleTarget::Scale(2.0),
-        ..Default::default()
-    };
-    let output = session
-        .upscale_latents(&input, &shape, &settings, None)
-        .unwrap();
-    assert_eq!(output.shape.size(), (64, 64));
-    assert_eq!(output.latents.audio, input.audio);
-    assert!(output.latents.video.iter().all(|v| v.is_finite()));
-    let expected = include_bytes!("fixtures/upscale/output.f32")
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-        .collect::<Vec<_>>();
-    let rmse = (output
-        .latents
-        .video
-        .iter()
-        .zip(&expected)
-        .map(|(a, b)| (a - b).powi(2) as f64)
-        .sum::<f64>()
-        / expected.len() as f64)
-        .sqrt();
-    let max = output
-        .latents
-        .video
-        .iter()
-        .zip(&expected)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    eprintln!("upscaler upstream parity: rmse={rmse}, max={max}");
-    assert!(rmse < 0.005 && max < 0.03, "rmse={rmse} max={max}");
+            .collect::<Vec<_>>();
+        let rmse = (output
+            .latents
+            .video
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).powi(2) as f64)
+            .sum::<f64>()
+            / expected.len() as f64)
+            .sqrt();
+        let max = output
+            .latents
+            .video
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("upscaler node parity at {size}px: rmse={rmse}, max={max}");
+        assert!(rmse < 0.005 && max < 0.03, "rmse={rmse} max={max}");
+    }
 }
 
 #[test]

@@ -275,6 +275,7 @@ impl Upscaler {
             .map(|budget| budget.reserve(host_bytes))
             .transpose()?;
         let mut output = vec![0f32; 24 * t * oh * ow];
+        let transforms = super::normalization::transforms();
         let mut total = vec![0f32; t];
         let chunks = if chunked { t.div_ceil(32) } else { 1 };
         let started = std::time::Instant::now();
@@ -292,7 +293,7 @@ impl Upscaler {
                 for p in 0..h * w {
                     for ch in 0..24 {
                         segment[(z * h * w + p) * 24 + ch] =
-                            f16::from_f32(input[(ch * t + source) * h * w + p]);
+                            transforms[ch].normalize(input[(ch * t + source) * h * w + p]);
                     }
                 }
             }
@@ -324,7 +325,8 @@ impl Upscaler {
         for ch in 0..24 {
             for z in 0..t {
                 for p in 0..oh * ow {
-                    output[(ch * t + z) * oh * ow + p] /= total[z];
+                    let v = &mut output[(ch * t + z) * oh * ow + p];
+                    *v = transforms[ch].restore(*v / total[z]);
                 }
             }
         }

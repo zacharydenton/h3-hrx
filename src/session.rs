@@ -438,6 +438,7 @@ impl Session {
     }
 
     /// Enlarge normalized video latents; audio is returned unchanged.
+    /// Applies the ComfyUI upscaler node's separate per-channel transform internally.
     pub fn upscale_latents(
         &mut self,
         input: &Latents,

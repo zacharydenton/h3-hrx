@@ -1,14 +1,27 @@
-# 3D upscaler reference
+# 3D upscaler references
 
-`input.f32` and `output.f32` are little-endian FP32, channel-first tensors
-with shapes `[24,2,2,2]` and `[24,2,4,4]`. Inputs are already normalized.
+The reference is the complete upstream `MinimaxH3LatentUpscaler3D.execute`
+node, including its input/output per-channel transforms. Those transforms are
+part of the upscaler even though H3's incoming video latents are already
+normalized by the VAE. Comparing only `LatentResizer3D.forward` misses this
+boundary and previously allowed severely incorrect colors through the tests.
 
-Generated once with PyTorch 2.14.0 on CPU, four threads, inference mode,
-and the unmodified `LatentResizer3D` class from upstream revision
-`40316cf008b2fd8663263270669eb4da23f89d2c`. All weights and activations are FP16.
-Input element `i` is `(i % 23 - 11) / 32`. Call:
-`model(input.half(), scale=2.0, target_size=(2,4,4), enable_chunking=True)`.
-Output is widened to FP32 for storage. No raw-VAE normalization is applied.
+Generated with PyTorch 2.14.0 on CPU, four threads, inference mode, using
+upstream revision `40316cf008b2fd8663263270669eb4da23f89d2c`. The node runs at
+FP16 precision, scale 2, alignment 32, and temporal chunking enabled. Model
+loading is supplied from the checkpoint below; the node's `execute` method
+and network are unmodified. Outputs retain the FP32 input dtype.
+
+All binary fixtures contain little-endian FP32 tensors, channel first:
+
+- `input.f32`: `[24,2,2,2]`, element `i` is `(i % 23 - 11) / 32`.
+- `node-output.f32`: the node's `[24,2,4,4]` output for `input.f32`.
+- `node-spatial-output.f32`: `[24,2,16,16]` output for a `[24,2,8,8]`
+  input whose FP32 element `i` is `(i % 103) / 51 - 1`.
+
+`normalization.json` records Torch FP16 input and output transforms for all
+24 channels, plus the restored value for a network output of 0.25. It tests
+the intermediate half-precision rounding boundaries without a GPU.
 
 Checkpoint: `LBH-123-AI/Minimax_h3_latent_Upscaler`,
 `minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors`.
