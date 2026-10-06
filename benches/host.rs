@@ -230,5 +230,39 @@ fn video_temporal(c: &mut Criterion) {
     }
     group.finish();
 }
-criterion_group! { name = benches; config = support::criterion(); targets = host, rotary, video_decoder_input, video_decoder_output, video_temporal }
+fn video_spatial(c: &mut Criterion) {
+    let mut group = c.benchmark_group("video_spatial");
+    for (frames, height, width) in [
+        (4, 272, 256),
+        (4, 256, 272),
+        (28, 480, 864),
+        (28, 768, 1344),
+    ] {
+        let fixture = support::values(3 * frames * 256 * 256, 0.5);
+        let run = |out: &mut Vec<f32>| {
+            h3_hrx::vvae::stitch_pixels(frames, height, width, out, |_, _, th, tw, tile| {
+                let count = 3 * frames * th * tw;
+                tile.resize(count, 0.0);
+                tile.copy_from_slice(&fixture[..count]);
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .unwrap();
+        };
+        group.throughput(Throughput::Elements((3 * frames * height * width) as u64));
+        group.bench_function(format!("{height}x{width}x{frames}/reused"), |b| {
+            let mut out = Vec::new();
+            run(&mut out);
+            b.iter(|| run(black_box(&mut out)));
+        });
+        group.bench_function(format!("{height}x{width}x{frames}/fresh"), |b| {
+            b.iter(|| {
+                let mut out = Vec::new();
+                run(&mut out);
+                black_box(out)
+            });
+        });
+    }
+    group.finish();
+}
+criterion_group! { name = benches; config = support::criterion(); targets = host, rotary, video_decoder_input, video_decoder_output, video_temporal, video_spatial }
 criterion_main!(benches);

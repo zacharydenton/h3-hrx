@@ -121,6 +121,11 @@ that execution path; it is not a quality-qualified cache preset.
 
 ## Measurement boundaries
 
+- **Spatial video assembly:** `video_spatial` measures tile-buffer allocation,
+  copying prebuilt decoded fixtures, overlap blending and planar output writes.
+  Cases cover each overlap axis and full 28-frame windows at 480p/768p, with
+  fresh and reused output buffers. Model execution is excluded; benchmark
+  buffers stay below 1 GiB.
 - **Temporal video assembly:** `video_temporal` measures window-buffer allocation,
   copying prebuilt decoded fixtures, temporal trimming, cross-fades and float RGB
   output writes. Cases cover short and multiple-window clips through 768p; peak

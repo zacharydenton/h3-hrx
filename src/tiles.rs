@@ -101,26 +101,54 @@ pub fn blend_pixels(
     th: usize,
     tw: usize,
 ) {
-    for c in 0..3 {
-        for t in 0..frames {
-            for y in 0..if vertical { extent } else { th } {
-                for x in 0..if vertical { tw } else { extent } {
-                    let wb = if vertical { y } else { x } as f32 / extent as f32;
-                    let wa = 1.0 - wb;
-                    let dst = ((c * frames + t) * th + y) * tw + x;
-                    let src = ((c * frames + t) * th + if vertical { th - extent + y } else { y })
-                        * tw
-                        + if vertical { x } else { tw - extent + x };
-                    tile[dst] = wa * a[src] + wb * tile[dst];
-                }
+    if vertical {
+        for cf in 0..3 * frames {
+            for y in 0..extent {
+                let dst = (cf * th + y) * tw;
+                let src = (cf * th + th - extent + y) * tw;
+                blend_row(
+                    &mut tile[dst..dst + tw],
+                    &a[src..src + tw],
+                    y as f32 / extent as f32,
+                );
             }
         }
+    } else {
+        // Every row uses the same ramp. Preserve FP32 division and multiply/add
+        // order while letting the row loop vectorize over contiguous slices.
+        let weights: Vec<_> = (0..extent)
+            .map(|x| {
+                let wb = x as f32 / extent as f32;
+                (1.0 - wb, wb)
+            })
+            .collect();
+        for row in 0..3 * frames * th {
+            let dst = row * tw;
+            let src = dst + tw - extent;
+            for ((d, &s), &(wa, wb)) in tile[dst..dst + extent]
+                .iter_mut()
+                .zip(&a[src..src + extent])
+                .zip(&weights)
+            {
+                *d = wa * s + wb * *d;
+            }
+        }
+    }
+}
+
+fn blend_row(dst: &mut [f32], src: &[f32], wb: f32) {
+    let wa = 1.0 - wb;
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d = wa * s + wb * *d;
     }
 }
 
 /// Decode and composite spatial tiles in row order. The previous row's strip is
 /// the finished horizontal composite; the left tile includes its vertical blend.
 /// Keeping raw neighbours instead reintroduces seams wherever overlaps cross.
+///
+/// Dimensions are positive multiples of 16. The callback fills `[3][frames][th][tw]`
+/// pixels for the supplied `(y0, x0, th, tw)` tile; output is `[3][frames][height][width]`.
 pub fn stitch_pixels<E>(
     frames: usize,
     height: usize,
@@ -134,7 +162,7 @@ pub fn stitch_pixels<E>(
     if ys.len() == 1 && xs.len() == 1 {
         return decode(0, 0, th, tw, out);
     }
-    out.clear();
+    // Every output pixel is overwritten below; retain initialized storage across windows.
     out.resize(3 * frames * height * width, 0.0);
     let (mut above, mut next_above, mut left, mut tile) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -148,11 +176,9 @@ pub fn stitch_pixels<E>(
                 for cf in 0..3 * frames {
                     for y in 0..extent {
                         let wb = y as f32 / extent as f32;
-                        for x in 0..tw {
-                            let dst = (cf * th + y) * tw + x;
-                            let src = (cf * extent + y) * width + x0 + x;
-                            tile[dst] = (1.0 - wb) * above[src] + wb * tile[dst];
-                        }
+                        let dst = (cf * th + y) * tw;
+                        let src = (cf * extent + y) * width + x0;
+                        blend_row(&mut tile[dst..dst + tw], &above[src..src + tw], wb);
                     }
                 }
             }
@@ -499,6 +525,83 @@ mod tests {
         assert_eq!(tile[0], 10.0, "row 0 takes the neighbour's row th - extent");
         assert_eq!(tile[tw], 60.0, "row 1 is half of 20 and half of 100");
         assert_eq!(tile[2 * tw], 100.0, "past the extent the tile is unchanged");
+    }
+
+    #[test]
+    fn pixel_blends_match_scalar_bits_in_both_directions() {
+        for (frames, th, tw) in [(2, 7, 11), (4, 256, 256)] {
+            let n = 3 * frames * th * tw;
+            let a: Vec<_> = (0..n)
+                .map(|i| ((i * 37 % 1009) as f32 - 504.0) / 127.0)
+                .collect();
+            let b: Vec<_> = (0..n)
+                .map(|i| ((i * 71 % 997) as f32 - 498.0) / 31.0)
+                .collect();
+            for vertical in [false, true] {
+                let side = if vertical { th } else { tw };
+                for extent in [0, 1, 3, side / 3, side / 2, side] {
+                    let mut got = b.clone();
+                    blend_pixels(&mut got, &a, extent, vertical, frames, th, tw);
+                    for i in 0..n {
+                        let (y, x) = (i / tw % th, i % tw);
+                        let k = if vertical { y } else { x };
+                        let expected = if k < extent {
+                            let src = i + if vertical {
+                                (th - extent) * tw
+                            } else {
+                                tw - extent
+                            };
+                            let wb = k as f32 / extent as f32;
+                            (1.0 - wb) * a[src] + wb * b[i]
+                        } else {
+                            b[i]
+                        };
+                        assert_eq!(
+                            got[i].to_bits(),
+                            expected.to_bits(),
+                            "{th}x{tw}, vertical={vertical}, extent={extent}, index={i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spatial_stitching_overwrites_reused_output_through_shape_changes() {
+        let mut reused = Vec::new();
+        for (frames, height, width) in [
+            (2, 272, 256),
+            (1, 256, 272),
+            (2, 480, 864),
+            (1, 256, 256),
+            (2, 272, 272),
+        ] {
+            let run = |out: &mut Vec<f32>| {
+                stitch_pixels(frames, height, width, out, |y0, x0, th, tw, tile| {
+                    tile.clear();
+                    for cf in 0..3 * frames {
+                        for y in 0..th {
+                            for x in 0..tw {
+                                tile.push(
+                                    (cf * 997 + y0 * 71 + x0 * 31 + y * 13 + x) as f32 / 127.0,
+                                );
+                            }
+                        }
+                    }
+                    Ok::<_, std::convert::Infallible>(())
+                })
+                .unwrap();
+            };
+            let mut fresh = Vec::new();
+            run(&mut fresh);
+            for _ in 0..2 {
+                reused.fill(f32::NAN);
+                run(&mut reused);
+                assert_eq!(reused.len(), 3 * frames * height * width);
+                assert_eq!(reused, fresh);
+            }
+        }
     }
 
     #[test]

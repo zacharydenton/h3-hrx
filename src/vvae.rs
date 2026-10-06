@@ -11,6 +11,7 @@ use crate::error::{other, Result};
 use crate::model::*;
 use crate::stack::{Constants, LayerCond, Stack, StackDims};
 use crate::tiles;
+pub use crate::tiles::stitch_pixels;
 use crate::weights::Weights;
 use half::slice::HalfFloatSliceExt;
 
@@ -505,7 +506,7 @@ impl VideoVae {
             return self.decode_clip(stream, c, prof, z, grid, frames);
         }
         let mut latent = Vec::new();
-        tiles::stitch_pixels(frames_n, height, width, frames, |y0, x0, th, tw, tile| {
+        stitch_pixels(frames_n, height, width, frames, |y0, x0, th, tw, tile| {
             let (lh, lw) = (th / VAE_PS, tw / VAE_PS);
             latent.resize(LATENT_CH * ft * lh * lw, 0.0);
             for ch in 0..LATENT_CH {
