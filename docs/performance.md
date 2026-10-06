@@ -77,9 +77,14 @@ H3_BENCH_ATTN=f16 cargo bench --locked --bench stages -- denoise/
 `H3_BENCH_ATTN` selects `i8` (default), `f16`, or experimental `i4` attention.
 `H3_GRAPH` is read once by the runtime: compare it in separate processes.
 Case names include attention, graph mode and the allocation budget to keep
-incompatible baselines separate. `H3_BENCH_BUDGET_GIB` defaults to 64 for the new
-stage/render/lifecycle/memory suite; the earlier `models` microbenchmarks retain
-their fixed 32 GiB budget.
+incompatible baselines separate. `H3_BENCH_BUDGET_GIB` defaults to 64 for the
+stage/render/lifecycle/memory suite and 32 for the `models` benchmarks. Profile
+a single DiT block with a smaller cap:
+
+```sh
+H3_BENCH_BUDGET_GIB=2 H3_PROFILE=device cargo bench --locked --bench models -- dit_stack/eager/2048 --test
+```
+
 `H3_BENCH_RESIDENCY` selects `budgeted` (default), `retain`, or `stage-scoped` for
 stage and API render benchmarks. A reused stage-scoped session reloads weights
 between stages; its name records that policy. CLI cases always use stage-scoped

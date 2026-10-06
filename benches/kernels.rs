@@ -34,12 +34,19 @@ fn check_f32(stream: &mut Stream, buffer: &Buffer) -> Vec<u8> {
 
 fn preparation(c: &mut Criterion) {
     let mut group = c.benchmark_group("prepare_f32_i8");
-    for (tokens, width) in [(256usize, 14336usize), (256, 25600), (2048, 14336)] {
+    for (tokens, width) in [
+        (1usize, 14336usize),
+        (32, 14336),
+        (256, 14336),
+        (256, 25600),
+        (2048, 14336),
+    ] {
         group.throughput(Throughput::Elements((tokens * width) as u64));
         group.bench_function(
             BenchmarkId::new("plain", format!("{tokens}x{width}")),
             |b| {
-                let mut stream = Stream::open().unwrap();
+                let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+                let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
                 let compiler = compiler();
                 let prepare = Prepare::build_with_input(
                     &compiler,

@@ -59,9 +59,13 @@ pub fn attention() -> h3_hrx::Attention {
 }
 
 pub fn budget_bytes() -> usize {
+    budget_bytes_or(64)
+}
+
+pub fn budget_bytes_or(default_gib: usize) -> usize {
     let gib: usize = std::env::var("H3_BENCH_BUDGET_GIB")
         .map(|s| s.parse().expect("integer GiB budget"))
-        .unwrap_or(64);
+        .unwrap_or(default_gib);
     assert!((1..=1024).contains(&gib));
     gib << 30
 }

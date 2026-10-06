@@ -3394,6 +3394,7 @@ fn f32_preparation_matches_dense_hadamard_and_marks_invalid_rows() {
         x[2 * width] = f32::NAN;
         x[3 * width + width - 1] = f32::INFINITY;
         x[4 * width + 13] = f32::NEG_INFINITY;
+        let mut untiled = None;
         for tiled in [false, true] {
             if !tiled && width > 16384 {
                 continue;
@@ -3418,6 +3419,70 @@ fn f32_preparation_matches_dense_hadamard_and_marks_invalid_rows() {
                 &[bytes(&x), vec![0; rows * stride], vec![0; rows * 4]],
             );
             let scales = floats(&out[2]);
+            let finite = (&out[1][..2 * stride], &out[2][..2 * 4]);
+            if let Some((codes, scales)) = &untiled {
+                assert_eq!(finite.0, codes, "tiled codes differ at width {width}");
+                assert_eq!(finite.1, scales, "tiled scales differ at width {width}");
+            } else if !tiled {
+                untiled = Some((finite.0.to_vec(), finite.1.to_vec()));
+            }
+            if width == 14336 && !tiled {
+                use h3_hrx::dispatch::{ActivationType, Prepare};
+                let compiler = h3_hrx::compile::Compiler::new(
+                    None,
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels"),
+                );
+                let prepare = Prepare::build_with_input(
+                    &compiler,
+                    &mut h.stream,
+                    "plain",
+                    "i8",
+                    width,
+                    1e-5,
+                    1,
+                    stride,
+                    ActivationType::F32,
+                )
+                .unwrap();
+                for tokens in [1, 31, 32, 33] {
+                    let input = h
+                        .stream
+                        .allocate_from(&bytes(&x[..width].repeat(tokens)))
+                        .unwrap();
+                    let codes = h.stream.allocate_zeroed(tokens * stride).unwrap();
+                    let scales = h.stream.allocate_zeroed(tokens * 4).unwrap();
+                    prepare
+                        .run(
+                            &mut h.stream,
+                            None,
+                            "prepare boundary",
+                            tokens as u32,
+                            input.binding(),
+                            None,
+                            codes.binding(),
+                            Some(scales.binding()),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        h.stream
+                            .read(codes.binding())
+                            .unwrap()
+                            .wait(&mut h.stream)
+                            .unwrap(),
+                        out[1][..stride].repeat(tokens),
+                        "dispatch codes for {tokens} rows",
+                    );
+                    assert_eq!(
+                        h.stream
+                            .read(scales.binding())
+                            .unwrap()
+                            .wait(&mut h.stream)
+                            .unwrap(),
+                        out[2][..4].repeat(tokens),
+                        "dispatch scales for {tokens} rows",
+                    );
+                }
+            }
             let rotated: Vec<f32> = x[..width]
                 .chunks_exact(256)
                 .flat_map(|group| {

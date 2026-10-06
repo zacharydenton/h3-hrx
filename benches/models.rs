@@ -24,7 +24,7 @@ fn audio(b: &mut Bencher) -> Result<()> {
         kernel_sources: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernels"),
         ..Config::default()
     };
-    let residency = hrx::residency::ResidencyManager::new(32 << 30)?;
+    let residency = hrx::residency::ResidencyManager::new(support::budget_bytes_or(32))?;
     let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
         memory_budget: Some(residency.budget()),
         ..Default::default()
@@ -59,7 +59,7 @@ fn audio(b: &mut Bencher) -> Result<()> {
 }
 
 fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Result<()> {
-    let residency = hrx::residency::ResidencyManager::new(32 << 30)?;
+    let residency = hrx::residency::ResidencyManager::new(support::budget_bytes_or(32))?;
     let mut stream = hrx::Stream::open()?.with_memory_budget(residency.budget());
     let compiler = Compiler::new(
         None,
@@ -151,10 +151,11 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
         .collect();
 
     // Compile and warm the eager path before recording or timing.
+    let mut profile = Profile::from_env();
     stream.upload_blocking(x.binding(), bytemuck::cast_slice(&input))?;
     stack.forward(
         &mut stream,
-        &mut Profile::default(),
+        &mut profile,
         x.binding(),
         classes.all(),
         cos.binding(),
@@ -177,7 +178,7 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
                 graph: &mut recording,
                 after: Default::default(),
             },
-            &mut Profile::default(),
+            &mut profile,
             x.binding(),
             classes.all(),
             cos.binding(),
@@ -206,7 +207,7 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
                 stack
                     .forward(
                         &mut stream,
-                        &mut Profile::default(),
+                        &mut profile,
                         x.binding(),
                         classes.all(),
                         cos.binding(),
