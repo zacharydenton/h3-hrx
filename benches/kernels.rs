@@ -926,7 +926,7 @@ fn attention_transpose(c: &mut Criterion) {
     use h3_hrx::dispatch::{emit, Profile};
     use h3_hrx::model::INNER;
     let mut group = c.benchmark_group("transpose_v_f16");
-    for tokens in [1usize, 257, 2048, 8192] {
+    for tokens in [1usize, 257, 2048, 8192, 8193] {
         for direct in [false, true] {
             let capacity = ((tokens + 16).div_ceil(32) * 32).max(tokens.div_ceil(256) * 256);
             group.throughput(Throughput::Bytes(((tokens + capacity) * INNER * 2) as u64));
@@ -963,6 +963,11 @@ fn attention_transpose(c: &mut Criterion) {
                     let out = upload(&mut stream, &vec![0xff; capacity * INNER * 2]);
                     let bindings = [x.binding(), out.binding()];
                     let required = bindings.map(|view| view.len());
+                    let tile = if direct {
+                        h3_hrx::model::transpose_qkv_tile(INNER)
+                    } else {
+                        32
+                    };
                     let mut profile = Profile::from_env();
                     let mut run = |stream: &mut Stream| {
                         emit(
@@ -970,7 +975,7 @@ fn attention_transpose(c: &mut Criterion) {
                             &kernel,
                             Some(&mut profile),
                             "transpose V",
-                            [(INNER / 32) as u32, (capacity / 32) as u32, 1],
+                            [(INNER / tile) as u32, capacity.div_ceil(tile) as u32, 1],
                             [256, 1, 1],
                             &[tokens as u32],
                             &bindings,

@@ -156,6 +156,15 @@ pub fn m_group_for(tokens: usize, tile: usize) -> u32 {
     best
 }
 
+/// Square tile used by the fused-QKV V transpose; matches its Loom launch geometry.
+pub fn transpose_qkv_tile(width: usize) -> usize {
+    if width.is_multiple_of(64) {
+        64
+    } else {
+        32
+    }
+}
+
 /// The long int8 down projection benefits from a smaller row group. Kept shape-specific: the one-row
 /// group and a wider tile both lost when measured.
 pub fn gemm_m_group_for(tokens: usize, k: usize, n: usize, bits: usize) -> u32 {

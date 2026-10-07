@@ -1340,18 +1340,19 @@ impl Stack {
             ends[i] = sink.head();
         }
         sink.resume(before);
+        let tile = transpose_qkv_tile(self.d.inner());
         emit(
             sink,
             self.transpose.as_ref().unwrap(),
             Some(prof),
             "fused V transpose",
             [
-                (self.d.inner() / 32) as u32,
+                (self.d.inner() / tile) as u32,
                 // Projection scratch may contain NaNs in the masked tail.
                 if iq.vt.is_none() {
-                    (self.capacity / 32) as u32
+                    self.capacity.div_ceil(tile) as u32
                 } else {
-                    t.div_ceil(32)
+                    t.div_ceil(tile as u32)
                 },
                 1,
             ],
@@ -1557,19 +1558,24 @@ impl Stack {
             } else {
                 (v, self.d.inner())
             };
+            let tile = if self.direct_v {
+                transpose_qkv_tile(self.d.inner())
+            } else {
+                32
+            };
             emit(
                 sink,
                 self.transpose.as_ref().expect("built with integer QK"),
                 Some(prof),
                 "attention operands",
                 [
-                    (self.d.inner() / 32) as u32,
+                    (self.d.inner() / tile) as u32,
                     // Reused projection bytes can contain arbitrary half values.
                     // Rewrite the entire V capacity so masked keys cannot see NaNs.
                     if int_qk.vt.is_none() {
-                        (cap / 32) as u32
+                        cap.div_ceil(tile) as u32
                     } else {
-                        t.div_ceil(32)
+                        t.div_ceil(tile as u32)
                     },
                     1,
                 ],

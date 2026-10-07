@@ -2533,7 +2533,11 @@ fn fused_qkv_operands_are_byte_identical_to_separate_preparation() {
         let new = h.run(
             "transpose_qkv_v_f16",
             &config,
-            [(width / 32) as u32, tokens.div_ceil(32) as u32, 1],
+            [
+                (width / h3_hrx::model::transpose_qkv_tile(width)) as u32,
+                tokens.div_ceil(h3_hrx::model::transpose_qkv_tile(width)) as u32,
+                1,
+            ],
             256,
             &[tokens as u64],
             &[bytes(&fused), vec![0; capacity * width * 2]],
@@ -2645,50 +2649,65 @@ fn subgroup_shuffle_preparation_matches_lds_repeatedly() {
 fn transposed_values_clear_reused_capacity() {
     let mut h = Harness::new();
     for width in [32, 96, 256, 7168] {
-        for tokens in [1usize, 31, 32, 33, 129, 4096, 4097] {
-            let capacity = (tokens + 32).div_ceil(256) * 256;
-            // Move raw half bits, including NaNs, infinities and signed zero.
-            let input: Vec<u16> = (0..tokens * width)
-                .map(|i| i.wrapping_mul(37) as u16)
-                .collect();
-            let actual = h.run(
-                "transpose_f16",
-                &cfg(&[("width", width), ("row_capacity", capacity)]),
-                [(width / 32) as u32, (capacity / 32) as u32, 1],
-                256,
-                &[tokens as u64],
-                &[bytes(&input), vec![0xff; capacity * width * 2]],
-            );
-            let mut fused = vec![0xffffu16; tokens * width * 3];
-            for (row, v) in fused
-                .chunks_exact_mut(width * 3)
-                .zip(input.chunks_exact(width))
-            {
-                row[2 * width..].copy_from_slice(v);
-            }
-            let direct = h.run(
-                "transpose_qkv_v_f16",
-                &cfg(&[("width", width), ("row_capacity", capacity)]),
-                [(width / 32) as u32, (capacity / 32) as u32, 1],
-                256,
-                &[tokens as u64],
-                &[bytes(&fused), vec![0xff; capacity * width * 2]],
-            );
-            assert!(
-                direct[1] == actual[1],
-                "direct V transpose changed bits or padding"
-            );
-            for (i, word) in actual[1].as_chunks::<2>().0.iter().enumerate() {
-                let (channel, row) = (i / capacity, i % capacity);
-                let expected = if row < tokens {
-                    input[row * width + channel].to_le_bytes()
-                } else {
-                    [0, 0]
-                };
-                assert_eq!(
-                    *word, expected,
-                    "tokens={tokens} row={row} channel={channel}"
+        for tokens in [1usize, 31, 32, 33, 63, 64, 65, 129, 4096, 4097, 8193] {
+            for capacity in [tokens.div_ceil(32) * 32, (tokens + 32).div_ceil(256) * 256] {
+                let output_bytes = capacity * width * 2;
+                let mut output = vec![0xff; output_bytes];
+                output.extend([0xa5; 19]);
+                // Move raw half bits, including NaNs, infinities and signed zero.
+                let input: Vec<u16> = (0..tokens * width)
+                    .map(|i| i.wrapping_mul(37) as u16)
+                    .collect();
+                let actual = h.run(
+                    "transpose_f16",
+                    &cfg(&[("width", width), ("row_capacity", capacity)]),
+                    [(width / 32) as u32, (capacity / 32) as u32, 1],
+                    256,
+                    &[tokens as u64],
+                    &[bytes(&input), output.clone()],
                 );
+                let mut fused = vec![0xffffu16; tokens * width * 3];
+                for (row, v) in fused
+                    .chunks_exact_mut(width * 3)
+                    .zip(input.chunks_exact(width))
+                {
+                    row[2 * width..].copy_from_slice(v);
+                }
+                let direct = h.run(
+                    "transpose_qkv_v_f16",
+                    &cfg(&[("width", width), ("row_capacity", capacity)]),
+                    [
+                        (width / h3_hrx::model::transpose_qkv_tile(width)) as u32,
+                        capacity.div_ceil(h3_hrx::model::transpose_qkv_tile(width)) as u32,
+                        1,
+                    ],
+                    256,
+                    &[tokens as u64],
+                    &[bytes(&fused), output],
+                );
+                assert!(
+                    direct[1] == actual[1],
+                    "direct V transpose changed bits or padding"
+                );
+                assert_eq!(&actual[1][output_bytes..], &[0xa5; 19]);
+                assert_eq!(&direct[1][output_bytes..], &[0xa5; 19]);
+                for (i, word) in actual[1][..output_bytes]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .enumerate()
+                {
+                    let (channel, row) = (i / capacity, i % capacity);
+                    let expected = if row < tokens {
+                        input[row * width + channel].to_le_bytes()
+                    } else {
+                        [0, 0]
+                    };
+                    assert_eq!(
+                        *word, expected,
+                        "tokens={tokens} row={row} channel={channel}"
+                    );
+                }
             }
         }
     }
