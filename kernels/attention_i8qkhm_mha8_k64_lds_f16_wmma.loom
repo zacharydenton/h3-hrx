@@ -16,7 +16,7 @@ config.decl @h3.attention_i8qkhm_mha8_k64_lds_f16_wmma.token_capacity : %value: 
 
 config.decl @h3.attention_i8qkhm_mha8_k64_lds_f16_wmma.scale : f32
 
-low.func.def target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_pack_probability(%even: reg<amdgpu.vgpr x4>, %odd: reg<amdgpu.vgpr x4>) -> (reg<amdgpu.vgpr x8>) asm {
+low.func.def target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_interleave_f16(%even: reg<amdgpu.vgpr x4>, %odd: reg<amdgpu.vgpr x4>) -> (reg<amdgpu.vgpr x8>) asm {
   %lo = s_mov_b32 84148480
   %hi = s_mov_b32 117834498
   %e0 = slice %even[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
@@ -762,25 +762,25 @@ kernel.def target(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) export("h3_a
     %other_words, %weight_ok = kernel.subgroup.shuffle<xor> %weight_words, %i32_16, %i32_32 : vector<4xi32>, i32, i32
     %even_words = scf.select %lane_group_even, %weight_words, %other_words : vector<4xi32>
     %odd_words = scf.select %lane_group_even, %other_words, %weight_words : vector<4xi32>
-    %probability = low.invoke @h3_pack_probability(%even_words, %odd_words) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
+    %probability = low.invoke @h3_interleave_f16(%even_words, %odd_words) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
     %weight_half_b = vector.fptrunc %weight_b : vector<8xf32> to vector<8xf16>
     %weight_words_b = vector.bitcast %weight_half_b : vector<8xf16> to vector<4xi32>
     %other_words_b, %weight_ok_b = kernel.subgroup.shuffle<xor> %weight_words_b, %i32_16, %i32_32 : vector<4xi32>, i32, i32
     %even_words_b = scf.select %lane_group_even, %weight_words_b, %other_words_b : vector<4xi32>
     %odd_words_b = scf.select %lane_group_even, %other_words_b, %weight_words_b : vector<4xi32>
-    %probability_b = low.invoke @h3_pack_probability(%even_words_b, %odd_words_b) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
+    %probability_b = low.invoke @h3_interleave_f16(%even_words_b, %odd_words_b) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
     %weight_half_c = vector.fptrunc %weight_c : vector<8xf32> to vector<8xf16>
     %weight_words_c = vector.bitcast %weight_half_c : vector<8xf16> to vector<4xi32>
     %other_words_c, %weight_ok_c = kernel.subgroup.shuffle<xor> %weight_words_c, %i32_16, %i32_32 : vector<4xi32>, i32, i32
     %even_words_c = scf.select %lane_group_even, %weight_words_c, %other_words_c : vector<4xi32>
     %odd_words_c = scf.select %lane_group_even, %other_words_c, %weight_words_c : vector<4xi32>
-    %probability_c = low.invoke @h3_pack_probability(%even_words_c, %odd_words_c) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
+    %probability_c = low.invoke @h3_interleave_f16(%even_words_c, %odd_words_c) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
     %weight_half_d = vector.fptrunc %weight_d : vector<8xf32> to vector<8xf16>
     %weight_words_d = vector.bitcast %weight_half_d : vector<8xf16> to vector<4xi32>
     %other_words_d, %weight_ok_d = kernel.subgroup.shuffle<xor> %weight_words_d, %i32_16, %i32_32 : vector<4xi32>, i32, i32
     %even_words_d = scf.select %lane_group_even, %weight_words_d, %other_words_d : vector<4xi32>
     %odd_words_d = scf.select %lane_group_even, %other_words_d, %weight_words_d : vector<4xi32>
-    %probability_d = low.invoke @h3_pack_probability(%even_words_d, %odd_words_d) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
+    %probability_d = low.invoke @h3_interleave_f16(%even_words_d, %odd_words_d) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
     %vrow0 = index.add %lane_column, %c0 : index
     %vrow1 = index.add %lane_column, %c16 : index
     %vrow2 = index.add %lane_column, %c32 : index
@@ -879,462 +879,81 @@ kernel.def target(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) export("h3_a
   %out5 = vector.divf<nnan|ninf|nsz|arcp> %final5, %selected_sum : vector<8xf32>
   %out6 = vector.divf<nnan|ninf|nsz|arcp> %final6, %selected_sum : vector<8xf32>
   %out7 = vector.divf<nnan|ninf|nsz|arcp> %final7, %selected_sum : vector<8xf32>
+  // Pair even and odd channels before the output mask, while both half-waves are active.
+  // Only the first half-wave stores; its own words always hold the even channels.
+  %half0 = vector.fptrunc %out0 : vector<8xf32> to vector<8xf16>
+  %words0 = vector.bitcast %half0 : vector<8xf16> to vector<4xi32>
+  %other0, %other_ok0 = kernel.subgroup.shuffle<xor> %words0, %i32_16, %i32_32 : vector<4xi32>, i32, i32
+  %packed0 = low.invoke @h3_interleave_f16(%words0, %other0) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
+  %half1 = vector.fptrunc %out1 : vector<8xf32> to vector<8xf16>
+  %words1 = vector.bitcast %half1 : vector<8xf16> to vector<4xi32>
+  %other1, %other_ok1 = kernel.subgroup.shuffle<xor> %words1, %i32_16, %i32_32 : vector<4xi32>, i32, i32
+  %packed1 = low.invoke @h3_interleave_f16(%words1, %other1) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
+  %half2 = vector.fptrunc %out2 : vector<8xf32> to vector<8xf16>
+  %words2 = vector.bitcast %half2 : vector<8xf16> to vector<4xi32>
+  %other2, %other_ok2 = kernel.subgroup.shuffle<xor> %words2, %i32_16, %i32_32 : vector<4xi32>, i32, i32
+  %packed2 = low.invoke @h3_interleave_f16(%words2, %other2) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
+  %half3 = vector.fptrunc %out3 : vector<8xf32> to vector<8xf16>
+  %words3 = vector.bitcast %half3 : vector<8xf16> to vector<4xi32>
+  %other3, %other_ok3 = kernel.subgroup.shuffle<xor> %words3, %i32_16, %i32_32 : vector<4xi32>, i32, i32
+  %packed3 = low.invoke @h3_interleave_f16(%words3, %other3) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
+  %half4 = vector.fptrunc %out4 : vector<8xf32> to vector<8xf16>
+  %words4 = vector.bitcast %half4 : vector<8xf16> to vector<4xi32>
+  %other4, %other_ok4 = kernel.subgroup.shuffle<xor> %words4, %i32_16, %i32_32 : vector<4xi32>, i32, i32
+  %packed4 = low.invoke @h3_interleave_f16(%words4, %other4) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
+  %half5 = vector.fptrunc %out5 : vector<8xf32> to vector<8xf16>
+  %words5 = vector.bitcast %half5 : vector<8xf16> to vector<4xi32>
+  %other5, %other_ok5 = kernel.subgroup.shuffle<xor> %words5, %i32_16, %i32_32 : vector<4xi32>, i32, i32
+  %packed5 = low.invoke @h3_interleave_f16(%words5, %other5) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
+  %half6 = vector.fptrunc %out6 : vector<8xf32> to vector<8xf16>
+  %words6 = vector.bitcast %half6 : vector<8xf16> to vector<4xi32>
+  %other6, %other_ok6 = kernel.subgroup.shuffle<xor> %words6, %i32_16, %i32_32 : vector<4xi32>, i32, i32
+  %packed6 = low.invoke @h3_interleave_f16(%words6, %other6) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
+  %half7 = vector.fptrunc %out7 : vector<8xf32> to vector<8xf16>
+  %words7 = vector.bitcast %half7 : vector<8xf16> to vector<4xi32>
+  %other7, %other_ok7 = kernel.subgroup.shuffle<xor> %words7, %i32_16, %i32_32 : vector<4xi32>, i32, i32
+  %packed7 = low.invoke @h3_interleave_f16(%words7, %other7) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
   %row_present = index.cmp ult, %q_row, %tokens0 : index
   %row_in_range = index.cmp ult, %q_row, %token_count : index
   %writes0 = scalar.andi %row_present, %row_in_range : i1
   %tile_present = index.cmp ult, %tile_in_image0, %tiles_per_image : index
-  %writes = scalar.andi %writes0, %tile_present : i1
+  %writes1 = scalar.andi %writes0, %tile_present : i1
+  %writes = scalar.andi %writes1, %lane_group_even : i1
   scf.if %writes {
     %global_row = index.assume %q_row [lt(%q_row, %token_count)] : index
-    %out_limit = index.sub %out_stride0, %c1 : index
+    %out_limit = index.sub %out_stride0, %c16 : index
     %oc0 = index.constant 0 : index
-    %col0a = index.add %head_base0, %oc0 : index
-    %col0b = index.add %col0a, %lane_group : index
-    %col0 = index.assume %col0b [le(%col0b, %out_limit)] : index
-    %outv0 = vector.extract %out0[0] : vector<8xf32> -> f32
-    %outh0 = scalar.fptrunc %outv0 : f32 to f16
-    view.store %outh0, %out_view[%global_row, %col0] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc2 = index.constant 2 : index
-    %col2a = index.add %head_base0, %oc2 : index
-    %col2b = index.add %col2a, %lane_group : index
-    %col2 = index.assume %col2b [le(%col2b, %out_limit)] : index
-    %outv2 = vector.extract %out0[1] : vector<8xf32> -> f32
-    %outh2 = scalar.fptrunc %outv2 : f32 to f16
-    view.store %outh2, %out_view[%global_row, %col2] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc4 = index.constant 4 : index
-    %col4a = index.add %head_base0, %oc4 : index
-    %col4b = index.add %col4a, %lane_group : index
-    %col4 = index.assume %col4b [le(%col4b, %out_limit)] : index
-    %outv4 = vector.extract %out0[2] : vector<8xf32> -> f32
-    %outh4 = scalar.fptrunc %outv4 : f32 to f16
-    view.store %outh4, %out_view[%global_row, %col4] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc6 = index.constant 6 : index
-    %col6a = index.add %head_base0, %oc6 : index
-    %col6b = index.add %col6a, %lane_group : index
-    %col6 = index.assume %col6b [le(%col6b, %out_limit)] : index
-    %outv6 = vector.extract %out0[3] : vector<8xf32> -> f32
-    %outh6 = scalar.fptrunc %outv6 : f32 to f16
-    view.store %outh6, %out_view[%global_row, %col6] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc8 = index.constant 8 : index
-    %col8a = index.add %head_base0, %oc8 : index
-    %col8b = index.add %col8a, %lane_group : index
-    %col8 = index.assume %col8b [le(%col8b, %out_limit)] : index
-    %outv8 = vector.extract %out0[4] : vector<8xf32> -> f32
-    %outh8 = scalar.fptrunc %outv8 : f32 to f16
-    view.store %outh8, %out_view[%global_row, %col8] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc10 = index.constant 10 : index
-    %col10a = index.add %head_base0, %oc10 : index
-    %col10b = index.add %col10a, %lane_group : index
-    %col10 = index.assume %col10b [le(%col10b, %out_limit)] : index
-    %outv10 = vector.extract %out0[5] : vector<8xf32> -> f32
-    %outh10 = scalar.fptrunc %outv10 : f32 to f16
-    view.store %outh10, %out_view[%global_row, %col10] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc12 = index.constant 12 : index
-    %col12a = index.add %head_base0, %oc12 : index
-    %col12b = index.add %col12a, %lane_group : index
-    %col12 = index.assume %col12b [le(%col12b, %out_limit)] : index
-    %outv12 = vector.extract %out0[6] : vector<8xf32> -> f32
-    %outh12 = scalar.fptrunc %outv12 : f32 to f16
-    view.store %outh12, %out_view[%global_row, %col12] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc14 = index.constant 14 : index
-    %col14a = index.add %head_base0, %oc14 : index
-    %col14b = index.add %col14a, %lane_group : index
-    %col14 = index.assume %col14b [le(%col14b, %out_limit)] : index
-    %outv14 = vector.extract %out0[7] : vector<8xf32> -> f32
-    %outh14 = scalar.fptrunc %outv14 : f32 to f16
-    view.store %outh14, %out_view[%global_row, %col14] : f16, view<[%token_count]x[%out_stride0]xf16>
+    %col0_0 = index.add %head_base0, %oc0 : index
+    %col0 = index.assume %col0_0 [le(%col0_0, %out_limit), mul(%col0_0, 16)] : index
+    vector.store %packed0, %out_view[%global_row, %col0] : vector<16xf16>, view<[%token_count]x[%out_stride0]xf16>
     %oc16 = index.constant 16 : index
-    %col16a = index.add %head_base0, %oc16 : index
-    %col16b = index.add %col16a, %lane_group : index
-    %col16 = index.assume %col16b [le(%col16b, %out_limit)] : index
-    %outv16 = vector.extract %out1[0] : vector<8xf32> -> f32
-    %outh16 = scalar.fptrunc %outv16 : f32 to f16
-    view.store %outh16, %out_view[%global_row, %col16] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc18 = index.constant 18 : index
-    %col18a = index.add %head_base0, %oc18 : index
-    %col18b = index.add %col18a, %lane_group : index
-    %col18 = index.assume %col18b [le(%col18b, %out_limit)] : index
-    %outv18 = vector.extract %out1[1] : vector<8xf32> -> f32
-    %outh18 = scalar.fptrunc %outv18 : f32 to f16
-    view.store %outh18, %out_view[%global_row, %col18] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc20 = index.constant 20 : index
-    %col20a = index.add %head_base0, %oc20 : index
-    %col20b = index.add %col20a, %lane_group : index
-    %col20 = index.assume %col20b [le(%col20b, %out_limit)] : index
-    %outv20 = vector.extract %out1[2] : vector<8xf32> -> f32
-    %outh20 = scalar.fptrunc %outv20 : f32 to f16
-    view.store %outh20, %out_view[%global_row, %col20] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc22 = index.constant 22 : index
-    %col22a = index.add %head_base0, %oc22 : index
-    %col22b = index.add %col22a, %lane_group : index
-    %col22 = index.assume %col22b [le(%col22b, %out_limit)] : index
-    %outv22 = vector.extract %out1[3] : vector<8xf32> -> f32
-    %outh22 = scalar.fptrunc %outv22 : f32 to f16
-    view.store %outh22, %out_view[%global_row, %col22] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc24 = index.constant 24 : index
-    %col24a = index.add %head_base0, %oc24 : index
-    %col24b = index.add %col24a, %lane_group : index
-    %col24 = index.assume %col24b [le(%col24b, %out_limit)] : index
-    %outv24 = vector.extract %out1[4] : vector<8xf32> -> f32
-    %outh24 = scalar.fptrunc %outv24 : f32 to f16
-    view.store %outh24, %out_view[%global_row, %col24] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc26 = index.constant 26 : index
-    %col26a = index.add %head_base0, %oc26 : index
-    %col26b = index.add %col26a, %lane_group : index
-    %col26 = index.assume %col26b [le(%col26b, %out_limit)] : index
-    %outv26 = vector.extract %out1[5] : vector<8xf32> -> f32
-    %outh26 = scalar.fptrunc %outv26 : f32 to f16
-    view.store %outh26, %out_view[%global_row, %col26] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc28 = index.constant 28 : index
-    %col28a = index.add %head_base0, %oc28 : index
-    %col28b = index.add %col28a, %lane_group : index
-    %col28 = index.assume %col28b [le(%col28b, %out_limit)] : index
-    %outv28 = vector.extract %out1[6] : vector<8xf32> -> f32
-    %outh28 = scalar.fptrunc %outv28 : f32 to f16
-    view.store %outh28, %out_view[%global_row, %col28] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc30 = index.constant 30 : index
-    %col30a = index.add %head_base0, %oc30 : index
-    %col30b = index.add %col30a, %lane_group : index
-    %col30 = index.assume %col30b [le(%col30b, %out_limit)] : index
-    %outv30 = vector.extract %out1[7] : vector<8xf32> -> f32
-    %outh30 = scalar.fptrunc %outv30 : f32 to f16
-    view.store %outh30, %out_view[%global_row, %col30] : f16, view<[%token_count]x[%out_stride0]xf16>
+    %col16_0 = index.add %head_base0, %oc16 : index
+    %col16 = index.assume %col16_0 [le(%col16_0, %out_limit), mul(%col16_0, 16)] : index
+    vector.store %packed1, %out_view[%global_row, %col16] : vector<16xf16>, view<[%token_count]x[%out_stride0]xf16>
     %oc32 = index.constant 32 : index
-    %col32a = index.add %head_base0, %oc32 : index
-    %col32b = index.add %col32a, %lane_group : index
-    %col32 = index.assume %col32b [le(%col32b, %out_limit)] : index
-    %outv32 = vector.extract %out2[0] : vector<8xf32> -> f32
-    %outh32 = scalar.fptrunc %outv32 : f32 to f16
-    view.store %outh32, %out_view[%global_row, %col32] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc34 = index.constant 34 : index
-    %col34a = index.add %head_base0, %oc34 : index
-    %col34b = index.add %col34a, %lane_group : index
-    %col34 = index.assume %col34b [le(%col34b, %out_limit)] : index
-    %outv34 = vector.extract %out2[1] : vector<8xf32> -> f32
-    %outh34 = scalar.fptrunc %outv34 : f32 to f16
-    view.store %outh34, %out_view[%global_row, %col34] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc36 = index.constant 36 : index
-    %col36a = index.add %head_base0, %oc36 : index
-    %col36b = index.add %col36a, %lane_group : index
-    %col36 = index.assume %col36b [le(%col36b, %out_limit)] : index
-    %outv36 = vector.extract %out2[2] : vector<8xf32> -> f32
-    %outh36 = scalar.fptrunc %outv36 : f32 to f16
-    view.store %outh36, %out_view[%global_row, %col36] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc38 = index.constant 38 : index
-    %col38a = index.add %head_base0, %oc38 : index
-    %col38b = index.add %col38a, %lane_group : index
-    %col38 = index.assume %col38b [le(%col38b, %out_limit)] : index
-    %outv38 = vector.extract %out2[3] : vector<8xf32> -> f32
-    %outh38 = scalar.fptrunc %outv38 : f32 to f16
-    view.store %outh38, %out_view[%global_row, %col38] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc40 = index.constant 40 : index
-    %col40a = index.add %head_base0, %oc40 : index
-    %col40b = index.add %col40a, %lane_group : index
-    %col40 = index.assume %col40b [le(%col40b, %out_limit)] : index
-    %outv40 = vector.extract %out2[4] : vector<8xf32> -> f32
-    %outh40 = scalar.fptrunc %outv40 : f32 to f16
-    view.store %outh40, %out_view[%global_row, %col40] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc42 = index.constant 42 : index
-    %col42a = index.add %head_base0, %oc42 : index
-    %col42b = index.add %col42a, %lane_group : index
-    %col42 = index.assume %col42b [le(%col42b, %out_limit)] : index
-    %outv42 = vector.extract %out2[5] : vector<8xf32> -> f32
-    %outh42 = scalar.fptrunc %outv42 : f32 to f16
-    view.store %outh42, %out_view[%global_row, %col42] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc44 = index.constant 44 : index
-    %col44a = index.add %head_base0, %oc44 : index
-    %col44b = index.add %col44a, %lane_group : index
-    %col44 = index.assume %col44b [le(%col44b, %out_limit)] : index
-    %outv44 = vector.extract %out2[6] : vector<8xf32> -> f32
-    %outh44 = scalar.fptrunc %outv44 : f32 to f16
-    view.store %outh44, %out_view[%global_row, %col44] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc46 = index.constant 46 : index
-    %col46a = index.add %head_base0, %oc46 : index
-    %col46b = index.add %col46a, %lane_group : index
-    %col46 = index.assume %col46b [le(%col46b, %out_limit)] : index
-    %outv46 = vector.extract %out2[7] : vector<8xf32> -> f32
-    %outh46 = scalar.fptrunc %outv46 : f32 to f16
-    view.store %outh46, %out_view[%global_row, %col46] : f16, view<[%token_count]x[%out_stride0]xf16>
+    %col32_0 = index.add %head_base0, %oc32 : index
+    %col32 = index.assume %col32_0 [le(%col32_0, %out_limit), mul(%col32_0, 16)] : index
+    vector.store %packed2, %out_view[%global_row, %col32] : vector<16xf16>, view<[%token_count]x[%out_stride0]xf16>
     %oc48 = index.constant 48 : index
-    %col48a = index.add %head_base0, %oc48 : index
-    %col48b = index.add %col48a, %lane_group : index
-    %col48 = index.assume %col48b [le(%col48b, %out_limit)] : index
-    %outv48 = vector.extract %out3[0] : vector<8xf32> -> f32
-    %outh48 = scalar.fptrunc %outv48 : f32 to f16
-    view.store %outh48, %out_view[%global_row, %col48] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc50 = index.constant 50 : index
-    %col50a = index.add %head_base0, %oc50 : index
-    %col50b = index.add %col50a, %lane_group : index
-    %col50 = index.assume %col50b [le(%col50b, %out_limit)] : index
-    %outv50 = vector.extract %out3[1] : vector<8xf32> -> f32
-    %outh50 = scalar.fptrunc %outv50 : f32 to f16
-    view.store %outh50, %out_view[%global_row, %col50] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc52 = index.constant 52 : index
-    %col52a = index.add %head_base0, %oc52 : index
-    %col52b = index.add %col52a, %lane_group : index
-    %col52 = index.assume %col52b [le(%col52b, %out_limit)] : index
-    %outv52 = vector.extract %out3[2] : vector<8xf32> -> f32
-    %outh52 = scalar.fptrunc %outv52 : f32 to f16
-    view.store %outh52, %out_view[%global_row, %col52] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc54 = index.constant 54 : index
-    %col54a = index.add %head_base0, %oc54 : index
-    %col54b = index.add %col54a, %lane_group : index
-    %col54 = index.assume %col54b [le(%col54b, %out_limit)] : index
-    %outv54 = vector.extract %out3[3] : vector<8xf32> -> f32
-    %outh54 = scalar.fptrunc %outv54 : f32 to f16
-    view.store %outh54, %out_view[%global_row, %col54] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc56 = index.constant 56 : index
-    %col56a = index.add %head_base0, %oc56 : index
-    %col56b = index.add %col56a, %lane_group : index
-    %col56 = index.assume %col56b [le(%col56b, %out_limit)] : index
-    %outv56 = vector.extract %out3[4] : vector<8xf32> -> f32
-    %outh56 = scalar.fptrunc %outv56 : f32 to f16
-    view.store %outh56, %out_view[%global_row, %col56] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc58 = index.constant 58 : index
-    %col58a = index.add %head_base0, %oc58 : index
-    %col58b = index.add %col58a, %lane_group : index
-    %col58 = index.assume %col58b [le(%col58b, %out_limit)] : index
-    %outv58 = vector.extract %out3[5] : vector<8xf32> -> f32
-    %outh58 = scalar.fptrunc %outv58 : f32 to f16
-    view.store %outh58, %out_view[%global_row, %col58] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc60 = index.constant 60 : index
-    %col60a = index.add %head_base0, %oc60 : index
-    %col60b = index.add %col60a, %lane_group : index
-    %col60 = index.assume %col60b [le(%col60b, %out_limit)] : index
-    %outv60 = vector.extract %out3[6] : vector<8xf32> -> f32
-    %outh60 = scalar.fptrunc %outv60 : f32 to f16
-    view.store %outh60, %out_view[%global_row, %col60] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc62 = index.constant 62 : index
-    %col62a = index.add %head_base0, %oc62 : index
-    %col62b = index.add %col62a, %lane_group : index
-    %col62 = index.assume %col62b [le(%col62b, %out_limit)] : index
-    %outv62 = vector.extract %out3[7] : vector<8xf32> -> f32
-    %outh62 = scalar.fptrunc %outv62 : f32 to f16
-    view.store %outh62, %out_view[%global_row, %col62] : f16, view<[%token_count]x[%out_stride0]xf16>
+    %col48_0 = index.add %head_base0, %oc48 : index
+    %col48 = index.assume %col48_0 [le(%col48_0, %out_limit), mul(%col48_0, 16)] : index
+    vector.store %packed3, %out_view[%global_row, %col48] : vector<16xf16>, view<[%token_count]x[%out_stride0]xf16>
     %oc64 = index.constant 64 : index
-    %col64a = index.add %head_base0, %oc64 : index
-    %col64b = index.add %col64a, %lane_group : index
-    %col64 = index.assume %col64b [le(%col64b, %out_limit)] : index
-    %outv64 = vector.extract %out4[0] : vector<8xf32> -> f32
-    %outh64 = scalar.fptrunc %outv64 : f32 to f16
-    view.store %outh64, %out_view[%global_row, %col64] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc66 = index.constant 66 : index
-    %col66a = index.add %head_base0, %oc66 : index
-    %col66b = index.add %col66a, %lane_group : index
-    %col66 = index.assume %col66b [le(%col66b, %out_limit)] : index
-    %outv66 = vector.extract %out4[1] : vector<8xf32> -> f32
-    %outh66 = scalar.fptrunc %outv66 : f32 to f16
-    view.store %outh66, %out_view[%global_row, %col66] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc68 = index.constant 68 : index
-    %col68a = index.add %head_base0, %oc68 : index
-    %col68b = index.add %col68a, %lane_group : index
-    %col68 = index.assume %col68b [le(%col68b, %out_limit)] : index
-    %outv68 = vector.extract %out4[2] : vector<8xf32> -> f32
-    %outh68 = scalar.fptrunc %outv68 : f32 to f16
-    view.store %outh68, %out_view[%global_row, %col68] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc70 = index.constant 70 : index
-    %col70a = index.add %head_base0, %oc70 : index
-    %col70b = index.add %col70a, %lane_group : index
-    %col70 = index.assume %col70b [le(%col70b, %out_limit)] : index
-    %outv70 = vector.extract %out4[3] : vector<8xf32> -> f32
-    %outh70 = scalar.fptrunc %outv70 : f32 to f16
-    view.store %outh70, %out_view[%global_row, %col70] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc72 = index.constant 72 : index
-    %col72a = index.add %head_base0, %oc72 : index
-    %col72b = index.add %col72a, %lane_group : index
-    %col72 = index.assume %col72b [le(%col72b, %out_limit)] : index
-    %outv72 = vector.extract %out4[4] : vector<8xf32> -> f32
-    %outh72 = scalar.fptrunc %outv72 : f32 to f16
-    view.store %outh72, %out_view[%global_row, %col72] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc74 = index.constant 74 : index
-    %col74a = index.add %head_base0, %oc74 : index
-    %col74b = index.add %col74a, %lane_group : index
-    %col74 = index.assume %col74b [le(%col74b, %out_limit)] : index
-    %outv74 = vector.extract %out4[5] : vector<8xf32> -> f32
-    %outh74 = scalar.fptrunc %outv74 : f32 to f16
-    view.store %outh74, %out_view[%global_row, %col74] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc76 = index.constant 76 : index
-    %col76a = index.add %head_base0, %oc76 : index
-    %col76b = index.add %col76a, %lane_group : index
-    %col76 = index.assume %col76b [le(%col76b, %out_limit)] : index
-    %outv76 = vector.extract %out4[6] : vector<8xf32> -> f32
-    %outh76 = scalar.fptrunc %outv76 : f32 to f16
-    view.store %outh76, %out_view[%global_row, %col76] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc78 = index.constant 78 : index
-    %col78a = index.add %head_base0, %oc78 : index
-    %col78b = index.add %col78a, %lane_group : index
-    %col78 = index.assume %col78b [le(%col78b, %out_limit)] : index
-    %outv78 = vector.extract %out4[7] : vector<8xf32> -> f32
-    %outh78 = scalar.fptrunc %outv78 : f32 to f16
-    view.store %outh78, %out_view[%global_row, %col78] : f16, view<[%token_count]x[%out_stride0]xf16>
+    %col64_0 = index.add %head_base0, %oc64 : index
+    %col64 = index.assume %col64_0 [le(%col64_0, %out_limit), mul(%col64_0, 16)] : index
+    vector.store %packed4, %out_view[%global_row, %col64] : vector<16xf16>, view<[%token_count]x[%out_stride0]xf16>
     %oc80 = index.constant 80 : index
-    %col80a = index.add %head_base0, %oc80 : index
-    %col80b = index.add %col80a, %lane_group : index
-    %col80 = index.assume %col80b [le(%col80b, %out_limit)] : index
-    %outv80 = vector.extract %out5[0] : vector<8xf32> -> f32
-    %outh80 = scalar.fptrunc %outv80 : f32 to f16
-    view.store %outh80, %out_view[%global_row, %col80] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc82 = index.constant 82 : index
-    %col82a = index.add %head_base0, %oc82 : index
-    %col82b = index.add %col82a, %lane_group : index
-    %col82 = index.assume %col82b [le(%col82b, %out_limit)] : index
-    %outv82 = vector.extract %out5[1] : vector<8xf32> -> f32
-    %outh82 = scalar.fptrunc %outv82 : f32 to f16
-    view.store %outh82, %out_view[%global_row, %col82] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc84 = index.constant 84 : index
-    %col84a = index.add %head_base0, %oc84 : index
-    %col84b = index.add %col84a, %lane_group : index
-    %col84 = index.assume %col84b [le(%col84b, %out_limit)] : index
-    %outv84 = vector.extract %out5[2] : vector<8xf32> -> f32
-    %outh84 = scalar.fptrunc %outv84 : f32 to f16
-    view.store %outh84, %out_view[%global_row, %col84] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc86 = index.constant 86 : index
-    %col86a = index.add %head_base0, %oc86 : index
-    %col86b = index.add %col86a, %lane_group : index
-    %col86 = index.assume %col86b [le(%col86b, %out_limit)] : index
-    %outv86 = vector.extract %out5[3] : vector<8xf32> -> f32
-    %outh86 = scalar.fptrunc %outv86 : f32 to f16
-    view.store %outh86, %out_view[%global_row, %col86] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc88 = index.constant 88 : index
-    %col88a = index.add %head_base0, %oc88 : index
-    %col88b = index.add %col88a, %lane_group : index
-    %col88 = index.assume %col88b [le(%col88b, %out_limit)] : index
-    %outv88 = vector.extract %out5[4] : vector<8xf32> -> f32
-    %outh88 = scalar.fptrunc %outv88 : f32 to f16
-    view.store %outh88, %out_view[%global_row, %col88] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc90 = index.constant 90 : index
-    %col90a = index.add %head_base0, %oc90 : index
-    %col90b = index.add %col90a, %lane_group : index
-    %col90 = index.assume %col90b [le(%col90b, %out_limit)] : index
-    %outv90 = vector.extract %out5[5] : vector<8xf32> -> f32
-    %outh90 = scalar.fptrunc %outv90 : f32 to f16
-    view.store %outh90, %out_view[%global_row, %col90] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc92 = index.constant 92 : index
-    %col92a = index.add %head_base0, %oc92 : index
-    %col92b = index.add %col92a, %lane_group : index
-    %col92 = index.assume %col92b [le(%col92b, %out_limit)] : index
-    %outv92 = vector.extract %out5[6] : vector<8xf32> -> f32
-    %outh92 = scalar.fptrunc %outv92 : f32 to f16
-    view.store %outh92, %out_view[%global_row, %col92] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc94 = index.constant 94 : index
-    %col94a = index.add %head_base0, %oc94 : index
-    %col94b = index.add %col94a, %lane_group : index
-    %col94 = index.assume %col94b [le(%col94b, %out_limit)] : index
-    %outv94 = vector.extract %out5[7] : vector<8xf32> -> f32
-    %outh94 = scalar.fptrunc %outv94 : f32 to f16
-    view.store %outh94, %out_view[%global_row, %col94] : f16, view<[%token_count]x[%out_stride0]xf16>
+    %col80_0 = index.add %head_base0, %oc80 : index
+    %col80 = index.assume %col80_0 [le(%col80_0, %out_limit), mul(%col80_0, 16)] : index
+    vector.store %packed5, %out_view[%global_row, %col80] : vector<16xf16>, view<[%token_count]x[%out_stride0]xf16>
     %oc96 = index.constant 96 : index
-    %col96a = index.add %head_base0, %oc96 : index
-    %col96b = index.add %col96a, %lane_group : index
-    %col96 = index.assume %col96b [le(%col96b, %out_limit)] : index
-    %outv96 = vector.extract %out6[0] : vector<8xf32> -> f32
-    %outh96 = scalar.fptrunc %outv96 : f32 to f16
-    view.store %outh96, %out_view[%global_row, %col96] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc98 = index.constant 98 : index
-    %col98a = index.add %head_base0, %oc98 : index
-    %col98b = index.add %col98a, %lane_group : index
-    %col98 = index.assume %col98b [le(%col98b, %out_limit)] : index
-    %outv98 = vector.extract %out6[1] : vector<8xf32> -> f32
-    %outh98 = scalar.fptrunc %outv98 : f32 to f16
-    view.store %outh98, %out_view[%global_row, %col98] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc100 = index.constant 100 : index
-    %col100a = index.add %head_base0, %oc100 : index
-    %col100b = index.add %col100a, %lane_group : index
-    %col100 = index.assume %col100b [le(%col100b, %out_limit)] : index
-    %outv100 = vector.extract %out6[2] : vector<8xf32> -> f32
-    %outh100 = scalar.fptrunc %outv100 : f32 to f16
-    view.store %outh100, %out_view[%global_row, %col100] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc102 = index.constant 102 : index
-    %col102a = index.add %head_base0, %oc102 : index
-    %col102b = index.add %col102a, %lane_group : index
-    %col102 = index.assume %col102b [le(%col102b, %out_limit)] : index
-    %outv102 = vector.extract %out6[3] : vector<8xf32> -> f32
-    %outh102 = scalar.fptrunc %outv102 : f32 to f16
-    view.store %outh102, %out_view[%global_row, %col102] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc104 = index.constant 104 : index
-    %col104a = index.add %head_base0, %oc104 : index
-    %col104b = index.add %col104a, %lane_group : index
-    %col104 = index.assume %col104b [le(%col104b, %out_limit)] : index
-    %outv104 = vector.extract %out6[4] : vector<8xf32> -> f32
-    %outh104 = scalar.fptrunc %outv104 : f32 to f16
-    view.store %outh104, %out_view[%global_row, %col104] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc106 = index.constant 106 : index
-    %col106a = index.add %head_base0, %oc106 : index
-    %col106b = index.add %col106a, %lane_group : index
-    %col106 = index.assume %col106b [le(%col106b, %out_limit)] : index
-    %outv106 = vector.extract %out6[5] : vector<8xf32> -> f32
-    %outh106 = scalar.fptrunc %outv106 : f32 to f16
-    view.store %outh106, %out_view[%global_row, %col106] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc108 = index.constant 108 : index
-    %col108a = index.add %head_base0, %oc108 : index
-    %col108b = index.add %col108a, %lane_group : index
-    %col108 = index.assume %col108b [le(%col108b, %out_limit)] : index
-    %outv108 = vector.extract %out6[6] : vector<8xf32> -> f32
-    %outh108 = scalar.fptrunc %outv108 : f32 to f16
-    view.store %outh108, %out_view[%global_row, %col108] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc110 = index.constant 110 : index
-    %col110a = index.add %head_base0, %oc110 : index
-    %col110b = index.add %col110a, %lane_group : index
-    %col110 = index.assume %col110b [le(%col110b, %out_limit)] : index
-    %outv110 = vector.extract %out6[7] : vector<8xf32> -> f32
-    %outh110 = scalar.fptrunc %outv110 : f32 to f16
-    view.store %outh110, %out_view[%global_row, %col110] : f16, view<[%token_count]x[%out_stride0]xf16>
+    %col96_0 = index.add %head_base0, %oc96 : index
+    %col96 = index.assume %col96_0 [le(%col96_0, %out_limit), mul(%col96_0, 16)] : index
+    vector.store %packed6, %out_view[%global_row, %col96] : vector<16xf16>, view<[%token_count]x[%out_stride0]xf16>
     %oc112 = index.constant 112 : index
-    %col112a = index.add %head_base0, %oc112 : index
-    %col112b = index.add %col112a, %lane_group : index
-    %col112 = index.assume %col112b [le(%col112b, %out_limit)] : index
-    %outv112 = vector.extract %out7[0] : vector<8xf32> -> f32
-    %outh112 = scalar.fptrunc %outv112 : f32 to f16
-    view.store %outh112, %out_view[%global_row, %col112] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc114 = index.constant 114 : index
-    %col114a = index.add %head_base0, %oc114 : index
-    %col114b = index.add %col114a, %lane_group : index
-    %col114 = index.assume %col114b [le(%col114b, %out_limit)] : index
-    %outv114 = vector.extract %out7[1] : vector<8xf32> -> f32
-    %outh114 = scalar.fptrunc %outv114 : f32 to f16
-    view.store %outh114, %out_view[%global_row, %col114] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc116 = index.constant 116 : index
-    %col116a = index.add %head_base0, %oc116 : index
-    %col116b = index.add %col116a, %lane_group : index
-    %col116 = index.assume %col116b [le(%col116b, %out_limit)] : index
-    %outv116 = vector.extract %out7[2] : vector<8xf32> -> f32
-    %outh116 = scalar.fptrunc %outv116 : f32 to f16
-    view.store %outh116, %out_view[%global_row, %col116] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc118 = index.constant 118 : index
-    %col118a = index.add %head_base0, %oc118 : index
-    %col118b = index.add %col118a, %lane_group : index
-    %col118 = index.assume %col118b [le(%col118b, %out_limit)] : index
-    %outv118 = vector.extract %out7[3] : vector<8xf32> -> f32
-    %outh118 = scalar.fptrunc %outv118 : f32 to f16
-    view.store %outh118, %out_view[%global_row, %col118] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc120 = index.constant 120 : index
-    %col120a = index.add %head_base0, %oc120 : index
-    %col120b = index.add %col120a, %lane_group : index
-    %col120 = index.assume %col120b [le(%col120b, %out_limit)] : index
-    %outv120 = vector.extract %out7[4] : vector<8xf32> -> f32
-    %outh120 = scalar.fptrunc %outv120 : f32 to f16
-    view.store %outh120, %out_view[%global_row, %col120] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc122 = index.constant 122 : index
-    %col122a = index.add %head_base0, %oc122 : index
-    %col122b = index.add %col122a, %lane_group : index
-    %col122 = index.assume %col122b [le(%col122b, %out_limit)] : index
-    %outv122 = vector.extract %out7[5] : vector<8xf32> -> f32
-    %outh122 = scalar.fptrunc %outv122 : f32 to f16
-    view.store %outh122, %out_view[%global_row, %col122] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc124 = index.constant 124 : index
-    %col124a = index.add %head_base0, %oc124 : index
-    %col124b = index.add %col124a, %lane_group : index
-    %col124 = index.assume %col124b [le(%col124b, %out_limit)] : index
-    %outv124 = vector.extract %out7[6] : vector<8xf32> -> f32
-    %outh124 = scalar.fptrunc %outv124 : f32 to f16
-    view.store %outh124, %out_view[%global_row, %col124] : f16, view<[%token_count]x[%out_stride0]xf16>
-    %oc126 = index.constant 126 : index
-    %col126a = index.add %head_base0, %oc126 : index
-    %col126b = index.add %col126a, %lane_group : index
-    %col126 = index.assume %col126b [le(%col126b, %out_limit)] : index
-    %outv126 = vector.extract %out7[7] : vector<8xf32> -> f32
-    %outh126 = scalar.fptrunc %outv126 : f32 to f16
-    view.store %outh126, %out_view[%global_row, %col126] : f16, view<[%token_count]x[%out_stride0]xf16>
+    %col112_0 = index.add %head_base0, %oc112 : index
+    %col112 = index.assume %col112_0 [le(%col112_0, %out_limit), mul(%col112_0, 16)] : index
+    vector.store %packed7, %out_view[%global_row, %col112] : vector<16xf16>, view<[%token_count]x[%out_stride0]xf16>
   }
   kernel.return
 }

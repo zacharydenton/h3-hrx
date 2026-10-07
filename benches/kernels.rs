@@ -542,10 +542,14 @@ fn quantized_attention(c: &mut Criterion) {
             compiler.flush(&mut stream).unwrap();
             let q = upload(&mut stream, &operand(capacity * INNER, "i8", 3));
             let k = upload(&mut stream, &operand(capacity * INNER, "i8", 7));
-            let scales = upload(
-                &mut stream,
-                bytemuck::cast_slice(&vec![1.0f32 / 128.0; capacity * HEADS]),
-            );
+            // Distinct head and token scales exercise attention operand addressing.
+            let scales = |period: usize| {
+                (0..capacity * HEADS)
+                    .map(|i| (1 + (i % capacity + 3 * (i / capacity)) % period) as f32 / 512.0)
+                    .collect::<Vec<_>>()
+            };
+            let q_scales = upload(&mut stream, bytemuck::cast_slice(&scales(7)));
+            let k_scales = upload(&mut stream, bytemuck::cast_slice(&scales(11)));
             // V is channel-major, matching the runtime's transposed operand.
             let values: Vec<_> = (0..capacity * INNER)
                 .map(|i| f16::from_f32(((i * 37 % 997) as f32 - 498.0) / 512.0))
@@ -554,9 +558,9 @@ fn quantized_attention(c: &mut Criterion) {
             let out = stream.allocate_zeroed(tokens * INNER * 2).unwrap();
             let bindings = [
                 q.binding(),
-                scales.binding(),
+                q_scales.binding(),
                 k.binding(),
-                scales.binding(),
+                k_scales.binding(),
                 v.binding(),
                 out.binding(),
             ];
