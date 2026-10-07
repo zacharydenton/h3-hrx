@@ -750,6 +750,52 @@ impl Clip<'_> {
     fn latent(&self) -> (usize, usize) {
         (self.height / VAE_PS, self.width / VAE_PS)
     }
+
+    /// ImageNet-normalized FP16 encoder rows for a spatial tile, `[frames*th*tw][8]`.
+    /// The tile must lie within this clip and `out` must hold all its rows.
+    /// Padding channels 3..8 are left untouched; the encoder initializes them to zero
+    /// when allocating its staging buffer.
+    pub fn prepare_encoder_input(
+        &self,
+        y0: usize,
+        x0: usize,
+        th: usize,
+        tw: usize,
+        out: &mut [half::f16],
+    ) {
+        // Normalize independent pixels together and batch the half conversion.
+        // Keep the original FP32 subtraction/division and preserve staging padding.
+        const LANES: usize = 32;
+        for t in 0..self.frames {
+            for y in 0..th {
+                let src = ((t * self.height + y0 + y) * self.width + x0) * 3;
+                let dst = (t * th + y) * tw * 8;
+                let pixels = &self.pixels[src..src + tw * 3];
+                let rows = &mut out[dst..dst + tw * 8];
+                for (input, output) in pixels.chunks(LANES * 3).zip(rows.chunks_mut(LANES * 8)) {
+                    let mut normalized = [0.0; LANES * 3];
+                    for (rgb, dst) in input
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
+                        .zip(normalized.as_chunks_mut::<3>().0)
+                    {
+                        *dst = crate::pixels::imagenet_normalise(*rgb);
+                    }
+                    let mut narrowed = [half::f16::ZERO; LANES * 3];
+                    narrowed[..input.len()].convert_from_f32_slice(&normalized[..input.len()]);
+                    for (dst, rgb) in output
+                        .as_chunks_mut::<8>()
+                        .0
+                        .iter_mut()
+                        .zip(narrowed.as_chunks::<3>().0)
+                    {
+                        dst[..3].copy_from_slice(rgb);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The encoder's residual stack: channels per level, spatial stride, temporal stride.
@@ -825,22 +871,13 @@ impl VideoVae {
         self.ensure_encoder(stream, rows0, frames)?;
         let scratch = self.encoder.as_mut().expect("sized above");
         let inrows = &mut scratch.input[..rows0 * 8];
-        for t in 0..frames {
-            for y in 0..th {
-                for x in 0..tw {
-                    let src = ((t * height + y0 + y) * full_w + x0 + x) * 3;
-                    let dst = ((t * th + y) * tw + x) * 8;
-                    let n = crate::pixels::imagenet_normalise([
-                        pixels[src],
-                        pixels[src + 1],
-                        pixels[src + 2],
-                    ]);
-                    for ch in 0..3 {
-                        inrows[dst + ch] = half::f16::from_f32(n[ch]);
-                    }
-                }
-            }
+        Clip {
+            pixels,
+            frames,
+            height,
+            width: full_w,
         }
+        .prepare_encoder_input(y0, x0, th, tw, inrows);
 
         let x = &scratch.x;
         stream.upload(x.binding(), as_bytes_f16(inrows))?;
@@ -1280,6 +1317,103 @@ fn bytes_mut(v: &mut [half::f16]) -> &mut [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoder_input_preserves_crops_padding_and_partial_batches() {
+        for tw in [1, 7, 16, 31, 32, 33, 63, 64, 65, 256] {
+            let (frames, height, width, th, y0, x0) = (3, 7, tw + 7, 5, 1, 3);
+            let pixels: Vec<_> = (0..frames * height * width * 3)
+                .map(|i| (i * 37 % 1009) as f32 / 1008.0)
+                .collect();
+            let clip = Clip {
+                pixels: &pixels,
+                frames,
+                height,
+                width,
+            };
+            let sentinel = half::f16::from_bits(0x3555);
+            let mut actual = vec![sentinel; (frames * th * tw + 2) * 8];
+            let mut expected = actual.clone();
+            for t in 0..frames {
+                for y in 0..th {
+                    for x in 0..tw {
+                        for c in 0..3 {
+                            let src = ((t * height + y0 + y) * width + x0 + x) * 3 + c;
+                            let dst = ((t * th + y) * tw + x + 1) * 8 + c;
+                            expected[dst] = half::f16::from_f32(
+                                (pixels[src] - IMAGENET_MEAN[c]) / IMAGENET_STD[c],
+                            );
+                        }
+                    }
+                }
+            }
+            for _ in 0..2 {
+                actual.fill(sentinel);
+                let end = actual.len() - 8;
+                clip.prepare_encoder_input(y0, x0, th, tw, &mut actual[8..end]);
+                assert_eq!(as_bytes_f16(&actual), as_bytes_f16(&expected), "width {tw}");
+            }
+        }
+    }
+
+    #[test]
+    fn encoder_input_matches_scalar_at_half_rounding_boundaries() {
+        let mut pixels = Vec::new();
+        // Adjacent representable inputs around every finite positive half midpoint,
+        // on both sides of zero. Include values outside normal RGB to cover saturation.
+        for bits in 0..0x7bff {
+            let lo = half::f16::from_bits(bits).to_f32();
+            let hi = half::f16::from_bits(bits + 1).to_f32();
+            for sign in [1.0, -1.0] {
+                let midpoint = sign * (lo + hi) * 0.5;
+                for offset in [-1i32, 0, 1] {
+                    for c in 0..3 {
+                        let input = midpoint * IMAGENET_STD[c] + IMAGENET_MEAN[c];
+                        pixels.push(f32::from_bits(input.to_bits().wrapping_add_signed(offset)));
+                    }
+                }
+            }
+        }
+        for value in [
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE,
+            f32::MAX,
+            -f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::from_bits(0xffc1_2345),
+        ] {
+            pixels.extend_from_slice(&[value; 3]);
+        }
+        let width = pixels.len() / 3;
+        let clip = Clip {
+            pixels: &pixels,
+            frames: 1,
+            height: 1,
+            width,
+        };
+        let mut actual = vec![half::f16::ZERO; width * 8];
+        clip.prepare_encoder_input(0, 0, 1, width, &mut actual);
+        for (rgb, row) in pixels
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(actual.as_chunks::<8>().0)
+        {
+            for c in 0..3 {
+                let expected = half::f16::from_f32((rgb[c] - IMAGENET_MEAN[c]) / IMAGENET_STD[c]);
+                assert_eq!(
+                    row[c].to_bits(),
+                    expected.to_bits(),
+                    "input {}, channel {c}",
+                    rgb[c]
+                );
+            }
+            assert!(row[3..].iter().all(|v| v.to_bits() == 0));
+        }
+    }
 
     #[test]
     fn temporal_assembly_matches_scalar_frame_mapping() {

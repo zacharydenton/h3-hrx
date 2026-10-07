@@ -264,5 +264,29 @@ fn video_spatial(c: &mut Criterion) {
     }
     group.finish();
 }
-criterion_group! { name = benches; config = support::criterion(); targets = host, rotary, video_decoder_input, video_decoder_output, video_temporal, video_spatial }
+fn video_encoder_input(c: &mut Criterion) {
+    let mut group = c.benchmark_group("video_encoder_input");
+    for (name, frames, height, width, y0, x0, th, tw) in [
+        ("tiny", 1, 16, 16, 0, 0, 16, 16),
+        ("image", 1, 256, 256, 0, 0, 256, 256),
+        ("clip", 17, 256, 256, 0, 0, 256, 256),
+        ("cropped_clip", 17, 480, 864, 192, 176, 256, 256),
+        ("narrow_clip", 17, 64, 48, 0, 16, 64, 16),
+    ] {
+        let pixels = support::values(frames * height * width * 3, 0.5);
+        let clip = h3_hrx::vvae::Clip {
+            pixels: &pixels,
+            frames,
+            height,
+            width,
+        };
+        let mut out = vec![half::f16::ZERO; frames * th * tw * 8];
+        group.throughput(Throughput::Elements((frames * th * tw) as u64));
+        group.bench_function(name, |b| {
+            b.iter(|| clip.prepare_encoder_input(y0, x0, th, tw, black_box(&mut out)));
+        });
+    }
+    group.finish();
+}
+criterion_group! { name = benches; config = support::criterion(); targets = host, rotary, video_decoder_input, video_decoder_output, video_temporal, video_spatial, video_encoder_input }
 criterion_main!(benches);

@@ -121,6 +121,10 @@ that execution path; it is not a quality-qualified cache preset.
 
 ## Measurement boundaries
 
+- **Video encoder input:** `video_encoder_input` measures ImageNet normalization
+  and FP16 packing into reused eight-channel staging rows. Cases cover stills,
+  full 17-frame tiles, cropped source frames and narrow edge tiles. Allocation
+  and GPU upload are excluded.
 - **Spatial video assembly:** `video_spatial` measures tile-buffer allocation,
   copying prebuilt decoded fixtures, overlap blending and planar output writes.
   Cases cover each overlap axis and full 28-frame windows at 480p/768p, with
