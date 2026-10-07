@@ -39,6 +39,41 @@ low.func.def target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_w
   return %p
 }
 
+low.func.def target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_interleave_wave_f16(%even: reg<amdgpu.vgpr x4>, %odd: reg<amdgpu.vgpr x4>, %lo: reg<amdgpu.vgpr>, %hi: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr x8>) asm {
+  %e0 = slice %even[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+  %o0 = slice %odd[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+  %p0 = v_perm_b32 %o0, %e0, %lo
+  %p1 = v_perm_b32 %o0, %e0, %hi
+  %e1 = slice %even[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+  %o1 = slice %odd[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+  %p2 = v_perm_b32 %o1, %e1, %lo
+  %p3 = v_perm_b32 %o1, %e1, %hi
+  %e2 = slice %even[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+  %o2 = slice %odd[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+  %p4 = v_perm_b32 %o2, %e2, %lo
+  %p5 = v_perm_b32 %o2, %e2, %hi
+  %e3 = slice %even[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+  %o3 = slice %odd[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
+  %p6 = v_perm_b32 %o3, %e3, %lo
+  %p7 = v_perm_b32 %o3, %e3, %hi
+  %p = concat(%p0, %p1, %p2, %p3, %p4, %p5, %p6, %p7) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x8>
+  return %p
+}
+
+// Short sequences favor fixed controls. For long sequences, lane-dependent
+// controls remove the repeated vector selections from each key tile.
+template.decl @h3.pack_attention_probability(%tokens: index, %words: vector<4xi32>, %other: vector<4xi32>, %even_lane: i1, %lo: i32, %hi: i32) -> (vector<16xf16>)
+template.def<@h3.pack_attention_probability> @h3_pack_probability_short(%tokens: index, %words: vector<4xi32>, %other: vector<4xi32>, %even_lane: i1, %lo: i32, %hi: i32) -> (vector<16xf16>) where [le(%tokens, 4095)] {
+  %even = scf.select %even_lane, %words, %other : vector<4xi32>
+  %odd = scf.select %even_lane, %other, %words : vector<4xi32>
+  %packed = low.invoke @h3_interleave_f16(%even, %odd) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
+  template.return %packed : vector<16xf16>
+}
+template.def<@h3.pack_attention_probability> @h3_pack_probability_long(%tokens: index, %words: vector<4xi32>, %other: vector<4xi32>, %even_lane: i1, %lo: i32, %hi: i32) -> (vector<16xf16>) where [ge(%tokens, 4096)] {
+  %packed = low.invoke @h3_interleave_wave_f16(%words, %other, %lo, %hi) : (vector<4xi32>, vector<4xi32>, i32, i32) -> (vector<16xf16>)
+  template.return %packed : vector<16xf16>
+}
+
 low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_pv32(%v: reg<amdgpu.vgpr x8>, %p: reg<amdgpu.vgpr x8>, %acc: reg<amdgpu.vgpr x8>) -> (reg<amdgpu.vgpr x8>) asm {
   %owned = copy %acc : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr x8>
   %result = v_wmma_f32_16x16x16_f16 %v, %p, %owned
@@ -171,6 +206,13 @@ kernel.def target(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) export("h3_a
   %lane_column = index.rem %lane, %c16 : index
   %lane_group = index.div %lane, %c16 : index
   %lane_group_even = index.cmp eq, %lane_group, %c0 : index
+  // Reverse byte selectors in odd half-waves instead of swapping the word vectors.
+  %pack_lo_even = scalar.constant 84148480 : i32
+  %pack_hi_even = scalar.constant 117834498 : i32
+  %pack_lo_odd = scalar.constant 16778500 : i32
+  %pack_hi_odd = scalar.constant 50464518 : i32
+  %pack_lo = scf.select %lane_group_even, %pack_lo_even, %pack_lo_odd : i32
+  %pack_hi = scf.select %lane_group_even, %pack_hi_even, %pack_hi_odd : i32
   // this wave's query head, and its channels in q and out
   %head_limit = index.div %out_stride0, %cd : index
   %rounded = index.add %tokens0, %c15 : index
@@ -760,27 +802,19 @@ kernel.def target(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) export("h3_a
     %weight_half = vector.fptrunc %weight : vector<8xf32> to vector<8xf16>
     %weight_words = vector.bitcast %weight_half : vector<8xf16> to vector<4xi32>
     %other_words, %weight_ok = kernel.subgroup.shuffle<xor> %weight_words, %i32_16, %i32_32 : vector<4xi32>, i32, i32
-    %even_words = scf.select %lane_group_even, %weight_words, %other_words : vector<4xi32>
-    %odd_words = scf.select %lane_group_even, %other_words, %weight_words : vector<4xi32>
-    %probability = low.invoke @h3_interleave_f16(%even_words, %odd_words) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
+    %probability = template.apply<@h3.pack_attention_probability>(%tokens0, %weight_words, %other_words, %lane_group_even, %pack_lo, %pack_hi) : (index, vector<4xi32>, vector<4xi32>, i1, i32, i32) -> (vector<16xf16>)
     %weight_half_b = vector.fptrunc %weight_b : vector<8xf32> to vector<8xf16>
     %weight_words_b = vector.bitcast %weight_half_b : vector<8xf16> to vector<4xi32>
     %other_words_b, %weight_ok_b = kernel.subgroup.shuffle<xor> %weight_words_b, %i32_16, %i32_32 : vector<4xi32>, i32, i32
-    %even_words_b = scf.select %lane_group_even, %weight_words_b, %other_words_b : vector<4xi32>
-    %odd_words_b = scf.select %lane_group_even, %other_words_b, %weight_words_b : vector<4xi32>
-    %probability_b = low.invoke @h3_interleave_f16(%even_words_b, %odd_words_b) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
+    %probability_b = template.apply<@h3.pack_attention_probability>(%tokens0, %weight_words_b, %other_words_b, %lane_group_even, %pack_lo, %pack_hi) : (index, vector<4xi32>, vector<4xi32>, i1, i32, i32) -> (vector<16xf16>)
     %weight_half_c = vector.fptrunc %weight_c : vector<8xf32> to vector<8xf16>
     %weight_words_c = vector.bitcast %weight_half_c : vector<8xf16> to vector<4xi32>
     %other_words_c, %weight_ok_c = kernel.subgroup.shuffle<xor> %weight_words_c, %i32_16, %i32_32 : vector<4xi32>, i32, i32
-    %even_words_c = scf.select %lane_group_even, %weight_words_c, %other_words_c : vector<4xi32>
-    %odd_words_c = scf.select %lane_group_even, %other_words_c, %weight_words_c : vector<4xi32>
-    %probability_c = low.invoke @h3_interleave_f16(%even_words_c, %odd_words_c) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
+    %probability_c = template.apply<@h3.pack_attention_probability>(%tokens0, %weight_words_c, %other_words_c, %lane_group_even, %pack_lo, %pack_hi) : (index, vector<4xi32>, vector<4xi32>, i1, i32, i32) -> (vector<16xf16>)
     %weight_half_d = vector.fptrunc %weight_d : vector<8xf32> to vector<8xf16>
     %weight_words_d = vector.bitcast %weight_half_d : vector<8xf16> to vector<4xi32>
     %other_words_d, %weight_ok_d = kernel.subgroup.shuffle<xor> %weight_words_d, %i32_16, %i32_32 : vector<4xi32>, i32, i32
-    %even_words_d = scf.select %lane_group_even, %weight_words_d, %other_words_d : vector<4xi32>
-    %odd_words_d = scf.select %lane_group_even, %other_words_d, %weight_words_d : vector<4xi32>
-    %probability_d = low.invoke @h3_interleave_f16(%even_words_d, %odd_words_d) : (vector<4xi32>, vector<4xi32>) -> (vector<16xf16>)
+    %probability_d = template.apply<@h3.pack_attention_probability>(%tokens0, %weight_words_d, %other_words_d, %lane_group_even, %pack_lo, %pack_hi) : (index, vector<4xi32>, vector<4xi32>, i1, i32, i32) -> (vector<16xf16>)
     %vrow0 = index.add %lane_column, %c0 : index
     %vrow1 = index.add %lane_column, %c16 : index
     %vrow2 = index.add %lane_column, %c32 : index

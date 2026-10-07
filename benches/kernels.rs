@@ -514,7 +514,7 @@ fn quantized_attention(c: &mut Criterion) {
     use h3_hrx::model::{HEADS, INNER};
     let mut group = c.benchmark_group("attention_i8qkhm");
     for tokens in [
-        1usize, 129, 256, 257, 2048, 4096, 4097, 8192, 8193, 16384, 16385,
+        1usize, 129, 256, 257, 2048, 4095, 4096, 4097, 8192, 8193, 16384, 16385,
     ] {
         group.throughput(Throughput::Elements((4 * tokens * tokens * INNER) as u64));
         group.bench_function(BenchmarkId::from_parameter(tokens), |b| {
