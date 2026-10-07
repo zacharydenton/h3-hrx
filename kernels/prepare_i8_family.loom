@@ -1,4 +1,75 @@
-// Shared i8 preparation finish: narrowing or Hadamard, scale and packing.
+// Each lane supplies eight contiguous columns. Finish the first three radix-4
+// stages in registers before staging the row for the cross-wave final stage.
+// Keep the ordered FP32 butterflies: reassociation can change the packed codes.
+template.decl @h3.prepare_hadamard64_i8(%values: vector<8xf32>) -> (vector<8xf32>)
+template.def<@h3.prepare_hadamard64_i8> @h3_prepare_hadamard64_i8(%values: vector<8xf32>) -> (vector<8xf32>) {
+  %wave_lane = kernel.subgroup.lane.id : index
+  %wave_i = index.cast %wave_lane : index to i32
+  %i1 = scalar.constant 1 : i32
+  %i2 = scalar.constant 2 : i32
+  %i4 = scalar.constant 4 : i32
+  %i32 = scalar.constant 32 : i32
+  %izero = scalar.constant 0 : i32
+  %partner1 = scalar.xori %wave_i, %i1 : i32
+  %partner2 = scalar.xori %wave_i, %i2 : i32
+  %partner4 = scalar.xori %wave_i, %i4 : i32
+  %digit2 = scalar.andi %wave_i, %i2 : i32
+  %even2 = scalar.cmpi eq, %digit2, %izero : i32
+  %e0 = vector.extract %values[0] : vector<8xf32> -> f32
+  %e1 = vector.extract %values[1] : vector<8xf32> -> f32
+  %e2 = vector.extract %values[2] : vector<8xf32> -> f32
+  %e3 = vector.extract %values[3] : vector<8xf32> -> f32
+  %e4 = vector.extract %values[4] : vector<8xf32> -> f32
+  %e5 = vector.extract %values[5] : vector<8xf32> -> f32
+  %e6 = vector.extract %values[6] : vector<8xf32> -> f32
+  %e7 = vector.extract %values[7] : vector<8xf32> -> f32
+  %s01_0 = scalar.addf %e0, %e1 : f32
+  %s23_0 = scalar.addf %e2, %e3 : f32
+  %d01_0 = scalar.subf %e0, %e1 : f32
+  %d23_0 = scalar.subf %e2, %e3 : f32
+  %o0_0 = scalar.addf %s01_0, %d23_0 : f32
+  %o1_0 = scalar.subf %s01_0, %d23_0 : f32
+  %o2_0 = scalar.addf %d01_0, %s23_0 : f32
+  %o3_0 = scalar.subf %s23_0, %d01_0 : f32
+  %quad0 = vector.from_elements %o0_0, %o1_0, %o2_0, %o3_0 : vector<4xf32>
+  %s01_1 = scalar.addf %e4, %e5 : f32
+  %s23_1 = scalar.addf %e6, %e7 : f32
+  %d01_1 = scalar.subf %e4, %e5 : f32
+  %d23_1 = scalar.subf %e6, %e7 : f32
+  %o0_1 = scalar.addf %s01_1, %d23_1 : f32
+  %o1_1 = scalar.subf %s01_1, %d23_1 : f32
+  %o2_1 = scalar.addf %d01_1, %s23_1 : f32
+  %o3_1 = scalar.subf %s23_1, %d01_1 : f32
+  %quad1 = vector.from_elements %o0_1, %o1_1, %o2_1, %o3_1 : vector<4xf32>
+  // Stride 4 pairs the lane's two quads; the other pair is in its neighbor.
+  %sum1 = vector.addf %quad0, %quad1 : vector<4xf32>
+  %diff1 = vector.subf %quad0, %quad1 : vector<4xf32>
+  %other_diff1, %ok1 = kernel.subgroup.shuffle<index> %diff1, %partner1, %i32 : vector<4xf32>, i32, i32
+  %plus1 = vector.addf %sum1, %other_diff1 : vector<4xf32>
+  %minus1 = vector.subf %sum1, %other_diff1 : vector<4xf32>
+  %v0 = vector.extract %plus1[0] : vector<4xf32> -> f32
+  %v1 = vector.extract %plus1[1] : vector<4xf32> -> f32
+  %v2 = vector.extract %plus1[2] : vector<4xf32> -> f32
+  %v3 = vector.extract %plus1[3] : vector<4xf32> -> f32
+  %v4 = vector.extract %minus1[0] : vector<4xf32> -> f32
+  %v5 = vector.extract %minus1[1] : vector<4xf32> -> f32
+  %v6 = vector.extract %minus1[2] : vector<4xf32> -> f32
+  %v7 = vector.extract %minus1[3] : vector<4xf32> -> f32
+  %stage1 = vector.from_elements %v0, %v1, %v2, %v3, %v4, %v5, %v6, %v7 : vector<8xf32>
+  // Stride 16 exchanges whole vectors within each eight-lane group.
+  %other2, %ok2 = kernel.subgroup.shuffle<index> %stage1, %partner2, %i32 : vector<8xf32>, i32, i32
+  %left2 = scf.select %even2, %stage1, %other2 : vector<8xf32>
+  %right2 = scf.select %even2, %other2, %stage1 : vector<8xf32>
+  %sum2 = vector.addf %left2, %right2 : vector<8xf32>
+  %diff2 = vector.subf %left2, %right2 : vector<8xf32>
+  %other_diff2, %ok4 = kernel.subgroup.shuffle<index> %diff2, %partner4, %i32 : vector<8xf32>, i32, i32
+  %plus2 = vector.addf %sum2, %other_diff2 : vector<8xf32>
+  %minus2 = vector.subf %sum2, %other_diff2 : vector<8xf32>
+  %stage2 = scf.select %even2, %plus2, %minus2 : vector<8xf32>
+  template.return %stage2 : vector<8xf32>
+}
+
+// Shared i8 preparation finish: final Hadamard stage, scale and packing.
 // Views are reconstructed inside the template to preserve scalar shape specialization.
 // Keep constants at the call site: moving their materialization changes native scheduling.
 template.decl @h3.prepare_finish_i8(%c0: index, %quads_per_lane: index, %c1: index, %lanes: index, %lane: index, %quads: index, %c64: index, %c4: index, %c256: index, %lds: buffer, %c0_offset: offset, %width: index, %c16: index, %chunks_per_lane: index, %zero8: vector<8xf32>, %c8: index, %width_last: index, %zero: f32, %sixteenth: f32, %tiny: f32, %qmax: f32, %word_width: index, %neg_qmax8: vector<8xf32>, %qmax8: vector<8xf32>, %mask8: vector<8xi32>, %sh8: i32, %sh16: i32, %sh24: i32, %c2: index, %word_last: index, %out_wlast: index, %q_global: buffer, %tokens_b: index, %out_words: index, %row: index, %qs_global: buffer)
@@ -9,67 +80,6 @@ template.def<@h3.prepare_finish_i8> @h3_prepare_finish_i8(%c0: index, %quads_per
   %qs_view = buffer.view %qs_global[%c0_offset] : buffer -> view<[%tokens_b]xf32>
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
-  // The first three radix-4 stages stay within 16 adjacent lanes (64 values).
-  // Each lane owns four contiguous columns; only the last stage crosses waves.
-  %wave_lane = kernel.subgroup.lane.id : index
-  %wave_i = index.cast %wave_lane : index to i32
-  %i32_1 = scalar.constant 1 : i32
-  %i32_2 = scalar.constant 2 : i32
-  %i32_4 = scalar.constant 4 : i32
-  %i32_8 = scalar.constant 8 : i32
-  %i32_32 = scalar.constant 32 : i32
-  %partner1 = scalar.xori %wave_i, %i32_1 : i32
-  %partner2 = scalar.xori %wave_i, %i32_2 : i32
-  %partner4 = scalar.xori %wave_i, %i32_4 : i32
-  %partner8 = scalar.xori %wave_i, %i32_8 : i32
-  %digit1 = index.rem %wave_lane, %c2 : index
-  %even1 = index.cmp eq, %digit1, %c0 : index
-  %digit4_0 = index.div %wave_lane, %c4 : index
-  %digit4 = index.rem %digit4_0, %c2 : index
-  %even4 = index.cmp eq, %digit4, %c0 : index
-  %quad_limit = index.sub %width, %c4 : index
-  scf.for %t_j = [%c0 to %quads_per_lane step %c1] {
-    %t_lane_step = index.mul %t_j, %lanes : index
-    %t0 = index.add %t_lane_step, %lane : index
-    %base0 = index.mul %t0, %c4 : index
-    %base = index.assume %base0 [le(%base0, %quad_limit), mul(%base0, 4)] : index
-    %values = vector.load %x_view[%base] : view<[%width]xf32> -> vector<4xf32>
-    %e0 = vector.extract %values[0] : vector<4xf32> -> f32
-    %e1 = vector.extract %values[1] : vector<4xf32> -> f32
-    %e2 = vector.extract %values[2] : vector<4xf32> -> f32
-    %e3 = vector.extract %values[3] : vector<4xf32> -> f32
-    %s01 = scalar.addf %e0, %e1 : f32
-    %s23 = scalar.addf %e2, %e3 : f32
-    %d01 = scalar.subf %e0, %e1 : f32
-    %d23 = scalar.subf %e2, %e3 : f32
-    %o0 = scalar.addf %s01, %d23 : f32
-    %o1 = scalar.subf %s01, %d23 : f32
-    %o2 = scalar.addf %d01, %s23 : f32
-    %o3 = scalar.subf %s23, %d01 : f32
-    %stage0 = vector.from_elements %o0, %o1, %o2, %o3 : vector<4xf32>
-
-    %other1, %ok1 = kernel.subgroup.shuffle<index> %stage0, %partner1, %i32_32 : vector<4xf32>, i32, i32
-    %left1 = scf.select %even1, %stage0, %other1 : vector<4xf32>
-    %right1 = scf.select %even1, %other1, %stage0 : vector<4xf32>
-    %sum1 = vector.addf %left1, %right1 : vector<4xf32>
-    %diff1 = vector.subf %left1, %right1 : vector<4xf32>
-    %other_diff1, %ok2 = kernel.subgroup.shuffle<index> %diff1, %partner2, %i32_32 : vector<4xf32>, i32, i32
-    %plus1 = vector.addf %sum1, %other_diff1 : vector<4xf32>
-    %minus1 = vector.subf %sum1, %other_diff1 : vector<4xf32>
-    %stage1 = scf.select %even1, %plus1, %minus1 : vector<4xf32>
-
-    %other4, %ok4 = kernel.subgroup.shuffle<index> %stage1, %partner4, %i32_32 : vector<4xf32>, i32, i32
-    %left4 = scf.select %even4, %stage1, %other4 : vector<4xf32>
-    %right4 = scf.select %even4, %other4, %stage1 : vector<4xf32>
-    %sum4 = vector.addf %left4, %right4 : vector<4xf32>
-    %diff4 = vector.subf %left4, %right4 : vector<4xf32>
-    %other_diff4, %ok8 = kernel.subgroup.shuffle<index> %diff4, %partner8, %i32_32 : vector<4xf32>, i32, i32
-    %plus4 = vector.addf %sum4, %other_diff4 : vector<4xf32>
-    %minus4 = vector.subf %sum4, %other_diff4 : vector<4xf32>
-    %stage2 = scf.select %even4, %plus4, %minus4 : vector<4xf32>
-    vector.store %stage2, %x_view[%base] : vector<4xf32>, view<[%width]xf32>
-  }
-  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
   // Collect the row maximum while the final butterfly outputs are still in registers.
   %inf = scalar.constant inf : f32
   %amax = scf.for %t_j = [%c0 to %quads_per_lane step %c1](%prev_max = %zero : f32) -> (f32) {
@@ -275,7 +285,8 @@ kernel.def target(@h3_prepare_plain_i8_gfx11) export("h3_prepare_plain_i8") @h3_
     %m_v16 = vector.load %h_view[%row, %m_i] : view<[%tokens_b]x[%width]xf16> -> vector<8xf16>
     %m_out0 = vector.extf %m_v16 : vector<8xf16> to vector<8xf32>
     %m_out = vector.mulf %m_out0, %prescale8 : vector<8xf32>
-    vector.store %m_out, %x_view[%m_i] : vector<8xf32>, view<[%width]xf32>
+    %rotated = template.apply<@h3.prepare_hadamard64_i8>(%m_out) : (vector<8xf32>) -> (vector<8xf32>)
+    vector.store %rotated, %x_view[%m_i] : vector<8xf32>, view<[%width]xf32>
   }
   template.apply<@h3.prepare_finish_i8>(%c0, %quads_per_lane, %c1, %lanes, %lane, %quads, %c64, %c4, %c256, %lds, %c0_offset, %width, %c16, %chunks_per_lane, %zero8, %c8, %width_last, %zero, %sixteenth, %tiny, %qmax, %word_width, %neg_qmax8, %qmax8, %mask8, %sh8, %sh16, %sh24, %c2, %word_last, %out_wlast, %q_global, %tokens_b, %out_words, %row, %qs_global) : (index, index, index, index, index, index, index, index, index, buffer, offset, index, index, index, vector<8xf32>, index, index, f32, f32, f32, f32, index, vector<8xf32>, vector<8xf32>, vector<8xi32>, i32, i32, i32, index, index, index, buffer, index, index, index, buffer)
   kernel.return
@@ -420,7 +431,8 @@ kernel.def target(@h3_prepare_norm_i8_gfx11) export("h3_prepare_norm_i8") @h3_pr
     %m_sh = vector.load %tab_view[%shift_row, %m_i] : view<[%table_rows]x[%width]xf32> -> vector<8xf32>
     %m_scaled = vector.mulf %m_normed, %m_ms1 : vector<8xf32>
     %m_out = vector.addf %m_scaled, %m_sh : vector<8xf32>
-    vector.store %m_out, %x_view[%m_i] : vector<8xf32>, view<[%width]xf32>
+    %rotated = template.apply<@h3.prepare_hadamard64_i8>(%m_out) : (vector<8xf32>) -> (vector<8xf32>)
+    vector.store %rotated, %x_view[%m_i] : vector<8xf32>, view<[%width]xf32>
   }
   template.apply<@h3.prepare_finish_i8>(%c0, %quads_per_lane, %c1, %lanes, %lane, %quads, %c64, %c4, %c256, %lds, %c0_offset, %width, %c16, %chunks_per_lane, %zero8, %c8, %width_last, %zero, %sixteenth, %tiny, %qmax, %word_width, %neg_qmax8, %qmax8, %mask8, %sh8, %sh16, %sh24, %c2, %word_last, %out_wlast, %q_global, %tokens_b, %out_words, %row, %qs_global) : (index, index, index, index, index, index, index, index, index, buffer, offset, index, index, index, vector<8xf32>, index, index, f32, f32, f32, f32, index, vector<8xf32>, vector<8xf32>, vector<8xi32>, i32, i32, i32, index, index, index, buffer, index, index, index, buffer)
   kernel.return
@@ -574,7 +586,8 @@ kernel.def target(@h3_prepare_lnorm_i8_gfx11) export("h3_prepare_lnorm_i8") @h3_
     %m_sh = vector.load %tab_view[%shift_row, %m_i] : view<[%table_rows]x[%width]xf32> -> vector<8xf32>
     %m_scaled = vector.mulf %m_normed, %m_ms1 : vector<8xf32>
     %m_out = vector.addf %m_scaled, %m_sh : vector<8xf32>
-    vector.store %m_out, %x_view[%m_i] : vector<8xf32>, view<[%width]xf32>
+    %rotated = template.apply<@h3.prepare_hadamard64_i8>(%m_out) : (vector<8xf32>) -> (vector<8xf32>)
+    vector.store %rotated, %x_view[%m_i] : vector<8xf32>, view<[%width]xf32>
   }
   template.apply<@h3.prepare_finish_i8>(%c0, %quads_per_lane, %c1, %lanes, %lane, %quads, %c64, %c4, %c256, %lds, %c0_offset, %width, %c16, %chunks_per_lane, %zero8, %c8, %width_last, %zero, %sixteenth, %tiny, %qmax, %word_width, %neg_qmax8, %qmax8, %mask8, %sh8, %sh16, %sh24, %c2, %word_last, %out_wlast, %q_global, %tokens_b, %out_words, %row, %qs_global) : (index, index, index, index, index, index, index, index, index, buffer, offset, index, index, index, vector<8xf32>, index, index, f32, f32, f32, f32, index, vector<8xf32>, vector<8xf32>, vector<8xi32>, i32, i32, i32, index, index, index, buffer, index, index, index, buffer)
   kernel.return
@@ -668,7 +681,8 @@ kernel.def target(@h3_prepare_plain_f32_i8_gfx11) export("h3_prepare_plain_f32_i
     %m_v16 = vector.load %h_view[%row, %m_i] : view<[%tokens_b]x[%width]xf32> -> vector<8xf32>
     %m_out0 = vector.addf %m_v16, %zero8 : vector<8xf32>
     %m_out = vector.mulf %m_out0, %prescale8 : vector<8xf32>
-    vector.store %m_out, %x_view[%m_i] : vector<8xf32>, view<[%width]xf32>
+    %rotated = template.apply<@h3.prepare_hadamard64_i8>(%m_out) : (vector<8xf32>) -> (vector<8xf32>)
+    vector.store %rotated, %x_view[%m_i] : vector<8xf32>, view<[%width]xf32>
   }
   template.apply<@h3.prepare_finish_i8>(%c0, %quads_per_lane, %c1, %lanes, %lane, %quads, %c64, %c4, %c256, %lds, %c0_offset, %width, %c16, %chunks_per_lane, %zero8, %c8, %width_last, %zero, %sixteenth, %tiny, %qmax, %word_width, %neg_qmax8, %qmax8, %mask8, %sh8, %sh16, %sh24, %c2, %word_last, %out_wlast, %q_global, %tokens_b, %out_words, %row, %qs_global) : (index, index, index, index, index, index, index, index, index, buffer, offset, index, index, index, vector<8xf32>, index, index, f32, f32, f32, f32, index, vector<8xf32>, vector<8xf32>, vector<8xi32>, i32, i32, i32, index, index, index, buffer, index, index, index, buffer)
   kernel.return
