@@ -734,6 +734,9 @@ fn rotary_qk_norm_matches_cpu_for_all_head_layouts_and_copies_v() {
             ("k_offset", offset),
         ]);
         config.push(("eps", "1e-5".into()));
+        if stem == "rope_qknorm_f16" {
+            config.push(("copy_v", "1".into()));
+        }
         let out = h.run_module(
             if stem == "rope_qknorm_f16" {
                 stem
@@ -759,6 +762,24 @@ fn rotary_qk_norm_matches_cpu_for_all_head_layouts_and_copies_v() {
         close(&halves(&out[5], false), &q, 2e-2, 2e-2);
         close(&halves(&out[6], false), &k, 2e-2, 2e-2);
         assert_eq!(out[7], bytes(&v));
+        if stem == "rope_qknorm_f16" {
+            config.iter_mut().find(|(k, _)| *k == "copy_v").unwrap().1 = "0".into();
+            let mut inputs = out.clone();
+            inputs[5].fill(0xff);
+            inputs[6].fill(0xff);
+            inputs[7].fill(0x55);
+            let direct = h.run(
+                stem,
+                &config,
+                [tokens as u32, 1, 1],
+                256,
+                &[tokens as u64],
+                &inputs,
+            );
+            assert_eq!(direct[5], out[5], "Q changed when skipping V");
+            assert_eq!(direct[6], out[6], "K changed when skipping V");
+            assert_eq!(direct[7], inputs[7], "skipped V was written");
+        }
     }
 }
 
@@ -2395,6 +2416,7 @@ fn fused_qkv_operands_are_byte_identical_to_separate_preparation() {
             ("heads", heads),
             ("kv_heads", heads),
             ("k_offset", width),
+            ("copy_v", 1),
         ]);
         config.push(("eps", "1e-5".into()));
         let split = h.run(
@@ -2468,7 +2490,7 @@ fn fused_qkv_operands_are_byte_identical_to_separate_preparation() {
         let new = h.run(
             "transpose_qkv_v_f16",
             &config,
-            [tokens.div_ceil(32) as u32, (width / 32) as u32, 1],
+            [(width / 32) as u32, tokens.div_ceil(32) as u32, 1],
             256,
             &[tokens as u64],
             &[bytes(&fused), vec![0; capacity * width * 2]],
@@ -2579,12 +2601,12 @@ fn subgroup_shuffle_preparation_matches_lds_repeatedly() {
 )]
 fn transposed_values_clear_reused_capacity() {
     let mut h = Harness::new();
-    for width in [32, 96, 256] {
+    for width in [32, 96, 256, 7168] {
         for tokens in [1usize, 31, 32, 33, 129, 4096, 4097] {
             let capacity = (tokens + 32).div_ceil(256) * 256;
-            let input: Vec<f16> = values(tokens * width, 0.7)
-                .into_iter()
-                .map(f16::from_f32)
+            // Move raw half bits, including NaNs, infinities and signed zero.
+            let input: Vec<u16> = (0..tokens * width)
+                .map(|i| i.wrapping_mul(37) as u16)
                 .collect();
             let actual = h.run(
                 "transpose_f16",
@@ -2593,6 +2615,25 @@ fn transposed_values_clear_reused_capacity() {
                 256,
                 &[tokens as u64],
                 &[bytes(&input), vec![0xff; capacity * width * 2]],
+            );
+            let mut fused = vec![0xffffu16; tokens * width * 3];
+            for (row, v) in fused
+                .chunks_exact_mut(width * 3)
+                .zip(input.chunks_exact(width))
+            {
+                row[2 * width..].copy_from_slice(v);
+            }
+            let direct = h.run(
+                "transpose_qkv_v_f16",
+                &cfg(&[("width", width), ("row_capacity", capacity)]),
+                [(width / 32) as u32, (capacity / 32) as u32, 1],
+                256,
+                &[tokens as u64],
+                &[bytes(&fused), vec![0xff; capacity * width * 2]],
+            );
+            assert!(
+                direct[1] == actual[1],
+                "direct V transpose changed bits or padding"
             );
             for (i, word) in actual[1].as_chunks::<2>().0.iter().enumerate() {
                 let (channel, row) = (i / capacity, i % capacity);

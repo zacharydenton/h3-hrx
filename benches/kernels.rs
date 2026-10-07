@@ -114,89 +114,100 @@ fn rotary_preparation(c: &mut Criterion) {
     use h3_hrx::model::{HEADS, INNER, QKV, ROPE_HALF};
     let mut group = c.benchmark_group("rope_qknorm_f16");
     for tokens in [1usize, 257, 2048, 4096] {
-        group.throughput(Throughput::Elements((tokens * QKV) as u64));
-        group.bench_function(BenchmarkId::from_parameter(tokens), |b| {
-            let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
-            let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
-            let compiler = compiler();
-            let kernel = compiler
-                .get(
-                    &mut stream,
-                    "rope_qknorm_f16",
-                    "h3_rope_qknorm_f16",
-                    &vec![
-                        ("h3.rope_qknorm_f16.row_stride".into(), QKV.to_string()),
-                        ("h3.rope_qknorm_f16.heads".into(), HEADS.to_string()),
-                        ("h3.rope_qknorm_f16.kv_heads".into(), HEADS.to_string()),
-                        ("h3.rope_qknorm_f16.k_offset".into(), INNER.to_string()),
-                        ("h3.rope_qknorm_f16.eps".into(), "1e-5".into()),
-                    ],
-                )
-                .unwrap();
-            compiler.flush(&mut stream).unwrap();
-            let input: Vec<_> = (0..tokens * QKV)
-                .map(|i| f16::from_f32(((i * 37 % 997) as f32 - 498.) / 512.))
-                .collect();
-            let weight: Vec<_> = (0..128).map(|i| 1. + (i % 7) as f32 / 100.).collect();
-            let angles: Vec<_> = (0..tokens * ROPE_HALF)
-                .map(|i| (i % 271) as f32 / 271.)
-                .collect();
-            let cos: Vec<_> = angles.iter().map(|v| v.cos()).collect();
-            let sin: Vec<_> = angles.iter().map(|v| v.sin()).collect();
-            let x = upload(&mut stream, bytemuck::cast_slice(&input));
-            let weight = upload(&mut stream, bytemuck::cast_slice(&weight));
-            let cos = upload(&mut stream, bytemuck::cast_slice(&cos));
-            let sin = upload(&mut stream, bytemuck::cast_slice(&sin));
-            let output: Vec<_> = (0..3)
-                .map(|_| stream.allocate_zeroed(tokens * INNER * 2).unwrap())
-                .collect();
-            let bindings = [
-                x.binding(),
-                weight.binding(),
-                weight.binding(),
-                cos.binding(),
-                sin.binding(),
-                output[0].binding(),
-                output[1].binding(),
-                output[2].binding(),
-            ];
-            let required = bindings.map(|v| v.len());
-            let mut profile = Profile::from_env();
-            let mut run = |stream: &mut Stream| {
-                emit(
-                    &mut Sink::Stream(stream),
-                    &kernel,
-                    Some(&mut profile),
-                    "qk norm + rope",
-                    [tokens as u32, 1, 1],
-                    [256, 1, 1],
-                    &[tokens as u32],
-                    &bindings,
-                    &required,
-                )
-                .unwrap();
-                stream.synchronize().unwrap();
-            };
-            run(&mut stream);
-            let expected: Vec<_> = output
-                .iter()
-                .map(|v| stream.read(v.binding()).unwrap().wait(&mut stream).unwrap())
-                .collect();
-            assert!(expected.iter().all(|v| v
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .all(|&v| f16::from_le_bytes(v).is_finite())));
-            b.iter(|| run(&mut stream));
-            for (output, expected) in output.iter().zip(&expected) {
-                let actual = stream
-                    .read(output.binding())
-                    .unwrap()
-                    .wait(&mut stream)
-                    .unwrap();
-                assert_eq!(&actual, expected);
-            }
-        });
+        for copy_v in [true, false] {
+            group.throughput(Throughput::Elements(
+                (tokens * INNER * if copy_v { 3 } else { 2 }) as u64,
+            ));
+            group.bench_function(
+                BenchmarkId::new(if copy_v { "qkv" } else { "qk" }, tokens),
+                |b| {
+                    let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+                    let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                    let compiler = compiler();
+                    let kernel = compiler
+                        .get(
+                            &mut stream,
+                            "rope_qknorm_f16",
+                            "h3_rope_qknorm_f16",
+                            &vec![
+                                ("h3.rope_qknorm_f16.row_stride".into(), QKV.to_string()),
+                                ("h3.rope_qknorm_f16.heads".into(), HEADS.to_string()),
+                                ("h3.rope_qknorm_f16.kv_heads".into(), HEADS.to_string()),
+                                ("h3.rope_qknorm_f16.k_offset".into(), INNER.to_string()),
+                                ("h3.rope_qknorm_f16.eps".into(), "1e-5".into()),
+                                (
+                                    "h3.rope_qknorm_f16.copy_v".into(),
+                                    usize::from(copy_v).to_string(),
+                                ),
+                            ],
+                        )
+                        .unwrap();
+                    compiler.flush(&mut stream).unwrap();
+                    let input: Vec<_> = (0..tokens * QKV)
+                        .map(|i| f16::from_f32(((i * 37 % 997) as f32 - 498.) / 512.))
+                        .collect();
+                    let weight: Vec<_> = (0..128).map(|i| 1. + (i % 7) as f32 / 100.).collect();
+                    let angles: Vec<_> = (0..tokens * ROPE_HALF)
+                        .map(|i| (i % 271) as f32 / 271.)
+                        .collect();
+                    let cos: Vec<_> = angles.iter().map(|v| v.cos()).collect();
+                    let sin: Vec<_> = angles.iter().map(|v| v.sin()).collect();
+                    let x = upload(&mut stream, bytemuck::cast_slice(&input));
+                    let weight = upload(&mut stream, bytemuck::cast_slice(&weight));
+                    let cos = upload(&mut stream, bytemuck::cast_slice(&cos));
+                    let sin = upload(&mut stream, bytemuck::cast_slice(&sin));
+                    let output: Vec<_> = (0..3)
+                        .map(|_| stream.allocate_zeroed(tokens * INNER * 2).unwrap())
+                        .collect();
+                    let bindings = [
+                        x.binding(),
+                        weight.binding(),
+                        weight.binding(),
+                        cos.binding(),
+                        sin.binding(),
+                        output[0].binding(),
+                        output[1].binding(),
+                        output[2].binding(),
+                    ];
+                    let required = bindings.map(|v| v.len());
+                    let mut profile = Profile::from_env();
+                    let mut run = |stream: &mut Stream| {
+                        emit(
+                            &mut Sink::Stream(stream),
+                            &kernel,
+                            Some(&mut profile),
+                            "qk norm + rope",
+                            [tokens as u32, 1, 1],
+                            [256, 1, 1],
+                            &[tokens as u32],
+                            &bindings,
+                            &required,
+                        )
+                        .unwrap();
+                        stream.synchronize().unwrap();
+                    };
+                    run(&mut stream);
+                    let expected: Vec<_> = output
+                        .iter()
+                        .map(|v| stream.read(v.binding()).unwrap().wait(&mut stream).unwrap())
+                        .collect();
+                    assert!(expected.iter().all(|v| v
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .all(|&v| f16::from_le_bytes(v).is_finite())));
+                    b.iter(|| run(&mut stream));
+                    for (output, expected) in output.iter().zip(&expected) {
+                        let actual = stream
+                            .read(output.binding())
+                            .unwrap()
+                            .wait(&mut stream)
+                            .unwrap();
+                        assert_eq!(&actual, expected);
+                    }
+                },
+            );
+        }
     }
     group.finish();
 }
@@ -671,64 +682,76 @@ fn attention_transpose(c: &mut Criterion) {
     use h3_hrx::model::INNER;
     let mut group = c.benchmark_group("transpose_v_f16");
     for tokens in [1usize, 257, 2048, 8192] {
-        let capacity = ((tokens + 16).div_ceil(32) * 32).max(tokens.div_ceil(256) * 256);
-        group.throughput(Throughput::Bytes(((tokens + capacity) * INNER * 2) as u64));
-        group.bench_function(BenchmarkId::from_parameter(tokens), |b| {
-            let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
-            let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
-            let compiler = compiler();
-            let kernel = compiler
-                .get(
-                    &mut stream,
-                    "transpose_f16",
-                    "h3_transpose_f16",
-                    &vec![
-                        ("h3.transpose_f16.width".into(), INNER.to_string()),
-                        ("h3.transpose_f16.row_capacity".into(), capacity.to_string()),
-                    ],
-                )
-                .unwrap();
-            compiler.flush(&mut stream).unwrap();
-            // Include every half bit pattern: transpose must preserve NaNs and signed zero too.
-            let input: Vec<u16> = (0..tokens * INNER)
-                .map(|i| i.wrapping_mul(37) as u16)
-                .collect();
-            let x = upload(&mut stream, bytemuck::cast_slice(&input));
-            let out = upload(&mut stream, &vec![0xff; capacity * INNER * 2]);
-            let bindings = [x.binding(), out.binding()];
-            let required = bindings.map(|view| view.len());
-            let mut profile = Profile::from_env();
-            let mut run = |stream: &mut Stream| {
-                emit(
-                    &mut Sink::Stream(stream),
-                    &kernel,
-                    Some(&mut profile),
-                    "transpose V",
-                    [(INNER / 32) as u32, (capacity / 32) as u32, 1],
-                    [256, 1, 1],
-                    &[tokens as u32],
-                    &bindings,
-                    &required,
-                )
-                .unwrap();
-                stream.synchronize().unwrap();
-            };
-            run(&mut stream);
-            b.iter(|| run(&mut stream));
-            let mut actual = vec![0u16; capacity * INNER];
-            stream
-                .read_blocking(out.binding(), bytemuck::cast_slice_mut(&mut actual))
-                .unwrap();
-            for (i, value) in actual.into_iter().enumerate() {
-                let (column, row) = (i / capacity, i % capacity);
-                let expected = if row < tokens {
-                    (row * INNER + column).wrapping_mul(37) as u16
-                } else {
-                    0
-                };
-                assert_eq!(value, expected, "row={row} column={column}");
-            }
-        });
+        for direct in [false, true] {
+            let capacity = ((tokens + 16).div_ceil(32) * 32).max(tokens.div_ceil(256) * 256);
+            group.throughput(Throughput::Bytes(((tokens + capacity) * INNER * 2) as u64));
+            group.bench_function(
+                BenchmarkId::new(if direct { "qkv" } else { "v" }, tokens),
+                |b| {
+                    let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+                    let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                    let compiler = compiler();
+                    let stem = if direct {
+                        "transpose_qkv_v_f16"
+                    } else {
+                        "transpose_f16"
+                    };
+                    let kernel = compiler
+                        .get(
+                            &mut stream,
+                            stem,
+                            &format!("h3_{stem}"),
+                            &vec![
+                                (format!("h3.{stem}.width"), INNER.to_string()),
+                                (format!("h3.{stem}.row_capacity"), capacity.to_string()),
+                            ],
+                        )
+                        .unwrap();
+                    compiler.flush(&mut stream).unwrap();
+                    // Include every half bit pattern: transpose must preserve NaNs and signed zero too.
+                    let stride = if direct { 3 * INNER } else { INNER };
+                    let offset = if direct { 2 * INNER } else { 0 };
+                    let input: Vec<u16> = (0..tokens * stride)
+                        .map(|i| i.wrapping_mul(37) as u16)
+                        .collect();
+                    let x = upload(&mut stream, bytemuck::cast_slice(&input));
+                    let out = upload(&mut stream, &vec![0xff; capacity * INNER * 2]);
+                    let bindings = [x.binding(), out.binding()];
+                    let required = bindings.map(|view| view.len());
+                    let mut profile = Profile::from_env();
+                    let mut run = |stream: &mut Stream| {
+                        emit(
+                            &mut Sink::Stream(stream),
+                            &kernel,
+                            Some(&mut profile),
+                            "transpose V",
+                            [(INNER / 32) as u32, (capacity / 32) as u32, 1],
+                            [256, 1, 1],
+                            &[tokens as u32],
+                            &bindings,
+                            &required,
+                        )
+                        .unwrap();
+                        stream.synchronize().unwrap();
+                    };
+                    run(&mut stream);
+                    b.iter(|| run(&mut stream));
+                    let mut actual = vec![0u16; capacity * INNER];
+                    stream
+                        .read_blocking(out.binding(), bytemuck::cast_slice_mut(&mut actual))
+                        .unwrap();
+                    for (i, value) in actual.into_iter().enumerate() {
+                        let (column, row) = (i / capacity, i % capacity);
+                        let expected = if row < tokens {
+                            (row * stride + offset + column).wrapping_mul(37) as u16
+                        } else {
+                            0
+                        };
+                        assert_eq!(value, expected, "row={row} column={column}");
+                    }
+                },
+            );
+        }
     }
     group.finish();
 }

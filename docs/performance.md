@@ -210,8 +210,9 @@ and 8,192 tokens with the same allocation cap and HRX profiling support.
 tokens, including partial query and key tiles. It uses head-major INT8 Q/K,
 transposed FP16 V, a 512 MiB allocation cap, and direct output checks outside
 timing. HRX profiling is available for these cases too.
-`transpose_v_f16` covers 1, 257, 2,048 and 8,192 tokens, checking exact half bits
-and zeroed padding after transposing across reused capacity.
+`rope_qknorm_f16` covers Q/K normalization with and without copying V.
+`transpose_v_f16` covers separate V and fused QKV inputs at 1, 257, 2,048 and
+8,192 tokens, checking exact half bits and zeroed padding across reused capacity.
 `prepare_attention_output_i8` compares 128/224/448-thread workgroups for the
 7,168-value FP16 attention output. Every case checks packed codes and scales
 against the 128-thread kernel outside timing and uses a 512 MiB allocation cap.

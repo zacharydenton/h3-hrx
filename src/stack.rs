@@ -163,6 +163,7 @@ pub struct Stack {
     calls: usize,
     direct_attn: bool,
     fused_operands: bool,
+    direct_v: bool,
     /// the row stride of `attn`, which is the inner width padded to the GEMM's pitch when the out
     /// projection reads it directly
     attn_width: usize,
@@ -192,9 +193,9 @@ pub struct Stack {
     a_q: hrx::Buffer,
     a_s: hrx::Buffer,
     fused: hrx::Buffer,
-    /// When the QKV projection is fused with rope, these are views into `fused`; otherwise they own
-    /// their own allocations.
-    qkv_split: Option<(hrx::Buffer, hrx::Buffer, hrx::Buffer)>,
+    /// Q/K own storage unless preparation is fused. V needs separate storage
+    /// only when rotary preparation copies it out of the projection.
+    qkv_split: Option<(hrx::Buffer, hrx::Buffer, Option<hrx::Buffer>)>,
     attn: hrx::Buffer,
     gu: Option<hrx::Buffer>,
     /// The integer QK^T operands, when the attention runs on them.
@@ -487,6 +488,13 @@ impl Stack {
             && d.rope_dim == 96
             && d.heads == d.kv_heads
             && env_once("H3_KSMOOTH") != Some("1");
+        let qk_int = d.attn_i4 || d.attn_qk_bits == 8;
+        let direct_v = qk_int
+            && !fused_qkv
+            && !fused_operands
+            && d.head_dim == 128
+            && d.rope_dim == 96
+            && d.heads == d.kv_heads;
         let rope = if fused_qkv || fused_operands {
             None
         } else {
@@ -498,6 +506,16 @@ impl Stack {
                 "rope_qknorm_f16"
             };
             let ns = format!("h3.{stem}.");
+            let mut cfg = vec![
+                (format!("{ns}row_stride"), d.qkv().to_string()),
+                (format!("{ns}heads"), d.heads.to_string()),
+                (format!("{ns}kv_heads"), d.kv_heads.to_string()),
+                (format!("{ns}k_offset"), d.inner().to_string()),
+                (format!("{ns}eps"), num(f64::from(d.eps))),
+            ];
+            if stem == "rope_qknorm_f16" {
+                cfg.push((format!("{ns}copy_v"), usize::from(!direct_v).to_string()));
+            }
             Some(c.get(
                 stream,
                 if d.head_dim == 64 || d.rope_dim == 128 {
@@ -506,17 +524,10 @@ impl Stack {
                     stem
                 },
                 &format!("h3_{stem}"),
-                &vec![
-                    (format!("{ns}row_stride"), d.qkv().to_string()),
-                    (format!("{ns}heads"), d.heads.to_string()),
-                    (format!("{ns}kv_heads"), d.kv_heads.to_string()),
-                    (format!("{ns}k_offset"), d.inner().to_string()),
-                    (format!("{ns}eps"), num(f64::from(d.eps))),
-                ],
+                &cfg,
             )?)
         };
 
-        let qk_int = d.attn_i4 || d.attn_qk_bits == 8;
         let qk_head_major = !d.attn_i4 && d.attn_qk_bits == 8 && waves == 8;
         let pqk = if d.attn_i4 {
             "prepare_qk_i4"
@@ -565,7 +576,7 @@ impl Stack {
                 cfg[1].1 = d.inner().to_string();
             }
             prep_k = Some(c.get(stream, pqk, &format!("h3_{pqk}"), &cfg)?);
-            let transpose_stem = if fused_operands {
+            let transpose_stem = if fused_operands || direct_v {
                 "transpose_qkv_v_f16"
             } else {
                 "transpose_f16"
@@ -682,7 +693,11 @@ impl Stack {
             Some((
                 stream.allocate(t * d.inner() * 2)?,
                 stream.allocate(t * d.kv_inner() * 2)?,
-                stream.allocate(t * d.kv_inner() * 2)?,
+                if direct_v {
+                    None
+                } else {
+                    Some(stream.allocate(t * d.kv_inner() * 2)?)
+                },
             ))
         };
         let attn_width = if direct_attn {
@@ -704,7 +719,9 @@ impl Stack {
         if let Some((q, k, v)) = &qkv_split {
             crate::transfer::fill(stream, q.slice(0, t * d.inner() * 2), 0)?;
             crate::transfer::fill(stream, k.slice(0, t * d.kv_inner() * 2), 0)?;
-            crate::transfer::fill(stream, v.slice(0, t * d.kv_inner() * 2), 0)?;
+            if let Some(v) = v {
+                crate::transfer::fill(stream, v.slice(0, t * d.kv_inner() * 2), 0)?;
+            }
         }
 
         let int_qk = if qk_int {
@@ -754,6 +771,7 @@ impl Stack {
             calls: 0,
             direct_attn,
             fused_operands,
+            direct_v,
             attn_width,
             a_stride: widest * if quant { 1 } else { 2 },
             direct_down,
@@ -837,6 +855,7 @@ impl Stack {
     }
 
     /// Q, K and V, whether they are their own allocations or views into the fused one.
+    /// With direct V transposition, V is the full projection and rotary leaves it untouched.
     fn qkv_views(&self) -> (View<'_>, View<'_>, View<'_>) {
         if self.fused_operands {
             return (
@@ -846,7 +865,12 @@ impl Stack {
             );
         }
         match &self.qkv_split {
-            Some((q, k, v)) => (q.binding(), k.binding(), v.binding()),
+            Some((q, k, v)) => (
+                q.binding(),
+                k.binding(),
+                v.as_ref()
+                    .map_or_else(|| self.fused.binding(), hrx::Buffer::binding),
+            ),
             None => {
                 // [Q/K/V][head][capacity][64] in one allocation
                 let (t, inner, kv) = (self.capacity, self.d.inner(), self.d.kv_inner());
@@ -1321,7 +1345,7 @@ impl Stack {
             self.transpose.as_ref().unwrap(),
             Some(prof),
             "fused V transpose",
-            [t.div_ceil(32), (self.d.inner() / 32) as u32, 1],
+            [(self.d.inner() / 32) as u32, t.div_ceil(32), 1],
             [THREADS, 1, 1],
             &[t],
             &[self.fused.binding(), self.vt_view(iq)],
@@ -1474,7 +1498,7 @@ impl Stack {
                 rows * self.d.heads * codes,
                 rows * self.d.heads * 4,
             ];
-            // The only three launches in a block that may overlap. They read `q`, `k` and `v`, share
+            // These three launches may overlap. They read Q, K and V (possibly from fused QKV), share
             // `zmean` read-only, and write six allocations no other two of them touch, so each waits for
             // what came before rather than for its neighbours.
             let before = sink.head();
@@ -1519,6 +1543,11 @@ impl Stack {
             )?;
             ends[1] = sink.head();
             sink.resume(before);
+            let (v_source, v_stride) = if self.direct_v {
+                (self.fused.binding(), self.d.qkv())
+            } else {
+                (v, self.d.inner())
+            };
             emit(
                 sink,
                 self.transpose.as_ref().expect("built with integer QK"),
@@ -1537,8 +1566,8 @@ impl Stack {
                 ],
                 [THREADS, 1, 1],
                 &[t],
-                &[v, self.vt_view(int_qk)],
-                &[rows * self.d.inner() * 2, self.d.inner() * cap * 2],
+                &[v_source, self.vt_view(int_qk)],
+                &[rows * v_stride * 2, self.d.inner() * cap * 2],
             )?;
             ends[2] = sink.head();
             sink.after_branches(ends)?;

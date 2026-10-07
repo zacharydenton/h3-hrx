@@ -16,6 +16,8 @@ config.decl @h3.rope_qknorm_f16.k_offset : %value: index where [range(%value, 12
 
 config.decl @h3.rope_qknorm_f16.eps : f32
 
+config.decl @h3.rope_qknorm_f16.copy_v : %value: index where [range(%value, 0, 1)]
+
 kernel.def target(@h3_rope_qknorm_f16_gfx11) export("h3_rope_qknorm_f16") @h3_rope_qknorm_f16(%tokens: index) {
   %c1 = index.constant 1 : index
   %c256 = index.constant 256 : index
@@ -47,7 +49,10 @@ kernel.def target(@h3_rope_qknorm_f16_gfx11) export("h3_rope_qknorm_f16") @h3_ro
   %lane_col = index.mul %lane, %cch : index
   %kv_heads = config.get @h3.rope_qknorm_f16.kv_heads : index
   %qk_heads = index.add %heads, %kv_heads : index
-  %heads_total = index.add %qk_heads, %kv_heads : index
+  // Integer attention can transpose V directly from QKV instead of copying it here.
+  %copy_v = config.get @h3.rope_qknorm_f16.copy_v : index
+  %v_heads = index.mul %kv_heads, %copy_v : index
+  %heads_total = index.add %qk_heads, %v_heads : index
   %kv_width = index.mul %kv_heads, %cd : index
   %kv_limit = index.sub %kv_width, %cch : index
   %rounds0 = index.add %heads_total, %c7 : index
