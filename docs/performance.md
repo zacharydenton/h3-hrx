@@ -302,6 +302,7 @@ H3_PROFILE=device cargo bench --bench upscale -- upscale/network/warm_weights --
 H3_BENCH_PROFILE=480p H3_BENCH_BUDGET_GIB=4 cargo bench --bench upscale -- upscale/network/warm_weights
 cargo bench --bench upscale -- upscale/groupnorm_stats
 cargo bench --bench upscale -- upscale/conv3d
+cargo bench --bench upscale -- upscale/temporal
 ```
 
 Network profiles separate convolutions, whole-volume normalization, temporal
@@ -309,8 +310,8 @@ convolutions, interpolation and residual updates. Results remain under `target/`
 GroupNorm statistics cases sweep whole-volume row counts and workgroup sizes
 within a 256 MiB device budget, check against FP64 mean and centered variance,
 and verify deterministic replay outside timing.
-Convolution cases cover small tensors and large 512-channel volumes within a
-1 GiB residency budget, including readback. They check sampled interior and
+Spatial and temporal convolution cases cover small tensors and large 512-channel
+volumes within a 1 GiB residency budget, including readback. They check sampled interior and
 boundary outputs against FP64 and verify finite, deterministic output outside timing.
 Packing cases use the released input, residual-block and output convolution
 weights without opening a GPU. They check every packed byte and padding byte

@@ -1,3 +1,4 @@
+// Four adjacent channels per thread; each keeps the original ordered FP32 tap sum.
 amdgpu.target<gfx11-generic> @target {subgroup_size = 32}
 config.decl @h3.upscale_temporal.channels : %value: index where [range(%value, 64, 1024), mul(%value, 64)]
 config.decl @h3.upscale_temporal.plane : %value: index where [range(%value, 1, 1048576)]
@@ -5,11 +6,12 @@ config.decl @h3.upscale_temporal.frames : %value: index where [range(%value, 1, 
 config.decl @h3.upscale_temporal.taps : %value: index where [range(%value, 1, 31)]
 kernel.def target(@target) export("h3_upscale_temporal") @h3_upscale_temporal(%count: index) {
   %one = index.constant 1 : index
-  %tile = index.constant 256 : index
-  %tail = index.constant 255 : index
+  %threads = index.constant 256 : index
+  %tile = index.constant 1024 : index
+  %tail = index.constant 1023 : index
   %rounded = index.add %count, %tail : index
   %groups = index.div %rounded, %tile : index
-  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%tile, %one, %one) : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%threads, %one, %one) : index
 } launch(%count: index, %x: buffer, %weight: buffer, %bias: buffer, %out: buffer) {
   %channels = config.get @h3.upscale_temporal.channels : index
   %plane = config.get @h3.upscale_temporal.plane : index
@@ -19,13 +21,13 @@ kernel.def target(@target) export("h3_upscale_temporal") @h3_upscale_temporal(%c
   %one = index.constant 1 : index
   %two = index.constant 2 : index
   %four = index.constant 4 : index
-  %tile = index.constant 256 : index
+  %tile = index.constant 1024 : index
   %offset = index.constant 0 : offset
-  %zero = scalar.constant 0.0 : f32
   %wg = kernel.workgroup.id<x> : index
   %lane = kernel.workitem.id<x> : index
   %base = index.mul %wg, %tile : index
-  %i = index.add %base, %lane : index
+  %lane4 = index.mul %lane, %four : index
+  %i = index.add %base, %lane4 : index
   %x_global = buffer.assume.memory_space<global> %x : buffer
   %weight_global = buffer.assume.memory_space<global> %weight : buffer
   %bias_global = buffer.assume.memory_space<global> %bias : buffer
@@ -39,35 +41,45 @@ kernel.def target(@target) export("h3_upscale_temporal") @h3_upscale_temporal(%c
     %ov = buffer.view %out_global[%offset] : buffer -> view<[%rows]x[%channels]xf16>
     %wv = buffer.view %weight_global[%offset] : buffer -> view<[%channels]x[%taps]xf16>
     %bv = buffer.view %bias_global[%offset] : buffer -> view<[%channels]xf32>
-    %c = index.rem %i, %channels : index
+    // Channel counts are multiples of 64, so no packet crosses a row boundary.
+    %c0 = index.rem %i, %channels : index
+    %last = index.sub %channels, %four : index
+    %c = index.assume %c0 [le(%c0, %last), mul(%c0, 4)] : index
     %row0 = index.div %i, %channels : index
     %row = index.assume %row0 [lt(%row0, %rows)] : index
     %t = index.div %row, %plane : index
     %p = index.rem %row, %plane : index
     %pad = index.div %taps, %two : index
     %end = index.add %frames, %pad : index
-    %biasv = view.load %bv[%c] : view<[%channels]xf32> -> f32
-    %value = scf.for %k = [%z to %taps step %one](%sum = %biasv : f32) -> (f32) {
+    %biasv = vector.load %bv[%c] : view<[%channels]xf32> -> vector<4xf32>
+    %value = scf.for %k = [%z to %taps step %one](%sum = %biasv : vector<4xf32>) -> (vector<4xf32>) unroll {
       %tp = index.add %t, %k : index
       %lo = index.cmp uge, %tp, %pad : index
       %hi = index.cmp ult, %tp, %end : index
       %ok = scalar.andi %lo, %hi : i1
-      %next = scf.if %ok -> (f32) {
+      %next = scf.if %ok -> (vector<4xf32>) {
         %ti = index.sub %tp, %pad : index
         %rb = index.mul %ti, %plane : index
         %r0 = index.add %rb, %p : index
         %r = index.assume %r0 [lt(%r0, %rows)] : index
-        %v16 = view.load %xv[%r, %c] : view<[%rows]x[%channels]xf16> -> f16
-        %w16 = view.load %wv[%c, %k] : view<[%channels]x[%taps]xf16> -> f16
-        %v = scalar.extf %v16 : f16 to f32
-        %w = scalar.extf %w16 : f16 to f32
-        %acc = scalar.fmaf %v, %w, %sum : f32
-        scf.yield %acc : f32
-      } else { scf.yield %sum : f32 }
-      scf.yield %next : f32
+        %v16 = vector.load %xv[%r, %c] : view<[%rows]x[%channels]xf16> -> vector<4xf16>
+        %c1 = index.add %c, %one : index
+        %c2 = index.add %c, %two : index
+        %c3 = index.add %c2, %one : index
+        %w0 = view.load %wv[%c, %k] : view<[%channels]x[%taps]xf16> -> f16
+        %w1 = view.load %wv[%c1, %k] : view<[%channels]x[%taps]xf16> -> f16
+        %w2 = view.load %wv[%c2, %k] : view<[%channels]x[%taps]xf16> -> f16
+        %w3 = view.load %wv[%c3, %k] : view<[%channels]x[%taps]xf16> -> f16
+        %w16 = vector.from_elements %w0, %w1, %w2, %w3 : vector<4xf16>
+        %v = vector.extf %v16 : vector<4xf16> to vector<4xf32>
+        %w = vector.extf %w16 : vector<4xf16> to vector<4xf32>
+        %acc = vector.fmaf %v, %w, %sum : vector<4xf32>
+        scf.yield %acc : vector<4xf32>
+      } else { scf.yield %sum : vector<4xf32> }
+      scf.yield %next : vector<4xf32>
     }
-    %half = scalar.fptrunc %value : f32 to f16
-    view.store %half, %ov[%row, %c] : f16, view<[%rows]x[%channels]xf16>
+    %half = vector.fptrunc %value : vector<4xf32> to vector<4xf16>
+    vector.store %half, %ov[%row, %c] : vector<4xf16>, view<[%rows]x[%channels]xf16>
   }
   kernel.return
 }

@@ -192,7 +192,7 @@ fn upscale(c: &mut Criterion) {
         );
     }
 }
-criterion_group! {name=benches;config=support::criterion();targets=packing,components,groupnorm_stats,convolutions,upscale}
+criterion_group! {name=benches;config=support::criterion();targets=packing,components,groupnorm_stats,convolutions,temporal_convolutions,upscale}
 criterion_main!(benches);
 
 fn packing(c: &mut Criterion) {
@@ -276,7 +276,7 @@ fn components(c: &mut Criterion) {
                             vec![0; channels * 4],
                             vec![0; rows * channels * 2],
                         ],
-                        [(rows * channels).div_ceil(256) as u32, 1, 1],
+                        [(rows * channels).div_ceil(1024) as u32, 1, 1],
                         256,
                         rows * channels,
                     )
@@ -623,6 +623,117 @@ fn convolutions(c: &mut Criterion) {
             assert!(
                 actual == expected,
                 "convolution replay changed for {frames}x{height}x{width}"
+            );
+        });
+    }
+}
+
+fn temporal_convolutions(c: &mut Criterion) {
+    use half::f16;
+    for (frames, plane) in [(8usize, 64usize), (42, 1620), (10, 6480), (42, 6480)] {
+        c.bench_function(&format!("upscale/temporal/{frames}x{plane}"), |b| {
+            let (channels, taps) = (512usize, 5usize);
+            let count = frames * plane * channels;
+            let manager = hrx::residency::ResidencyManager::new(1 << 30).unwrap();
+            let mut stream = hrx::Stream::open()
+                .unwrap()
+                .with_memory_budget(manager.budget());
+            let compiler = hrx::loom::Compiler::resolve(None).unwrap();
+            let source =
+                std::fs::read_to_string(support::sources().join("upscale_temporal.loom")).unwrap();
+            let mut spec = hrx::loom::Specialization::new("h3_upscale_temporal");
+            spec.replace_config(
+                [
+                    ("frames", frames),
+                    ("plane", plane),
+                    ("channels", channels),
+                    ("taps", taps),
+                ]
+                .map(|(key, value)| (format!("h3.upscale_temporal.{key}"), value.to_string()))
+                .into_iter()
+                .collect(),
+            );
+            let artifact = compiler.module(&source).compile(&spec).unwrap();
+            // SAFETY: checked-in source, configuration-derived bindings and launch geometry.
+            let kernel = unsafe { stream.load_artifact(&artifact) }.unwrap();
+            let input = support::values(count, 0.2)
+                .into_iter()
+                .map(f16::from_f32)
+                .collect::<Vec<_>>();
+            let weights = support::values(channels * taps, 0.3)
+                .into_iter()
+                .map(f16::from_f32)
+                .collect::<Vec<_>>();
+            let bias = support::values(channels, 0.1);
+            let x = stream.allocate_from(bytemuck::cast_slice(&input)).unwrap();
+            let w = stream
+                .allocate_from(bytemuck::cast_slice(&weights))
+                .unwrap();
+            let bias_buffer = stream.allocate_from(bytemuck::cast_slice(&bias)).unwrap();
+            let out = stream.allocate(count * 2).unwrap();
+            let constants = hrx::Constants::indices(&kernel, &[count as u32]).unwrap();
+            let run = |stream: &mut hrx::Stream| {
+                // SAFETY: complete channel packets, exact tensor extents, disjoint output.
+                unsafe {
+                    stream.dispatch(
+                        &kernel,
+                        [count.div_ceil(1024) as u32, 1, 1],
+                        [256, 1, 1],
+                        &constants,
+                        &[
+                            x.binding(),
+                            w.binding(),
+                            bias_buffer.binding(),
+                            out.binding(),
+                        ],
+                    )
+                }
+                .unwrap();
+                stream.synchronize().unwrap();
+            };
+            run(&mut stream);
+            let expected = stream
+                .read(out.binding())
+                .unwrap()
+                .wait(&mut stream)
+                .unwrap();
+            // Cover temporal padding, interior frames, spatial endpoints and packet boundaries.
+            for t in [0, 1, frames / 2, frames - 2, frames - 1] {
+                for p in [0, plane / 2, plane - 1] {
+                    for ch in [0, 3, 4, channels / 2, channels - 1] {
+                        let mut sum = bias[ch] as f64;
+                        for k in 0..taps {
+                            let ti = t as isize + k as isize - (taps / 2) as isize;
+                            if (0..frames as isize).contains(&ti) {
+                                sum += input[(ti as usize * plane + p) * channels + ch].to_f64()
+                                    * weights[ch * taps + k].to_f64();
+                            }
+                        }
+                        let i = ((t * plane + p) * channels + ch) * 2;
+                        let got =
+                            f16::from_le_bytes(expected[i..i + 2].try_into().unwrap()).to_f64();
+                        assert!(
+                            (got - sum).abs() < 0.001 + 0.001 * sum.abs(),
+                            "temporal t={t} p={p} ch={ch}: {got} != {sum}"
+                        );
+                    }
+                }
+            }
+            assert!(expected
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|v| f16::from_le_bytes(*v).is_finite()));
+            drop(input);
+            b.iter(|| run(&mut stream));
+            let actual = stream
+                .read(out.binding())
+                .unwrap()
+                .wait(&mut stream)
+                .unwrap();
+            assert!(
+                actual == expected,
+                "temporal replay changed for {frames}x{plane}"
             );
         });
     }

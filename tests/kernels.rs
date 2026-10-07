@@ -4130,50 +4130,71 @@ fn upscale_groupnorm_centered_variance_handles_large_offsets() {
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires provisioned HRX")]
 fn upscale_temporal_depthwise_keeps_channels_separate() {
     let mut harness = Harness::new();
-    let (frames, plane, channels, taps) = (3usize, 4usize, 64usize, 5usize);
-    let count = frames * plane * channels;
-    let input = values(count, 0.2)
-        .into_iter()
-        .map(f16::from_f32)
-        .collect::<Vec<_>>();
-    let weight = values(channels * taps, 0.3)
-        .into_iter()
-        .map(f16::from_f32)
-        .collect::<Vec<_>>();
-    let bias = values(channels, 0.1);
-    let mut want = vec![0f64; count];
-    for t in 0..frames {
-        for p in 0..plane {
-            for c in 0..channels {
-                let mut sum = bias[c] as f64;
-                for k in 0..taps {
-                    let ti = t as isize + k as isize - (taps / 2) as isize;
-                    if ti >= 0 && ti < frames as isize {
-                        sum += input[(ti as usize * plane + p) * channels + c].to_f64()
-                            * weight[c * taps + k].to_f64();
+    for (frames, plane, channels, taps) in [
+        (1usize, 1usize, 64usize, 1usize),
+        (1, 7, 128, 15),
+        (3, 4, 64, 5),
+        (3, 7, 192, 3),
+        (3, 17, 512, 5),
+        (42, 17, 512, 5),
+        (64, 3, 1024, 15),
+        (3, 2051, 64, 5),
+        (2, 1, 64, 31),
+    ] {
+        let count = frames * plane * channels;
+        let input = values(count, 0.2)
+            .into_iter()
+            .map(f16::from_f32)
+            .collect::<Vec<_>>();
+        let weight = values(channels * taps, 0.3)
+            .into_iter()
+            .map(f16::from_f32)
+            .collect::<Vec<_>>();
+        let bias = values(channels, 0.1);
+        let mut want = vec![0f64; count];
+        let mut ordered = vec![f16::ZERO; count];
+        for t in 0..frames {
+            for p in 0..plane {
+                for c in 0..channels {
+                    let mut sum = bias[c] as f64;
+                    let mut fp32 = bias[c];
+                    for k in 0..taps {
+                        let ti = t as isize + k as isize - (taps / 2) as isize;
+                        if ti >= 0 && ti < frames as isize {
+                            let x = input[(ti as usize * plane + p) * channels + c];
+                            let w = weight[c * taps + k];
+                            sum += x.to_f64() * w.to_f64();
+                            fp32 = x.to_f32().mul_add(w.to_f32(), fp32);
+                        }
                     }
+                    let i = (t * plane + p) * channels + c;
+                    want[i] = sum;
+                    ordered[i] = f16::from_f32(fp32);
                 }
-                want[(t * plane + p) * channels + c] = sum;
             }
         }
+        // Partial workgroups must leave the suffix untouched.
+        let guard = f16::from_f32(-123.0);
+        let out = harness.run(
+            "upscale_temporal",
+            &cfg(&[
+                ("frames", frames),
+                ("plane", plane),
+                ("channels", channels),
+                ("taps", taps),
+            ]),
+            [count.div_ceil(1024) as u32, 1, 1],
+            256,
+            &[count as u64],
+            &[
+                bytes(&input),
+                bytes(&weight),
+                bytes(&bias),
+                bytes(&vec![guard; count + 19]),
+            ],
+        );
+        assert_eq!(out[3][..count * 2], bytes(&ordered));
+        assert_eq!(out[3][count * 2..], bytes(&[guard; 19]));
+        close(&halves(&out[3][..count * 2], false), &want, 0.001, 0.002);
     }
-    let out = harness.run(
-        "upscale_temporal",
-        &cfg(&[
-            ("frames", frames),
-            ("plane", plane),
-            ("channels", channels),
-            ("taps", taps),
-        ]),
-        [count.div_ceil(256) as u32, 1, 1],
-        256,
-        &[count as u64],
-        &[
-            bytes(&input),
-            bytes(&weight),
-            bytes(&bias),
-            bytes(&vec![f16::ZERO; count]),
-        ],
-    );
-    close(&halves(&out[3], false), &want, 0.001, 0.002);
 }
