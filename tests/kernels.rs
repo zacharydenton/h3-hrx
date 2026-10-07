@@ -665,12 +665,14 @@ fn float_preparation_normalizes_large_values_and_respects_padded_pitch() {
 )]
 fn rotary_qk_norm_matches_cpu_for_all_head_layouts_and_copies_v() {
     let mut h = Harness::new();
-    for (stem, d, rot) in [
-        ("rope_qknorm_f16", 128usize, 96usize),
-        ("rope64_qknorm_f16", 64, 48),
-        ("rope128_qknorm_f16", 128, 128),
+    for (stem, d, rot, heads, kv) in [
+        ("rope_qknorm_f16", 128usize, 96usize, 4usize, 2usize),
+        ("rope_qknorm_f16", 128, 96, 56, 56),
+        ("rope_qknorm_f16", 128, 96, 12, 3),
+        ("rope64_qknorm_f16", 64, 48, 4, 2),
+        ("rope128_qknorm_f16", 128, 128, 4, 2),
     ] {
-        let (tokens, heads, kv) = (3usize, 4usize, 2usize);
+        let tokens = 3usize;
         let stride = (heads + 2 * kv) * d;
         let offset = heads * d;
         let fused: Vec<_> = values(tokens * stride, 0.7)

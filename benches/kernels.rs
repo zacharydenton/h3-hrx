@@ -109,6 +109,98 @@ fn operand(count: usize, elem: &str, seed: usize) -> Vec<u8> {
     }
 }
 
+fn rotary_preparation(c: &mut Criterion) {
+    use h3_hrx::dispatch::{emit, Profile};
+    use h3_hrx::model::{HEADS, INNER, QKV, ROPE_HALF};
+    let mut group = c.benchmark_group("rope_qknorm_f16");
+    for tokens in [1usize, 257, 2048, 4096] {
+        group.throughput(Throughput::Elements((tokens * QKV) as u64));
+        group.bench_function(BenchmarkId::from_parameter(tokens), |b| {
+            let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+            let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+            let compiler = compiler();
+            let kernel = compiler
+                .get(
+                    &mut stream,
+                    "rope_qknorm_f16",
+                    "h3_rope_qknorm_f16",
+                    &vec![
+                        ("h3.rope_qknorm_f16.row_stride".into(), QKV.to_string()),
+                        ("h3.rope_qknorm_f16.heads".into(), HEADS.to_string()),
+                        ("h3.rope_qknorm_f16.kv_heads".into(), HEADS.to_string()),
+                        ("h3.rope_qknorm_f16.k_offset".into(), INNER.to_string()),
+                        ("h3.rope_qknorm_f16.eps".into(), "1e-5".into()),
+                    ],
+                )
+                .unwrap();
+            compiler.flush(&mut stream).unwrap();
+            let input: Vec<_> = (0..tokens * QKV)
+                .map(|i| f16::from_f32(((i * 37 % 997) as f32 - 498.) / 512.))
+                .collect();
+            let weight: Vec<_> = (0..128).map(|i| 1. + (i % 7) as f32 / 100.).collect();
+            let angles: Vec<_> = (0..tokens * ROPE_HALF)
+                .map(|i| (i % 271) as f32 / 271.)
+                .collect();
+            let cos: Vec<_> = angles.iter().map(|v| v.cos()).collect();
+            let sin: Vec<_> = angles.iter().map(|v| v.sin()).collect();
+            let x = upload(&mut stream, bytemuck::cast_slice(&input));
+            let weight = upload(&mut stream, bytemuck::cast_slice(&weight));
+            let cos = upload(&mut stream, bytemuck::cast_slice(&cos));
+            let sin = upload(&mut stream, bytemuck::cast_slice(&sin));
+            let output: Vec<_> = (0..3)
+                .map(|_| stream.allocate_zeroed(tokens * INNER * 2).unwrap())
+                .collect();
+            let bindings = [
+                x.binding(),
+                weight.binding(),
+                weight.binding(),
+                cos.binding(),
+                sin.binding(),
+                output[0].binding(),
+                output[1].binding(),
+                output[2].binding(),
+            ];
+            let required = bindings.map(|v| v.len());
+            let mut profile = Profile::from_env();
+            let mut run = |stream: &mut Stream| {
+                emit(
+                    &mut Sink::Stream(stream),
+                    &kernel,
+                    Some(&mut profile),
+                    "qk norm + rope",
+                    [tokens as u32, 1, 1],
+                    [256, 1, 1],
+                    &[tokens as u32],
+                    &bindings,
+                    &required,
+                )
+                .unwrap();
+                stream.synchronize().unwrap();
+            };
+            run(&mut stream);
+            let expected: Vec<_> = output
+                .iter()
+                .map(|v| stream.read(v.binding()).unwrap().wait(&mut stream).unwrap())
+                .collect();
+            assert!(expected.iter().all(|v| v
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|&v| f16::from_le_bytes(v).is_finite())));
+            b.iter(|| run(&mut stream));
+            for (output, expected) in output.iter().zip(&expected) {
+                let actual = stream
+                    .read(output.binding())
+                    .unwrap()
+                    .wait(&mut stream)
+                    .unwrap();
+                assert_eq!(&actual, expected);
+            }
+        });
+    }
+    group.finish();
+}
+
 fn attention_preparation(c: &mut Criterion) {
     use h3_hrx::dispatch::{emit, Profile};
     use h3_hrx::model::{HEADS, INNER};
@@ -955,6 +1047,6 @@ criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10).warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3));
-    targets = preparation, attention_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
+    targets = preparation, rotary_preparation, attention_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
 }
 criterion_main!(benches);
