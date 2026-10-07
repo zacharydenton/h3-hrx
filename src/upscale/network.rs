@@ -437,12 +437,18 @@ impl Upscaler {
             &[x.binding(), stats.binding()],
             &[bytes, 256],
         )?;
+        let apply_tile = if rows * self.channels >= 65536 && (self.channels / 32).is_multiple_of(4)
+        {
+            1024
+        } else {
+            256
+        };
         dispatch::checked(
             s,
             &apply,
             Some(p),
             "upscale groupnorm silu",
-            [(rows * self.channels).div_ceil(256) as u32, 1, 1],
+            [(rows * self.channels).div_ceil(apply_tile) as u32, 1, 1],
             [256, 1, 1],
             &[1],
             &[

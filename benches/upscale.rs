@@ -192,7 +192,7 @@ fn upscale(c: &mut Criterion) {
         );
     }
 }
-criterion_group! {name=benches;config=support::criterion();targets=packing,components,groupnorm_stats,convolutions,temporal_convolutions,upscale}
+criterion_group! {name=benches;config=support::criterion();targets=packing,components,groupnorm_stats,convolutions,temporal_convolutions,groupnorm_apply,upscale}
 criterion_main!(benches);
 
 fn packing(c: &mut Criterion) {
@@ -324,7 +324,7 @@ fn components(c: &mut Criterion) {
                                 vec![0; rows * channels * 2],
                                 vec![0; channels * 8],
                             ],
-                            [(rows * channels).div_ceil(256) as u32, 1, 1],
+                            [(rows * channels).div_ceil(1024) as u32, 1, 1],
                             256,
                             1,
                         )
@@ -734,6 +734,121 @@ fn temporal_convolutions(c: &mut Criterion) {
             assert!(
                 actual == expected,
                 "temporal replay changed for {frames}x{plane}"
+            );
+        });
+    }
+}
+
+fn groupnorm_apply(c: &mut Criterion) {
+    use half::f16;
+    for rows in [32usize, 64, 127, 128, 256, 512, 12960, 64800, 272160] {
+        c.bench_function(&format!("upscale/groupnorm_apply/{rows}"), |b| {
+            let channels = 512usize;
+            let count = rows * channels;
+            let tile = if count >= 65536 { 1024 } else { 256 };
+            let manager = hrx::residency::ResidencyManager::new(1 << 30).unwrap();
+            let mut stream = hrx::Stream::open()
+                .unwrap()
+                .with_memory_budget(manager.budget());
+            let compiler = hrx::loom::Compiler::resolve(None).unwrap();
+            let source =
+                std::fs::read_to_string(support::sources().join("upscale_gn_silu.loom")).unwrap();
+            let mut spec = hrx::loom::Specialization::new("h3_upscale_gn_silu");
+            let mut config = [
+                ("channels", channels),
+                ("groups", 32),
+                ("plane", rows),
+                ("rows_bound", rows.div_ceil(64) * 64),
+            ]
+            .map(|(k, v)| (format!("h3.upscale_gn_silu.{k}"), v.to_string()))
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+            config.insert("h3.upscale_gn_silu.eps".into(), "0.00001".into());
+            spec.replace_config(config);
+            let artifact = compiler.module(&source).compile(&spec).unwrap();
+            // SAFETY: checked-in source, configuration-derived bindings and launch geometry.
+            let kernel = unsafe { stream.load_artifact(&artifact) }.unwrap();
+            let input = support::values(count, 8.0)
+                .into_iter()
+                .map(f16::from_f32)
+                .collect::<Vec<_>>();
+            let stats = (0..32)
+                .flat_map(|g| [((g * 17 % 31) as f32 - 15.0) * 0.1, 0.2 + (g % 7) as f32])
+                .collect::<Vec<_>>();
+            let gamma = support::values(channels, 0.3);
+            let beta = support::values(channels, 0.1);
+            let modulation = support::values(channels * 2, 0.2);
+            let x = stream.allocate_from(bytemuck::cast_slice(&input)).unwrap();
+            let st = stream.allocate_from(bytemuck::cast_slice(&stats)).unwrap();
+            let ga = stream.allocate_from(bytemuck::cast_slice(&gamma)).unwrap();
+            let be = stream.allocate_from(bytemuck::cast_slice(&beta)).unwrap();
+            let mods = stream
+                .allocate_from(bytemuck::cast_slice(&modulation))
+                .unwrap();
+            let out = stream.allocate(count * 2).unwrap();
+            let constants = hrx::Constants::indices(&kernel, &[1]).unwrap();
+            let run = |stream: &mut hrx::Stream| {
+                // SAFETY: complete channel packets, exact tensor extents, disjoint output.
+                unsafe {
+                    stream.dispatch(
+                        &kernel,
+                        [count.div_ceil(tile) as u32, 1, 1],
+                        [256, 1, 1],
+                        &constants,
+                        &[
+                            x.binding(),
+                            st.binding(),
+                            ga.binding(),
+                            be.binding(),
+                            out.binding(),
+                            mods.binding(),
+                        ],
+                    )
+                }
+                .unwrap();
+                stream.synchronize().unwrap();
+            };
+            run(&mut stream);
+            let expected = stream
+                .read(out.binding())
+                .unwrap()
+                .wait(&mut stream)
+                .unwrap();
+            let half = |v| f16::from_f32(v).to_f32();
+            for row in [0, 1, rows / 2, rows - 1] {
+                for ch in [0, 3, 4, 15, 16, channels / 2, channels - 1] {
+                    let g = ch / 16;
+                    let inv = 1.0 / (stats[g * 2 + 1] + 1e-5).sqrt();
+                    let norm = half(
+                        ((input[row * channels + ch].to_f32() - stats[g * 2]) * inv)
+                            .mul_add(gamma[ch], beta[ch]),
+                    );
+                    let y =
+                        half(half(norm * half(1.0 + modulation[ch])) + modulation[channels + ch]);
+                    let want = half(y * (1.0 / (1.0 + (-y).exp())));
+                    let i = (row * channels + ch) * 2;
+                    let got = f16::from_le_bytes(expected[i..i + 2].try_into().unwrap()).to_f32();
+                    assert!(
+                        (got - want).abs() < 0.0001 + 0.002 * want.abs(),
+                        "groupnorm apply row={row} ch={ch}: {got} != {want}"
+                    );
+                }
+            }
+            assert!(expected
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|v| f16::from_le_bytes(*v).is_finite()));
+            drop(input);
+            b.iter(|| run(&mut stream));
+            let actual = stream
+                .read(out.binding())
+                .unwrap()
+                .wait(&mut stream)
+                .unwrap();
+            assert!(
+                actual == expected,
+                "groupnorm apply replay changed for {rows} rows"
             );
         });
     }

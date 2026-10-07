@@ -301,6 +301,7 @@ cargo bench --bench upscale -- upscale/pack
 H3_PROFILE=device cargo bench --bench upscale -- upscale/network/warm_weights --test
 H3_BENCH_PROFILE=480p H3_BENCH_BUDGET_GIB=4 cargo bench --bench upscale -- upscale/network/warm_weights
 cargo bench --bench upscale -- upscale/groupnorm_stats
+cargo bench --bench upscale -- upscale/groupnorm_apply
 cargo bench --bench upscale -- upscale/conv3d
 cargo bench --bench upscale -- upscale/temporal
 ```
@@ -310,6 +311,8 @@ convolutions, interpolation and residual updates. Results remain under `target/`
 GroupNorm statistics cases sweep whole-volume row counts and workgroup sizes
 within a 256 MiB device budget, check against FP64 mean and centered variance,
 and verify deterministic replay outside timing.
+GroupNorm apply cases use up to 1 GiB, check modulation with FP16 rounding at
+each intermediate boundary, and verify finite, deterministic output outside timing.
 Spatial and temporal convolution cases cover small tensors and large 512-channel
 volumes within a 1 GiB residency budget, including readback. They check sampled interior and
 boundary outputs against FP64 and verify finite, deterministic output outside timing.

@@ -4198,3 +4198,84 @@ fn upscale_temporal_depthwise_keeps_channels_separate() {
         close(&halves(&out[3][..count * 2], false), &want, 0.001, 0.002);
     }
 }
+
+#[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires provisioned HRX")]
+fn upscale_groupnorm_apply_preserves_modulation_and_padding() {
+    let mut harness = Harness::new();
+    let half = |x| f16::from_f32(x).to_f32();
+    for (frames, plane, channels, groups, offset, spread, variance) in [
+        (1usize, 1usize, 32usize, 32usize, 0.0f32, 2.0f32, 1.0f32),
+        (2, 7, 64, 32, 0.0, 8.0, 2.0),
+        (3, 17, 192, 32, 0.0, 2.0, 0.5),
+        (2, 513, 192, 32, 0.0, 2.0, 0.5),
+        (3, 19, 128, 32, 0.0, 8.0, 0.0),
+        (2, 513, 128, 32, 0.0, 2.0, 1.0),
+        (1, 127, 512, 32, 0.0, 2.0, 1.0),
+        (1, 128, 512, 32, 0.0, 2.0, 1.0),
+        (2, 129, 512, 32, 10000.0, 8.0, 64.0),
+        (1, 513, 512, 32, 65504.0, 0.0, 0.0),
+        (3, 17, 256, 64, 0.0, 0.00001, 1e-12),
+        (2, 17, 1024, 16, 0.0, 0.0, -0.001),
+    ] {
+        let count = frames * plane * channels;
+        let input = values(count, spread)
+            .into_iter()
+            .map(|v| f16::from_f32(offset + v))
+            .collect::<Vec<_>>();
+        let stats = (0..frames * groups)
+            .flat_map(|tg| [offset + (tg % 7) as f32 * spread * 0.125, variance])
+            .collect::<Vec<_>>();
+        let gamma = values(channels, 0.7);
+        let beta = values(channels, 0.1);
+        let modulation = values(channels * 2, 1.25);
+        let expected = (0..count)
+            .map(|i| {
+                let ch = i % channels;
+                let tg = (i / (channels * plane)) * groups + ch / (channels / groups);
+                let mean = stats[2 * tg];
+                let inv = 1.0 / (stats[2 * tg + 1].max(0.0) + 1e-5).sqrt();
+                let norm = half(((input[i].to_f32() - mean) * inv).mul_add(gamma[ch], beta[ch]));
+                // The upstream node rounds normalization, factor, product and shift separately.
+                let factor = half(1.0 + modulation[ch]);
+                let y = half(half(norm * factor) + modulation[channels + ch]);
+                half(y * (1.0 / (1.0 + (-y).exp()))) as f64
+            })
+            .collect::<Vec<_>>();
+        let mut config = cfg(&[
+            ("channels", channels),
+            ("groups", groups),
+            ("plane", plane),
+            ("rows_bound", (frames * plane).div_ceil(64) * 64),
+        ]);
+        config.push(("eps", "0.00001".into()));
+        let tile = if plane * channels >= 65536 && (channels / groups).is_multiple_of(4) {
+            1024
+        } else {
+            256
+        };
+        let guard = f16::from_f32(-123.0);
+        let out = harness.run(
+            "upscale_gn_silu",
+            &config,
+            [count.div_ceil(tile) as u32, 1, 1],
+            256,
+            &[frames as u64],
+            &[
+                bytes(&input),
+                bytes(&stats),
+                bytes(&gamma),
+                bytes(&beta),
+                bytes(&vec![guard; count + 19]),
+                bytes(&modulation),
+            ],
+        );
+        assert_eq!(out[4][count * 2..], bytes(&[guard; 19]));
+        close(
+            &halves(&out[4][..count * 2], false),
+            &expected,
+            0.0001,
+            0.002,
+        );
+    }
+}
