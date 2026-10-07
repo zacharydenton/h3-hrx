@@ -298,6 +298,201 @@ fn attention_preparation(c: &mut Criterion) {
     group.finish();
 }
 
+fn fused_qk_preparation(c: &mut Criterion) {
+    use h3_hrx::dispatch::{emit, Profile};
+    use h3_hrx::model::{HEADS, INNER, QKV, ROPE_HALF};
+    let mut group = c.benchmark_group("qk_rotary_quantization");
+    for tokens in [1usize, 257, 4096, 8192] {
+        for fused in [false, true] {
+            group.throughput(Throughput::Elements((tokens * INNER * 2) as u64));
+            group.bench_function(
+                BenchmarkId::new(if fused { "fused" } else { "separate" }, tokens),
+                |b| {
+                    // The reference needs both full-width FP16 intermediates.
+                    let manager = hrx::residency::ResidencyManager::new(1 << 30).unwrap();
+                    let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                    let compiler = compiler();
+                    let capacity = (tokens + 16).div_ceil(32) * 32;
+                    let rope = compiler
+                        .get(
+                            &mut stream,
+                            "rope_qknorm_f16",
+                            "h3_rope_qknorm_f16",
+                            &vec![
+                                ("h3.rope_qknorm_f16.row_stride".into(), QKV.to_string()),
+                                ("h3.rope_qknorm_f16.heads".into(), HEADS.to_string()),
+                                ("h3.rope_qknorm_f16.kv_heads".into(), HEADS.to_string()),
+                                ("h3.rope_qknorm_f16.k_offset".into(), INNER.to_string()),
+                                ("h3.rope_qknorm_f16.eps".into(), "1e-5".into()),
+                                ("h3.rope_qknorm_f16.copy_v".into(), "0".into()),
+                            ],
+                        )
+                        .unwrap();
+                    let prepare = |stream: &mut Stream, fused: bool| {
+                        let stem = if fused {
+                            "prepare_qk_rope_i8hm"
+                        } else {
+                            "prepare_qk_i8hm"
+                        };
+                        [0, 1].map(|head| {
+                            let mut cfg = vec![
+                                (
+                                    format!("h3.{stem}.row_stride"),
+                                    if fused { QKV } else { INNER }.to_string(),
+                                ),
+                                (
+                                    format!("h3.{stem}.head_offset"),
+                                    if fused { head * INNER } else { 0 }.to_string(),
+                                ),
+                                (format!("h3.{stem}.heads"), HEADS.to_string()),
+                                (format!("h3.{stem}.token_capacity"), capacity.to_string()),
+                                (
+                                    format!("h3.{stem}.extra_scale"),
+                                    h3_hrx::compile::num(if head == 0 {
+                                        1. / 128f64.sqrt() / 128.
+                                    } else {
+                                        1.
+                                    }),
+                                ),
+                            ];
+                            if fused {
+                                cfg.push((format!("h3.{stem}.eps"), "1e-5".into()));
+                            }
+                            compiler
+                                .get(stream, stem, &format!("h3_{stem}"), &cfg)
+                                .unwrap()
+                        })
+                    };
+                    let separate = prepare(&mut stream, false);
+                    let combined = prepare(&mut stream, true);
+                    compiler.flush(&mut stream).unwrap();
+                    let input: Vec<_> = (0..tokens * QKV)
+                        .map(|i| f16::from_f32(((i * 37 % 997) as f32 - 498.) / 512.))
+                        .collect();
+                    let x = upload(&mut stream, bytemuck::cast_slice(&input));
+                    let weights: Vec<_> = [0, 1]
+                        .into_iter()
+                        .map(|head| {
+                            let weight: Vec<_> = (0..128)
+                                .map(|i| 1. + (i % 7 + head) as f32 / 100.)
+                                .collect();
+                            upload(&mut stream, bytemuck::cast_slice(&weight))
+                        })
+                        .collect();
+                    let angles: Vec<_> = (0..tokens * ROPE_HALF)
+                        .map(|i| (i % 271) as f32 / 271.)
+                        .collect();
+                    let cos: Vec<_> = angles.iter().map(|v| v.cos()).collect();
+                    let sin: Vec<_> = angles.iter().map(|v| v.sin()).collect();
+                    let cos = upload(&mut stream, bytemuck::cast_slice(&cos));
+                    let sin = upload(&mut stream, bytemuck::cast_slice(&sin));
+                    let qk: Vec<_> = (0..2)
+                        .map(|_| stream.allocate(tokens * INNER * 2).unwrap())
+                        .collect();
+                    let codes: Vec<_> = (0..2)
+                        .map(|_| stream.allocate_zeroed(capacity * INNER).unwrap())
+                        .collect();
+                    let scales: Vec<_> = (0..2)
+                        .map(|_| stream.allocate_zeroed(capacity * HEADS * 4).unwrap())
+                        .collect();
+                    let mean = stream.allocate_zeroed(INNER * 4).unwrap();
+                    let mut profile = Profile::from_env();
+                    let mut run = |stream: &mut Stream, fused: bool| {
+                        if !fused {
+                            let views = [
+                                x.binding(),
+                                weights[0].binding(),
+                                weights[1].binding(),
+                                cos.binding(),
+                                sin.binding(),
+                                qk[0].binding(),
+                                qk[1].binding(),
+                                x.binding(),
+                            ];
+                            emit(
+                                &mut Sink::Stream(stream),
+                                &rope,
+                                Some(&mut profile),
+                                "qk norm + rope",
+                                [tokens as u32, 1, 1],
+                                [256, 1, 1],
+                                &[tokens as u32],
+                                &views,
+                                &views.map(|v| v.len()),
+                            )
+                            .unwrap();
+                        }
+                        for head in 0..2 {
+                            if fused {
+                                let views = [
+                                    x.binding(),
+                                    weights[head].binding(),
+                                    cos.binding(),
+                                    sin.binding(),
+                                    codes[head].binding(),
+                                    scales[head].binding(),
+                                ];
+                                emit(
+                                    &mut Sink::Stream(stream),
+                                    &combined[head],
+                                    Some(&mut profile),
+                                    "fused QK preparation",
+                                    [tokens as u32, 1, 1],
+                                    [256, 1, 1],
+                                    &[tokens as u32],
+                                    &views,
+                                    &views.map(|v| v.len()),
+                                )
+                                .unwrap();
+                            } else {
+                                let views = [
+                                    qk[head].binding(),
+                                    mean.binding(),
+                                    codes[head].binding(),
+                                    scales[head].binding(),
+                                ];
+                                emit(
+                                    &mut Sink::Stream(stream),
+                                    &separate[head],
+                                    Some(&mut profile),
+                                    "separate QK preparation",
+                                    [tokens as u32, 1, 1],
+                                    [256, 1, 1],
+                                    &[tokens as u32],
+                                    &views,
+                                    &views.map(|v| v.len()),
+                                )
+                                .unwrap();
+                            }
+                        }
+                        stream.synchronize().unwrap();
+                    };
+                    run(&mut stream, false);
+                    let expected: Vec<_> = codes
+                        .iter()
+                        .chain(&scales)
+                        .map(|v| stream.read(v.binding()).unwrap().wait(&mut stream).unwrap())
+                        .collect();
+                    run(&mut stream, fused);
+                    b.iter(|| run(&mut stream, fused));
+                    for (buffer, expected) in codes.iter().chain(&scales).zip(expected) {
+                        let actual = stream
+                            .read(buffer.binding())
+                            .unwrap()
+                            .wait(&mut stream)
+                            .unwrap();
+                        assert!(
+                            actual == expected,
+                            "Q/K codes or scales differ: tokens={tokens}, fused={fused}"
+                        );
+                    }
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 fn quantized_attention(c: &mut Criterion) {
     use h3_hrx::dispatch::{emit, Profile};
     use h3_hrx::model::{HEADS, INNER};
@@ -1070,6 +1265,6 @@ criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10).warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3));
-    targets = preparation, rotary_preparation, attention_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
+    targets = preparation, rotary_preparation, attention_preparation, fused_qk_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
 }
 criterion_main!(benches);

@@ -223,7 +223,17 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
         }
         let mut actual = vec![0u8; expected.len()];
         stream.read_blocking(x.binding(), &mut actual).unwrap();
-        assert_eq!(actual, expected, "stack replay changed");
+        if actual != expected {
+            let differences: Vec<_> = actual
+                .as_chunks::<4>().0.iter()
+                .zip(expected.as_chunks::<4>().0)
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .map(|(i, (a, b))| (i, f32::from_le_bytes(*a), f32::from_le_bytes(*b)))
+                .take(8)
+                .collect();
+            panic!("stack replay changed: first (index, actual, expected) differences: {differences:?}");
+        }
         elapsed
     });
     Ok(())
@@ -232,7 +242,7 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
 fn models(c: &mut Criterion) {
     c.bench_function("audio/roundtrip/3200", |b| audio(b).unwrap());
     let mut group = c.benchmark_group("dit_stack");
-    for tokens in [256, 1024, 2048, 2049, 4096] {
+    for tokens in [256, 1024, 2048, 2049, 4096, 8192] {
         for graph in [false, true] {
             let mode = if graph { "graph" } else { "eager" };
             group.bench_function(format!("{mode}/{tokens}/1_layer"), |b| {

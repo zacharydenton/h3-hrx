@@ -11,7 +11,7 @@ Results and baselines belong in ignored `target/criterion/`, never in Git.
 | --- | --- |
 | `host` | Short/long tokenization, mixed-media presentation, image resizing, RefMod loading/strength/copies, packed sequence layout |
 | `kernels` | FP32 Hadamard preparation, INT8 attention preparation in both layouts, V transpose, INT8/BF16 GEMMs with FP32 outputs including DiT projection dimensions, cached/rotating weights, eager/graph dispatch |
-| `models` | Resident one-block DiT eager/graph comparison at 256/2048/4096 tokens, covering both integer attention layouts, and short audio roundtrip |
+| `models` | Resident one-block DiT eager/graph comparison through 8,192 tokens, covering both integer attention layouts, and short audio roundtrip |
 | `stages` | Complete text encoder plus token refiner, vision tower, video encode/decode, audio encode/decode, complete 50-block denoising trajectories with Euler and ResMultistep |
 | `lifecycle` | Mapping/planning, tensor packing and completed uploads, block loading throughput, cold-file loading, forced audio eviction/reload |
 | `pipeline` | Complete text, first/last-frame, image/audio reference, video/audio reference, RefMod, LoRA, Turbo and World renders; cache observation/reuse; WAV and H.264/AAC output; fresh CLI processes |
@@ -91,6 +91,10 @@ a single DiT block with a smaller cap:
 ```sh
 H3_BENCH_BUDGET_GIB=2 H3_PROFILE=device cargo bench --locked --bench models -- dit_stack/eager/2048 --test
 ```
+
+DiT fuses Q/K normalization, rotary embedding and INT8 preparation from 4,096
+tokens unless K smoothing is enabled. `H3_FUSED_OPERANDS=0` selects the separate
+path for comparisons; the fused path preserves the intermediate FP16 rounding.
 
 `H3_BENCH_RESIDENCY` selects `budgeted` (default), `retain`, or `stage-scoped` for
 stage and API render benchmarks. A reused stage-scoped session reloads weights
@@ -206,6 +210,9 @@ through 4,096 tokens, plus wider 25,600-value rows. It supports the same HRX
 profiling and allocation cap, with direct readback outside timing.
 `prepare_qk_i8` cases cover token-major and head-major operands at 1, 257, 2,048
 and 8,192 tokens with the same allocation cap and HRX profiling support.
+`qk_rotary_quantization` compares fused and separate Q/K preparation at 1, 257,
+4,096 and 8,192 tokens. It checks exact codes and scales against the separate
+path outside timing, with a 1 GiB allocation cap for the reference intermediates.
 `attention_i8qkhm` runs the DiT attention kernel with all 56 heads at 1–8,192
 tokens, including partial query and key tiles. It uses head-major INT8 Q/K,
 transposed FP16 V, a 512 MiB allocation cap, and direct output checks outside

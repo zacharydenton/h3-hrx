@@ -477,9 +477,9 @@ impl Stack {
             0,
         )?;
 
-        // Keep the numerical experiment opt-in until production-shape parity and
-        // timing qualify it. Smoothing still uses the separate K reduction path.
-        let fused_operands = env_once("H3_FUSED_OPERANDS") == Some("1")
+        // Fuse head-major INT8 operands while retaining the separate K reduction
+        // when smoothing is requested. The override keeps comparisons reproducible.
+        let fused_operands = env_once("H3_FUSED_OPERANDS") != Some("0")
             && !d.attn_i4
             && d.attn_qk_bits == 8
             && waves == 8
@@ -733,7 +733,7 @@ impl Stack {
             let kmean = stream.allocate(d.inner() * 4)?;
             let zmean = stream.allocate_zeroed(d.inner() * 4)?;
             let vt_bytes = d.inner() * t * 2;
-            let vt = if qk_head_major && !fused_operands && vt_bytes <= a_q.bytes() {
+            let vt = if qk_head_major && vt_bytes <= a_q.bytes() {
                 None
             } else {
                 Some(stream.allocate_zeroed(vt_bytes)?)
@@ -1345,7 +1345,16 @@ impl Stack {
             self.transpose.as_ref().unwrap(),
             Some(prof),
             "fused V transpose",
-            [(self.d.inner() / 32) as u32, t.div_ceil(32), 1],
+            [
+                (self.d.inner() / 32) as u32,
+                // Projection scratch may contain NaNs in the masked tail.
+                if iq.vt.is_none() {
+                    (self.capacity / 32) as u32
+                } else {
+                    t.div_ceil(32)
+                },
+                1,
+            ],
             [THREADS, 1, 1],
             &[t],
             &[self.fused.binding(), self.vt_view(iq)],

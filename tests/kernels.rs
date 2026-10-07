@@ -2399,13 +2399,19 @@ fn adapter_f32_gemms_preserve_values_above_f16_range() {
 )]
 fn fused_qkv_operands_are_byte_identical_to_separate_preparation() {
     let mut h = Harness::new();
-    for (tokens, heads) in [(3usize, 2usize), (129, 56)] {
+    for (tokens, heads) in [(3usize, 2usize), (129, 56), (257, 17), (4097, 56)] {
         let width = heads * 128;
         let capacity = tokens.div_ceil(256) * 256;
-        let fused: Vec<_> = values(tokens * width * 3, 0.7)
+        let mut fused: Vec<_> = values(tokens * width * 3, 0.7)
             .into_iter()
             .map(f16::from_f32)
             .collect();
+        for row in fused.chunks_exact_mut(width * 3) {
+            for offset in [0, width] {
+                row[offset..offset + 128].fill(f16::ZERO);
+                row[offset + 128..offset + 256].fill(f16::MAX);
+            }
+        }
         let qw: Vec<_> = values(128, 0.1).into_iter().map(|x| 1.0 + x).collect();
         let kw: Vec<_> = qw.iter().map(|x| x + 0.05).collect();
         let angles = values(tokens * 48, 3.0);
@@ -2453,30 +2459,38 @@ fn fused_qkv_operands_are_byte_identical_to_separate_preparation() {
                 &[
                     split[5 + i].clone(),
                     vec![0; width * 4],
-                    vec![0; capacity * width],
-                    vec![0; capacity * heads * 4],
+                    vec![0x55; capacity * width],
+                    vec![0x55; capacity * heads * 4],
                 ],
             );
             config[0].1 = (width * 3).to_string();
             config[2].1 = (i * width).to_string();
             config.push(("eps", "1e-5".into()));
-            let new = h.run(
-                "prepare_qk_rope_i8hm",
-                &config,
-                [tokens as u32, 1, 1],
-                256,
-                &[tokens as u64],
-                &[
-                    bytes(&fused),
-                    bytes(weight),
-                    bytes(&cos),
-                    bytes(&sin),
-                    vec![0; capacity * width],
-                    vec![0; capacity * heads * 4],
-                ],
-            );
-            assert!(old[2] == new[4], "codes differ: tokens={tokens} head={i}");
-            assert!(old[3] == new[5], "scales differ: tokens={tokens} head={i}");
+            for repetition in 0..8 {
+                let new = h.run(
+                    "prepare_qk_rope_i8hm",
+                    &config,
+                    [tokens as u32, 1, 1],
+                    256,
+                    &[tokens as u64],
+                    &[
+                        bytes(&fused),
+                        bytes(weight),
+                        bytes(&cos),
+                        bytes(&sin),
+                        vec![0x55; capacity * width],
+                        vec![0x55; capacity * heads * 4],
+                    ],
+                );
+                assert!(
+                    old[2] == new[4],
+                    "codes differ: tokens={tokens} head={i} repetition={repetition}"
+                );
+                assert!(
+                    old[3] == new[5],
+                    "scales differ: tokens={tokens} head={i} repetition={repetition}"
+                );
+            }
         }
         let config = cfg(&[("width", width), ("row_capacity", capacity)]);
         let old = h.run(
