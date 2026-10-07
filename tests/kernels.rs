@@ -1910,15 +1910,34 @@ fn quantized_preparation_matches_group_rotation_and_packing() {
             }
             let shapes = if bits == 8 && kind == "plain" {
                 vec![(512usize, 640usize, 64usize), (7168, 7232, 448)]
+            } else if bits == 8 && kind == "norm" {
+                vec![
+                    (512, 640, 64),
+                    (5376, 5440, 96),
+                    (5376, 5440, 224),
+                    (5376, 5440, 672),
+                ]
             } else {
                 vec![(512, 640, 64)]
             };
             for (width, stride, lanes) in shapes {
-                let tokens = 3;
-                let input = values(tokens * width, 0.4);
-                let weights = vec![1.0f32; width];
-                let table = vec![0.0f32; 2 * width];
-                let classes = vec![0i32; tokens];
+                let tokens = 6;
+                let mut input = values(tokens * width, 0.4);
+                if kind == "norm" {
+                    // Include the large residuals seen in late DiT blocks,
+                    // epsilon-dominated rows, and exact zero variance.
+                    for (row, scale) in input
+                        .chunks_exact_mut(width)
+                        .zip([1., 1e6, 1e-4, 0., 17., 0.01])
+                    {
+                        for v in row {
+                            *v *= scale;
+                        }
+                    }
+                }
+                let weights: Vec<_> = values(width, 0.2).into_iter().map(|v| 1. + v).collect();
+                let table = values(3 * 2 * width, 0.1);
+                let classes: Vec<i32> = (0..tokens).map(|r| (r % 3) as i32).collect();
                 let mut want = vec![0.; tokens * width];
                 for row in 0..tokens {
                     let x: Vec<f64> = input[row * width..(row + 1) * width]
@@ -1937,6 +1956,21 @@ fn quantized_preparation_matches_group_rotation_and_packing() {
                         0.
                     };
                     let variance = x.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / width as f64;
+                    let normalized: Vec<_> = x
+                        .iter()
+                        .enumerate()
+                        .map(|(col, &v)| {
+                            if kind == "plain" {
+                                v
+                            } else {
+                                let scale_row = classes[row] as usize * 2 * width;
+                                (v - mean) / (variance + 1e-5).sqrt()
+                                    * f64::from(weights[col])
+                                    * (1. + f64::from(table[scale_row + col]))
+                                    + f64::from(table[scale_row + width + col])
+                            }
+                        })
+                        .collect();
                     for col in 0..width {
                         want[row * width + col] = (0..256)
                             .map(|j| {
@@ -1949,12 +1983,7 @@ fn quantized_preparation_matches_group_rotation_and_packing() {
                                         s
                                     }
                                 });
-                                let value = x[col / 256 * 256 + j];
-                                sign * if kind == "plain" {
-                                    value
-                                } else {
-                                    (value - mean) / (variance + 1e-5).sqrt()
-                                }
+                                sign * normalized[col / 256 * 256 + j]
                             })
                             .sum::<f64>()
                             / 16.;
@@ -1966,7 +1995,7 @@ fn quantized_preparation_matches_group_rotation_and_packing() {
                         &input.iter().copied().map(f16::from_f32).collect::<Vec<_>>(),
                     )]
                 } else {
-                    config.extend([("eps", "1e-5".into()), ("classes", "1".into())]);
+                    config.extend([("eps", "1e-5".into()), ("classes", "3".into())]);
                     vec![
                         bytes(&input),
                         bytes(&weights),

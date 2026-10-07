@@ -552,6 +552,10 @@ impl Prepare {
         };
         let lanes = (if tiled {
             Some(256)
+        } else if form == "norm" && elem == "i8" && width == HID {
+            // Three eight-value chunks per lane reduce the normalization and
+            // Hadamard work per thread while keeping short rows efficient.
+            Some(224)
         } else if form == "plain"
             && elem == "i8"
             && width == INNER

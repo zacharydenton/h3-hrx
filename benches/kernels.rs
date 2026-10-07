@@ -363,7 +363,7 @@ fn normalization_preparation(c: &mut Criterion) {
     use h3_hrx::dispatch::{emit, Profile};
     use h3_hrx::model::{gemm_pitch, CLASSES, HID};
     let mut group = c.benchmark_group("prepare_norm_i8");
-    for tokens in [1usize, 256, 2048] {
+    for tokens in [1usize, 256, 2048, 8192] {
         for lanes in [96usize, 224, 672] {
             group.throughput(Throughput::Elements((tokens * HID) as u64));
             group.bench_function(format!("{tokens}/lanes_{lanes}"), |b| {
