@@ -497,10 +497,14 @@ fn quantized_attention(c: &mut Criterion) {
     use h3_hrx::dispatch::{emit, Profile};
     use h3_hrx::model::{HEADS, INNER};
     let mut group = c.benchmark_group("attention_i8qkhm");
-    for tokens in [1usize, 129, 256, 257, 2048, 4096, 4097, 8192] {
+    for tokens in [
+        1usize, 129, 256, 257, 2048, 4096, 4097, 8192, 8193, 16384, 16385,
+    ] {
         group.throughput(Throughput::Elements((4 * tokens * tokens * INNER) as u64));
         group.bench_function(BenchmarkId::from_parameter(tokens), |b| {
-            let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+            // Long attention inputs and outputs exceed 512 MiB; keep each case bounded.
+            let budget = if tokens > 8192 { 1 << 30 } else { 512 << 20 };
+            let manager = hrx::residency::ResidencyManager::new(budget).unwrap();
             let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
             let compiler = compiler();
             let capacity = (tokens + 16).div_ceil(128) * 128;

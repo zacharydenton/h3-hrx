@@ -11,7 +11,7 @@ Results and baselines belong in ignored `target/criterion/`, never in Git.
 | --- | --- |
 | `host` | Short/long tokenization, mixed-media presentation, image resizing, RefMod loading/strength/copies, packed sequence layout |
 | `kernels` | FP32 Hadamard preparation, INT8 attention preparation in both layouts, V transpose, INT8/BF16 GEMMs with FP32 outputs including DiT projection dimensions, cached/rotating weights, eager/graph dispatch |
-| `models` | Resident one-block DiT eager/graph comparison through 8,192 tokens, covering both integer attention layouts, and short audio roundtrip |
+| `models` | Resident one-block DiT eager/graph comparison through 8,193 tokens, covering both integer attention layouts and partial tiles, and short audio roundtrip |
 | `stages` | Complete text encoder plus token refiner, vision tower, video encode/decode, audio encode/decode, complete 50-block denoising trajectories with Euler and ResMultistep |
 | `lifecycle` | Mapping/planning, tensor packing and completed uploads, block loading throughput, cold-file loading, forced audio eviction/reload |
 | `pipeline` | Complete text, first/last-frame, image/audio reference, video/audio reference, RefMod, LoRA, Turbo and World renders; cache observation/reuse; WAV and H.264/AAC output; fresh CLI processes |

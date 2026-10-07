@@ -1418,7 +1418,9 @@ fn head_major_int8_attention_handles_long_reference_sequences() {
     ignore = "requires gfx1151 and provisioned HRX"
 )]
 fn head_major_int8_attention_handles_short_sequences_and_partial_tiles() {
-    check_head_major_attention(&[1024, 1025, 2048, 2049, 4095]);
+    check_head_major_attention(&[
+        1, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1024, 1025, 2048, 2049, 4095,
+    ]);
 }
 
 fn check_head_major_attention(token_counts: &[usize]) {
@@ -1477,10 +1479,15 @@ fn check_head_major_attention(token_counts: &[usize]) {
                     bytes(&k),
                     bytes(&ks),
                     bytes(&vt),
-                    vec![0xff; queries * stride * 2],
+                    vec![0xff; (queries * stride + 19) * 2],
                 ],
             );
-            let got = halves(&out[5], false);
+            let output_bytes = queries * stride * 2;
+            assert!(
+                out[5][output_bytes..].iter().all(|&byte| byte == 0xff),
+                "attention wrote past the output at {tokens} tokens"
+            );
+            let got = halves(&out[5][..output_bytes], false);
             assert!(got.iter().all(|x| x.is_finite()), "tokens={tokens}");
             if let Some(previous) = &previous {
                 assert!(previous == &out[5], "unstable attention at {tokens} tokens");
