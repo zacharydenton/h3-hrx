@@ -192,7 +192,7 @@ fn upscale(c: &mut Criterion) {
         );
     }
 }
-criterion_group! {name=benches;config=support::criterion();targets=packing,components,groupnorm_stats,upscale}
+criterion_group! {name=benches;config=support::criterion();targets=packing,components,groupnorm_stats,convolutions,upscale}
 criterion_main!(benches);
 
 fn packing(c: &mut Criterion) {
@@ -499,5 +499,131 @@ fn groupnorm_stats(c: &mut Criterion) {
                 );
             });
         }
+    }
+}
+
+fn convolutions(c: &mut Criterion) {
+    use half::f16;
+    for (frames, height, width) in [
+        (8usize, 8usize, 8usize),
+        (2, 60, 108),
+        (10, 60, 108),
+        (42, 60, 108),
+    ] {
+        let rows = frames * height * width;
+        c.bench_function(&format!("upscale/conv3d/{frames}x{height}x{width}"), |b| {
+            let manager = hrx::residency::ResidencyManager::new(1 << 30).unwrap();
+            let mut stream = hrx::Stream::open()
+                .unwrap()
+                .with_memory_budget(manager.budget());
+            let compiler = support::compiler();
+            let channels = 512usize;
+            let k = channels * 27;
+            let conv = h3_hrx::dispatch::Conv3d::build_padding(
+                &compiler,
+                &mut stream,
+                false,
+                frames,
+                height,
+                width,
+                1,
+                1,
+                3,
+                channels,
+                channels,
+                k,
+                channels,
+                true,
+            )
+            .unwrap();
+            let input = support::values(rows * channels, 0.2)
+                .into_iter()
+                .map(f16::from_f32)
+                .collect::<Vec<_>>();
+            let weights = support::values(channels * k, 0.03)
+                .into_iter()
+                .map(f16::from_f32)
+                .collect::<Vec<_>>();
+            let bias = support::values(channels, 0.1);
+            let x = stream.allocate_from(bytemuck::cast_slice(&input)).unwrap();
+            let w = stream
+                .allocate_from(bytemuck::cast_slice(&weights))
+                .unwrap();
+            let bias_buffer = stream.allocate_from(bytemuck::cast_slice(&bias)).unwrap();
+            let out = stream.allocate(rows * channels * 2).unwrap();
+            let mut profile = h3_hrx::dispatch::Profile::from_env();
+            let mut run = |stream: &mut hrx::Stream| {
+                conv.run(
+                    stream,
+                    Some(&mut profile),
+                    "upscale conv3d",
+                    x.binding(),
+                    w.binding(),
+                    bias_buffer.binding(),
+                    out.binding(),
+                    None,
+                )
+                .unwrap();
+                stream.synchronize().unwrap();
+            };
+            run(&mut stream);
+            let expected = stream
+                .read(out.binding())
+                .unwrap()
+                .wait(&mut stream)
+                .unwrap();
+            // Sample interiors, temporal/spatial boundaries, and the final tile against FP64.
+            for row in [0, width - 1, height * width, rows / 2 + width + 1, rows - 1] {
+                let (t, y, x) = (row / (height * width), row / width % height, row % width);
+                for co in [0, 255, 511] {
+                    let mut sum = bias[co] as f64;
+                    for dt in -1isize..=1 {
+                        for dy in -1isize..=1 {
+                            for dx in -1isize..=1 {
+                                let (it, iy, ix) =
+                                    (t as isize + dt, y as isize + dy, x as isize + dx);
+                                if it < 0
+                                    || iy < 0
+                                    || ix < 0
+                                    || it >= frames as isize
+                                    || iy >= height as isize
+                                    || ix >= width as isize
+                                {
+                                    continue;
+                                }
+                                let ir = (it as usize * height + iy as usize) * width + ix as usize;
+                                let tap = ((dt + 1) * 9 + (dy + 1) * 3 + dx + 1) as usize;
+                                for ci in 0..channels {
+                                    sum += input[ir * channels + ci].to_f64()
+                                        * weights[co * k + tap * channels + ci].to_f64();
+                                }
+                            }
+                        }
+                    }
+                    let pos = (row * channels + co) * 2;
+                    let got =
+                        f16::from_le_bytes(expected[pos..pos + 2].try_into().unwrap()).to_f64();
+                    assert!(
+                        (got - sum).abs() < 0.001 + 0.001 * sum.abs(),
+                        "conv3d row={row} co={co}: {got} != {sum}"
+                    );
+                }
+            }
+            assert!(expected
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|b| f16::from_le_bytes(*b).is_finite()));
+            b.iter(|| run(&mut stream));
+            let actual = stream
+                .read(out.binding())
+                .unwrap()
+                .wait(&mut stream)
+                .unwrap();
+            assert!(
+                actual == expected,
+                "convolution replay changed for {frames}x{height}x{width}"
+            );
+        });
     }
 }

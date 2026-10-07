@@ -3979,87 +3979,95 @@ fn f32_dispatch_rejects_half_sized_activation_bindings() {
 )]
 fn upscale_convolution_uses_symmetric_zero_padding() {
     let mut harness = Harness::new();
-    let (t, h, w, ci, co) = (3usize, 4usize, 4usize, 24usize, 64usize);
-    let k = (27 * ci).div_ceil(32) * 32;
-    let rows = t * h * w;
-    let x = values(rows * ci, 0.3)
-        .into_iter()
-        .map(f16::from_f32)
-        .collect::<Vec<_>>();
-    let weights = values(co * k, 0.2)
-        .into_iter()
-        .map(f16::from_f32)
-        .collect::<Vec<_>>();
-    let bias = values(co, 0.1);
-    let mut want = vec![0f64; rows * co];
-    for z in 0..t {
-        for y in 0..h {
-            for xx in 0..w {
-                for o in 0..co {
-                    let mut sum = bias[o] as f64;
-                    for dz in 0..3 {
-                        for dy in 0..3 {
-                            for dx in 0..3 {
-                                let (iz, iy, ix) = (
-                                    z as isize + dz as isize - 1,
-                                    y as isize + dy as isize - 1,
-                                    xx as isize + dx as isize - 1,
-                                );
-                                if iz < 0
-                                    || iy < 0
-                                    || ix < 0
-                                    || iz >= t as isize
-                                    || iy >= h as isize
-                                    || ix >= w as isize
-                                {
-                                    continue;
-                                }
-                                for c in 0..ci {
-                                    sum += x[((iz as usize * h + iy as usize) * w + ix as usize)
-                                        * ci
-                                        + c]
-                                        .to_f64()
-                                        * weights[o * k + ((dz * 3 + dy) * 3 + dx) * ci + c]
-                                            .to_f64();
+    for (t, h, w, ci, co) in [
+        (3usize, 4usize, 4usize, 24usize, 64usize),
+        (3, 10, 10, 24, 128),
+        (2, 10, 18, 32, 192),
+        (5, 10, 10, 24, 192),
+        (3, 4, 6, 512, 64),
+    ] {
+        let k = (27 * ci).div_ceil(32) * 32;
+        let rows = t * h * w;
+        let x = values(rows * ci, 0.3)
+            .into_iter()
+            .map(f16::from_f32)
+            .collect::<Vec<_>>();
+        let weights = values(co * k, 0.2)
+            .into_iter()
+            .map(f16::from_f32)
+            .collect::<Vec<_>>();
+        let bias = values(co, 0.1);
+        let mut want = vec![0f64; rows * co];
+        for z in 0..t {
+            for y in 0..h {
+                for xx in 0..w {
+                    for o in 0..co {
+                        let mut sum = bias[o] as f64;
+                        for dz in 0..3 {
+                            for dy in 0..3 {
+                                for dx in 0..3 {
+                                    let (iz, iy, ix) = (
+                                        z as isize + dz as isize - 1,
+                                        y as isize + dy as isize - 1,
+                                        xx as isize + dx as isize - 1,
+                                    );
+                                    if iz < 0
+                                        || iy < 0
+                                        || ix < 0
+                                        || iz >= t as isize
+                                        || iy >= h as isize
+                                        || ix >= w as isize
+                                    {
+                                        continue;
+                                    }
+                                    for c in 0..ci {
+                                        sum += x[((iz as usize * h + iy as usize) * w
+                                            + ix as usize)
+                                            * ci
+                                            + c]
+                                            .to_f64()
+                                            * weights[o * k + ((dz * 3 + dy) * 3 + dx) * ci + c]
+                                                .to_f64();
+                                    }
                                 }
                             }
                         }
+                        want[((z * h + y) * w + xx) * co + o] = sum;
                     }
-                    want[((z * h + y) * w + xx) * co + o] = sum;
                 }
             }
         }
+        let config = cfg(&[
+            ("frames", t),
+            ("height", h),
+            ("width", w),
+            ("stride", 1),
+            ("tstride", 1),
+            ("taps_t", 3),
+            ("cin_pad", ci),
+            ("cin_stride", ci),
+            ("rows_bound", rows.div_ceil(64) * 64),
+            ("k_size", k),
+            ("n_size", co),
+        ]);
+        let out = harness.run_module(
+            "conv3d_f16_family",
+            "upscale_conv3d",
+            &config,
+            [(co / 64) as u32, rows.div_ceil(64) as u32, 1],
+            256,
+            &[rows as u64],
+            &[
+                bytes(&x),
+                bytes(&weights),
+                bytes(&bias),
+                bytes(&vec![f16::from_f32(123.0); rows * co + 64]),
+            ],
+        );
+        let got = halves(&out[3], false);
+        close(&got[..rows * co], &want, 0.002, 0.003);
+        assert!(got[rows * co..].iter().all(|v| *v == 123.0));
     }
-    let config = cfg(&[
-        ("frames", t),
-        ("height", h),
-        ("width", w),
-        ("stride", 1),
-        ("tstride", 1),
-        ("taps_t", 3),
-        ("cin_pad", ci),
-        ("cin_stride", ci),
-        ("rows_bound", rows.div_ceil(64) * 64),
-        ("k_size", k),
-        ("n_size", co),
-    ]);
-    let out = harness.run_module(
-        "conv3d_f16_family",
-        "upscale_conv3d",
-        &config,
-        [1, rows.div_ceil(64) as u32, 1],
-        256,
-        &[rows as u64],
-        &[
-            bytes(&x),
-            bytes(&weights),
-            bytes(&bias),
-            bytes(&vec![f16::from_f32(123.0); rows * co + 64]),
-        ],
-    );
-    let got = halves(&out[3], false);
-    close(&got[..rows * co], &want, 0.002, 0.003);
-    assert!(got[rows * co..].iter().all(|v| *v == 123.0));
 }
 
 #[test]
