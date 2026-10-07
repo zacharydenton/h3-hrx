@@ -2484,50 +2484,89 @@ fn fused_qkv_operands_are_byte_identical_to_separate_preparation() {
 )]
 fn subgroup_shuffle_preparation_matches_lds_repeatedly() {
     let mut h = Harness::new();
-    let (tokens, heads, capacity) = (257usize, 17usize, 512usize);
-    let width = heads * 128;
-    let x: Vec<_> = values(tokens * width, 0.7)
-        .into_iter()
-        .map(f16::from_f32)
-        .collect();
-    let mut config = cfg(&[
-        ("row_stride", width),
-        ("head_offset", 0),
-        ("heads", heads),
-        ("token_capacity", capacity),
-    ]);
-    config.push(("extra_scale", "0.0006905339660024879".into()));
-    let inputs = [
-        bytes(&x),
-        bytes(&values(width, 0.1)),
-        vec![0; capacity * width],
-        vec![0; capacity * heads * 4],
-    ];
-    let expected = h.run(
-        "prepare_qk_i8hm",
-        &config,
-        [tokens as u32, 1, 1],
-        256,
-        &[tokens as u64],
-        &inputs,
-    );
-    for iteration in 0..64 {
-        let actual = h.run(
-            "prepare_qk_i8hm_shuffle",
+    // Exercise partial waves, repeated head rounds and production head counts.
+    // Nonzero offsets and poisoned capacity also catch addressing regressions.
+    for (tokens, heads, offset, extra_scale) in [
+        (1usize, 1usize, 0usize, "1.0"),
+        (257, 17, 128, "0.0006905339660024879"),
+        (3, 256, 128, "1.0"),
+        (2049, 56, 128, "0.0006905339660024879"),
+        (4097, 56, 0, "1.0"),
+    ] {
+        let capacity = tokens.div_ceil(256) * 256;
+        let width = heads * 128;
+        let stride = offset + width + 128;
+        let mut x: Vec<_> = values(tokens * stride, 0.7)
+            .into_iter()
+            .map(f16::from_f32)
+            .collect();
+        let mut mean = values(stride, 0.1);
+        mean[offset..offset + 128].fill(0.0);
+        for row in x.chunks_exact_mut(stride) {
+            row[offset..offset + 128].fill(f16::ZERO);
+            if heads > 1 {
+                row[offset + 128..offset + 256].fill(f16::MAX);
+            }
+        }
+        let mut config = cfg(&[
+            ("row_stride", stride),
+            ("head_offset", offset),
+            ("heads", heads),
+            ("token_capacity", capacity),
+        ]);
+        config.push(("extra_scale", extra_scale.into()));
+        let inputs = [
+            bytes(&x),
+            bytes(&mean),
+            vec![0x55; capacity * width],
+            vec![0x55; capacity * heads * 4],
+        ];
+        let expected = h.run(
+            "prepare_qk_i8hm_lds",
             &config,
             [tokens as u32, 1, 1],
             256,
             &[tokens as u64],
             &inputs,
         );
-        assert!(
-            actual[2] == expected[2],
-            "shuffle codes differ at repetition {iteration}"
-        );
-        assert!(
-            actual[3] == expected[3],
-            "shuffle scales differ at repetition {iteration}"
-        );
+        let mut token_codes = inputs[2].clone();
+        let mut token_scales = inputs[3].clone();
+        for token in 0..tokens {
+            for head in 0..heads {
+                let src = head * capacity + token;
+                let dst = token * heads + head;
+                token_codes[dst * 128..(dst + 1) * 128]
+                    .copy_from_slice(&expected[2][src * 128..(src + 1) * 128]);
+                token_scales[dst * 4..(dst + 1) * 4]
+                    .copy_from_slice(&expected[3][src * 4..(src + 1) * 4]);
+            }
+        }
+        for (stem, codes, scales) in [
+            ("prepare_qk_i8hm", &expected[2], &expected[3]),
+            ("prepare_qk_i8", &token_codes, &token_scales),
+        ] {
+            if stem == "prepare_qk_i8" {
+                config.retain(|(key, _)| *key != "token_capacity");
+            }
+            for iteration in 0..64 {
+                let actual = h.run(
+                    stem,
+                    &config,
+                    [tokens as u32, 1, 1],
+                    256,
+                    &[tokens as u64],
+                    &inputs,
+                );
+                assert!(
+                    actual[2] == *codes,
+                    "{stem} codes differ: tokens={tokens}, heads={heads}, repetition={iteration}"
+                );
+                assert!(
+                    actual[3] == *scales,
+                    "{stem} scales differ: tokens={tokens}, heads={heads}, repetition={iteration}"
+                );
+            }
+        }
     }
 }
 

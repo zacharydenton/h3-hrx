@@ -1,30 +1,29 @@
-// Diagnostic only: test whether the historical subgroup-shuffle lowering issue remains.
+// LDS reference for bit-exact compiler regressions against subgroup shuffles.
 // quantization as prepare_qk_i8, written directly to codes [heads][capacity][32]
 // i32 and scales [heads][capacity] f32. The caller zeroes padded capacity once.
-amdgpu.target<gfx11-generic> @h3_prepare_qk_i8hm_shuffle_gfx11 {subgroup_size = 32}
+amdgpu.target<gfx11-generic> @h3_prepare_qk_i8hm_lds_gfx11 {subgroup_size = 32}
 
-config.decl @h3.prepare_qk_i8hm_shuffle.row_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.prepare_qk_i8hm_lds.row_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
 
-config.decl @h3.prepare_qk_i8hm_shuffle.head_offset : %value: index where [range(%value, 0, 65536), mul(%value, 128)]
+config.decl @h3.prepare_qk_i8hm_lds.head_offset : %value: index where [range(%value, 0, 65536), mul(%value, 128)]
 
-config.decl @h3.prepare_qk_i8hm_shuffle.heads : %value: index where [range(%value, 1, 256)]
+config.decl @h3.prepare_qk_i8hm_lds.heads : %value: index where [range(%value, 1, 256)]
 
-config.decl @h3.prepare_qk_i8hm_shuffle.extra_scale : f32
+config.decl @h3.prepare_qk_i8hm_lds.extra_scale : f32
 
-config.decl @h3.prepare_qk_i8hm_shuffle.token_capacity : %value: index where [range(%value, 32, 1048576), mul(%value, 32)]
+config.decl @h3.prepare_qk_i8hm_lds.token_capacity : %value: index where [range(%value, 32, 1048576), mul(%value, 32)]
 
-kernel.def target(@h3_prepare_qk_i8hm_shuffle_gfx11) export("h3_prepare_qk_i8hm_shuffle") @h3_prepare_qk_i8hm_shuffle(%tokens: index) {
+kernel.def target(@h3_prepare_qk_i8hm_lds_gfx11) export("h3_prepare_qk_i8hm_lds") @h3_prepare_qk_i8hm_lds(%tokens: index) {
   %c1 = index.constant 1 : index
   %c256 = index.constant 256 : index
   kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
 } launch(%tokens: index, %x: buffer, %mean: buffer, %codes: buffer, %scales: buffer) {
-  %capacity = config.get @h3.prepare_qk_i8hm_shuffle.token_capacity : index
-  %row_stride = config.get @h3.prepare_qk_i8hm_shuffle.row_stride : index
-  %head_offset = config.get @h3.prepare_qk_i8hm_shuffle.head_offset : index
-  %heads = config.get @h3.prepare_qk_i8hm_shuffle.heads : index
-  %extra = config.get @h3.prepare_qk_i8hm_shuffle.extra_scale : f32
+  %capacity = config.get @h3.prepare_qk_i8hm_lds.token_capacity : index
+  %row_stride = config.get @h3.prepare_qk_i8hm_lds.row_stride : index
+  %head_offset = config.get @h3.prepare_qk_i8hm_lds.head_offset : index
+  %heads = config.get @h3.prepare_qk_i8hm_lds.heads : index
+  %extra = config.get @h3.prepare_qk_i8hm_lds.extra_scale : f32
   %c0 = index.constant 0 : index
-  %i32_32 = scalar.constant 32 : i32
   %c1 = index.constant 1 : index
   %c2 = index.constant 2 : index
   %c4 = index.constant 4 : index
@@ -91,8 +90,8 @@ kernel.def target(@h3_prepare_qk_i8hm_shuffle_gfx11) export("h3_prepare_qk_i8hm_
       %m4 = vector.load %m_view[%col] : view<[%row_stride]xf32> -> vector<4xf32>
       %y = vector.subf %x4, %m4 : vector<4xf32>
       // H_128, unnormalised: within the lane (index bits 0, 1), then across lanes (bits 2..6) through
-      // this wave's 128-float LDS row (no lane shuffles or subgroup reductions: their lowering on
-      // gfx1151 reads stale registers intermittently)
+      // this wave's 128-float LDS row. Keep the reference independent of shuffle/reduction
+      // lowering to detect a recurrence of historical stale-register compiler bugs.
       %a = vector.extract %y[0] : vector<4xf32> -> f32
       %b = vector.extract %y[1] : vector<4xf32> -> f32
       %c = vector.extract %y[2] : vector<4xf32> -> f32
@@ -108,6 +107,8 @@ kernel.def target(@h3_prepare_qk_i8hm_shuffle_gfx11) export("h3_prepare_qk_i8hm_
       %s0 = vector.from_elements %e0, %e1, %e2, %e3 : vector<4xf32>
       %lane_col = index.mul %lane, %c4 : index
       %lc = index.assume %lane_col [le(%lane_col, %c124), mul(%lane_col, 4)] : index
+      vector.store %s0, %row_view[%lc] : vector<4xf32>, view<128xf32>
+      kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
       %lq1 = index.div %lane, %c1 : index
       %lb1 = index.rem %lq1, %c2 : index
       %hi1 = index.cmp eq, %lb1, %c1 : index
@@ -116,12 +117,13 @@ kernel.def target(@h3_prepare_qk_i8hm_shuffle_gfx11) export("h3_prepare_qk_i8hm_
       %pl1 = scf.select %hi1, %pl1a, %pl1b : index
       %pc10 = index.mul %pl1, %c4 : index
       %pc1 = index.assume %pc10 [range(%pc10, 0, 124), mul(%pc10, 4)] : index
-      %pl1_bounded = index.assume %pl1 [range(%pl1, 0, 31)] : index
-      %partner1 = index.cast %pl1_bounded : index to i32
-      %p1, %ok1 = kernel.subgroup.shuffle<index> %s0, %partner1, %i32_32 : vector<4xf32>, i32, i32
+      %p1 = vector.load %row_view[%pc1] : view<128xf32> -> vector<4xf32>
       %sum1 = vector.addf %s0, %p1 : vector<4xf32>
       %dif1 = vector.subf %p1, %s0 : vector<4xf32>
       %s2 = scf.select %hi1, %dif1, %sum1 : vector<4xf32>
+      kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+      vector.store %s2, %row_view[%lc] : vector<4xf32>, view<128xf32>
+      kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
       %lq2 = index.div %lane, %c2 : index
       %lb2 = index.rem %lq2, %c2 : index
       %hi2 = index.cmp eq, %lb2, %c1 : index
@@ -130,12 +132,13 @@ kernel.def target(@h3_prepare_qk_i8hm_shuffle_gfx11) export("h3_prepare_qk_i8hm_
       %pl2 = scf.select %hi2, %pl2a, %pl2b : index
       %pc20 = index.mul %pl2, %c4 : index
       %pc2 = index.assume %pc20 [range(%pc20, 0, 124), mul(%pc20, 4)] : index
-      %pl2_bounded = index.assume %pl2 [range(%pl2, 0, 31)] : index
-      %partner2 = index.cast %pl2_bounded : index to i32
-      %p2, %ok2 = kernel.subgroup.shuffle<index> %s2, %partner2, %i32_32 : vector<4xf32>, i32, i32
+      %p2 = vector.load %row_view[%pc2] : view<128xf32> -> vector<4xf32>
       %sum2 = vector.addf %s2, %p2 : vector<4xf32>
       %dif2 = vector.subf %p2, %s2 : vector<4xf32>
       %s4 = scf.select %hi2, %dif2, %sum2 : vector<4xf32>
+      kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+      vector.store %s4, %row_view[%lc] : vector<4xf32>, view<128xf32>
+      kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
       %lq4 = index.div %lane, %c4 : index
       %lb4 = index.rem %lq4, %c2 : index
       %hi4 = index.cmp eq, %lb4, %c1 : index
@@ -144,12 +147,13 @@ kernel.def target(@h3_prepare_qk_i8hm_shuffle_gfx11) export("h3_prepare_qk_i8hm_
       %pl4 = scf.select %hi4, %pl4a, %pl4b : index
       %pc40 = index.mul %pl4, %c4 : index
       %pc4 = index.assume %pc40 [range(%pc40, 0, 124), mul(%pc40, 4)] : index
-      %pl4_bounded = index.assume %pl4 [range(%pl4, 0, 31)] : index
-      %partner4 = index.cast %pl4_bounded : index to i32
-      %p4, %ok4 = kernel.subgroup.shuffle<index> %s4, %partner4, %i32_32 : vector<4xf32>, i32, i32
+      %p4 = vector.load %row_view[%pc4] : view<128xf32> -> vector<4xf32>
       %sum4 = vector.addf %s4, %p4 : vector<4xf32>
       %dif4 = vector.subf %p4, %s4 : vector<4xf32>
       %s8 = scf.select %hi4, %dif4, %sum4 : vector<4xf32>
+      kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+      vector.store %s8, %row_view[%lc] : vector<4xf32>, view<128xf32>
+      kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
       %lq8 = index.div %lane, %c8 : index
       %lb8 = index.rem %lq8, %c2 : index
       %hi8 = index.cmp eq, %lb8, %c1 : index
@@ -158,12 +162,13 @@ kernel.def target(@h3_prepare_qk_i8hm_shuffle_gfx11) export("h3_prepare_qk_i8hm_
       %pl8 = scf.select %hi8, %pl8a, %pl8b : index
       %pc80 = index.mul %pl8, %c4 : index
       %pc8 = index.assume %pc80 [range(%pc80, 0, 124), mul(%pc80, 4)] : index
-      %pl8_bounded = index.assume %pl8 [range(%pl8, 0, 31)] : index
-      %partner8 = index.cast %pl8_bounded : index to i32
-      %p8, %ok8 = kernel.subgroup.shuffle<index> %s8, %partner8, %i32_32 : vector<4xf32>, i32, i32
+      %p8 = vector.load %row_view[%pc8] : view<128xf32> -> vector<4xf32>
       %sum8 = vector.addf %s8, %p8 : vector<4xf32>
       %dif8 = vector.subf %p8, %s8 : vector<4xf32>
       %s16 = scf.select %hi8, %dif8, %sum8 : vector<4xf32>
+      kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+      vector.store %s16, %row_view[%lc] : vector<4xf32>, view<128xf32>
+      kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
       %lq16 = index.div %lane, %c16 : index
       %lb16 = index.rem %lq16, %c2 : index
       %hi16 = index.cmp eq, %lb16, %c1 : index
@@ -172,15 +177,23 @@ kernel.def target(@h3_prepare_qk_i8hm_shuffle_gfx11) export("h3_prepare_qk_i8hm_
       %pl16 = scf.select %hi16, %pl16a, %pl16b : index
       %pc160 = index.mul %pl16, %c4 : index
       %pc16 = index.assume %pc160 [range(%pc160, 0, 124), mul(%pc160, 4)] : index
-      %pl16_bounded = index.assume %pl16 [range(%pl16, 0, 31)] : index
-      %partner16 = index.cast %pl16_bounded : index to i32
-      %p16, %ok16 = kernel.subgroup.shuffle<index> %s16, %partner16, %i32_32 : vector<4xf32>, i32, i32
+      %p16 = vector.load %row_view[%pc16] : view<128xf32> -> vector<4xf32>
       %sum16 = vector.addf %s16, %p16 : vector<4xf32>
       %dif16 = vector.subf %p16, %s16 : vector<4xf32>
       %r = scf.select %hi16, %dif16, %sum16 : vector<4xf32>
-      %absr = vector.absf %r : vector<4xf32>
-      %lane_max = vector.reduce<maxnumf> %absr, %zero : vector<4xf32>, f32
-      %amax0 = kernel.subgroup.reduce<maxnumf> %lane_max : f32
+      kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+      %local_abs = vector.absf %r : vector<4xf32>
+      %local_max = vector.reduce<maxnumf> %local_abs, %zero : vector<4xf32>, f32
+      view.store %local_max, %row_view[%lane] : f32, view<128xf32>
+      kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
+      // Scan 32 lane maxima instead of all 128 values; keep the exchange in LDS.
+      %amax_v = scf.for %i = [%c0 to %c32 step %c4](%acc = %zero4 : vector<4xf32>) -> (vector<4xf32>) {
+        %ii = index.assume %i [le(%i, %c124), mul(%i, 4)] : index
+        %v = vector.load %row_view[%ii] : view<128xf32> -> vector<4xf32>
+        %m = vector.maxnumf %acc, %v : vector<4xf32>
+        scf.yield %m : vector<4xf32>
+      }
+      %amax0 = vector.reduce<maxnumf> %amax_v, %zero : vector<4xf32>, f32
       %amax = scalar.maxnumf %amax0, %tiny : f32
       %sc = scalar.divf %amax, %seven : f32
       %inv = scalar.divf %seven, %amax : f32
