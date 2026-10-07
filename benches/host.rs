@@ -342,6 +342,36 @@ fn text_rotary(c: &mut Criterion) {
     group.finish();
 }
 
+fn video_rotary(c: &mut Criterion) {
+    use h3_hrx::{model::VAE_ROPE_HALF, vvae::Grid};
+    let mut group = c.benchmark_group("rotary/video_decoder");
+    for (ft, h, w) in [
+        (1, 1, 1),
+        (1, 1, 7),
+        (1, 16, 16),
+        (2, 4, 4),
+        (7, 8, 16),
+        (7, 16, 16),
+    ] {
+        let grid = Grid { ft, h, w };
+        let mut cos = vec![1.0; grid.tokens() * VAE_ROPE_HALF];
+        let mut sin = vec![0.0; cos.len()];
+        group.throughput(Throughput::Elements(grid.voxels() as u64));
+        group.bench_function(format!("{ft}x{h}x{w}"), |b| {
+            b.iter(|| {
+                h3_hrx::vvae::rotary_tables(
+                    black_box(ft),
+                    black_box(h),
+                    black_box(w),
+                    black_box(&mut cos),
+                    black_box(&mut sin),
+                )
+            });
+        });
+    }
+    group.finish();
+}
+
 fn vision_rotary(c: &mut Criterion) {
     let mut group = c.benchmark_group("rotary/vision");
     for (height, width) in [
@@ -369,5 +399,5 @@ fn vision_rotary(c: &mut Criterion) {
     }
     group.finish();
 }
-criterion_group! { name = benches; config = support::criterion(); targets = host, rotary, video_decoder_input, video_decoder_output, video_temporal, video_spatial, video_encoder_input, vision_tokens, text_rotary, vision_rotary }
+criterion_group! { name = benches; config = support::criterion(); targets = host, rotary, video_decoder_input, video_decoder_output, video_temporal, video_spatial, video_encoder_input, vision_tokens, text_rotary, video_rotary, vision_rotary }
 criterion_main!(benches);

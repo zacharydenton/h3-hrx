@@ -161,23 +161,40 @@ pub fn vision(gh: usize, gw: usize, cos: &mut [f32], sin: &mut [f32]) {
 ///
 /// Each axis maps its index to `2 (i + 0.5) / size - 1`, so a tile's angles depend on the tile's own
 /// extent rather than on where it sits. Rows past the grid — the register and cls rows — keep the
-/// identity rotation the caller filled in.
+/// identity rotation the caller filled in. Each output row has 24 values, ordered t/y/x.
 pub fn vae(ft: usize, h: usize, w: usize, cos: &mut [f32], sin: &mut [f32]) {
-    let sizes = [ft, h, w];
-    for t in 0..ft {
-        for y in 0..h {
-            for x in 0..w {
+    if ft == 0 || h == 0 || w == 0 {
+        return;
+    }
+    let inv: [f64; 8] = std::array::from_fn(|j| 100.0f64.powf(-(j as f64) * 6.0 / 48.0));
+    // Cache each axis at its own normalised extent. Retain the FP64 operation order
+    // and narrow only the final sine/cosine, as in the per-voxel calculation.
+    let mut axes = Vec::with_capacity(ft + h + w);
+    for size in [ft, h, w] {
+        for i in 0..size {
+            let pos = 2.0 * ((i as f64 + 0.5) / size as f64) - 1.0;
+            let (mut c, mut s) = ([0.0f32; 8], [0.0f32; 8]);
+            for (j, &freq) in inv.iter().enumerate() {
+                let ang = 2.0 * std::f64::consts::PI * pos * freq;
+                c[j] = ang.cos() as f32;
+                s[j] = ang.sin() as f32;
+            }
+            axes.push((c, s));
+        }
+    }
+    let (ts, spatial) = axes.split_at(ft);
+    let (ys, xs) = spatial.split_at(h);
+    for (t, (ct, st)) in ts.iter().enumerate() {
+        for (y, (cy, sy)) in ys.iter().enumerate() {
+            for (x, (cx, sx)) in xs.iter().enumerate() {
                 let r = (t * h + y) * w + x;
-                let idx = [t, y, x];
-                for ax in 0..3 {
-                    for j in 0..8 {
-                        let pos = 2.0 * ((idx[ax] as f64 + 0.5) / sizes[ax] as f64) - 1.0;
-                        let inv = 100.0f64.powf(-(j as f64) * 6.0 / 48.0);
-                        let ang = 2.0 * std::f64::consts::PI * pos * inv;
-                        cos[r * VAE_ROPE_HALF + ax * 8 + j] = ang.cos() as f32;
-                        sin[r * VAE_ROPE_HALF + ax * 8 + j] = ang.sin() as f32;
-                    }
-                }
+                let start = r * VAE_ROPE_HALF;
+                cos[start..start + 8].copy_from_slice(ct);
+                sin[start..start + 8].copy_from_slice(st);
+                cos[start + 8..start + 16].copy_from_slice(cy);
+                sin[start + 8..start + 16].copy_from_slice(sy);
+                cos[start + 16..start + 24].copy_from_slice(cx);
+                sin[start + 16..start + 24].copy_from_slice(sx);
             }
         }
     }
@@ -413,6 +430,73 @@ mod tests {
         let (mut c, mut s) = (vec![9.0f32; 36], vec![9.0f32; 36]);
         vision(1, 1, &mut c, &mut s);
         assert!(c.iter().all(|v| *v == 1.0) && s.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn vae_tables_match_scalar_bits_and_preserve_special_rows() {
+        for (ft, h, w) in [
+            (0, 0, 0),
+            (0, 2, 3),
+            (2, 0, 3),
+            (2, 3, 0),
+            (1, 1, 1),
+            (1, 1, 7),
+            (1, 7, 1),
+            (7, 1, 1),
+            (1, 16, 16),
+            (2, 4, 4),
+            (7, 8, 16),
+            (7, 16, 16),
+            (7, 13, 16),
+            (7, 16, 13),
+            (3, 11, 17),
+            (1, 1, 1024),
+        ] {
+            let len = ft * h * w * VAE_ROPE_HALF;
+            let end = VAE_ROPE_HALF + len + 5 * VAE_ROPE_HALF;
+            let (mut cos, mut sin) = (
+                vec![9.0; end + VAE_ROPE_HALF],
+                vec![9.0; end + VAE_ROPE_HALF],
+            );
+            vae(
+                ft,
+                h,
+                w,
+                &mut cos[VAE_ROPE_HALF..end],
+                &mut sin[VAE_ROPE_HALF..end],
+            );
+            for t in 0..ft {
+                for y in 0..h {
+                    for x in 0..w {
+                        let r = (t * h + y) * w + x;
+                        for (ax, (i, size)) in [(t, ft), (y, h), (x, w)].into_iter().enumerate() {
+                            for j in 0..8 {
+                                let pos = 2.0 * ((i as f64 + 0.5) / size as f64) - 1.0;
+                                let inv = 100.0f64.powf(-(j as f64) * 6.0 / 48.0);
+                                let ang = 2.0 * std::f64::consts::PI * pos * inv;
+                                let at = VAE_ROPE_HALF + r * VAE_ROPE_HALF + ax * 8 + j;
+                                assert_eq!(
+                                    cos[at].to_bits(),
+                                    (ang.cos() as f32).to_bits(),
+                                    "cos at {at}, grid {ft}x{h}x{w}"
+                                );
+                                assert_eq!(
+                                    sin[at].to_bits(),
+                                    (ang.sin() as f32).to_bits(),
+                                    "sin at {at}, grid {ft}x{h}x{w}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            for table in [&cos, &sin] {
+                assert!(table[..VAE_ROPE_HALF]
+                    .iter()
+                    .chain(&table[VAE_ROPE_HALF + len..])
+                    .all(|&v| v == 9.0));
+            }
+        }
     }
 
     #[test]

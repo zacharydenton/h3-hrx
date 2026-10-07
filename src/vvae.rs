@@ -9,6 +9,7 @@ use crate::compile::Compiler;
 use crate::dispatch::{Conv3d, Gemm, GroupNormSilu, Matmul, Prepare, Profile, Tile};
 use crate::error::{other, Result};
 use crate::model::*;
+pub use crate::rope::vae as rotary_tables;
 use crate::stack::{Constants, LayerCond, Stack, StackDims};
 use crate::tiles;
 pub use crate::tiles::stitch_pixels;
@@ -298,7 +299,7 @@ impl VideoVae {
             vec![1.0f32; t * VAE_ROPE_HALF],
             vec![0.0f32; t * VAE_ROPE_HALF],
         );
-        crate::rope::vae(grid.ft, grid.h, grid.w, &mut cos_h, &mut sin_h);
+        rotary_tables(grid.ft, grid.h, grid.w, &mut cos_h, &mut sin_h);
         let cos = stream.allocate(t * VAE_ROPE_HALF * 4)?;
         let sin = stream.allocate(t * VAE_ROPE_HALF * 4)?;
         stream.upload(cos.binding(), as_bytes(&cos_h))?;
