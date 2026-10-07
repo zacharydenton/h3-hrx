@@ -793,9 +793,13 @@ fn quantized_gemms_match_integer_dot_products_bias_and_residual_classes() {
     for bits in [4usize, 8] {
         for biased in [false, true] {
             for mode in ["plain", "resid", "swiglu"] {
-                for pad in [0usize, 128] {
-                    // Padded cases cross the 256-row workgroup boundary.
-                    let (m, k, n) = (if pad == 0 { 17usize } else { 257 }, 128usize, 128usize);
+                for (m, n, pad, m_group) in [
+                    (17usize, 128usize, 0usize, 1usize),
+                    (257, 128, 128, 1),
+                    // Two column tiles and a raster group containing a whole empty row tile.
+                    (1025, 256, 128, 3),
+                ] {
+                    let k = 128;
                     let stride = k + pad;
                     let a: Vec<i8> = (0..m * stride).map(|i| ((i * 3 % 15) as i8) - 7).collect();
                     let w: Vec<i8> = (0..n * stride).map(|i| ((i * 7 % 15) as i8) - 7).collect();
@@ -846,7 +850,7 @@ fn quantized_gemms_match_integer_dot_products_bias_and_residual_classes() {
                         ("k_size", k),
                         ("n_size", n),
                         ("k_stride", stride),
-                        ("m_group", 1),
+                        ("m_group", m_group),
                     ]);
                     let mut data = vec![pack(&a), pack(&w), bytes(&ws), bytes(&scales)];
                     let want = if mode == "resid" {
@@ -880,21 +884,28 @@ fn quantized_gemms_match_integer_dot_products_bias_and_residual_classes() {
                     if biased {
                         data.push(bytes(&bias));
                     }
+                    let output_bytes = data[4].len();
+                    data[4].extend([0xa5; 64]);
                     let out = h.run_module(
                         "gemm_packed_256",
                         &stem,
                         &config,
-                        [1, m.div_ceil(256) as u32, 1],
+                        [
+                            (n / 128) as u32,
+                            (m.div_ceil(256).div_ceil(m_group) * m_group) as u32,
+                            1,
+                        ],
                         256,
                         &[m as u64],
                         &data,
                     );
                     let got = if mode == "resid" {
-                        floats(&out[4])
+                        floats(&out[4][..output_bytes])
                     } else {
-                        halves(&out[4], false)
+                        halves(&out[4][..output_bytes], false)
                     };
-                    eprintln!("checking {stem} with padding {pad}");
+                    assert_eq!(&out[4][output_bytes..], &[0xa5; 64], "{stem} output guard");
+                    eprintln!("checking {stem} with rows {m}, padding {pad}, raster {m_group}");
                     close(&got, &want, 2e-3, 2e-3);
                 }
             }
@@ -2350,8 +2361,12 @@ fn adapter_finish_adds_before_activation_and_preserves_f32_residuals() {
 )]
 fn adapter_f32_gemms_preserve_values_above_f16_range() {
     let mut h = Harness::new();
-    let (rows, k, n, stride) = (17usize, 128usize, 128usize, 192usize);
     for integer in [true, false] {
+        let (rows, k, n, stride, group) = if integer {
+            (1025usize, 128usize, 256usize, 192usize, 3usize)
+        } else {
+            (17, 128, 128, 192, 1)
+        };
         let input = if integer {
             vec![32u8; rows * stride]
         } else {
@@ -2367,6 +2382,7 @@ fn adapter_f32_gemms_preserve_values_above_f16_range() {
             data.extend([bytes(&vec![1.0f32; n]), bytes(&vec![1.0f32; rows])]);
         }
         data.push(vec![0; rows * n * 4]);
+        data.last_mut().unwrap().extend([0xa5; 64]);
         let stem = if integer {
             "gemm_i8_f32_256"
         } else {
@@ -2384,14 +2400,20 @@ fn adapter_f32_gemms_preserve_values_above_f16_range() {
                 ("k_size", k.to_string()),
                 ("n_size", n.to_string()),
                 ("k_stride", stride.to_string()),
-                ("m_group", "1".into()),
+                ("m_group", group.to_string()),
             ],
-            [1, 1, 1],
+            [
+                (n / 128) as u32,
+                (rows.div_ceil(256).div_ceil(group) * group) as u32,
+                1,
+            ],
             256,
             &[rows as u64],
             &data,
         );
-        for value in floats(out.last().unwrap()) {
+        let output = out.last().unwrap();
+        assert_eq!(&output[rows * n * 4..], &[0xa5; 64]);
+        for value in floats(&output[..rows * n * 4]) {
             assert_eq!(value, 131072.0, "{stem}");
         }
     }
@@ -3586,7 +3608,10 @@ fn tiled_preparation_matches_single_pass_across_formats() {
 )]
 fn swiglu_preserves_f32_range() {
     let mut h = Harness::new();
-    let (rows, k, n) = (1usize, 128usize, 128usize);
+    let (rows, k, n) = (1025usize, 128usize, 256usize);
+    let output_bytes = rows * n / 2 * 4;
+    let mut output = vec![0; output_bytes];
+    output.extend([0xa5; 64]);
     let out = h.run_module(
         "gemm_packed_256",
         "gemm_i8_swiglu_f32_256",
@@ -3594,20 +3619,21 @@ fn swiglu_preserves_f32_range() {
             ("k_size", k),
             ("n_size", n),
             ("k_stride", k),
-            ("m_group", 1),
+            ("m_group", 3),
         ]),
-        [1, 1, 1],
+        [2, 6, 1],
         256,
         &[rows as u64],
         &[
-            vec![1u8; 256 * k],
+            vec![1u8; rows * k],
             vec![2u8; n * k],
             bytes(&vec![2.0f32; n]),
-            bytes(&vec![1.0f32; 256]),
-            vec![0; n / 2 * 4],
+            bytes(&vec![1.0f32; rows]),
+            output,
         ],
     );
-    let got = floats(&out[4]);
+    assert_eq!(&out[4][output_bytes..], &[0xa5; 64]);
+    let got = floats(&out[4][..output_bytes]);
     eprintln!(
         "FINITE SwiGLU: gate=512 up=512 expected product=262144 actual={}",
         got[0]

@@ -31,6 +31,18 @@ fn check_f32(stream: &mut Stream, buffer: &Buffer) -> Vec<u8> {
     bytes
 }
 
+fn check_f16(stream: &mut Stream, buffer: &Buffer) -> Vec<u8> {
+    let mut bytes = vec![0; buffer.binding().len()];
+    stream.read_blocking(buffer.binding(), &mut bytes).unwrap();
+    assert!(bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .all(|v| f16::from_le_bytes(*v).is_finite()));
+    assert!(bytes.iter().any(|&v| v != 0), "empty output");
+    bytes
+}
+
 fn preparation(c: &mut Criterion) {
     let mut group = c.benchmark_group("prepare_f32_i8");
     for (tokens, width) in [
@@ -786,6 +798,13 @@ fn gemm(c: &mut Criterion) {
                 ("swiglu", 4096, HID, 2 * FFN),
                 ("swiglu", 8192, HID, 2 * FFN),
             ]);
+            // Actual FP16 QKV outputs, including raster groups with empty row tiles.
+            for m in [1024, 1025, 4096, 4097] {
+                shapes.push(("plain", m, HID, QKV));
+            }
+            for m in [1025, 4097] {
+                shapes.extend([("swiglu", m, HID, 2 * FFN), ("resid", m, FFN, HID)]);
+            }
         }
         for (mode, m, k, n) in shapes {
             for rotating in [false, true] {
@@ -802,6 +821,11 @@ fn gemm(c: &mut Criterion) {
                     let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
                     let compiler = compiler();
                     let stride = h3_hrx::model::gemm_pitch(k, h3_hrx::model::elem_bits(elem));
+                    let output_type = if mode == "plain" {
+                        ActivationType::F16
+                    } else {
+                        ActivationType::F32
+                    };
                     let gemm = Gemm::build_with_output(
                         &compiler,
                         &mut stream,
@@ -816,7 +840,7 @@ fn gemm(c: &mut Criterion) {
                         stride,
                         Tile::Plain,
                         0,
-                        ActivationType::F32,
+                        output_type,
                     )
                     .unwrap();
                     compiler.flush(&mut stream).unwrap();
@@ -832,7 +856,14 @@ fn gemm(c: &mut Criterion) {
                     let ws = upload(&mut stream, bytemuck::cast_slice(&vec![0.01f32; n]));
                     let as_ = upload(&mut stream, bytemuck::cast_slice(&vec![0.01f32; m]));
                     let width = if mode == "swiglu" { n / 2 } else { n };
-                    let out = stream.allocate_zeroed(m * width * 4).unwrap();
+                    let out = stream
+                        .allocate_zeroed(m * width * if mode == "plain" { 2 } else { 4 })
+                        .unwrap();
+                    let check = if mode == "plain" {
+                        check_f16
+                    } else {
+                        check_f32
+                    };
                     let residual = (mode == "resid").then(|| {
                         let gate = upload(&mut stream, bytemuck::cast_slice(&vec![0.75f32; n]));
                         let classes = h3_hrx::dispatch::Classes::zeroed(&mut stream, m).unwrap();
@@ -858,7 +889,7 @@ fn gemm(c: &mut Criterion) {
                         stream.synchronize().unwrap();
                     };
                     run(&mut stream, 0);
-                    let expected = check_f32(&mut stream, &out);
+                    let expected = check(&mut stream, &out);
                     let mut index = 0;
                     if mode == "resid" {
                         b.iter_custom(|iterations| {
@@ -881,7 +912,7 @@ fn gemm(c: &mut Criterion) {
                         });
                     }
                     assert!(
-                        check_f32(&mut stream, &out) == expected,
+                        check(&mut stream, &out) == expected,
                         "GEMM replay changed: {elem}/{mode}/{storage}/{m}x{k}x{n}"
                     );
                 });
