@@ -10,7 +10,7 @@ use crate::compile::Compiler;
 use crate::dispatch::{axpy, Profile};
 use crate::error::{invalid, Result};
 use crate::model::*;
-use crate::rope::{self, VisionSpan};
+pub use crate::rope::{mrope_positions, te as rotary_tables, VisionSpan};
 use crate::stack::{Constants, Stack, StackDims};
 use crate::weights::Weights;
 
@@ -181,12 +181,12 @@ impl TextEncoder {
         let x = stream.allocate_zeroed(t * TE_HID * 4)?;
         let cls = crate::dispatch::Classes::zeroed(stream, t)?;
 
-        let positions = rope::mrope_positions(n, &signature_spans(spans));
+        let positions = mrope_positions(n, &signature_spans(spans));
         let (mut cos_h, mut sin_h) = (
             vec![0.0f32; n * TE_ROPE_HALF],
             vec![0.0f32; n * TE_ROPE_HALF],
         );
-        rope::te(&positions, &mut cos_h, &mut sin_h);
+        rotary_tables(&positions, &mut cos_h, &mut sin_h);
         let cos = stream.allocate(t * TE_ROPE_HALF * 4)?;
         let sin = stream.allocate(t * TE_ROPE_HALF * 4)?;
         stream.upload_at(&cos, 0, crate::vvae::as_bytes(&cos_h))?;

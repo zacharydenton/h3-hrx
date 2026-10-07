@@ -307,6 +307,41 @@ fn vision_tokens(c: &mut Criterion) {
     }
     group.finish();
 }
+fn text_rotary(c: &mut Criterion) {
+    use h3_hrx::te::{mrope_positions, rotary_tables, VisionSpan};
+    let mut group = c.benchmark_group("rotary/text");
+    let mut cases = vec![
+        ("one_token", 1, vec![]),
+        ("prompt_128", 128, vec![]),
+        ("prompt_4096", 4096, vec![]),
+    ];
+    for (name, images, h, w) in [
+        ("image_768p", 1, 24, 42),
+        ("two_portraits", 2, 42, 24),
+        ("video_16_pairs", 16, 24, 42),
+    ] {
+        let spans = (0..images)
+            .map(|i| VisionSpan {
+                start: 64 + i * (h * w + 8),
+                count: h * w,
+                merged_h: h,
+                merged_w: w,
+            })
+            .collect();
+        cases.push((name, 128 + images * (h * w + 8), spans));
+    }
+    for (name, tokens, spans) in cases {
+        let pos = mrope_positions(tokens, &spans);
+        let mut cos = vec![0.0; tokens * h3_hrx::model::TE_ROPE_HALF];
+        let mut sin = cos.clone();
+        group.throughput(Throughput::Elements(tokens as u64));
+        group.bench_function(name, |b| {
+            b.iter(|| rotary_tables(black_box(&pos), black_box(&mut cos), black_box(&mut sin)));
+        });
+    }
+    group.finish();
+}
+
 fn vision_rotary(c: &mut Criterion) {
     let mut group = c.benchmark_group("rotary/vision");
     for (height, width) in [
@@ -334,5 +369,5 @@ fn vision_rotary(c: &mut Criterion) {
     }
     group.finish();
 }
-criterion_group! { name = benches; config = support::criterion(); targets = host, rotary, video_decoder_input, video_decoder_output, video_temporal, video_spatial, video_encoder_input, vision_tokens, vision_rotary }
+criterion_group! { name = benches; config = support::criterion(); targets = host, rotary, video_decoder_input, video_decoder_output, video_temporal, video_spatial, video_encoder_input, vision_tokens, text_rotary, vision_rotary }
 criterion_main!(benches);

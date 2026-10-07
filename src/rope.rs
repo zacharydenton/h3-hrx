@@ -8,15 +8,6 @@
 //! normalised coordinates for the VAE.
 use crate::model::*;
 
-/// Which of (t, h, w) pair `j` reads, for Qwen3-VL's interleaved mrope sections.
-pub fn mrope_axis(pair: usize) -> usize {
-    if pair < 60 {
-        pair % 3
-    } else {
-        0
-    }
-}
-
 /// The DiT's table: three axes of sixteen frequencies from the checkpoint's `rope.inv_freq`.
 ///
 /// The angle is computed and passed as `float`, so this is `cosf`, not `cos` narrowed. That is the
@@ -85,15 +76,49 @@ pub fn mrope_positions(n: usize, spans: &[VisionSpan]) -> Vec<f64> {
 }
 
 /// The text encoder's table: theta 5e6 over the head dimension, each pair reading its mrope axis.
+/// Each input row is `[t, h, w]`; each cosine and sine output row has 64 values.
 pub fn te(pos: &[f64], cos: &mut [f32], sin: &mut [f32]) {
-    let n = pos.len() / 3;
-    for t in 0..n {
-        for j in 0..TE_ROPE_HALF {
-            let ax = mrope_axis(j);
-            let inv = 5_000_000.0f64.powf(-((2 * j) as f64) / HEAD_DIM as f64);
-            let ang = pos[t * 3 + ax] * inv;
-            cos[t * TE_ROPE_HALF + j] = ang.cos() as f32;
-            sin[t * TE_ROPE_HALF + j] = ang.sin() as f32;
+    let rows = pos.as_chunks::<3>().0;
+    if rows.is_empty() {
+        return;
+    }
+    let inv: [f64; TE_ROPE_HALF] =
+        std::array::from_fn(|j| 5_000_000.0f64.powf(-((2 * j) as f64) / HEAD_DIM as f64));
+    let evaluate = |p: f64| {
+        let (mut c, mut s) = ([0.0; TE_ROPE_HALF], [0.0; TE_ROPE_HALF]);
+        for (j, &freq) in inv.iter().enumerate() {
+            let ang = p * freq;
+            c[j] = ang.cos() as f32;
+            s[j] = ang.sin() as f32;
+        }
+        (c, s)
+    };
+    let mut axes = std::collections::HashMap::new();
+    for (t, pos) in rows.iter().enumerate() {
+        let start = t * TE_ROPE_HALF;
+        let (c, s) = (
+            &mut cos[start..start + TE_ROPE_HALF],
+            &mut sin[start..start + TE_ROPE_HALF],
+        );
+        let bits = pos.map(f64::to_bits);
+        // Text advances all three axes together, so retain no cache for its unique positions.
+        if bits[0] == bits[1] && bits[0] == bits[2] {
+            let (pc, ps) = evaluate(pos[0]);
+            c.copy_from_slice(&pc);
+            s.copy_from_slice(&ps);
+            continue;
+        }
+        // Image grids repeat coordinates. Keep double bit keys, including signed zero.
+        for ax in 0..3 {
+            let (pc, ps) = axes.entry(bits[ax]).or_insert_with(|| evaluate(pos[ax]));
+            for j in (ax..60).step_by(3) {
+                c[j] = pc[j];
+                s[j] = ps[j];
+            }
+            if ax == 0 {
+                c[60..].copy_from_slice(&pc[60..]);
+                s[60..].copy_from_slice(&ps[60..]);
+            }
         }
     }
 }
@@ -162,6 +187,15 @@ pub fn vae(ft: usize, h: usize, w: usize, cos: &mut [f32], sin: &mut [f32]) {
 mod tests {
     use super::*;
 
+    /// Which of (t, h, w) pair `j` reads, for Qwen3-VL's interleaved mrope sections.
+    fn mrope_axis(pair: usize) -> usize {
+        if pair < 60 {
+            pair % 3
+        } else {
+            0
+        }
+    }
+
     #[test]
     fn the_mrope_sections_are_interleaved_then_all_temporal() {
         // [24, 20, 20] interleaved: pairs 0..60 cycle t, h, w; the remaining four are temporal
@@ -184,6 +218,66 @@ mod tests {
         for i in 0..5 {
             assert_eq!(&pos[i * 3..i * 3 + 3], &[i as f64; 3]);
         }
+    }
+
+    fn assert_te_matches_scalar(pos: &[f64]) {
+        let len = pos.len() / 3 * TE_ROPE_HALF;
+        let (mut cos, mut sin) = (vec![9.0; len + 16], vec![9.0; len + 16]);
+        te(pos, &mut cos, &mut sin);
+        for t in 0..pos.len() / 3 {
+            for j in 0..TE_ROPE_HALF {
+                let inv = 5_000_000.0f64.powf(-((2 * j) as f64) / HEAD_DIM as f64);
+                let ang = pos[t * 3 + mrope_axis(j)] * inv;
+                let i = t * TE_ROPE_HALF + j;
+                assert_eq!(cos[i].to_bits(), (ang.cos() as f32).to_bits(), "cos at {i}");
+                assert_eq!(sin[i].to_bits(), (ang.sin() as f32).to_bits(), "sin at {i}");
+            }
+        }
+        assert!(cos[len..].iter().chain(&sin[len..]).all(|&v| v == 9.0));
+    }
+
+    #[test]
+    fn text_rotary_tables_match_scalar_for_text_and_reference_grids() {
+        for tokens in [0, 1, 128, 4096] {
+            assert_te_matches_scalar(&mrope_positions(tokens, &[]));
+        }
+        for (images, h, w) in [(1, 1, 1), (1, 24, 42), (2, 42, 24), (16, 24, 42)] {
+            let spans: Vec<_> = (0..images)
+                .map(|i| VisionSpan {
+                    start: 64 + i * (h * w + 8),
+                    count: h * w,
+                    merged_h: h,
+                    merged_w: w,
+                })
+                .collect();
+            assert_te_matches_scalar(&mrope_positions(128 + images * (h * w + 8), &spans));
+        }
+    }
+
+    #[test]
+    fn text_rotary_tables_preserve_double_coordinates_and_signed_zero() {
+        let mut pos = Vec::new();
+        for p in [
+            0.0,
+            -0.0,
+            1.0,
+            1.0 + f64::EPSILON,
+            -0.125,
+            1e7,
+            1e20,
+            1e300,
+            f64::from_bits(1),
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::from_bits(0x7ff8_1234_5678_9000),
+        ] {
+            pos.extend_from_slice(&[p, p, p]);
+            pos.extend_from_slice(&[p, -p, p]);
+            pos.extend_from_slice(&[1.0, p, -p]);
+            pos.extend_from_slice(&[p, -p, p]);
+        }
+        pos.extend_from_slice(&[42.0, 43.0]);
+        assert_te_matches_scalar(&pos);
     }
 
     #[test]
