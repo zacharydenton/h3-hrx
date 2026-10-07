@@ -3745,8 +3745,8 @@ fn f32_preparation_matches_dense_hadamard_and_marks_invalid_rows() {
                 / 16.0
         })
         .collect();
-    for width in [4352usize, 14336, 25600] {
-        let rows = 6;
+    for width in [256usize, 4352, 8192, 14336, 25600] {
+        let rows = 7;
         let stride = width + 64;
         let mut x = vec![0.0f32; rows * width];
         for (i, v) in x[..width].iter_mut().enumerate() {
@@ -3758,6 +3758,8 @@ fn f32_preparation_matches_dense_hadamard_and_marks_invalid_rows() {
         x[3 * width] = f32::NAN;
         x[4 * width + width - 1] = f32::INFINITY;
         x[5 * width + 13] = f32::NEG_INFINITY;
+        // Finite inputs can still overflow inside a butterfly; mark that row invalid too.
+        x[6 * width..].fill(f32::MAX);
         let mut untiled = None;
         let mut variants = vec![(true, 256)];
         if width <= 16384 {
@@ -3766,12 +3768,22 @@ fn f32_preparation_matches_dense_hadamard_and_marks_invalid_rows() {
         if width == 14336 {
             variants.splice(1..1, [(false, 448), (false, 896)]);
         }
+        if width == 8192 {
+            variants.splice(
+                1..1,
+                [(false, 32), (false, 64), (false, 512), (false, 1024)],
+            );
+        }
         for (tiled, lanes) in variants {
             let (module, stem) = if tiled {
                 ("prepare_plain_tiled", "prepare_plain_tiled_f32_i8")
             } else {
                 ("prepare_i8_family", "prepare_plain_f32_i8")
             };
+            let mut codes = vec![0; rows * stride + 19];
+            codes[rows * stride..].fill(0x55);
+            let mut scale_bytes = vec![0; rows * 4 + 20];
+            scale_bytes[rows * 4..].fill(0x55);
             let out = h.run_module(
                 module,
                 stem,
@@ -3779,9 +3791,11 @@ fn f32_preparation_matches_dense_hadamard_and_marks_invalid_rows() {
                 [rows as u32, 1, 1],
                 lanes as u32,
                 &[rows as u64],
-                &[bytes(&x), vec![0; rows * stride], vec![0; rows * 4]],
+                &[bytes(&x), codes, scale_bytes],
             );
-            let scales = floats(&out[2]);
+            assert!(out[1][rows * stride..].iter().all(|&byte| byte == 0x55));
+            assert!(out[2][rows * 4..].iter().all(|&byte| byte == 0x55));
+            let scales = floats(&out[2][..rows * 4]);
             let finite = (&out[1][..3 * stride], &out[2][..3 * 4]);
             if let Some((codes, scales)) = &untiled {
                 assert_eq!(

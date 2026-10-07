@@ -40,12 +40,14 @@ fn preparation(c: &mut Criterion) {
         (256, 25600),
         (2048, 14336),
         (4096, 14336),
+        (8193, 14336),
     ] {
         group.throughput(Throughput::Elements((tokens * width) as u64));
         group.bench_function(
             BenchmarkId::new("plain", format!("{tokens}x{width}")),
             |b| {
-                let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+                let budget = if tokens > 4096 { 1 << 30 } else { 512 << 20 };
+                let manager = hrx::residency::ResidencyManager::new(budget).unwrap();
                 let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
                 let compiler = compiler();
                 let prepare = Prepare::build_with_input(
@@ -583,7 +585,7 @@ fn attention_output_preparation(c: &mut Criterion) {
     use h3_hrx::dispatch::{emit, Profile};
     use h3_hrx::model::{gemm_pitch, INNER};
     let mut group = c.benchmark_group("prepare_attention_output_i8");
-    for tokens in [1usize, 256, 2048, 8192] {
+    for tokens in [1usize, 256, 2048, 8192, 8193] {
         for lanes in [128usize, 224, 448] {
             group.throughput(Throughput::Elements((tokens * INNER) as u64));
             group.bench_function(format!("{tokens}/lanes_{lanes}"), |b| {
@@ -665,7 +667,7 @@ fn normalization_preparation(c: &mut Criterion) {
     use h3_hrx::dispatch::{emit, Profile};
     use h3_hrx::model::{gemm_pitch, CLASSES, HID};
     let mut group = c.benchmark_group("prepare_norm_i8");
-    for tokens in [1usize, 256, 2048, 8192] {
+    for tokens in [1usize, 256, 2048, 8192, 8193] {
         for lanes in [96usize, 224, 672] {
             group.throughput(Throughput::Elements((tokens * HID) as u64));
             group.bench_function(format!("{tokens}/lanes_{lanes}"), |b| {

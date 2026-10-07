@@ -9,27 +9,35 @@ template.def<@h3.prepare_finish_i8> @h3_prepare_finish_i8(%c0: index, %quads_per
   %qs_view = buffer.view %qs_global[%c0_offset] : buffer -> view<[%tokens_b]xf32>
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
-  // Hadamard: four radix-4 stages; each lane owns whole quads, so no barrier inside a stage.
+  // The first three radix-4 stages stay within 16 adjacent lanes (64 values).
+  // Each lane owns four contiguous columns; only the last stage crosses waves.
+  %wave_lane = kernel.subgroup.lane.id : index
+  %wave_i = index.cast %wave_lane : index to i32
+  %i32_1 = scalar.constant 1 : i32
+  %i32_2 = scalar.constant 2 : i32
+  %i32_4 = scalar.constant 4 : i32
+  %i32_8 = scalar.constant 8 : i32
+  %i32_32 = scalar.constant 32 : i32
+  %partner1 = scalar.xori %wave_i, %i32_1 : i32
+  %partner2 = scalar.xori %wave_i, %i32_2 : i32
+  %partner4 = scalar.xori %wave_i, %i32_4 : i32
+  %partner8 = scalar.xori %wave_i, %i32_8 : i32
+  %digit1 = index.rem %wave_lane, %c2 : index
+  %even1 = index.cmp eq, %digit1, %c0 : index
+  %digit4_0 = index.div %wave_lane, %c4 : index
+  %digit4 = index.rem %digit4_0, %c2 : index
+  %even4 = index.cmp eq, %digit4, %c0 : index
+  %quad_limit = index.sub %width, %c4 : index
   scf.for %t_j = [%c0 to %quads_per_lane step %c1] {
     %t_lane_step = index.mul %t_j, %lanes : index
     %t0 = index.add %t_lane_step, %lane : index
-    %t = index.assume %t0 [lt(%t0, %quads)] : index
-    %g = index.div %t, %c64 : index
-    %within = index.rem %t, %c64 : index
-    %lo = index.rem %within, %c1 : index
-    %hi = index.div %within, %c1 : index
-    %hi4 = index.mul %hi, %c4 : index
-    %hi4d = index.mul %hi4, %c1 : index
-    %g256 = index.mul %g, %c256 : index
-    %base0 = index.add %g256, %hi4d : index
-    %base = index.add %base0, %lo : index
-    %i1 = index.add %base, %c1 : index
-    %i2 = index.add %i1, %c1 : index
-    %i3 = index.add %i2, %c1 : index
-    %e0 = view.load %x_view[%base] : view<[%width]xf32> -> f32
-    %e1 = view.load %x_view[%i1] : view<[%width]xf32> -> f32
-    %e2 = view.load %x_view[%i2] : view<[%width]xf32> -> f32
-    %e3 = view.load %x_view[%i3] : view<[%width]xf32> -> f32
+    %base0 = index.mul %t0, %c4 : index
+    %base = index.assume %base0 [le(%base0, %quad_limit), mul(%base0, 4)] : index
+    %values = vector.load %x_view[%base] : view<[%width]xf32> -> vector<4xf32>
+    %e0 = vector.extract %values[0] : vector<4xf32> -> f32
+    %e1 = vector.extract %values[1] : vector<4xf32> -> f32
+    %e2 = vector.extract %values[2] : vector<4xf32> -> f32
+    %e3 = vector.extract %values[3] : vector<4xf32> -> f32
     %s01 = scalar.addf %e0, %e1 : f32
     %s23 = scalar.addf %e2, %e3 : f32
     %d01 = scalar.subf %e0, %e1 : f32
@@ -38,81 +46,33 @@ template.def<@h3.prepare_finish_i8> @h3_prepare_finish_i8(%c0: index, %quads_per
     %o1 = scalar.subf %s01, %d23 : f32
     %o2 = scalar.addf %d01, %s23 : f32
     %o3 = scalar.subf %s23, %d01 : f32
-    view.store %o0, %x_view[%base] : f32, view<[%width]xf32>
-    view.store %o1, %x_view[%i1] : f32, view<[%width]xf32>
-    view.store %o2, %x_view[%i2] : f32, view<[%width]xf32>
-    view.store %o3, %x_view[%i3] : f32, view<[%width]xf32>
+    %stage0 = vector.from_elements %o0, %o1, %o2, %o3 : vector<4xf32>
+
+    %other1, %ok1 = kernel.subgroup.shuffle<index> %stage0, %partner1, %i32_32 : vector<4xf32>, i32, i32
+    %left1 = scf.select %even1, %stage0, %other1 : vector<4xf32>
+    %right1 = scf.select %even1, %other1, %stage0 : vector<4xf32>
+    %sum1 = vector.addf %left1, %right1 : vector<4xf32>
+    %diff1 = vector.subf %left1, %right1 : vector<4xf32>
+    %other_diff1, %ok2 = kernel.subgroup.shuffle<index> %diff1, %partner2, %i32_32 : vector<4xf32>, i32, i32
+    %plus1 = vector.addf %sum1, %other_diff1 : vector<4xf32>
+    %minus1 = vector.subf %sum1, %other_diff1 : vector<4xf32>
+    %stage1 = scf.select %even1, %plus1, %minus1 : vector<4xf32>
+
+    %other4, %ok4 = kernel.subgroup.shuffle<index> %stage1, %partner4, %i32_32 : vector<4xf32>, i32, i32
+    %left4 = scf.select %even4, %stage1, %other4 : vector<4xf32>
+    %right4 = scf.select %even4, %other4, %stage1 : vector<4xf32>
+    %sum4 = vector.addf %left4, %right4 : vector<4xf32>
+    %diff4 = vector.subf %left4, %right4 : vector<4xf32>
+    %other_diff4, %ok8 = kernel.subgroup.shuffle<index> %diff4, %partner8, %i32_32 : vector<4xf32>, i32, i32
+    %plus4 = vector.addf %sum4, %other_diff4 : vector<4xf32>
+    %minus4 = vector.subf %sum4, %other_diff4 : vector<4xf32>
+    %stage2 = scf.select %even4, %plus4, %minus4 : vector<4xf32>
+    vector.store %stage2, %x_view[%base] : vector<4xf32>, view<[%width]xf32>
   }
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-  scf.for %t_j = [%c0 to %quads_per_lane step %c1] {
-    %t_lane_step = index.mul %t_j, %lanes : index
-    %t0 = index.add %t_lane_step, %lane : index
-    %t = index.assume %t0 [lt(%t0, %quads)] : index
-    %g = index.div %t, %c64 : index
-    %within = index.rem %t, %c64 : index
-    %lo = index.rem %within, %c4 : index
-    %hi = index.div %within, %c4 : index
-    %hi4 = index.mul %hi, %c4 : index
-    %hi4d = index.mul %hi4, %c4 : index
-    %g256 = index.mul %g, %c256 : index
-    %base0 = index.add %g256, %hi4d : index
-    %base = index.add %base0, %lo : index
-    %i1 = index.add %base, %c4 : index
-    %i2 = index.add %i1, %c4 : index
-    %i3 = index.add %i2, %c4 : index
-    %e0 = view.load %x_view[%base] : view<[%width]xf32> -> f32
-    %e1 = view.load %x_view[%i1] : view<[%width]xf32> -> f32
-    %e2 = view.load %x_view[%i2] : view<[%width]xf32> -> f32
-    %e3 = view.load %x_view[%i3] : view<[%width]xf32> -> f32
-    %s01 = scalar.addf %e0, %e1 : f32
-    %s23 = scalar.addf %e2, %e3 : f32
-    %d01 = scalar.subf %e0, %e1 : f32
-    %d23 = scalar.subf %e2, %e3 : f32
-    %o0 = scalar.addf %s01, %d23 : f32
-    %o1 = scalar.subf %s01, %d23 : f32
-    %o2 = scalar.addf %d01, %s23 : f32
-    %o3 = scalar.subf %s23, %d01 : f32
-    view.store %o0, %x_view[%base] : f32, view<[%width]xf32>
-    view.store %o1, %x_view[%i1] : f32, view<[%width]xf32>
-    view.store %o2, %x_view[%i2] : f32, view<[%width]xf32>
-    view.store %o3, %x_view[%i3] : f32, view<[%width]xf32>
-  }
-  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-  scf.for %t_j = [%c0 to %quads_per_lane step %c1] {
-    %t_lane_step = index.mul %t_j, %lanes : index
-    %t0 = index.add %t_lane_step, %lane : index
-    %t = index.assume %t0 [lt(%t0, %quads)] : index
-    %g = index.div %t, %c64 : index
-    %within = index.rem %t, %c64 : index
-    %lo = index.rem %within, %c16 : index
-    %hi = index.div %within, %c16 : index
-    %hi4 = index.mul %hi, %c4 : index
-    %hi4d = index.mul %hi4, %c16 : index
-    %g256 = index.mul %g, %c256 : index
-    %base0 = index.add %g256, %hi4d : index
-    %base = index.add %base0, %lo : index
-    %i1 = index.add %base, %c16 : index
-    %i2 = index.add %i1, %c16 : index
-    %i3 = index.add %i2, %c16 : index
-    %e0 = view.load %x_view[%base] : view<[%width]xf32> -> f32
-    %e1 = view.load %x_view[%i1] : view<[%width]xf32> -> f32
-    %e2 = view.load %x_view[%i2] : view<[%width]xf32> -> f32
-    %e3 = view.load %x_view[%i3] : view<[%width]xf32> -> f32
-    %s01 = scalar.addf %e0, %e1 : f32
-    %s23 = scalar.addf %e2, %e3 : f32
-    %d01 = scalar.subf %e0, %e1 : f32
-    %d23 = scalar.subf %e2, %e3 : f32
-    %o0 = scalar.addf %s01, %d23 : f32
-    %o1 = scalar.subf %s01, %d23 : f32
-    %o2 = scalar.addf %d01, %s23 : f32
-    %o3 = scalar.subf %s23, %d01 : f32
-    view.store %o0, %x_view[%base] : f32, view<[%width]xf32>
-    view.store %o1, %x_view[%i1] : f32, view<[%width]xf32>
-    view.store %o2, %x_view[%i2] : f32, view<[%width]xf32>
-    view.store %o3, %x_view[%i3] : f32, view<[%width]xf32>
-  }
-  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-  scf.for %t_j = [%c0 to %quads_per_lane step %c1] {
+  // Collect the row maximum while the final butterfly outputs are still in registers.
+  %inf = scalar.constant inf : f32
+  %amax = scf.for %t_j = [%c0 to %quads_per_lane step %c1](%prev_max = %zero : f32) -> (f32) {
     %t_lane_step = index.mul %t_j, %lanes : index
     %t0 = index.add %t_lane_step, %lane : index
     %t = index.assume %t0 [lt(%t0, %quads)] : index
@@ -144,24 +104,27 @@ template.def<@h3.prepare_finish_i8> @h3_prepare_finish_i8(%c0: index, %quads_per
     view.store %o1, %x_view[%i1] : f32, view<[%width]xf32>
     view.store %o2, %x_view[%i2] : f32, view<[%width]xf32>
     view.store %o3, %x_view[%i3] : f32, view<[%width]xf32>
+    %abs0 = scalar.absf %o0 : f32
+    %finite0 = scalar.cmpf olt, %abs0, %inf : f32
+    %checked0 = scf.select %finite0, %abs0, %inf : f32
+    %max0 = scalar.maxnumf %prev_max, %checked0 : f32
+    %abs1 = scalar.absf %o1 : f32
+    %finite1 = scalar.cmpf olt, %abs1, %inf : f32
+    %checked1 = scf.select %finite1, %abs1, %inf : f32
+    %max1 = scalar.maxnumf %max0, %checked1 : f32
+    %abs2 = scalar.absf %o2 : f32
+    %finite2 = scalar.cmpf olt, %abs2, %inf : f32
+    %checked2 = scf.select %finite2, %abs2, %inf : f32
+    %max2 = scalar.maxnumf %max1, %checked2 : f32
+    %abs3 = scalar.absf %o3 : f32
+    %finite3 = scalar.cmpf olt, %abs3, %inf : f32
+    %checked3 = scf.select %finite3, %abs3, %inf : f32
+    %max3 = scalar.maxnumf %max2, %checked3 : f32
+    scf.yield %max3 : f32
   }
   kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
-  // absmax (the 1/16 normalisation folded into the scale), quantise, pack 8 codes per lane per step
-  %amax_v = scf.for %a_j = [%c0 to %chunks_per_lane step %c1](%a_acc = %zero8 : vector<8xf32>) -> (vector<8xf32>) {
-    %a_lane_step = index.mul %a_j, %lanes : index
-    %a_chunk = index.add %a_lane_step, %lane : index
-    %a_i0 = index.mul %a_chunk, %c8 : index
-    %a_i = index.assume %a_i0 [le(%a_i0, %width_last), mul(%a_i0, 8)] : index
-    %a_x = vector.load %x_view[%a_i] : view<[%width]xf32> -> vector<8xf32>
-    %a_abs = vector.absf %a_x : vector<8xf32>
-    %check_inf = vector.constant inf : vector<8xf32>
-    %check_finite = vector.cmpf olt, %a_abs, %check_inf : vector<8xf32> -> vector<8xi1>
-    %check_abs = vector.select %check_finite, %a_abs, %check_inf : vector<8xf32>
-    %a_next = vector.maxnumf %a_acc, %check_abs : vector<8xf32>
-    scf.yield %a_next : vector<8xf32>
-  }
-  %amax = vector.reduce<maxnumf> %amax_v, %zero : vector<8xf32>, f32
+  // Fold the 1/16 normalization into the scale, then quantize and pack.
   %row_max0 = kernel.workgroup.reduce<maxnumf> %amax : f32
   %row_max = scalar.mulf %row_max0, %sixteenth : f32
   %row_max_safe = scalar.maxnumf %row_max, %tiny : f32
