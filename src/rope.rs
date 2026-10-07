@@ -103,15 +103,31 @@ pub fn te(pos: &[f64], cos: &mut [f32], sin: &mut [f32]) {
 /// Pairs below eighteen take the row coordinate and the rest the column, theta 1e4 over dimension 36.
 /// The row a patch lands on is the merge order: 2x2 blocks, row-major within the block.
 pub fn vision(gh: usize, gw: usize, cos: &mut [f32], sin: &mut [f32]) {
-    for hy in 0..gh {
-        for wx in 0..gw {
-            let pi = (((hy / 2) * (gw / 2) + wx / 2) * 2 + hy % 2) * 2 + wx % 2;
-            for j in 0..36 {
-                let inv = 10_000.0f64.powf(-((2 * (j % 18)) as f64) / 36.0);
-                let ang = if j < 18 { hy as f64 } else { wx as f64 } * inv;
-                cos[pi * 36 + j] = ang.cos() as f32;
-                sin[pi * 36 + j] = ang.sin() as f32;
+    if gh == 0 || gw == 0 {
+        return;
+    }
+    // Both axes use the same frequencies. Evaluate each distinct integer coordinate
+    // once, keeping the original FP64 angle/trigonometry and final FP32 narrowing.
+    let inv: [f64; 18] = std::array::from_fn(|j| 10_000.0f64.powf(-((2 * j) as f64) / 36.0));
+    let axes: Vec<_> = (0..gh.max(gw))
+        .map(|p| {
+            let (mut c, mut s) = ([0.0f32; 18], [0.0f32; 18]);
+            for (j, &freq) in inv.iter().enumerate() {
+                let ang = p as f64 * freq;
+                c[j] = ang.cos() as f32;
+                s[j] = ang.sin() as f32;
             }
+            (c, s)
+        })
+        .collect();
+    for (hy, (cy, sy)) in axes.iter().take(gh).enumerate() {
+        for (wx, (cx, sx)) in axes.iter().take(gw).enumerate() {
+            let pi = (((hy / 2) * (gw / 2) + wx / 2) * 2 + hy % 2) * 2 + wx % 2;
+            let start = pi * 36;
+            cos[start..start + 18].copy_from_slice(cy);
+            sin[start..start + 18].copy_from_slice(sy);
+            cos[start + 18..start + 36].copy_from_slice(cx);
+            sin[start + 18..start + 36].copy_from_slice(sx);
         }
     }
 }
@@ -337,5 +353,51 @@ mod tests {
         assert_eq!(at(0), 0.0f64.cos() as f32); // (hy, wx) = (0, 0)
         assert_eq!(at(1), 1.0f64.cos() as f32); // (0, 1)
         assert_eq!(at(4), 2.0f64.cos() as f32); // (0, 2) starts the next block
+    }
+
+    #[test]
+    fn vision_tables_match_scalar_bits_and_preserve_surrounding_rows() {
+        for (gh, gw) in [
+            (0, 0),
+            (0, 8),
+            (8, 0),
+            (1, 1),
+            (1, 2),
+            (2, 2),
+            (4, 6),
+            (30, 54),
+            (48, 84),
+            (84, 48),
+            (224, 224),
+            (2, 25088),
+            (25088, 2),
+        ] {
+            let len = gh * gw * 36;
+            let (mut cos, mut sin) = (vec![9.0f32; len + 72], vec![9.0f32; len + 72]);
+            let (mut expected_cos, mut expected_sin) = (cos.clone(), sin.clone());
+            vision(gh, gw, &mut cos[36..len + 36], &mut sin[36..len + 36]);
+            // Original per-patch formula, independent of coordinate caching.
+            for hy in 0..gh {
+                for wx in 0..gw {
+                    let pi = (((hy / 2) * (gw / 2) + wx / 2) * 2 + hy % 2) * 2 + wx % 2;
+                    for j in 0..36 {
+                        let inv = 10_000.0f64.powf(-((2 * (j % 18)) as f64) / 36.0);
+                        let ang = if j < 18 { hy as f64 } else { wx as f64 } * inv;
+                        expected_cos[36 + pi * 36 + j] = ang.cos() as f32;
+                        expected_sin[36 + pi * 36 + j] = ang.sin() as f32;
+                    }
+                }
+            }
+            assert_eq!(
+                crate::vvae::as_bytes(&cos),
+                crate::vvae::as_bytes(&expected_cos),
+                "cos grid {gh}x{gw}"
+            );
+            assert_eq!(
+                crate::vvae::as_bytes(&sin),
+                crate::vvae::as_bytes(&expected_sin),
+                "sin grid {gh}x{gw}"
+            );
+        }
     }
 }

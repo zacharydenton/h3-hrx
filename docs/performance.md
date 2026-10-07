@@ -121,6 +121,10 @@ that execution path; it is not a quality-qualified cache preset.
 
 ## Measurement boundaries
 
+- **Vision rotary tables:** `rotary/vision` measures table construction into reused
+  buffers, including any per-call coordinate cache. Cases span 32px through
+  landscape/portrait 768p, and the 3584px square maximum vision area. GPU uploads
+  and output-buffer allocation are excluded.
 - **Vision tokens:** `vision_tokens` measures copying prebuilt patch projections,
   FP32 position interpolation/addition, and allocation/conversion of FP16 residual
   rows. Cases span 32px through 768p in both orientations. GPU projection,

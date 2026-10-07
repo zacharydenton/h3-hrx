@@ -307,5 +307,32 @@ fn vision_tokens(c: &mut Criterion) {
     }
     group.finish();
 }
-criterion_group! { name = benches; config = support::criterion(); targets = host, rotary, video_decoder_input, video_decoder_output, video_temporal, video_spatial, video_encoder_input, vision_tokens }
+fn vision_rotary(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rotary/vision");
+    for (height, width) in [
+        (32, 32),
+        (256, 256),
+        (480, 864),
+        (768, 1344),
+        (1344, 768),
+        (3584, 3584),
+    ] {
+        let (gh, gw) = (height / 16, width / 16);
+        group.throughput(Throughput::Elements((gh * gw) as u64));
+        group.bench_function(format!("{height}x{width}"), |b| {
+            let mut cos = vec![0.0; gh * gw * 36];
+            let mut sin = vec![0.0; gh * gw * 36];
+            b.iter(|| {
+                h3_hrx::vision::rotary_tables(
+                    black_box(gh),
+                    black_box(gw),
+                    black_box(&mut cos),
+                    black_box(&mut sin),
+                )
+            });
+        });
+    }
+    group.finish();
+}
+criterion_group! { name = benches; config = support::criterion(); targets = host, rotary, video_decoder_input, video_decoder_output, video_temporal, video_spatial, video_encoder_input, vision_tokens, vision_rotary }
 criterion_main!(benches);

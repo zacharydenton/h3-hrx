@@ -12,6 +12,7 @@ use crate::compile::{Cfg, Compiler};
 use crate::dispatch::{checked, LayerNorm16, Matmul16, Profile};
 use crate::error::{invalid, Result};
 use crate::model::*;
+pub use crate::rope::vision as rotary_tables;
 use crate::weights::Weights;
 use half::vec::HalfFloatVecExt;
 
@@ -161,7 +162,7 @@ fn embed_frames(
     stream.upload(x16.binding(), crate::vvae::as_bytes_f16(&x16h))?;
 
     let (mut cosv, mut sinv) = (vec![0.0f32; n * 36], vec![0.0f32; n * 36]);
-    crate::rope::vision(gh, gw, &mut cosv, &mut sinv);
+    rotary_tables(gh, gw, &mut cosv, &mut sinv);
     let cosb = stream.allocate(cosv.len() * 4)?;
     let sinb = stream.allocate(sinv.len() * 4)?;
     stream.upload(cosb.binding(), crate::vvae::as_bytes(&cosv))?;
