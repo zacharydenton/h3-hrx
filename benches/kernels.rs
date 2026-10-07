@@ -127,7 +127,7 @@ fn rotary_preparation(c: &mut Criterion) {
     use h3_hrx::dispatch::{emit, Profile};
     use h3_hrx::model::{HEADS, INNER, QKV, ROPE_HALF};
     let mut group = c.benchmark_group("rope_qknorm_f16");
-    for tokens in [1usize, 257, 2048, 4096] {
+    for tokens in [1usize, 257, 2048, 4096, 8193] {
         for copy_v in [true, false] {
             group.throughput(Throughput::Elements(
                 (tokens * INNER * if copy_v { 3 } else { 2 }) as u64,
@@ -135,7 +135,9 @@ fn rotary_preparation(c: &mut Criterion) {
             group.bench_function(
                 BenchmarkId::new(if copy_v { "qkv" } else { "qk" }, tokens),
                 |b| {
-                    let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+                    // Long QKV inputs and the three FP16 outputs exceed 512 MiB.
+                    let budget = if tokens > 4096 { 1 << 30 } else { 512 << 20 };
+                    let manager = hrx::residency::ResidencyManager::new(budget).unwrap();
                     let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
                     let compiler = compiler();
                     let kernel = compiler
@@ -316,7 +318,7 @@ fn fused_qk_preparation(c: &mut Criterion) {
     use h3_hrx::dispatch::{emit, Profile};
     use h3_hrx::model::{HEADS, INNER, QKV, ROPE_HALF};
     let mut group = c.benchmark_group("qk_rotary_quantization");
-    for tokens in [1usize, 257, 4096, 8192] {
+    for tokens in [1usize, 257, 4096, 8192, 8193] {
         for fused in [false, true] {
             group.throughput(Throughput::Elements((tokens * INNER * 2) as u64));
             group.bench_function(

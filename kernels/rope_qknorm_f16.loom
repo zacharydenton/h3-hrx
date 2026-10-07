@@ -92,6 +92,11 @@ kernel.def target(@h3_rope_qknorm_f16_gfx11) export("h3_rope_qknorm_f16") @h3_ro
   %pair_lane3 = scf.select %is_pair, %pair_lane2, %c0 : index
   %pair_col0 = index.mul %pair_lane3, %cch : index
   %pair_col = index.assume %pair_col0 [le(%pair_col0, %cpair_last), mul(%pair_col0, 4)] : index
+  // Reuse channel weights and this token's rotary tables across all head rounds.
+  %w_q = vector.load %qw_view[%lane_col] : view<128xf32> -> vector<4xf32>
+  %w_k = vector.load %kw_view[%lane_col] : view<128xf32> -> vector<4xf32>
+  %c = vector.load %cos_view[%row, %pair_col] : view<[%tokens_b]x48xf32> -> vector<4xf32>
+  %s = vector.load %sin_view[%row, %pair_col] : view<[%tokens_b]x48xf32> -> vector<4xf32>
   scf.for %r = [%c0 to %rounds step %c1] {
     %r8 = index.mul %r, %c8 : index
     %head = index.add %r8, %wave : index
@@ -129,8 +134,6 @@ kernel.def target(@h3_rope_qknorm_f16_gfx11) export("h3_rope_qknorm_f16") @h3_ro
         %rinv = scalar.rsqrtf %mean_eps : f32
         %rinv_v = vector.splat %rinv : vector<4xf32>
         %normed = vector.mulf %v, %rinv_v : vector<4xf32>
-        %w_q = vector.load %qw_view[%lane_col] : view<128xf32> -> vector<4xf32>
-        %w_k = vector.load %kw_view[%lane_col] : view<128xf32> -> vector<4xf32>
         %w = scf.if %is_q -> (vector<4xf32>) {
           scf.yield %w_q : vector<4xf32>
         } else {
@@ -138,8 +141,6 @@ kernel.def target(@h3_rope_qknorm_f16_gfx11) export("h3_rope_qknorm_f16") @h3_ro
         }
         %x = vector.mulf %normed, %w : vector<4xf32>
         %px, %ok = kernel.subgroup.shuffle<index> %x, %partner, %i32_32 : vector<4xf32>, i32, i32
-        %c = vector.load %cos_view[%row, %pair_col] : view<[%tokens_b]x48xf32> -> vector<4xf32>
-        %s = vector.load %sin_view[%row, %pair_col] : view<[%tokens_b]x48xf32> -> vector<4xf32>
         // x1' = x1 cos - x2 sin (the lo lanes, partner x2); x2' = x1 sin + x2 cos (the hi lanes)
         %xc = vector.mulf %x, %c : vector<4xf32>
         %ps = vector.mulf %px, %s : vector<4xf32>

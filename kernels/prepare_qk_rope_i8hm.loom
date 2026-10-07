@@ -90,6 +90,11 @@ kernel.def target(@h3_prepare_qk_rope_i8hm_gfx11) export("h3_prepare_qk_rope_i8h
   %nr_paircol = index.assume %nr_paircol0 [le(%nr_paircol0, %nr_44), mul(%nr_paircol0, 4)] : index
   %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%rows]x32xi32>
   %s_view = buffer.view %s_global[%c0_offset] : buffer -> view<[%heads]x[%capacity]xf32>
+  // Every head uses the same channel weights and this token's rotary tables.
+  %lane4 = index.mul %lane, %c4 : index
+  %nr_w = vector.load %nr_wv[%lane4] : view<128xf32> -> vector<4xf32>
+  %nr_c = vector.load %nr_cv[%token, %nr_paircol] : view<[%tokens_b]x48xf32> -> vector<4xf32>
+  %nr_s = vector.load %nr_sv[%token, %nr_paircol] : view<[%tokens_b]x48xf32> -> vector<4xf32>
   scf.for %r = [%c0 to %rounds step %c1] {
     %r8 = index.mul %r, %c8 : index
     %head0 = index.add %r8, %wave : index
@@ -98,7 +103,6 @@ kernel.def target(@h3_prepare_qk_rope_i8hm_gfx11) export("h3_prepare_qk_rope_i8h
       %head = index.assume %head0 [lt(%head0, %heads)] : index
       %hcol0 = index.mul %head, %c128 : index
       %hcol1 = index.add %hcol0, %head_offset : index
-      %lane4 = index.mul %lane, %c4 : index
       %col0 = index.add %hcol1, %lane4 : index
       %col_limit = index.sub %row_stride, %c4 : index
       %col = index.assume %col0 [le(%col0, %col_limit), mul(%col0, 4)] : index
@@ -112,11 +116,8 @@ kernel.def target(@h3_prepare_qk_rope_i8hm_gfx11) export("h3_prepare_qk_rope_i8h
       %nr_ri = scalar.rsqrtf %nr_me : f32
       %nr_riv = vector.splat %nr_ri : vector<4xf32>
       %nr_norm = vector.mulf %nr_v, %nr_riv : vector<4xf32>
-      %nr_w = vector.load %nr_wv[%lane4] : view<128xf32> -> vector<4xf32>
       %nr_x = vector.mulf %nr_norm, %nr_w : vector<4xf32>
       %nr_px, %nr_ok = kernel.subgroup.shuffle<index> %nr_x, %nr_partner, %nr_32 : vector<4xf32>, i32, i32
-      %nr_c = vector.load %nr_cv[%token, %nr_paircol] : view<[%tokens_b]x48xf32> -> vector<4xf32>
-      %nr_s = vector.load %nr_sv[%token, %nr_paircol] : view<[%tokens_b]x48xf32> -> vector<4xf32>
       %nr_xc = vector.mulf %nr_x, %nr_c : vector<4xf32>
       %nr_ps = vector.mulf %nr_px, %nr_s : vector<4xf32>
       %nr_lout = vector.subf %nr_xc, %nr_ps : vector<4xf32>
