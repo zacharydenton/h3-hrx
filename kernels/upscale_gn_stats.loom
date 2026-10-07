@@ -3,6 +3,8 @@ amdgpu.target<gfx11-generic> @h3_upscale_gn_stats_gfx11 {subgroup_size = 32}
 
 config.decl @h3.upscale_gn_stats.channels : %value: index where [range(%value, 32, 4096), mul(%value, 32)]
 
+config.decl @h3.upscale_gn_stats.lanes : %value: index where [range(%value, 32, 1024), mul(%value, 32)]
+
 config.decl @h3.upscale_gn_stats.groups : %value: index where [range(%value, 1, 64)]
 
 config.decl @h3.upscale_gn_stats.plane : %value: index where [range(%value, 1, 1048576)]
@@ -11,9 +13,9 @@ config.decl @h3.upscale_gn_stats.rows_bound : %value: index where [range(%value,
 
 kernel.def target(@h3_upscale_gn_stats_gfx11) export("h3_upscale_gn_stats") @h3_upscale_gn_stats(%frames: index) {
   %c1 = index.constant 1 : index
-  %c32 = index.constant 32 : index
+  %lanes = config.get @h3.upscale_gn_stats.lanes : index
   %groups = config.get @h3.upscale_gn_stats.groups : index
-  kernel.launch.config workgroups(%frames, %groups, %c1) workgroup_size(%c32, %c1, %c1) : index
+  kernel.launch.config workgroups(%frames, %groups, %c1) workgroup_size(%lanes, %c1, %c1) : index
 } launch(%frames: index, %x: buffer, %out: buffer) {
   %channels = config.get @h3.upscale_gn_stats.channels : index
   %groups = config.get @h3.upscale_gn_stats.groups : index
@@ -22,7 +24,7 @@ kernel.def target(@h3_upscale_gn_stats_gfx11) export("h3_upscale_gn_stats") @h3_
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c2 = index.constant 2 : index
-  %c32 = index.constant 32 : index
+  %lanes = config.get @h3.upscale_gn_stats.lanes : index
   %c0_offset = index.constant 0 : offset
   %zero = scalar.constant 0.0 : f32
   %frames_b = index.assume %frames [range(%frames, 1, 64)] : index
@@ -45,7 +47,7 @@ kernel.def target(@h3_upscale_gn_stats_gfx11) export("h3_upscale_gn_stats") @h3_
   %anchor_row = index.assume %row_base [lt(%row_base, %rows)] : index
   %anchor_half = view.load %x_view[%anchor_row, %anchor_col] : view<[%rows]x[%channels]xf16> -> f16
   %anchor = scalar.extf %anchor_half : f16 to f32
-  %sum_l = scf.for %p = [%lane to %plane step %c32](%s = %zero : f32) -> (f32) {
+  %sum_l = scf.for %p = [%lane to %plane step %lanes](%s = %zero : f32) -> (f32) {
     %row0 = index.add %row_base, %p : index
     %row = index.assume %row0 [lt(%row0, %rows)] : index
     %s_in = scf.for %ci = [%c0 to %per_group step %c1](%s2 = %s : f32) -> (f32) {
@@ -59,13 +61,13 @@ kernel.def target(@h3_upscale_gn_stats_gfx11) export("h3_upscale_gn_stats") @h3_
     }
     scf.yield %s_in : f32
   }
-  %sum = kernel.subgroup.reduce<addf> %sum_l : f32
+  %sum = kernel.workgroup.reduce<addf> %sum_l : f32
   %count = index.mul %plane, %per_group : index
   %counti = index.cast %count : index to i32
   %countf = scalar.sitofp %counti : i32 to f32
   %mean_delta = scalar.divf %sum, %countf : f32
   %mean = scalar.addf %mean_delta, %anchor : f32
-  %var_l = scf.for %vp = [%lane to %plane step %c32](%vs = %zero : f32) -> (f32) {
+  %var_l = scf.for %vp = [%lane to %plane step %lanes](%vs = %zero : f32) -> (f32) {
     %vr0 = index.add %row_base, %vp : index
     %vr = index.assume %vr0 [lt(%vr0, %rows)] : index
     %inner = scf.for %vc = [%c0 to %per_group step %c1](%acc = %vs : f32) -> (f32) {
@@ -79,7 +81,7 @@ kernel.def target(@h3_upscale_gn_stats_gfx11) export("h3_upscale_gn_stats") @h3_
     }
     scf.yield %inner : f32
   }
-  %var_sum = kernel.subgroup.reduce<addf> %var_l : f32
+  %var_sum = kernel.workgroup.reduce<addf> %var_l : f32
   %variance = scalar.divf %var_sum, %countf : f32
   %is0 = index.cmp eq, %lane, %c0 : index
   scf.if %is0 {

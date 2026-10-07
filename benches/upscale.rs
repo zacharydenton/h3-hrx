@@ -29,19 +29,38 @@ fn upscale(c: &mut Criterion) {
             std::hint::black_box(model.device_bytes());
         });
     });
+    let (network_profile, network_params) = support::params();
+    let network_shape = h3_hrx::shape_for(
+        network_params.height,
+        network_params.width,
+        network_params.frames,
+    )
+    .unwrap();
+    let network_input = Latents {
+        video: support::values(
+            24 * network_shape.latent_t as usize
+                * network_shape.lat_h as usize
+                * network_shape.lat_w as usize,
+            0.2,
+        ),
+        audio: support::values(64 * network_shape.audio_t as usize, 0.1),
+    };
+    let target_shape = settings.output_shape(&network_shape).unwrap();
     for cold in [false, true] {
         let mut fixture = None;
         c.bench_function(
-            if cold {
-                "upscale/network/cold_weights"
-            } else {
-                "upscale/network/warm_weights"
-            },
+            &format!(
+                "upscale/network/{}/{network_profile}",
+                if cold { "cold_weights" } else { "warm_weights" }
+            ),
             |b| {
                 let (runtime, session) = fixture.get_or_insert_with(|| {
                     let runtime = support::Runtime::new();
                     let session = runtime.session(
-                        h3_hrx::Config::default(),
+                        h3_hrx::Config {
+                            kernel_sources: support::sources(),
+                            ..Default::default()
+                        },
                         SessionOptions {
                             residency: if cold {
                                 h3_hrx::ResidencyPolicy::StageScoped
@@ -58,12 +77,12 @@ fn upscale(c: &mut Criterion) {
                     b,
                     || {
                         session
-                            .upscale_latents(&input, &shape, &settings, None)
+                            .upscale_latents(&network_input, &network_shape, &settings, None)
                             .unwrap()
                     },
                     |out| {
-                        assert_eq!(out.shape.size(), (128, 128));
-                        assert_eq!(out.latents.audio, input.audio);
+                        assert_eq!(out.shape.size(), target_shape.size());
+                        assert_eq!(out.latents.audio, network_input.audio);
                         std::hint::black_box(support::digest(&out.latents.video));
                     },
                 );
@@ -173,7 +192,7 @@ fn upscale(c: &mut Criterion) {
         );
     }
 }
-criterion_group! {name=benches;config=support::criterion();targets=packing,components,upscale}
+criterion_group! {name=benches;config=support::criterion();targets=packing,components,groupnorm_stats,upscale}
 criterion_main!(benches);
 
 fn packing(c: &mut Criterion) {
@@ -290,7 +309,8 @@ fn components(c: &mut Criterion) {
                     set("plane", rows);
                     set("rows_bound", rows);
                     if stem == "upscale_gn_stats" {
-                        (vec![input, vec![0; 256]], [1, 32, 1], 32, 1)
+                        set("lanes", 256);
+                        (vec![input, vec![0; 256]], [1, 32, 1], 256, 1)
                     } else {
                         config.insert(format!("h3.{stem}.eps"), "0.00001".into());
                         let stats = (0..64).map(|i| (i % 2) as f32).collect::<Vec<_>>();
@@ -385,4 +405,99 @@ fn components(c: &mut Criterion) {
         run();
         b.iter(&mut run);
     });
+}
+
+fn groupnorm_stats(c: &mut Criterion) {
+    use h3_hrx::dispatch::{emit, Profile, Sink};
+    use half::f16;
+    let channels = 512usize;
+    let groups = 32usize;
+    // Whole-volume rows, including long clips and a partial workgroup.
+    for rows in [512usize, 12960, 51840, 129025] {
+        for lanes in [32usize, 128, 256, 512, 1024] {
+            c.bench_function(&format!("upscale/groupnorm_stats/{rows}/{lanes}"), |b| {
+                let manager = hrx::residency::ResidencyManager::new(256 << 20).unwrap();
+                let mut stream = hrx::Stream::open()
+                    .unwrap()
+                    .with_memory_budget(manager.budget());
+                let compiler = support::compiler();
+                let cfg = [
+                    ("channels", channels),
+                    ("groups", groups),
+                    ("plane", rows),
+                    ("rows_bound", rows.div_ceil(64) * 64),
+                    ("lanes", lanes),
+                ]
+                .map(|(key, value)| (format!("h3.upscale_gn_stats.{key}"), value.to_string()))
+                .to_vec();
+                let kernel = compiler
+                    .get(&mut stream, "upscale_gn_stats", "h3_upscale_gn_stats", &cfg)
+                    .unwrap();
+                let input = support::values(rows * channels, 0.2)
+                    .into_iter()
+                    .map(f16::from_f32)
+                    .collect::<Vec<_>>();
+                let mut means = [0f64; 32];
+                let mut variances = [0f64; 32];
+                for (i, value) in input.iter().enumerate() {
+                    means[i % channels / (channels / groups)] += value.to_f64();
+                }
+                let count = (rows * channels / groups) as f64;
+                means.iter_mut().for_each(|v| *v /= count);
+                for (i, value) in input.iter().enumerate() {
+                    let g = i % channels / (channels / groups);
+                    variances[g] += (value.to_f64() - means[g]).powi(2);
+                }
+                variances.iter_mut().for_each(|v| *v /= count);
+                let x = stream.allocate_from(bytemuck::cast_slice(&input)).unwrap();
+                let out = stream.allocate(256).unwrap();
+                let mut profile = Profile::from_env();
+                let mut run = |stream: &mut hrx::Stream| {
+                    emit(
+                        &mut Sink::Stream(stream),
+                        &kernel,
+                        Some(&mut profile),
+                        "upscale groupnorm stats",
+                        [1, 32, 1],
+                        [lanes as u32, 1, 1],
+                        &[1],
+                        &[x.binding(), out.binding()],
+                        &[rows * channels * 2, 256],
+                    )
+                    .unwrap();
+                    stream.synchronize().unwrap();
+                };
+                run(&mut stream);
+                let expected = stream
+                    .read(out.binding())
+                    .unwrap()
+                    .wait(&mut stream)
+                    .unwrap();
+                for (g, pair) in expected.as_chunks::<8>().0.iter().enumerate() {
+                    let mean = f32::from_le_bytes(pair[..4].try_into().unwrap()) as f64;
+                    let variance = f32::from_le_bytes(pair[4..].try_into().unwrap()) as f64;
+                    assert!(
+                        (mean - means[g]).abs() < 5e-5,
+                        "mean group {g}: {mean} != {}",
+                        means[g]
+                    );
+                    assert!(
+                        (variance - variances[g]).abs() < 1e-4 * variances[g] + 1e-7,
+                        "variance group {g}: {variance} != {}",
+                        variances[g]
+                    );
+                }
+                b.iter(|| run(&mut stream));
+                let actual = stream
+                    .read(out.binding())
+                    .unwrap()
+                    .wait(&mut stream)
+                    .unwrap();
+                assert!(
+                    actual == expected,
+                    "GroupNorm replay changed for rows={rows}, lanes={lanes}"
+                );
+            });
+        }
+    }
 }

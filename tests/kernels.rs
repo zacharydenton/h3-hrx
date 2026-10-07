@@ -4066,24 +4066,32 @@ fn upscale_convolution_uses_symmetric_zero_padding() {
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires provisioned HRX")]
 fn upscale_groupnorm_centered_variance_handles_large_offsets() {
     let mut harness = Harness::new();
-    let (rows, channels) = (128usize, 64usize);
-    for offset in [0.0, 10000.0] {
-        let input = (0..rows * channels)
-            .map(|i| f16::from_f32(offset + ((i * 7) % 19) as f32 * 8.0))
+    for (frames, rows, channels, lanes, offset, scale) in [
+        (1usize, 128usize, 64usize, 32usize, 0.0, 8.0),
+        (1, 128, 64, 32, 10000.0, 8.0),
+        (2, 513, 512, 128, 10000.0, 8.0),
+        (3, 1031, 512, 256, 0.0, 8000.0),
+        (2, 129, 512, 512, 10000.0, 0.0),
+        (1, 12961, 512, 1024, 0.0, 0.001),
+        (1, 272161, 512, 256, 10000.0, 8.0),
+    ] {
+        let input = (0..frames * rows * channels)
+            .map(|i| f16::from_f32(offset + (((i * 7) % 17) as f32 - 8.0) * scale))
             .collect::<Vec<_>>();
         let config = cfg(&[
+            ("lanes", lanes),
             ("channels", channels),
             ("groups", 32),
             ("plane", rows),
-            ("rows_bound", rows),
+            ("rows_bound", (frames * rows).div_ceil(64) * 64),
         ]);
         let stats = harness.run(
             "upscale_gn_stats",
             &config,
-            [1, 32, 1],
-            32,
-            &[1],
-            &[bytes(&input), bytes(&vec![0.0f32; 64])],
+            [frames as u32, 32, 1],
+            lanes as u32,
+            &[frames as u64],
+            &[bytes(&input), bytes(&vec![0.0f32; frames * 64])],
         );
         let got = stats[1]
             .as_chunks::<4>()
@@ -4091,19 +4099,21 @@ fn upscale_groupnorm_centered_variance_handles_large_offsets() {
             .iter()
             .map(|b| f32::from_le_bytes(*b))
             .collect::<Vec<_>>();
-        for g in 0..32 {
-            let data = (0..rows)
+        for tg in 0..frames * 32 {
+            let t = tg / 32;
+            let g = tg % 32;
+            let per_group = channels / 32;
+            let data = (t * rows..(t + 1) * rows)
                 .flat_map(|r| {
-                    [
-                        input[r * channels + g * 2].to_f64(),
-                        input[r * channels + g * 2 + 1].to_f64(),
-                    ]
+                    input[r * channels + g * per_group..r * channels + (g + 1) * per_group]
+                        .iter()
+                        .map(|v| v.to_f64())
                 })
                 .collect::<Vec<_>>();
             let mean = data.iter().sum::<f64>() / data.len() as f64;
             let variance = data.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / data.len() as f64;
-            assert!((got[g * 2] as f64 - mean).abs() < 0.01);
-            assert!((got[g * 2 + 1] as f64 - variance).abs() < 0.01);
+            assert!((got[tg * 2] as f64 - mean).abs() < 0.002 + mean.abs() * 1e-6);
+            assert!((got[tg * 2 + 1] as f64 - variance).abs() < 1e-8 + variance * 1e-5);
         }
     }
 }

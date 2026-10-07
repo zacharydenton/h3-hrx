@@ -417,12 +417,11 @@ impl Upscaler {
                 ),
             ]
         };
-        let stat = c.get(
-            s,
-            "upscale_gn_stats",
-            "h3_upscale_gn_stats",
-            &cfg("upscale_gn_stats"),
-        )?;
+        // Large volumes need more than one wave per group to hide memory latency.
+        let lanes = if rows >= 512 { 256 } else { 32 };
+        let mut stat_cfg = cfg("upscale_gn_stats");
+        stat_cfg.push(("h3.upscale_gn_stats.lanes".into(), lanes.to_string()));
+        let stat = c.get(s, "upscale_gn_stats", "h3_upscale_gn_stats", &stat_cfg)?;
         let mut apply_cfg = cfg("upscale_gn_silu");
         apply_cfg.push(("h3.upscale_gn_silu.eps".into(), crate::compile::num(1e-5)));
         let apply = c.get(s, "upscale_gn_silu", "h3_upscale_gn_silu", &apply_cfg)?;
@@ -433,7 +432,7 @@ impl Upscaler {
             Some(p),
             "upscale groupnorm stats",
             [1, 32, 1],
-            [32, 1, 1],
+            [lanes, 1, 1],
             &[1],
             &[x.binding(), stats.binding()],
             &[bytes, 256],

@@ -289,18 +289,25 @@ rollouts are outside these benchmarks.
 
 `cargo bench` includes the `upscale` Criterion target: checkpoint metadata,
 CPU convolution-weight packing, cold/warm learned-network execution,
-reference-conditioned refinement, and both generation passes through video/audio decoding. Inputs are bounded to
-64×64 → 128×128 and five frames. Existing `H3_BENCH_BUDGET_GIB`, residency,
+reference-conditioned refinement, and both generation passes through video/audio decoding.
+Network cases honor `H3_BENCH_PROFILE` (`smoke`, `480p`, or `768p`) with 2× spatial
+upscaling; refinement and pipeline cases use 64×64 → 128×128 and five frames.
+Existing `H3_BENCH_BUDGET_GIB`, residency,
 attention and HRX profiling controls apply.
 
 ```sh
 cargo bench --bench upscale
 cargo bench --bench upscale -- upscale/pack
 H3_PROFILE=device cargo bench --bench upscale -- upscale/network/warm_weights --test
+H3_BENCH_PROFILE=480p H3_BENCH_BUDGET_GIB=4 cargo bench --bench upscale -- upscale/network/warm_weights
+cargo bench --bench upscale -- upscale/groupnorm_stats
 ```
 
 Network profiles separate convolutions, whole-volume normalization, temporal
 convolutions, interpolation and residual updates. Results remain under `target/`.
+GroupNorm statistics cases sweep whole-volume row counts and workgroup sizes
+within a 256 MiB device budget, check against FP64 mean and centered variance,
+and verify deterministic replay outside timing.
 Packing cases use the released input, residual-block and output convolution
 weights without opening a GPU. They check every packed byte and padding byte
 against the original checkpoint layout outside timing.

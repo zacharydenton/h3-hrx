@@ -1,4 +1,4 @@
-// GroupNorm apply + SiLU on channels-last f16 rows [frames*plane][channels] from the (sum, sum of squares) statistics:
+// GroupNorm apply + SiLU on channels-last f16 rows [frames*plane][channels] from the (mean, centered variance) statistics:
 //   y = (x - mean) * rsqrt(var + eps) * gamma[c] + beta[c];  out = y * sigmoid(y)
 amdgpu.target<gfx11-generic> @h3_upscale_gn_silu_gfx11 {subgroup_size = 32}
 
