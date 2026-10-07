@@ -121,6 +121,10 @@ that execution path; it is not a quality-qualified cache preset.
 
 ## Measurement boundaries
 
+- **Vision tokens:** `vision_tokens` measures copying prebuilt patch projections,
+  FP32 position interpolation/addition, and allocation/conversion of FP16 residual
+  rows. Cases span 32px through 768p in both orientations. GPU projection,
+  readback and upload are excluded.
 - **Video encoder input:** `video_encoder_input` measures ImageNet normalization
   and FP16 packing into reused eight-channel staging rows. Cases cover stills,
   full 17-frame tiles, cropped source frames and narrow edge tiles. Allocation

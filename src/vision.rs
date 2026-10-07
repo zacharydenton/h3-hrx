@@ -13,6 +13,7 @@ use crate::dispatch::{checked, LayerNorm16, Matmul16, Profile};
 use crate::error::{invalid, Result};
 use crate::model::*;
 use crate::weights::Weights;
+use half::vec::HalfFloatVecExt;
 
 /// What one image's tower run produces.
 #[derive(Clone)]
@@ -60,6 +61,14 @@ pub fn add_positions(x: &mut [f32], pos: &[f32], gh: usize, gw: usize) {
             }
         }
     }
+}
+
+/// Add interpolated positions to merge-ordered FP32 patch rows and narrow them
+/// to the vision tower's FP16 residual stream. `x` holds `[gh*gw][1152]` values
+/// and `pos` holds the learned `[48][48][1152]` table.
+pub fn prepare_tokens(x: &mut [f32], pos: &[f32], gh: usize, gw: usize) -> Vec<half::f16> {
+    add_positions(x, pos, gh, gw);
+    Vec::from_f32_slice(x)
 }
 
 /// Runs the tower over one image, reading its weights from the text encoder's checkpoint.
@@ -147,8 +156,7 @@ fn embed_frames(
     let pos = weights.host_f32("vis.pos", VPOS_GRID * VPOS_GRID * VHID)?;
     let mut x0 = vec![0.0f32; n * VHID];
     stream.read_blocking(x32.binding(), crate::vvae::as_bytes_mut(&mut x0))?;
-    add_positions(&mut x0, &pos, gh, gw);
-    let x16h: Vec<half::f16> = x0.iter().map(|v| half::f16::from_f32(*v)).collect();
+    let x16h = prepare_tokens(&mut x0, &pos, gh, gw);
     let x16 = stream.allocate(x16h.len() * 2)?;
     stream.upload(x16.binding(), crate::vvae::as_bytes_f16(&x16h))?;
 
@@ -450,6 +458,44 @@ fn embed_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_preparation_preserves_fp32_positions_and_scalar_half_bits() {
+        let mut pos: Vec<_> = (0..VPOS_GRID * VPOS_GRID * VHID)
+            .map(|i| ((i * 37 % 1009) as f32 - 504.0) / 127.0)
+            .collect();
+        for zero_positions in [false, true] {
+            if zero_positions {
+                pos.fill(0.0);
+            }
+            for (gh, gw) in [(2, 2), (4, 6), (6, 4), (16, 18)] {
+                // Visit every half bit pattern and its next midpoint, including
+                // subnormals, signed zeros, infinities and NaNs.
+                let mut x: Vec<_> = (0..gh * gw * VHID)
+                    .map(|i| {
+                        let bits = ((i / 2) as u16).wrapping_mul(37);
+                        let lo = half::f16::from_bits(bits).to_f32();
+                        let hi = half::f16::from_bits(bits.wrapping_add(1)).to_f32();
+                        if i & 1 == 0 {
+                            lo
+                        } else {
+                            (lo + hi) * 0.5
+                        }
+                    })
+                    .collect();
+                let mut expected = x.clone();
+                add_positions(&mut expected, &pos, gh, gw);
+                let want: Vec<_> = expected.iter().map(|&v| half::f16::from_f32(v)).collect();
+                let got = prepare_tokens(&mut x, &pos, gh, gw);
+                assert_eq!(crate::vvae::as_bytes(&x), crate::vvae::as_bytes(&expected));
+                assert_eq!(
+                    crate::vvae::as_bytes_f16(&got),
+                    crate::vvae::as_bytes_f16(&want),
+                    "grid {gh}x{gw}, zero positions: {zero_positions}"
+                );
+            }
+        }
+    }
 
     /// A position table whose row `(r, c)` is the constant `r * 100 + c`, so an interpolated row reads
     /// back as its grid coordinate.

@@ -288,5 +288,24 @@ fn video_encoder_input(c: &mut Criterion) {
     }
     group.finish();
 }
-criterion_group! { name = benches; config = support::criterion(); targets = host, rotary, video_decoder_input, video_decoder_output, video_temporal, video_spatial, video_encoder_input }
+fn vision_tokens(c: &mut Criterion) {
+    use h3_hrx::model::{VHID, VPOS_GRID};
+
+    let positions = support::values(VPOS_GRID * VPOS_GRID * VHID, 0.1);
+    let mut group = c.benchmark_group("vision_tokens");
+    for (height, width) in [(32, 32), (256, 256), (480, 864), (768, 1344), (1344, 768)] {
+        let (gh, gw) = (height / 16, width / 16);
+        let projected = support::values(gh * gw * VHID, 0.5);
+        let mut input = projected.clone();
+        group.throughput(Throughput::Elements(projected.len() as u64));
+        group.bench_function(format!("{height}x{width}"), |b| {
+            b.iter(|| {
+                input.copy_from_slice(black_box(&projected));
+                h3_hrx::vision::prepare_tokens(black_box(&mut input), black_box(&positions), gh, gw)
+            });
+        });
+    }
+    group.finish();
+}
+criterion_group! { name = benches; config = support::criterion(); targets = host, rotary, video_decoder_input, video_decoder_output, video_temporal, video_spatial, video_encoder_input, vision_tokens }
 criterion_main!(benches);
