@@ -361,6 +361,7 @@ impl Upscaler {
         name: &str,
         x: &hrx::Buffer,
         out: &hrx::Buffer,
+        residual: Option<&hrx::Buffer>,
         t: usize,
         h: usize,
         w: usize,
@@ -371,7 +372,23 @@ impl Upscaler {
         let co = co.div_ceil(64) * 64;
         let weight = self.weights.at(s, &format!("{name}.weight"), co * k * 2)?;
         let bias = self.weights.at(s, &format!("{name}.bias"), co * 4)?;
-        Conv3d::build_padding(c, s, false, t, h, w, 1, 1, 3, ci, ci, k, co, true)?.run(
+        Conv3d::build_padding(
+            c,
+            s,
+            residual.is_some(),
+            t,
+            h,
+            w,
+            1,
+            1,
+            3,
+            ci,
+            ci,
+            k,
+            co,
+            true,
+        )?
+        .run(
             s,
             Some(p),
             "upscale conv3d",
@@ -379,7 +396,7 @@ impl Upscaler {
             weight.binding(),
             bias.binding(),
             out.binding(),
-            None,
+            residual.map(hrx::Buffer::binding),
         )?;
         Ok(())
     }
@@ -498,7 +515,20 @@ impl Upscaler {
                 .flat_map(|v| v.to_le_bytes())
                 .collect::<Vec<_>>(),
         )?;
-        self.conv(s, c, p, "conv_in", &src, &x, t, h, w, 24, self.channels)?;
+        self.conv(
+            s,
+            c,
+            p,
+            "conv_in",
+            &src,
+            &x,
+            None,
+            t,
+            h,
+            w,
+            24,
+            self.channels,
+        )?;
         drop(src);
         let silu = |v: f32| f16::from_f32(v / (1.0 + (-v).exp())).to_f32();
         let emb = self
@@ -602,6 +632,16 @@ impl Upscaler {
                         bias.binding(),
                         y.binding(),
                     )?;
+                    pointwise(
+                        s,
+                        c,
+                        p,
+                        "upscale_add",
+                        &[],
+                        n * self.channels,
+                        &[y.binding(), x.binding()],
+                        &[plane, plane],
+                    )?;
                 } else {
                     self.norm(
                         s,
@@ -621,6 +661,7 @@ impl Upscaler {
                         &format!("{b}.in_layers.2"),
                         &y,
                         &tmp,
+                        None,
                         t,
                         hh,
                         ww,
@@ -646,6 +687,7 @@ impl Upscaler {
                         &format!("{b}.out_layers.2"),
                         &y,
                         &tmp,
+                        Some(&x),
                         t,
                         hh,
                         ww,
@@ -654,21 +696,24 @@ impl Upscaler {
                     )?;
                     std::mem::swap(&mut y, &mut tmp);
                 }
-                pointwise(
-                    s,
-                    c,
-                    p,
-                    "upscale_add",
-                    &[],
-                    n * self.channels,
-                    &[y.binding(), x.binding()],
-                    &[plane, plane],
-                )?;
                 std::mem::swap(&mut x, &mut y);
             }
         }
         self.norm(s, c, p, "norm_out", &x, &y, &stats, rows, None)?;
-        self.conv(s, c, p, "conv_out", &y, &tmp, t, oh, ow, self.channels, 24)?;
+        self.conv(
+            s,
+            c,
+            p,
+            "conv_out",
+            &y,
+            &tmp,
+            None,
+            t,
+            oh,
+            ow,
+            self.channels,
+            24,
+        )?;
         let mut result = vec![f16::ZERO; rows * 64];
         let mut bytes = vec![0u8; result.len() * 2];
         s.read_blocking(tmp.slice(0, bytes.len()), &mut bytes)?;

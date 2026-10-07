@@ -503,6 +503,12 @@ fn groupnorm_stats(c: &mut Criterion) {
 }
 
 fn convolutions(c: &mut Criterion) {
+    for add in [false, true] {
+        convolution_cases(c, add);
+    }
+}
+
+fn convolution_cases(c: &mut Criterion, add: bool) {
     use half::f16;
     for (frames, height, width) in [
         (8usize, 8usize, 8usize),
@@ -511,8 +517,10 @@ fn convolutions(c: &mut Criterion) {
         (42, 60, 108),
     ] {
         let rows = frames * height * width;
-        c.bench_function(&format!("upscale/conv3d/{frames}x{height}x{width}"), |b| {
-            let manager = hrx::residency::ResidencyManager::new(1 << 30).unwrap();
+        let kind = if add { "conv3d_residual" } else { "conv3d" };
+        c.bench_function(&format!("upscale/{kind}/{frames}x{height}x{width}"), |b| {
+            let manager =
+                hrx::residency::ResidencyManager::new((if add { 2 } else { 1 }) << 30).unwrap();
             let mut stream = hrx::Stream::open()
                 .unwrap()
                 .with_memory_budget(manager.budget());
@@ -522,7 +530,7 @@ fn convolutions(c: &mut Criterion) {
             let conv = h3_hrx::dispatch::Conv3d::build_padding(
                 &compiler,
                 &mut stream,
-                false,
+                add,
                 frames,
                 height,
                 width,
@@ -551,6 +559,15 @@ fn convolutions(c: &mut Criterion) {
                 .unwrap();
             let bias_buffer = stream.allocate_from(bytemuck::cast_slice(&bias)).unwrap();
             let out = stream.allocate(rows * channels * 2).unwrap();
+            let residual_values = add.then(|| {
+                support::values(rows * channels, 0.3)
+                    .into_iter()
+                    .map(f16::from_f32)
+                    .collect::<Vec<_>>()
+            });
+            let residual = residual_values
+                .as_ref()
+                .map(|v| stream.allocate_from(bytemuck::cast_slice(v)).unwrap());
             let mut profile = h3_hrx::dispatch::Profile::from_env();
             let mut run = |stream: &mut hrx::Stream| {
                 conv.run(
@@ -561,7 +578,7 @@ fn convolutions(c: &mut Criterion) {
                     w.binding(),
                     bias_buffer.binding(),
                     out.binding(),
-                    None,
+                    residual.as_ref().map(hrx::Buffer::binding),
                 )
                 .unwrap();
                 stream.synchronize().unwrap();
@@ -599,6 +616,10 @@ fn convolutions(c: &mut Criterion) {
                                 }
                             }
                         }
+                    }
+                    if let Some(residual) = &residual_values {
+                        sum = f16::from_f32(sum as f32).to_f64()
+                            + residual[row * channels + co].to_f64();
                     }
                     let pos = (row * channels + co) * 2;
                     let got =

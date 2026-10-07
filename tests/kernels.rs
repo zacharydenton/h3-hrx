@@ -4279,3 +4279,134 @@ fn upscale_groupnorm_apply_preserves_modulation_and_padding() {
         );
     }
 }
+
+#[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires provisioned HRX")]
+fn upscale_fused_residual_preserves_convolution_rounding_and_guards() {
+    let mut harness = Harness::new();
+    let compiler =
+        h3_hrx::compile::Compiler::new(None, Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels"));
+    for (frames, height, width, ci, co) in [
+        (1usize, 2usize, 2usize, 8usize, 64usize),
+        (3, 4, 6, 24, 64),
+        (2, 10, 18, 32, 192),
+        (3, 4, 6, 512, 64),
+    ] {
+        let rows = frames * height * width;
+        let k = (27 * ci).div_ceil(32) * 32;
+        let kernels = [false, true].map(|add| {
+            h3_hrx::dispatch::Conv3d::build_padding(
+                &compiler,
+                &mut harness.stream,
+                add,
+                frames,
+                height,
+                width,
+                1,
+                1,
+                3,
+                ci,
+                ci,
+                k,
+                co,
+                true,
+            )
+            .unwrap()
+        });
+        for zero_weights in [false, true] {
+            let input = values(rows * ci, 0.2)
+                .into_iter()
+                .map(f16::from_f32)
+                .collect::<Vec<_>>();
+            let weights = values(co * k, if zero_weights { 0.0 } else { 0.03 })
+                .into_iter()
+                .map(f16::from_f32)
+                .collect::<Vec<_>>();
+            // These biases differ from their FP16 values. With zero weights and a cancelling
+            // residual, a fused path that skips the convolution's FP16 boundary returns nonzero.
+            let bias = (0..co)
+                .map(|ch| if ch % 2 == 0 { 1.0003f32 } else { -1.0003 })
+                .collect::<Vec<_>>();
+            let guard = f16::from_f32(-123.0);
+            let mut residual = (0..rows * co)
+                .map(|i| {
+                    if zero_weights {
+                        f16::from_f32(-f16::from_f32(bias[i % co]).to_f32())
+                    } else {
+                        f16::from_f32(((i * 7 % 101) as f32 - 50.0) * 0.03)
+                    }
+                })
+                .collect::<Vec<_>>();
+            residual.extend([guard; 19]);
+            let x = harness.stream.allocate_from(&bytes(&input)).unwrap();
+            let w = harness.stream.allocate_from(&bytes(&weights)).unwrap();
+            let b = harness.stream.allocate_from(&bytes(&bias)).unwrap();
+            let res = harness.stream.allocate_from(&bytes(&residual)).unwrap();
+            let out = harness
+                .stream
+                .allocate_from(&bytes(&vec![guard; rows * co + 19]))
+                .unwrap();
+            kernels[0]
+                .run(
+                    &mut harness.stream,
+                    None,
+                    "upscale conv",
+                    x.binding(),
+                    w.binding(),
+                    b.binding(),
+                    out.binding(),
+                    None,
+                )
+                .unwrap();
+            let separate = harness
+                .stream
+                .read(out.binding())
+                .unwrap()
+                .wait(&mut harness.stream)
+                .unwrap();
+            let expected = separate[..rows * co * 2]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(&residual)
+                .map(|(v, r)| f16::from_f32(f16::from_le_bytes(*v).to_f32() + r.to_f32()))
+                .collect::<Vec<_>>();
+            if zero_weights {
+                assert!(expected.iter().all(|v| v.to_f32() == 0.0));
+            }
+            harness
+                .stream
+                .upload(out.binding(), &bytes(&vec![guard; rows * co + 19]))
+                .unwrap();
+            kernels[1]
+                .run(
+                    &mut harness.stream,
+                    None,
+                    "upscale conv + residual",
+                    x.binding(),
+                    w.binding(),
+                    b.binding(),
+                    out.binding(),
+                    Some(res.binding()),
+                )
+                .unwrap();
+            let actual = harness
+                .stream
+                .read(out.binding())
+                .unwrap()
+                .wait(&mut harness.stream)
+                .unwrap();
+            assert_eq!(actual[..rows * co * 2], bytes(&expected));
+            assert_eq!(actual[rows * co * 2..], bytes(&[guard; 19]));
+            assert_eq!(
+                harness
+                    .stream
+                    .read(res.binding())
+                    .unwrap()
+                    .wait(&mut harness.stream)
+                    .unwrap(),
+                bytes(&residual)
+            );
+        }
+    }
+}

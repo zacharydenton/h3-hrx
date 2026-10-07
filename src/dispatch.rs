@@ -1027,20 +1027,25 @@ impl Conv3d {
         cout_pad: usize,
         symmetric: bool,
     ) -> Result<Self> {
-        if symmetric && (add || stride != 1 || tstride != 1 || taps_t != 3) {
+        if symmetric && (stride != 1 || tstride != 1 || taps_t != 3) {
             return Err(crate::compile::Error::Io(
-                "symmetric conv3d requires stride one, three temporal taps and a separate residual"
-                    .into(),
+                "symmetric conv3d requires stride one and three temporal taps".into(),
             ));
         }
-        let stem = if symmetric {
+        let stem = if symmetric && add {
+            "upscale_conv3d_add"
+        } else if symmetric {
             "upscale_conv3d"
         } else if add {
             "conv3d_f16_wmma_add"
         } else {
             "conv3d_f16_wmma"
         };
-        let ns = format!("h3.{stem}.");
+        let ns = if symmetric {
+            "h3.upscale_conv3d.".into()
+        } else {
+            format!("h3.{stem}.")
+        };
         let rows_bound = (frames * h * w).div_ceil(64) * 64;
         let cfg: Cfg = vec![
             (format!("{ns}frames"), frames.to_string()),

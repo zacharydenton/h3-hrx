@@ -316,6 +316,8 @@ each intermediate boundary, and verify finite, deterministic output outside timi
 Spatial and temporal convolution cases cover small tensors and large 512-channel
 volumes within a 1 GiB residency budget, including readback. They check sampled interior and
 boundary outputs against FP64 and verify finite, deterministic output outside timing.
+The `conv3d_residual` cases include the fused residual addition and use a 2 GiB
+budget to accommodate the extra input and readback.
 Packing cases use the released input, residual-block and output convolution
 weights without opening a GPU. They check every packed byte and padding byte
 against the original checkpoint layout outside timing.

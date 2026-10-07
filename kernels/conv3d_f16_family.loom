@@ -364,7 +364,15 @@ template.def<@h3.shared_conv3d_f16_wmma_add> @h3_body_conv3d_f16_wmma_add(%m_siz
         %finished = scf.if %add_residual -> (vector<4xf32>) {
           %prior_half = vector.load %residual_view[%bounded, %out_col] : view<[%m_size]x[%n_size]xf16> -> vector<4xf16>
           %prior = vector.extf %prior_half : vector<4xf16> to vector<4xf32>
-          %summed = vector.addf %biased, %prior : vector<4xf32>
+          // The upscaler rounds convolution output to FP16 before adding its residual.
+          %value = scf.if %symmetric -> (vector<4xf32>) {
+            %biased_half = vector.fptrunc %biased : vector<4xf32> to vector<4xf16>
+            %rounded = vector.extf %biased_half : vector<4xf16> to vector<4xf32>
+            scf.yield %rounded : vector<4xf32>
+          } else {
+            scf.yield %biased : vector<4xf32>
+          }
+          %summed = vector.addf %value, %prior : vector<4xf32>
           scf.yield %summed : vector<4xf32>
         } else {
           scf.yield %biased : vector<4xf32>
@@ -540,5 +548,33 @@ kernel.def target(@h3_upscale_conv3d_gfx11) export("h3_upscale_conv3d") @h3_upsc
   %add_residual = scalar.constant false : i1
   %symmetric = scalar.constant true : i1
   template.apply<@h3.shared_conv3d_f16_wmma_add>(%m_size, %a, %w, %bias, %c, %c, %cfg_frames, %cfg_height, %cfg_width, %cfg_stride, %cfg_tstride, %cfg_taps_t, %cfg_cin_pad, %cfg_cin_stride, %cfg_rows_bound, %cfg_k_size, %cfg_n_size, %add_residual, %symmetric) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, index, index, index, index, i1, i1)
+  kernel.return
+}
+
+kernel.def target(@h3_upscale_conv3d_gfx11) export("h3_upscale_conv3d_add") @h3_upscale_conv3d_add(%m_size: index) {
+  %c1 = index.constant 1 : index
+  %c63 = index.constant 63 : index
+  %c64 = index.constant 64 : index
+  %c256 = index.constant 256 : index
+  %n_size0 = config.get @h3.upscale_conv3d.n_size : index
+  %m_rounded = index.add %m_size, %c63 : index
+  %m_tiles = index.div %m_rounded, %c64 : index
+  %n_tiles = index.div %n_size0, %c64 : index
+  kernel.launch.config workgroups(%n_tiles, %m_tiles, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%m_size: index, %a: buffer, %w: buffer, %bias: buffer, %c: buffer, %residual: buffer) {
+  %cfg_frames = config.get @h3.upscale_conv3d.frames : index
+  %cfg_height = config.get @h3.upscale_conv3d.height : index
+  %cfg_width = config.get @h3.upscale_conv3d.width : index
+  %cfg_stride = config.get @h3.upscale_conv3d.stride : index
+  %cfg_tstride = config.get @h3.upscale_conv3d.tstride : index
+  %cfg_taps_t = config.get @h3.upscale_conv3d.taps_t : index
+  %cfg_cin_pad = config.get @h3.upscale_conv3d.cin_pad : index
+  %cfg_cin_stride = config.get @h3.upscale_conv3d.cin_stride : index
+  %cfg_rows_bound = config.get @h3.upscale_conv3d.rows_bound : index
+  %cfg_k_size = config.get @h3.upscale_conv3d.k_size : index
+  %cfg_n_size = config.get @h3.upscale_conv3d.n_size : index
+  %add_residual = scalar.constant true : i1
+  %symmetric = scalar.constant true : i1
+  template.apply<@h3.shared_conv3d_f16_wmma_add>(%m_size, %a, %w, %bias, %c, %residual, %cfg_frames, %cfg_height, %cfg_width, %cfg_stride, %cfg_tstride, %cfg_taps_t, %cfg_cin_pad, %cfg_cin_stride, %cfg_rows_bound, %cfg_k_size, %cfg_n_size, %add_residual, %symmetric) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, index, index, index, index, i1, i1)
   kernel.return
 }
