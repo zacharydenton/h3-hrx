@@ -1377,8 +1377,7 @@ fn int8_qk_attention_matches_the_attention_its_operands_define() {
     }
 }
 
-/// RefMods can push the packed sequence into the head-major kernel at 4096
-/// tokens. Check long key loops, partial final tiles and both query-wave halves
+/// Check the head-major crossover, long key loops, partial final tiles and both query-wave halves
 /// against scalar attention; very long cases execute 128 query rows against the
 /// entire key sequence to cover production lengths without quadratic test cost.
 #[test]
@@ -1387,11 +1386,24 @@ fn int8_qk_attention_matches_the_attention_its_operands_define() {
     ignore = "requires gfx1151 and provisioned HRX"
 )]
 fn head_major_int8_attention_handles_long_reference_sequences() {
+    check_head_major_attention(&[4096, 4097, 8193, 65537, 119585, 478340]);
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
+fn head_major_int8_attention_handles_short_sequences_and_partial_tiles() {
+    check_head_major_attention(&[1024, 1025, 2048, 2049, 4095]);
+}
+
+fn check_head_major_attention(token_counts: &[usize]) {
     use rand::{Rng, SeedableRng};
     let mut h = Harness::new();
     let (heads, d) = (3usize, 128usize);
     let stride = heads * d;
-    for tokens in [4096usize, 4097, 8193, 65537, 119585, 478340] {
+    for &tokens in token_counts {
         let queries = if tokens > 65536 { 128 } else { tokens };
         let capacity = (tokens + 16).div_ceil(256) * 256;
         let mut rng = rand_chacha::ChaCha12Rng::seed_from_u64(tokens as u64);

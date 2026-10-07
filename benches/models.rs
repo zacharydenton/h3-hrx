@@ -232,8 +232,7 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
 fn models(c: &mut Criterion) {
     c.bench_function("audio/roundtrip/3200", |b| audio(b).unwrap());
     let mut group = c.benchmark_group("dit_stack");
-    // 4096 also covers the head-major integer attention path.
-    for tokens in [256, 2048, 4096] {
+    for tokens in [256, 1024, 2048, 2049, 4096] {
         for graph in [false, true] {
             let mode = if graph { "graph" } else { "eager" };
             group.bench_function(format!("{mode}/{tokens}/1_layer"), |b| {
