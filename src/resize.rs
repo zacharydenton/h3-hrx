@@ -163,33 +163,41 @@ pub fn world_first_frame(rgb: &[u8], sw: i32, sh: i32, dw: i32, dh: i32) -> Vec<
     let end = rows.iter().map(|(lo, w)| lo + w.len()).max().unwrap();
     let stride = dw as usize * 3;
     let mut horizontal = vec![0u8; (end - first) * stride];
-    for (x, (lo, weights)) in columns.iter().enumerate() {
-        for y in first..end {
+    let source_stride = sw as usize * 3;
+    // Traverse rows so adjacent outputs reuse source pixels and write contiguously.
+    for (y, dest) in horizontal.chunks_exact_mut(stride).enumerate() {
+        let source = &rgb[(y + first) * source_stride..][..source_stride];
+        for ((lo, weights), dest) in columns.iter().zip(dest.as_chunks_mut::<3>().0.iter_mut()) {
             let mut pixel = [0.0f64; 3];
-            for (i, w) in weights.iter().enumerate() {
-                let at = (y * sw as usize + lo + i) * 3;
+            for (w, input) in weights.iter().zip(
+                source[lo * 3..(lo + weights.len()) * 3]
+                    .as_chunks::<3>()
+                    .0
+                    .iter(),
+            ) {
                 for c in 0..3 {
-                    pixel[c] += w * rgb[at + c] as f64;
+                    pixel[c] += w * input[c] as f64;
                 }
             }
             for (c, v) in pixel.into_iter().enumerate() {
-                horizontal[(y - first) * stride + x * 3 + c] = v.round().clamp(0.0, 255.0) as u8;
+                dest[c] = v.round().clamp(0.0, 255.0) as u8;
             }
         }
     }
     let mut out = vec![0.0; dw as usize * dh as usize * 3];
-    for (y, (lo, weights)) in rows.iter().enumerate() {
-        for x in 0..dw as usize {
-            let mut pixel = [0.0f64; 3];
-            for (i, w) in weights.iter().enumerate() {
-                let at = (lo + i - first) * stride + x * 3;
-                for c in 0..3 {
-                    pixel[c] += w * horizontal[at + c] as f64;
-                }
+    let mut acc = vec![0.0f64; stride];
+    for ((lo, weights), dest) in rows.iter().zip(out.chunks_exact_mut(stride)) {
+        acc.fill(0.0);
+        // Vectorize across components; retain each component's FP64 tap order and
+        // the RGB8 rounding boundary between the horizontal and vertical passes.
+        let source = &horizontal[(lo - first) * stride..(lo - first + weights.len()) * stride];
+        for (w, row) in weights.iter().zip(source.chunks_exact(stride)) {
+            for (sum, &v) in acc.iter_mut().zip(row) {
+                *sum += w * v as f64;
             }
-            for (c, v) in pixel.into_iter().enumerate() {
-                out[(y * dw as usize + x) * 3 + c] = v.round().clamp(0.0, 255.0) as f32 / 255.0;
-            }
+        }
+        for (dest, &v) in dest.iter_mut().zip(&acc) {
+            *dest = v.round().clamp(0.0, 255.0) as f32 / 255.0;
         }
     }
     out
