@@ -3643,29 +3643,31 @@ fn f32_preparation_matches_dense_hadamard_and_marks_invalid_rows() {
         })
         .collect();
     for width in [4352usize, 14336, 25600] {
-        let rows = 5;
+        let rows = 6;
         let stride = width + 64;
         let mut x = vec![0.0f32; rows * width];
         for (i, v) in x[..width].iter_mut().enumerate() {
             *v = ((i * 37 % 997) as f32 - 498.0) * 512.0;
         }
-        x[2 * width] = f32::NAN;
-        x[3 * width + width - 1] = f32::INFINITY;
-        x[4 * width + 13] = f32::NEG_INFINITY;
+        for (i, v) in x[width..2 * width].iter_mut().enumerate() {
+            *v = ((i * 17 % 199) as f32 - 99.0) / 127.0;
+        }
+        x[3 * width] = f32::NAN;
+        x[4 * width + width - 1] = f32::INFINITY;
+        x[5 * width + 13] = f32::NEG_INFINITY;
         let mut untiled = None;
-        for tiled in [false, true] {
-            if !tiled && width > 16384 {
-                continue;
-            }
+        let mut variants = vec![(true, 256)];
+        if width <= 16384 {
+            variants.insert(0, (false, h3_hrx::model::lanes_for(width).unwrap()));
+        }
+        if width == 14336 {
+            variants.splice(1..1, [(false, 448), (false, 896)]);
+        }
+        for (tiled, lanes) in variants {
             let (module, stem) = if tiled {
                 ("prepare_plain_tiled", "prepare_plain_tiled_f32_i8")
             } else {
                 ("prepare_i8_family", "prepare_plain_f32_i8")
-            };
-            let lanes = if tiled {
-                256
-            } else {
-                h3_hrx::model::lanes_for(width).unwrap()
             };
             let out = h.run_module(
                 module,
@@ -3677,14 +3679,20 @@ fn f32_preparation_matches_dense_hadamard_and_marks_invalid_rows() {
                 &[bytes(&x), vec![0; rows * stride], vec![0; rows * 4]],
             );
             let scales = floats(&out[2]);
-            let finite = (&out[1][..2 * stride], &out[2][..2 * 4]);
+            let finite = (&out[1][..3 * stride], &out[2][..3 * 4]);
             if let Some((codes, scales)) = &untiled {
-                assert_eq!(finite.0, codes, "tiled codes differ at width {width}");
-                assert_eq!(finite.1, scales, "tiled scales differ at width {width}");
+                assert_eq!(
+                    finite.0, codes,
+                    "codes differ: width={width}, lanes={lanes}, tiled={tiled}"
+                );
+                assert_eq!(
+                    finite.1, scales,
+                    "scales differ: width={width}, lanes={lanes}, tiled={tiled}"
+                );
             } else if !tiled {
                 untiled = Some((finite.0.to_vec(), finite.1.to_vec()));
             }
-            if width == 14336 && !tiled {
+            if width == 14336 && !tiled && lanes == 256 {
                 use h3_hrx::dispatch::{ActivationType, Prepare};
                 let compiler = h3_hrx::compile::Compiler::new(
                     None,
@@ -3713,7 +3721,7 @@ fn f32_preparation_matches_dense_hadamard_and_marks_invalid_rows() {
                         .run(
                             &mut h.stream,
                             None,
-                            "prepare boundary",
+                            "prepare FFN",
                             tokens as u32,
                             input.binding(),
                             None,
@@ -3769,9 +3777,9 @@ fn f32_preparation_matches_dense_hadamard_and_marks_invalid_rows() {
                     "{stem} code {i}"
                 );
             }
-            assert!(scales[1].is_finite() && scales[1] > 0.0);
-            assert!(out[1][stride..2 * stride].iter().all(|&v| v == 0));
-            for row in 2..rows {
+            assert!(scales[2].is_finite() && scales[2] > 0.0);
+            assert!(out[1][2 * stride..3 * stride].iter().all(|&v| v == 0));
+            for row in 3..rows {
                 assert!(!scales[row].is_finite());
                 assert!(out[1][row * stride..(row + 1) * stride]
                     .iter()

@@ -472,7 +472,6 @@ impl ActivationType {
 /// write rows and nothing else.
 pub struct Prepare {
     kernel: crate::compile::Kernel,
-    tiled_ffn: Option<crate::compile::Kernel>,
     lanes: usize,
     form: String,
     input_type: ActivationType,
@@ -552,6 +551,14 @@ impl Prepare {
         };
         let lanes = (if tiled {
             Some(256)
+        } else if form == "plain"
+            && elem == "i8"
+            && width == FFN
+            && input_type == ActivationType::F32
+        {
+            // Two chunks per lane fill more waves while retaining a single
+            // Hadamard pass over the FFN row.
+            Some(896)
         } else if form == "norm" && elem == "i8" && width == HID {
             // Three eight-value chunks per lane reduce the normalization and
             // Hadamard work per thread while keeping short rows efficient.
@@ -589,27 +596,8 @@ impl Prepare {
             format!("prepare_{elem}_family")
         };
         let kernel = c.get(stream, &module, &format!("h3_{stem}"), &cfg)?;
-        // The FFN row uses 56 KiB of LDS in the single-pass kernel. Tiling improves
-        // occupancy for batches, but its second pass costs more for tiny inputs.
-        let tiled_ffn =
-            if form == "plain" && width == FFN && elem == "i8" && input_type == ActivationType::F32
-            {
-                let stem = "prepare_plain_tiled_f32_i8";
-                let cfg = vec![
-                    (format!("h3.{stem}.width"), width.to_string()),
-                    (format!("h3.{stem}.lanes"), "256".into()),
-                    (
-                        format!("h3.{stem}.out_stride"),
-                        if out_stride != 0 { out_stride } else { width }.to_string(),
-                    ),
-                ];
-                Some(c.get(stream, "prepare_plain_tiled", &format!("h3_{stem}"), &cfg)?)
-            } else {
-                None
-            };
         Ok(Self {
             kernel,
-            tiled_ffn,
             lanes,
             form: form.into(),
             input_type,
@@ -677,11 +665,7 @@ impl Prepare {
         }
         emit(
             sink,
-            if tokens >= 32 {
-                self.tiled_ffn.as_ref().unwrap_or(&self.kernel)
-            } else {
-                &self.kernel
-            },
+            &self.kernel,
             profile,
             stage,
             [tokens, 1, 1],
