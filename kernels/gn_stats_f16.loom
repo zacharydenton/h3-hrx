@@ -23,6 +23,7 @@ kernel.def target(@h3_gn_stats_f16_gfx11) export("h3_gn_stats_f16") @h3_gn_stats
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
   %c32 = index.constant 32 : index
   %c0_offset = index.constant 0 : offset
   %zero = scalar.constant 0.0 : f32
@@ -35,6 +36,8 @@ kernel.def target(@h3_gn_stats_f16_gfx11) export("h3_gn_stats_f16") @h3_gn_stats
   %g = index.assume %g0 [lt(%g0, %groups)] : index
   %lane = kernel.workitem.id<x> : index
   %per_group = index.div %channels, %groups : index
+  %chunks = index.div %per_group, %c4 : index
+  %vector_end = index.mul %chunks, %c4 : index
   %cbase = index.mul %g, %per_group : index
   %x_global = buffer.assume.memory_space<global> %x : buffer
   %out_global = buffer.assume.memory_space<global> %out : buffer
@@ -44,7 +47,28 @@ kernel.def target(@h3_gn_stats_f16_gfx11) export("h3_gn_stats_f16") @h3_gn_stats
   %sum_l, %sq_l = scf.for %p = [%lane to %plane step %c32](%s = %zero : f32, %q = %zero : f32) -> (f32, f32) {
     %row0 = index.add %row_base, %p : index
     %row = index.assume %row0 [lt(%row0, %rows)] : index
-    %s_in, %q_in = scf.for %ci = [%c0 to %per_group step %c1](%s2 = %s : f32, %q2 = %q : f32) -> (f32, f32) {
+    // Load neighboring channels together, but retain the scalar FP32 accumulation order.
+    %s_vec, %q_vec = scf.for %ci = [%c0 to %vector_end step %c4](%s2 = %s : f32, %q2 = %q : f32) -> (f32, f32) {
+      %col0 = index.add %cbase, %ci : index
+      %col_limit = index.sub %channels, %c4 : index
+      %col = index.assume %col0 [le(%col0, %col_limit)] : index
+      %packed = vector.load %x_view[%row, %col] : view<[%rows]x[%channels]xf16> -> vector<4xf16>
+      %values = vector.extf %packed : vector<4xf16> to vector<4xf32>
+      %v0 = vector.extract %values[0] : vector<4xf32> -> f32
+      %s_0 = scalar.addf %s2, %v0 : f32
+      %q_0 = scalar.fmaf %v0, %v0, %q2 : f32
+      %v1 = vector.extract %values[1] : vector<4xf32> -> f32
+      %s_1 = scalar.addf %s_0, %v1 : f32
+      %q_1 = scalar.fmaf %v1, %v1, %q_0 : f32
+      %v2 = vector.extract %values[2] : vector<4xf32> -> f32
+      %s_2 = scalar.addf %s_1, %v2 : f32
+      %q_2 = scalar.fmaf %v2, %v2, %q_1 : f32
+      %v3 = vector.extract %values[3] : vector<4xf32> -> f32
+      %s_3 = scalar.addf %s_2, %v3 : f32
+      %q_3 = scalar.fmaf %v3, %v3, %q_2 : f32
+      scf.yield %s_3, %q_3 : f32, f32
+    }
+    %s_in, %q_in = scf.for %ci = [%vector_end to %per_group step %c1](%s2 = %s_vec : f32, %q2 = %q_vec : f32) -> (f32, f32) {
       %col0 = index.add %cbase, %ci : index
       %col = index.assume %col0 [lt(%col0, %channels)] : index
       %v16 = view.load %x_view[%row, %col] : view<[%rows]x[%channels]xf16> -> f16

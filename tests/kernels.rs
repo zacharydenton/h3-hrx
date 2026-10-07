@@ -176,6 +176,71 @@ fn cfg(v: &[(&'static str, usize)]) -> Vec<(&'static str, String)> {
     not(feature = "gpu-tests"),
     ignore = "requires gfx1151 and provisioned HRX"
 )]
+fn groupnorm_statistics_match_cpu_with_channel_and_plane_tails() {
+    let mut h = Harness::new();
+    for (frames, plane, channels, groups) in [
+        (1usize, 1usize, 32usize, 32usize),
+        (2, 31, 64, 32),
+        (3, 33, 96, 32),
+        (2, 65, 128, 32),
+        (2, 37, 160, 32),
+        (1, 127, 192, 32),
+        (1, 129, 224, 32),
+        (2, 257, 256, 32),
+        (1, 4096, 128, 32),
+        (2, 32, 512, 32),
+        (2, 16, 1024, 32),
+        (1, 33, 4096, 1),
+    ] {
+        let per_group = channels / groups;
+        for amplitude in [0., 0.0005, 1., 512.] {
+            let input: Vec<f16> = (0..frames * plane * channels)
+                .map(|i| f16::from_f32(((i * 37 % 101) as f32 - 50.) * amplitude / 50.))
+                .collect();
+            let mut expected = vec![0f64; frames * groups * 2];
+            for t in 0..frames {
+                for p in 0..plane {
+                    for c in 0..channels {
+                        let v = input[(t * plane + p) * channels + c].to_f64();
+                        let i = 2 * (t * groups + c / per_group);
+                        expected[i] += v;
+                        expected[i + 1] += v * v;
+                    }
+                }
+            }
+            let guard = [0xa5u8; 28];
+            let mut output = vec![0; expected.len() * 4];
+            output.extend_from_slice(&guard);
+            let result = h.run(
+                "gn_stats_f16",
+                &cfg(&[
+                    ("channels", channels),
+                    ("groups", groups),
+                    ("plane", plane),
+                    ("rows_bound", (frames * plane).div_ceil(64) * 64),
+                ]),
+                [frames as u32, groups as u32, 1],
+                32,
+                &[frames as u64],
+                &[bytes(&input), output],
+            );
+            let actual = &result[1];
+            close(
+                &floats(&actual[..expected.len() * 4]),
+                &expected,
+                2e-5 * amplitude.max(1.) as f64,
+                2e-5,
+            );
+            assert_eq!(&actual[expected.len() * 4..], &guard);
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn groupnorm_silu_handles_zero_and_small_variance() {
     let mut h = Harness::new();
     let mut config = cfg(&[
