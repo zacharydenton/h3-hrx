@@ -115,6 +115,14 @@ pub fn fit(width: i32, height: i32, canvas_width: i32, canvas_height: i32) -> (i
     (round(width), round(height))
 }
 
+// Round to the nearest byte, saturating Lanczos overshoot. Testing the fraction
+// avoids both a general-purpose round call and the double rounding of `v + 0.5`
+// immediately below a half-integer.
+fn round_byte(v: f64) -> u8 {
+    let whole = v as u8;
+    whole.saturating_add(u8::from(v - f64::from(whole) >= 0.5))
+}
+
 /// H3-World cover resize with Lanczos-3 followed by a centered crop.
 /// Intermediate RGB8 rounding follows PIL's two-pass image resizing.
 pub fn world_first_frame(rgb: &[u8], sw: i32, sh: i32, dw: i32, dh: i32) -> Vec<f32> {
@@ -180,7 +188,7 @@ pub fn world_first_frame(rgb: &[u8], sw: i32, sh: i32, dw: i32, dh: i32) -> Vec<
                 }
             }
             for (c, v) in pixel.into_iter().enumerate() {
-                dest[c] = v.round().clamp(0.0, 255.0) as u8;
+                dest[c] = round_byte(v);
             }
         }
     }
@@ -206,6 +214,29 @@ pub fn world_first_frame(rgb: &[u8], sw: i32, sh: i32, dw: i32, dh: i32) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_rounding_matches_round_and_clamp_at_boundaries() {
+        let check = |v: f64| {
+            assert_eq!(round_byte(v), v.round().clamp(0.0, 255.0) as u8, "{v:?}");
+        };
+        for i in -1024..=2048 {
+            let v = f64::from(i) / 2.0;
+            check(v.next_down());
+            check(v);
+            check(v.next_up());
+        }
+        for v in [
+            f64::MIN,
+            f64::MAX,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NAN,
+            -0.0,
+        ] {
+            check(v);
+        }
+    }
 
     #[test]
     fn row_wise_resize_preserves_scalar_output_bits() {
