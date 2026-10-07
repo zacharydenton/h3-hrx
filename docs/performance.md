@@ -201,10 +201,11 @@ H3_PROFILE=device H3_COMPILE_REPORT_DIR=target/h3-reports cargo bench --bench ke
 ```
 
 GEMM cases include DiT QKV, FFN and down-projection dimensions at 256 and 2,048
-rows. Residual down projections also cover 4,096 rows, with cached and rotating
-weights; their residual is reset outside timing before each iteration. Cases use
-the runtime's operand pitches, direct buffer initialization and a 512 MiB GPU
-allocation budget. Setup and output readback stay outside timing.
+rows. FP32 SwiGLU also covers 4,096 and 8,192 rows with cached and rotating
+weights, using a 1 GiB GPU allocation budget. Residual down projections cover
+4,096 rows; their residual is reset outside timing before each iteration. Other
+GEMM cases use a 512 MiB budget. All use the runtime's operand pitches and direct
+buffer initialization. Setup and output readback stay outside timing.
 `prepare_f32_i8` covers tiny rows, the tiled FFN dispatch boundary, and batches
 through 4,096 tokens, plus wider 25,600-value rows. It supports the same HRX
 profiling and allocation cap, with direct readback outside timing.

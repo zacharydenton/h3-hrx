@@ -776,13 +776,23 @@ fn gemm(c: &mut Criterion) {
                 ]);
             }
             shapes.push(("resid", 4096, FFN, HID));
+            shapes.extend([
+                ("swiglu", 4096, HID, 2 * FFN),
+                ("swiglu", 8192, HID, 2 * FFN),
+            ]);
         }
         for (mode, m, k, n) in shapes {
             for rotating in [false, true] {
                 let storage = if rotating { "rotating" } else { "cached" };
                 group.throughput(Throughput::Elements((2 * m * k * n) as u64));
                 group.bench_function(format!("{elem}/{mode}/{storage}/{m}x{k}x{n}"), |b| {
-                    let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+                    // Long FP32 SwiGLU outputs plus the rotating weights exceed 512 MiB.
+                    let budget = if mode == "swiglu" && m >= 4096 {
+                        1 << 30
+                    } else {
+                        512 << 20
+                    };
+                    let manager = hrx::residency::ResidencyManager::new(budget).unwrap();
                     let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
                     let compiler = compiler();
                     let stride = h3_hrx::model::gemm_pitch(k, h3_hrx::model::elem_bits(elem));
@@ -864,7 +874,10 @@ fn gemm(c: &mut Criterion) {
                             index = (index + 1) % count;
                         });
                     }
-                    assert_eq!(check_f32(&mut stream, &out), expected);
+                    assert!(
+                        check_f32(&mut stream, &out) == expected,
+                        "GEMM replay changed: {elem}/{mode}/{storage}/{m}x{k}x{n}"
+                    );
                 });
             }
         }
