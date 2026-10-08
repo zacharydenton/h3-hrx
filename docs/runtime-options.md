@@ -163,6 +163,8 @@ Adjacent file fragments share a read and a descriptor-driven GPU gather, keeping
 the read lease alive until the gather completes. Each gather uses a bounded,
 rebased destination view; layouts that exceed its indexing limits use individual
 copies or row gathers.
+The first bounded set of reads overlaps destination allocation; accepted reads
+retain their slots through completion even if the destination exceeds the budget.
 
 `--storage-slots 1..64` and `--storage-slot-mib 1..64` override the native
 payload capacity. Larger slots reduce read/copy command counts; additional slots

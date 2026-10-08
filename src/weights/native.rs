@@ -295,14 +295,7 @@ impl Loader {
         } else {
             None
         };
-        let allocation = self.timed.then(Instant::now);
-        let output = stream.allocate(bytes.max(1))?;
-        if pitch_bytes != row_bytes {
-            crate::transfer::fill(stream, output.binding(), 0)?;
-        }
-        if let Some(start) = allocation {
-            add(&mut self.statistics.allocation, start.elapsed());
-        }
+        let mut output = None;
         let mut pending = VecDeque::new();
         let mut copies = VecDeque::new();
         let mut next = batches.into_iter().peekable();
@@ -319,6 +312,19 @@ impl Loader {
                     Err(error) => return Err(error.into()),
                 }
             }
+            // Service the first bounded set of reads while allocating the destination.
+            if output.is_none() {
+                let allocation = self.timed.then(Instant::now);
+                let buffer = stream.allocate(bytes.max(1))?;
+                if pitch_bytes != row_bytes {
+                    crate::transfer::fill(stream, buffer.binding(), 0)?;
+                }
+                output = Some(buffer);
+                if let Some(start) = allocation {
+                    add(&mut self.statistics.allocation, start.elapsed());
+                }
+            }
+            let output = output.as_ref().unwrap();
             if let Some(((chunk, gather), ticket)) = pending.pop_front() {
                 let wait = Instant::now();
                 let lease = ticket.wait()?;
@@ -433,7 +439,7 @@ impl Loader {
         if self.timed {
             add(&mut self.statistics.total, start.elapsed());
         }
-        Ok(output)
+        Ok(output.unwrap())
     }
 }
 fn add(total: &mut Option<Duration>, elapsed: Duration) {
@@ -697,6 +703,64 @@ mod tests {
             assert_eq!(actual, expected);
             // Fifteen fragments in the first read and two in the second.
             assert_eq!(weights.io_statistics().unwrap().consumer_commands, 2);
+        }
+        assert_eq!(manager.budget().reserved_bytes(), 0);
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires native GPU and io_uring"
+    )]
+    fn prefetched_reads_survive_destination_budget_failure() {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let path = dir.path().join("rows.safetensors");
+        let width = 1 << 20;
+        shard(&path, "a", 17, width, 43);
+        let manager = hrx::residency::ResidencyManager::new(16 << 20).unwrap();
+        {
+            let runtime = hrx::execution::Runtime::with_options(RuntimeOptions {
+                native_lifetime: hrx::fabric::NativeLifetime::Process,
+                memory_budget: Some(manager.budget()),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut stream = runtime.stream(None).unwrap();
+            // SAFETY: this private checkpoint remains immutable while mapped.
+            let mut weights = unsafe {
+                Weights::open(path, |ck, out| {
+                    out.insert("large".into(), super::super::rows_of(ck, &["a"], 0)?);
+                    out.insert(
+                        "small".into(),
+                        super::super::rows_permuted(ck, "a", &[(16, 1)], 0)?,
+                    );
+                    Ok(())
+                })
+            }
+            .unwrap();
+            weights
+                .set_io(
+                    WeightIo {
+                        mode: WeightIoMode::NativeBuffered,
+                        progress: StorageProgress::Wait,
+                        slots: NonZeroUsize::new(1),
+                        slot_bytes: NonZeroUsize::new(width),
+                        ..Default::default()
+                    },
+                    &crate::compile::Compiler::new(None, std::path::PathBuf::new()),
+                )
+                .unwrap();
+            assert!(weights.at(&mut stream, "large", 17 * width).is_err());
+            let stats = weights.io_statistics().unwrap();
+            assert_eq!(stats.storage.logical_requests, 1);
+            assert_eq!(stats.consumer_commands, 0);
+            // An accepted read is not cancelled by the failed destination allocation.
+            // Its slot must retire so the same loader can load a different extent.
+            let output = weights.at(&mut stream, "small", width).unwrap();
+            let mut actual = vec![0; width];
+            stream.read_blocking(output.binding(), &mut actual).unwrap();
+            assert_eq!(actual, weights.assemble("small").unwrap());
+            assert_eq!(weights.io_statistics().unwrap().storage.peak_slots, 1);
         }
         assert_eq!(manager.budget().reserved_bytes(), 0);
     }
