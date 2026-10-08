@@ -264,9 +264,13 @@ template.def<@h3.shared_conv3d_f16_wmma_add> @h3_body_conv3d_f16_wmma_add(%m_siz
   } else {
     scf.yield %zero_packet : vector<[%packet_width]xf16>
   }
-  // Group narrow 3-D encoder steps without enlarging the LDS tile. Wide tiles
-  // and compact downsampling retain their existing loop for register scheduling.
-  %keep_rolled = scalar.ori %reuse_operands, %full_history : i1
+  // Group narrow 3-D encoder steps and small 1024-channel planes without
+  // enlarging the LDS tile. Other wide tiles keep their existing loop.
+  %deep_channels = index.cmp eq, %cfg_cin_pad, %c1024 : index
+  %deep_plane = index.cmp ule, %spatial_plane, %c64 : index
+  %deep_wide = scalar.andi %deep_plane, %deep_channels : i1
+  %keep_rolled_base = scalar.ori %reuse_operands, %full_history : i1
+  %keep_rolled = scf.select %deep_wide, %symmetric, %keep_rolled_base : i1
   %group_candidate = scf.select %encoder_aligned, %c128, %tile_k : index
   %group_k = scf.select %keep_rolled, %tile_k, %group_candidate : index
   %acc0, %acc1, %a_values_last, %w_values_last = scf.for %k_block = [%k_start to %k_size step %group_k](%block0 = %acc_init0 : vector<8xf32>, %block1 = %acc_init1 : vector<8xf32>, %block_a = %a_values_first : vector<[%packet_width]xf16>, %block_w = %w_values_first : vector<[%packet_width]xf16>) -> (vector<8xf32>, vector<8xf32>, vector<[%packet_width]xf16>, vector<[%packet_width]xf16>) {
