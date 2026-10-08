@@ -44,6 +44,8 @@ pub struct WeightStatistics {
     pub tensors: u64,
     pub logical_bytes: u64,
     pub device_bytes: u64,
+    /// Logical copy/gather commands submitted to consume storage reads.
+    pub consumer_commands: u64,
     pub allocation: Option<Duration>,
     pub read_submit: Option<Duration>,
     pub read_wait: Option<Duration>,
@@ -58,6 +60,7 @@ pub struct WeightStatistics {
 pub(super) struct Loader {
     session: StorageSession,
     gather: std::collections::BTreeMap<(usize, usize), crate::compile::Kernel>,
+    gather_batches: std::collections::BTreeMap<(usize, usize), crate::compile::Kernel>,
     compiler: crate::compile::Compiler,
     statistics: WeightStatistics,
     timed: bool,
@@ -75,6 +78,49 @@ struct Batch {
     offset: u64,
     bytes: usize,
     parts: Vec<Chunk>,
+}
+struct Gather {
+    destination: usize,
+    span: usize,
+    tiles: u32,
+    descriptors: Vec<[i32; 4]>,
+}
+impl Batch {
+    fn gather(&self, row: usize, pitch: usize) -> Option<Gather> {
+        if !(2..=65535).contains(&self.parts.len())
+            || row > i32::MAX as usize
+            || pitch > i32::MAX as usize
+        {
+            return None;
+        }
+        let destination = self.parts.iter().map(|p| p.destination).min()?;
+        let end = self.parts.iter().try_fold(destination, |end, p| {
+            p.destination.checked_add(p.span).map(|n| end.max(n))
+        })?;
+        let span = end.checked_sub(destination)?;
+        i32::try_from(span).ok()?;
+        i32::try_from(self.bytes).ok()?;
+        let mut descriptors = Vec::with_capacity(self.parts.len());
+        let mut tiles = 0;
+        for part in &self.parts {
+            let source = part.offset.checked_sub(self.offset)?;
+            let first = if row == pitch { 0 } else { part.first };
+            i32::try_from(first.checked_add(part.bytes)?).ok()?;
+            descriptors.push([
+                i32::try_from(source).ok()?,
+                i32::try_from(part.destination - destination).ok()?,
+                i32::try_from(part.bytes).ok()?,
+                i32::try_from(first).ok()?,
+            ]);
+            tiles = tiles.max(part.bytes.div_ceil(256) as u32);
+        }
+        Some(Gather {
+            destination,
+            span,
+            tiles,
+            descriptors,
+        })
+    }
 }
 fn coalesce(mut chunks: Vec<Chunk>, capacity: usize) -> Vec<Batch> {
     chunks.sort_by_key(|chunk| (chunk.file, chunk.offset));
@@ -130,6 +176,7 @@ impl Loader {
             session,
             compiler,
             gather: Default::default(),
+            gather_batches: Default::default(),
             statistics: WeightStatistics::default(),
             timed: io.statistics,
         })
@@ -218,6 +265,36 @@ impl Loader {
             kernel.resolve(stream)?;
             self.gather.insert((*row_bytes, *pitch_bytes), kernel);
         }
+        let batches: Vec<_> = coalesce(chunks, self.session.read_chunk_bytes())
+            .into_iter()
+            .map(|batch| {
+                let gather = batch.gather(*row_bytes, *pitch_bytes);
+                (batch, gather)
+            })
+            .collect();
+        let batch_kernel = if batches.iter().any(|(_, gather)| gather.is_some()) {
+            let key = (*row_bytes, *pitch_bytes);
+            if !self.gather_batches.contains_key(&key) {
+                let cfg = vec![
+                    (
+                        "h3.weight_rows_batch.row_bytes".into(),
+                        row_bytes.to_string(),
+                    ),
+                    (
+                        "h3.weight_rows_batch.pitch_bytes".into(),
+                        pitch_bytes.to_string(),
+                    ),
+                ];
+                let kernel =
+                    self.compiler
+                        .get(stream, "weight_rows_batch", "h3_weight_rows_batch", &cfg)?;
+                kernel.resolve(stream)?;
+                self.gather_batches.insert(key, kernel);
+            }
+            Some(self.gather_batches[&key].clone())
+        } else {
+            None
+        };
         let allocation = self.timed.then(Instant::now);
         let output = stream.allocate(bytes.max(1))?;
         if pitch_bytes != row_bytes {
@@ -228,11 +305,9 @@ impl Loader {
         }
         let mut pending = VecDeque::new();
         let mut copies = VecDeque::new();
-        let mut next = coalesce(chunks, self.session.read_chunk_bytes())
-            .into_iter()
-            .peekable();
+        let mut next = batches.into_iter().peekable();
         loop {
-            while let Some(chunk) = next.peek() {
+            while let Some((chunk, _)) = next.peek() {
                 let submitted = self.timed.then(Instant::now);
                 let result = self.session.read(chunk.file, chunk.offset, chunk.bytes);
                 if let Some(start) = submitted {
@@ -244,18 +319,48 @@ impl Loader {
                     Err(error) => return Err(error.into()),
                 }
             }
-            if let Some((chunk, ticket)) = pending.pop_front() {
+            if let Some(((chunk, gather), ticket)) = pending.pop_front() {
                 let wait = Instant::now();
                 let lease = ticket.wait()?;
                 if self.timed {
                     add(&mut self.statistics.read_wait, wait.elapsed());
                 }
                 drop(ticket);
+                let descriptors = gather
+                    .as_ref()
+                    .map(|plan| stream.allocate_from(bytemuck::cast_slice(&plan.descriptors)))
+                    .transpose()?;
                 // SAFETY: each part reads a checked subrange of this lease and writes
                 // its disjoint destination rows. All consumers are enqueued immediately
                 // on this stream; the lease remains held through their common fence.
                 let consume =
                     |stream: &mut hrx::Stream, source: hrx::View<'_>| -> hrx::Result<()> {
+                        if let Some(plan) = &gather {
+                            let kernel = batch_kernel
+                                .as_ref()
+                                .unwrap()
+                                .resolve(stream)
+                                .map_err(|error| hrx::Error::Message(error.to_string()))?;
+                            let mut constants = hrx::Constants::new();
+                            for value in [chunk.bytes, plan.span, plan.descriptors.len()] {
+                                constants.push(value as u32)?;
+                            }
+                            // The plan bounds every descriptor within these views. HRX
+                            // retains descriptor backing and the lease through completion.
+                            return unsafe {
+                                stream.dispatch(
+                                    kernel,
+                                    [plan.tiles, plan.descriptors.len() as u32, 1],
+                                    [256, 1, 1],
+                                    &constants,
+                                    &[
+                                        source,
+                                        output.try_slice(plan.destination, plan.span)?,
+                                        descriptors.as_ref().unwrap().binding(),
+                                    ],
+                                )
+                            };
+                        }
                         for part in &chunk.parts {
                             let source =
                                 source.slice((part.offset - chunk.offset) as usize, part.bytes)?;
@@ -289,6 +394,11 @@ impl Loader {
                 // SAFETY: only the immediate, bounded consumers above use this source.
                 let submitted = self.timed.then(Instant::now);
                 let copy = unsafe { lease.enqueue(stream, consume) }?;
+                self.statistics.consumer_commands += if gather.is_some() {
+                    1
+                } else {
+                    chunk.parts.len() as u64
+                };
                 if let Some(start) = submitted {
                     add(&mut self.statistics.consumer_submit, start.elapsed());
                 }
@@ -379,6 +489,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gather_rebases_large_destinations_and_falls_back_for_wide_spans() {
+        let base = 1usize << 32;
+        let mut batch = Batch {
+            file: 0,
+            offset: 100,
+            bytes: 8,
+            parts: vec![
+                Chunk {
+                    file: 0,
+                    offset: 100,
+                    bytes: 4,
+                    destination: base + 16,
+                    first: 3,
+                    span: 4,
+                },
+                Chunk {
+                    file: 0,
+                    offset: 104,
+                    bytes: 4,
+                    destination: base,
+                    first: 0,
+                    span: 4,
+                },
+            ],
+        };
+        let plan = batch.gather(7, 7).unwrap();
+        assert_eq!((plan.destination, plan.span), (base, 20));
+        // Unpitched destinations already include the partial-row offset.
+        assert_eq!(plan.descriptors, [[0, 16, 4, 0], [4, 0, 4, 0]]);
+        batch.parts[0].span = 7;
+        let pitched = batch.gather(7, 12).unwrap();
+        assert_eq!(pitched.descriptors[0][3], 3);
+        assert_eq!(pitched.span, 23);
+        batch.parts[0].destination = base + i32::MAX as usize;
+        assert!(batch.gather(7, 7).is_none());
+    }
+
     fn shard(path: &std::path::Path, name: &str, rows: usize, width: usize, seed: usize) {
         let count = rows * width;
         let header=format!("{{\"{name}\":{{\"dtype\":\"U8\",\"shape\":[{rows},{width}],\"data_offsets\":[0,{count}]}}}}");
@@ -402,6 +550,20 @@ mod tests {
             "permuted".into(),
             super::super::rows_permuted(ck, "a", &[(8, 9), (0, 8)], 0)?,
         );
+        let order: Vec<_> = (0..17)
+            .step_by(2)
+            .chain((1..17).step_by(2))
+            .map(|row| (row, 1))
+            .collect();
+        for (name, pitch) in [
+            ("fragmented", 0),
+            ("fragmented_padded", ck.at("a")?.row_bytes()? + 5),
+        ] {
+            out.insert(
+                name.into(),
+                super::super::rows_permuted(ck, "a", &order, pitch)?,
+            );
+        }
         out.insert(
             "built".into(),
             Recipe::Built {
@@ -475,6 +637,73 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "gpu-tests"),
+        ignore = "requires native AQL and io_uring"
+    )]
+    fn fragmented_rows_pass_native_address_and_race_checks() {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let path = dir.path().join("rows.safetensors");
+        shard(&path, "a", 17, 259, 43);
+        let options = crate::compile::Options {
+            sanitizer: hrx::loom::SanitizerChecks {
+                access: true,
+                race: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let manager = hrx::residency::ResidencyManager::new(256 << 20).unwrap();
+        {
+            let runtime = hrx::execution::Runtime::with_options(RuntimeOptions {
+                native_lifetime: hrx::fabric::NativeLifetime::Process,
+                compute_engine: ComputeEngine::Aql {
+                    maximum_private_bytes: 512,
+                },
+                memory_budget: Some(manager.budget()),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut stream = runtime
+                .stream(Some(options.sanitizer_runtime.clone()))
+                .unwrap();
+            let compiler =
+                crate::compile::Compiler::with_options(None, std::path::PathBuf::new(), options);
+            // SAFETY: the private checkpoint remains immutable throughout the test.
+            let mut weights = unsafe {
+                Weights::open(path, |ck, out| {
+                    let order: Vec<_> = (0..17).rev().map(|r| (r, 1)).collect();
+                    out.insert(
+                        "rows".into(),
+                        super::super::rows_permuted(ck, "a", &order, 267)?,
+                    );
+                    Ok(())
+                })
+            }
+            .unwrap();
+            weights
+                .set_io(
+                    WeightIo {
+                        mode: WeightIoMode::NativeBuffered,
+                        slots: NonZeroUsize::new(1),
+                        slot_bytes: NonZeroUsize::new(4096),
+                        ..Default::default()
+                    },
+                    &compiler,
+                )
+                .unwrap();
+            let expected = weights.assemble("rows").unwrap();
+            let output = weights.at(&mut stream, "rows", expected.len()).unwrap();
+            let mut actual = vec![0; expected.len()];
+            stream.read_blocking(output.binding(), &mut actual).unwrap();
+            assert_eq!(actual, expected);
+            // Fifteen fragments in the first read and two in the second.
+            assert_eq!(weights.io_statistics().unwrap().consumer_commands, 2);
+        }
+        assert_eq!(manager.budget().reserved_bytes(), 0);
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
         ignore = "requires native GPU and NVMe direct I/O"
     )]
     fn native_rows_preserve_shards_padding_and_engine_ordering() {
@@ -521,7 +750,15 @@ mod tests {
                                     &crate::compile::Compiler::new(None, std::path::PathBuf::new()),
                                 )
                                 .unwrap();
-                            for name in ["straight", "sharded", "padded", "permuted", "built"] {
+                            for name in [
+                                "straight",
+                                "sharded",
+                                "padded",
+                                "permuted",
+                                "fragmented",
+                                "fragmented_padded",
+                                "built",
+                            ] {
                                 let expected = weights.assemble(name).unwrap();
                                 let buffer = weights.at(&mut stream, name, expected.len()).unwrap();
                                 let mut actual = vec![0; expected.len()];
@@ -538,7 +775,7 @@ mod tests {
                                 )
                                 .is_err());
                             let stats = weights.io_statistics().unwrap();
-                            assert_eq!(stats.tensors, 4);
+                            assert_eq!(stats.tensors, 6);
                             assert!(stats.storage.peak_slots <= 2);
                             assert!(stats.total.is_some());
                             assert!(stats.allocation.is_some());

@@ -1,0 +1,60 @@
+// One workgroup row per fragment in a retained storage read. Copy encoded bytes.
+config.decl @h3.weight_rows_batch.row_bytes : %value: index where [range(%value, 1, 2147483647)]
+config.decl @h3.weight_rows_batch.pitch_bytes : %value: index where [range(%value, 1, 2147483647)]
+kernel.def export("h3_weight_rows_batch") @h3_weight_rows_batch(%tiles: index, %parts: index) {
+  %one = index.constant 1 : index
+  %width = index.constant 256 : index
+  kernel.launch.config workgroups(%tiles, %parts, %one) workgroup_size(%width, %one, %one) : index
+} launch(%input: buffer, %output: buffer, %descriptors: buffer, %input32: i32, %output32: i32, %parts32: i32) {
+  %zero = index.constant 0 : offset
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c2 = index.constant 2 : index
+  %c3 = index.constant 3 : index
+  %width = index.constant 256 : index
+  %input_raw = index.cast %input32 : i32 to index
+  %input_size = index.assume %input_raw [range(%input_raw, 1, 2147483647)] : index
+  %output_raw = index.cast %output32 : i32 to index
+  %output_size = index.assume %output_raw [range(%output_raw, 1, 2147483647)] : index
+  %parts_raw = index.cast %parts32 : i32 to index
+  %parts = index.assume %parts_raw [range(%parts_raw, 1, 65535)] : index
+  %row = config.get @h3.weight_rows_batch.row_bytes : index
+  %pitch = config.get @h3.weight_rows_batch.pitch_bytes : index
+  %part_raw = kernel.workgroup.id<y> : index
+  %part = index.assume %part_raw [lt(%part_raw, %parts)] : index
+  %table = buffer.view %descriptors[%zero] : buffer -> view<[%parts]x4xi32>
+  %source32 = view.load %table[%part, %c0] : view<[%parts]x4xi32> -> i32
+  %destination32 = view.load %table[%part, %c1] : view<[%parts]x4xi32> -> i32
+  %count32 = view.load %table[%part, %c2] : view<[%parts]x4xi32> -> i32
+  %first32 = view.load %table[%part, %c3] : view<[%parts]x4xi32> -> i32
+  %source_raw = index.cast %source32 : i32 to index
+  %source = index.assume %source_raw [range(%source_raw, 0, 2147483647)] : index
+  %destination_raw = index.cast %destination32 : i32 to index
+  %destination = index.assume %destination_raw [range(%destination_raw, 0, 2147483647)] : index
+  %count_raw = index.cast %count32 : i32 to index
+  %count = index.assume %count_raw [range(%count_raw, 1, 2147483647)] : index
+  %first_raw = index.cast %first32 : i32 to index
+  %first = index.assume %first_raw [range(%first_raw, 0, 2147483647)] : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %group, %width : index
+  %i = index.add %base, %lane : index
+  %src = buffer.view %input[%zero] : buffer -> view<[%input_size]xi8>
+  %dst = buffer.view %output[%zero] : buffer -> view<[%output_size]xi8>
+  %active = index.cmp ult, %i, %count : index
+  scf.if %active {
+    %at_raw = index.add %first, %i : index
+    %at = index.assume %at_raw [range(%at_raw, 0, 2147483647)] : index
+    %r = index.div %at, %row : index
+    %c = index.rem %at, %row : index
+    %start = index.mul %r, %pitch : index
+    %relative = index.add %start, %c : index
+    %out = index.add %destination, %relative : index
+    %in = index.add %source, %i : index
+    %in_checked = index.assume %in [lt(%in, %input_size)] : index
+    %out_checked = index.assume %out [lt(%out, %output_size)] : index
+    %value = view.load %src[%in_checked] : view<[%input_size]xi8> -> i8
+    view.store %value, %dst[%out_checked] : i8, view<[%output_size]xi8>
+  }
+  kernel.return
+}

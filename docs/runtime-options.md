@@ -159,6 +159,10 @@ Mapped loading remains the default. Native modes use HRX's GPU-authored io_uring
 session and four retained 16 MiB payload slots. Contiguous, gathered, interleaved
 and pitched row recipes preserve their encoded bytes; built recipes continue to
 run on the CPU. Loaded tensors remain resident under the selected residency policy.
+Adjacent file fragments share a read and a descriptor-driven GPU gather, keeping
+the read lease alive until the gather completes. Each gather uses a bounded,
+rebased destination view; layouts that exceed its indexing limits use individual
+copies or row gathers.
 
 `--storage-slots 1..64` and `--storage-slot-mib 1..64` override the native
 payload capacity. Larger slots reduce read/copy command counts; additional slots
@@ -175,6 +179,8 @@ shared allocation budget in addition to resident weights and execution scratch.
 The timings separate allocation, read submission/wait, consumer submission/wait,
 and completed-consumer retirement. They measure host time, including any blocking
 inside those calls, rather than isolated GPU copy duration.
+`consumer_commands` counts logical copies and gathers, allowing fragmented
+recipes to be compared with the number of storage requests.
 
 Rust callers set `Config::weight_io`. `Session::new` selects the required native
 lifetime; applications supplying a `ModelContext` must choose
