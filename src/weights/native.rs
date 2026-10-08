@@ -112,7 +112,7 @@ impl Batch {
                 i32::try_from(part.bytes).ok()?,
                 i32::try_from(first).ok()?,
             ]);
-            tiles = tiles.max(part.bytes.div_ceil(256) as u32);
+            tiles = tiles.max((part.span - first).div_ceil(256) as u32);
         }
         Some(Gather {
             destination,
@@ -232,8 +232,9 @@ impl Loader {
             while consumed < length {
                 let take = (length - consumed).min(self.session.read_chunk_bytes());
                 let first = consumed % row_bytes;
-                let last = first + take - 1;
-                let span = (last / row_bytes) * pitch_bytes + last % row_bytes + 1;
+                let end = first + take;
+                // A chunk that finishes a row owns its trailing padding too.
+                let span = (end / row_bytes) * pitch_bytes + end % row_bytes;
                 if pitch_bytes != row_bytes
                     && [first + take, *row_bytes, *pitch_bytes, span]
                         .iter()
@@ -316,9 +317,6 @@ impl Loader {
             if output.is_none() {
                 let allocation = self.timed.then(Instant::now);
                 let buffer = stream.allocate(bytes.max(1))?;
-                if pitch_bytes != row_bytes {
-                    crate::transfer::fill(stream, buffer.binding(), 0)?;
-                }
                 output = Some(buffer);
                 if let Some(start) = allocation {
                     add(&mut self.statistics.allocation, start.elapsed());
@@ -387,7 +385,7 @@ impl Loader {
                                 unsafe {
                                     stream.dispatch(
                                         kernel,
-                                        [part.bytes.div_ceil(256) as u32, 1, 1],
+                                        [(part.span - part.first).div_ceil(256) as u32, 1, 1],
                                         [256, 1, 1],
                                         &constants,
                                         &[source, destination],
@@ -525,10 +523,10 @@ mod tests {
         assert_eq!((plan.destination, plan.span), (base, 20));
         // Unpitched destinations already include the partial-row offset.
         assert_eq!(plan.descriptors, [[0, 16, 4, 0], [4, 0, 4, 0]]);
-        batch.parts[0].span = 7;
+        batch.parts[0].span = 12;
         let pitched = batch.gather(7, 12).unwrap();
         assert_eq!(pitched.descriptors[0][3], 3);
-        assert_eq!(pitched.span, 23);
+        assert_eq!(pitched.span, 28);
         batch.parts[0].destination = base + i32::MAX as usize;
         assert!(batch.gather(7, 7).is_none());
     }
@@ -579,6 +577,70 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires native GPU")]
+    fn row_gathers_write_padding_and_preserve_partial_row_guards() {
+        let mut stream = hrx::Stream::open().unwrap();
+        let compiler = crate::compile::Compiler::new(None, std::path::PathBuf::new());
+        for batched in [false, true] {
+            let stem = if batched {
+                "weight_rows_batch"
+            } else {
+                "weight_rows"
+            };
+            let cfg = vec![
+                (format!("h3.{stem}.row_bytes"), "7".into()),
+                (format!("h3.{stem}.pitch_bytes"), "11".into()),
+            ];
+            let kernel = compiler
+                .get(&mut stream, stem, &format!("h3_{stem}"), &cfg)
+                .unwrap();
+            let kernel = kernel.resolve(&mut stream).unwrap();
+            // Start within a row, cross a row boundary, and either finish the
+            // second row or stop within it. The unused prefix/tail stay poisoned.
+            for count in [4, 6, 11] {
+                let input: Vec<u8> = (1..=count).collect();
+                let source = stream.allocate_from(&input).unwrap();
+                let output = stream.allocate_from(&[0xad; 44]).unwrap();
+                let end = 3 + count as usize;
+                let span = end / 7 * 11 + end % 7;
+                let descriptors = [[0i32, 11, count as i32, 3]];
+                let table = stream
+                    .allocate_from(bytemuck::cast_slice(&descriptors))
+                    .unwrap();
+                let mut constants = hrx::Constants::new();
+                for value in if batched {
+                    [count as u32, 44, 1]
+                } else {
+                    [count as u32, 3, span as u32]
+                } {
+                    constants.push(value).unwrap();
+                }
+                let destination = output.try_slice(11, span).unwrap();
+                let bindings = if batched {
+                    vec![source.binding(), output.binding(), table.binding()]
+                } else {
+                    vec![source.binding(), destination]
+                };
+                // SAFETY: the constants and descriptor describe the checked
+                // source range and a window wholly inside the poisoned output.
+                unsafe { stream.dispatch(kernel, [1, 1, 1], [256, 1, 1], &constants, &bindings) }
+                    .unwrap();
+                let mut actual = [0; 44];
+                stream.read_blocking(output.binding(), &mut actual).unwrap();
+                let mut expected = [0xad; 44];
+                for (i, &byte) in input.iter().enumerate() {
+                    let position = 3 + i;
+                    expected[11 + position / 7 * 11 + position % 7] = byte;
+                    if position % 7 == 6 {
+                        expected[11 + position / 7 * 11 + 7..11 + (position / 7 + 1) * 11].fill(0);
+                    }
+                }
+                assert_eq!(actual, expected, "{stem}, {count} input bytes");
+            }
+        }
+    }
+
     #[test]
     #[cfg_attr(
         not(feature = "gpu-tests"),

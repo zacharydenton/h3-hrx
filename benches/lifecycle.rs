@@ -11,6 +11,21 @@ type Plan = fn(
     &mut std::collections::BTreeMap<String, h3_hrx::weights::Recipe>,
 ) -> h3_hrx::weights::Result<()>;
 
+fn check_bytes(name: &str, actual: &[u8], expected: &[u8]) {
+    assert_eq!(actual.len(), expected.len(), "{name}: byte count");
+    if actual != expected {
+        let at = actual
+            .iter()
+            .zip(expected)
+            .position(|(a, b)| a != b)
+            .unwrap();
+        panic!(
+            "{name}: byte {at}: got {}, expected {}",
+            actual[at], expected[at]
+        );
+    }
+}
+
 fn loading(c: &mut Criterion) {
     let mut group = c.benchmark_group("checkpoint");
     for (name, relative, plan, tensor) in [
@@ -53,7 +68,7 @@ fn loading(c: &mut Criterion) {
             support::measure(
                 b,
                 || weights.assemble(tensor).unwrap(),
-                |actual| assert_eq!(*actual, expected),
+                |actual| check_bytes(tensor, actual, &expected),
             );
         });
         group.bench_function(format!("{name}/pack_and_upload/{tensor}"), |b| {
@@ -81,7 +96,7 @@ fn loading(c: &mut Criterion) {
                         );
                     }
                     let actual = support::read(&mut stream, buffer.binding());
-                    assert_eq!(actual, weights.assemble(tensor).unwrap());
+                    check_bytes(tensor, &actual, &weights.assemble(tensor).unwrap());
                 }
                 elapsed
             });
@@ -163,7 +178,7 @@ fn block_loading(c: &mut Criterion) {
                     }
                     for ((tensor, _), buffer) in tensors.iter().zip(buffers) {
                         let actual = support::read(&mut stream, buffer.binding());
-                        assert_eq!(actual, weights.assemble(tensor).unwrap());
+                        check_bytes(tensor, &actual, &weights.assemble(tensor).unwrap());
                     }
                 }
                 elapsed
@@ -236,7 +251,7 @@ fn model_loading(c: &mut Criterion) {
                 for (name, bytes) in &tensors {
                     let buffer = weights.at(&mut stream, name, *bytes).unwrap();
                     let actual = support::read(&mut stream, buffer.binding());
-                    assert_eq!(actual, weights.assemble(name).unwrap(), "{name}");
+                    check_bytes(name, &actual, &weights.assemble(name).unwrap());
                     if let h3_hrx::weights::Recipe::Rows { segments, .. } =
                         weights.recipe(name).unwrap()
                     {
@@ -394,7 +409,7 @@ fn cold_loading(c: &mut Criterion) {
                         );
                     }
                     let actual = support::read(&mut stream, buffer.binding());
-                    assert_eq!(actual, weights.assemble(tensor).unwrap());
+                    check_bytes(tensor, &actual, &weights.assemble(tensor).unwrap());
                 }
                 elapsed
             });

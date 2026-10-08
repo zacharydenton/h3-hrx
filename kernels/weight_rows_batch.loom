@@ -1,4 +1,4 @@
-// One workgroup row per fragment in a retained storage read. Copy encoded bytes.
+// One workgroup row per fragment: encoded bytes and completed-row zero padding.
 config.decl @h3.weight_rows_batch.row_bytes : %value: index where [range(%value, 1, 2147483647)]
 config.decl @h3.weight_rows_batch.pitch_bytes : %value: index where [range(%value, 1, 2147483647)]
 kernel.def export("h3_weight_rows_batch") @h3_weight_rows_batch(%tiles: index, %parts: index) {
@@ -41,19 +41,34 @@ kernel.def export("h3_weight_rows_batch") @h3_weight_rows_batch(%tiles: index, %
   %i = index.add %base, %lane : index
   %src = buffer.view %input[%zero] : buffer -> view<[%input_size]xi8>
   %dst = buffer.view %output[%zero] : buffer -> view<[%output_size]xi8>
-  %active = index.cmp ult, %i, %count : index
+  %end = index.add %first, %count : index
+  %rows = index.div %end, %row : index
+  %tail = index.rem %end, %row : index
+  %whole = index.mul %rows, %pitch : index
+  %span = index.add %whole, %tail : index
+  %extent = index.sub %span, %first : index
+  %active = index.cmp ult, %i, %extent : index
   scf.if %active {
     %at_raw = index.add %first, %i : index
     %at = index.assume %at_raw [range(%at_raw, 0, 2147483647)] : index
-    %r = index.div %at, %row : index
-    %c = index.rem %at, %row : index
-    %start = index.mul %r, %pitch : index
-    %relative = index.add %start, %c : index
-    %out = index.add %destination, %relative : index
-    %in = index.add %source, %i : index
-    %in_checked = index.assume %in [lt(%in, %input_size)] : index
+    %r = index.div %at, %pitch : index
+    %c = index.rem %at, %pitch : index
+    %out = index.add %destination, %at : index
+    %data = index.cmp ult, %c, %row : index
+    %value = scf.if %data -> (i8) {
+      %start = index.mul %r, %row : index
+      %position = index.add %start, %c : index
+      %relative_raw = index.sub %position, %first : index
+      %relative = index.assume %relative_raw [range(%relative_raw, 0, 2147483647), lt(%relative_raw, %count)] : index
+      %in = index.add %source, %relative : index
+      %in_checked = index.assume %in [lt(%in, %input_size)] : index
+      %byte = view.load %src[%in_checked] : view<[%input_size]xi8> -> i8
+      scf.yield %byte : i8
+    } else {
+      %pad = scalar.constant 0 : i8
+      scf.yield %pad : i8
+    }
     %out_checked = index.assume %out [lt(%out, %output_size)] : index
-    %value = view.load %src[%in_checked] : view<[%input_size]xi8> -> i8
     view.store %value, %dst[%out_checked] : i8, view<[%output_size]xi8>
   }
   kernel.return

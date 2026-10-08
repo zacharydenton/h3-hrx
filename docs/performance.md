@@ -402,6 +402,9 @@ Keep hardware, checkpoints, adapter files, profile, budget and runtime options
 fixed. Defaults are ten samples, one second of warmup and a three-second target
 measurement window; slow cases necessarily exceed that window. Criterion's
 `--sample-size`, `--warm-up-time` and `--measurement-time` control longer runs.
+Benchmarks read Loom sources from their build checkout's `kernels/` directory.
+For alternating kernel comparisons, build in separate worktrees and retain both
+source trees; copying only the executable does not freeze its kernels.
 
 The suite covers the local inference and media pipeline. External prompt/LLM
 services, network downloads, disk-cache eviction and long World save/resume

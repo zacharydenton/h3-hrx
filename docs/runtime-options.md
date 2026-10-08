@@ -163,6 +163,8 @@ Adjacent file fragments share a read and a descriptor-driven GPU gather, keeping
 the read lease alive until the gather completes. Each gather uses a bounded,
 rebased destination view; layouts that exceed its indexing limits use individual
 copies or row gathers.
+Row gathers also zero the padding of every completed row, including rows split
+across reads, so padded tensors do not need a separate full-buffer clear.
 The first bounded set of reads overlaps destination allocation; accepted reads
 retain their slots through completion even if the destination exceeds the budget.
 
