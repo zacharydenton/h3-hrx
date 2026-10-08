@@ -142,10 +142,33 @@ template.def<@h3.shared_conv3d_f16_wmma_add> @h3_body_conv3d_f16_wmma_add(%m_siz
   %h_xs0 = index.mul %h_xo0, %cfg_stride : index
   %h_tb0 = index.mul %h_img0, %cfg_tstride : index
 
+  // Skip only leading causal taps that are zero for every valid row in this
+  // workgroup. The last row also covers tiles spanning a frame boundary.
+  %tile_end = index.add %base_m, %c64 : index
+  %valid_end = index.min %tile_end, %m_bounded : index
+  %last_row = index.sub %valid_end, %c1 : index
+  %last_frame = index.div %last_row, %plane : index
+  %last_time = index.mul %last_frame, %cfg_tstride : index
+  %history = index.min %last_time, %c2 : index
+  %missing_taps = index.sub %c2, %history : index
+  %missing_spatial = index.mul %missing_taps, %c9 : index
+  %missing_k = index.mul %missing_spatial, %cfg_cin_pad : index
+  %missing_tiles = index.div %missing_k, %tile_k : index
+  %causal_start = index.mul %missing_tiles, %tile_k : index
+  %full_history = scalar.ori %is_2d, %symmetric : i1
+  // Dynamic loop bounds favor aligned stride-one encoder planes. Keep fixed
+  // bounds for irregular K layouts, small planes and downsampling.
+  %large_plane = index.cmp uge, %spatial_plane, %c256 : index
+  %stride_one = index.cmp eq, %cfg_stride, %c1 : index
+  %large_stride_one = scalar.andi %large_plane, %stride_one : i1
+  %skip_prefix = scalar.andi %encoder_aligned, %large_stride_one : i1
+  %aligned_start = scf.select %skip_prefix, %causal_start, %c0 : index
+  %k_start = scf.select %full_history, %c0, %aligned_start : index
+
   // The first step's packets, gathered before the loop; every iteration then
   // stores the packets it was handed and gathers the next step's while the
   // WMMA runs on the staged tile.
-  %source_k_first = index.add %c0, %load_k : index
+  %source_k_first = index.add %k_start, %load_k : index
   %row_first = index.add %load_row, %c0 : index
   %source_m_first = index.add %base_m, %row_first : index
   %m_in_range_first = index.cmp ult, %source_m_first, %m_size : index
@@ -241,7 +264,7 @@ template.def<@h3.shared_conv3d_f16_wmma_add> @h3_body_conv3d_f16_wmma_add(%m_siz
   } else {
     scf.yield %zero_packet : vector<[%packet_width]xf16>
   }
-  %acc0, %acc1, %a_values_last, %w_values_last = scf.for %k_base = [%c0 to %k_size step %tile_k](%run0 = %acc_init0 : vector<8xf32>, %run1 = %acc_init1 : vector<8xf32>, %a_cur = %a_values_first : vector<[%packet_width]xf16>, %w_cur = %w_values_first : vector<[%packet_width]xf16>) -> (vector<8xf32>, vector<8xf32>, vector<[%packet_width]xf16>, vector<[%packet_width]xf16>) {
+  %acc0, %acc1, %a_values_last, %w_values_last = scf.for %k_base = [%k_start to %k_size step %tile_k](%run0 = %acc_init0 : vector<8xf32>, %run1 = %acc_init1 : vector<8xf32>, %a_cur = %a_values_first : vector<[%packet_width]xf16>, %w_cur = %w_values_first : vector<[%packet_width]xf16>) -> (vector<8xf32>, vector<8xf32>, vector<[%packet_width]xf16>, vector<[%packet_width]xf16>) {
     vector.store %a_cur, %a_stage_view[%load_row, %load_k] : vector<[%packet_width]xf16>, view<64x[%stage_pitch]xf16>
     vector.store %w_cur, %w_stage_view[%load_row, %load_k] : vector<[%packet_width]xf16>, view<64x[%stage_pitch]xf16>
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
