@@ -17,6 +17,8 @@ pub enum Command {
 }
 #[derive(Args)]
 pub struct Create {
+    #[command(flatten)]
+    runtime: super::runtime::RuntimeArgs,
     /// Image directory (nonrecursive), or image files in the desired order
     #[arg(value_name = "IMAGE_OR_DIR")]
     images: Vec<PathBuf>,
@@ -107,6 +109,7 @@ fn image_paths(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 fn create(args: Create) -> Result<()> {
+    args.runtime.options(None)?;
     let name = args.name.clone().unwrap_or_else(|| {
         args.out
             .file_stem()
@@ -177,7 +180,9 @@ fn create(args: Create) -> Result<()> {
             None => Ok(resolver.find(relative)?),
         }
     };
+    let context = hrx::inference::ModelContext::new(args.runtime.options(None)?)?;
     let config = Config {
+        compiler: args.runtime.compiler(),
         video_vae: if decoded.is_empty() {
             None
         } else {
@@ -193,7 +198,7 @@ fn create(args: Create) -> Result<()> {
         ..Config::default()
     };
     // Safety: this command only reads the checkpoints and never replaces them.
-    let mut session = unsafe { Session::new(config) }?;
+    let mut session = unsafe { Session::new_in(config, Default::default(), &context) }?;
     let images = decoded
         .iter()
         .map(|(pixels, w, h)| ImageInput {

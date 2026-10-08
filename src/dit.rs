@@ -1618,8 +1618,7 @@ impl Dit {
                     &cb.metric,
                     Some(prof),
                     "cache metric",
-                    [groups as u32, 1, 1],
-                    [THREADS, 1, 1],
+                    &[count as u32],
                     &[count as u32],
                     &[
                         seq.x.slice(row0 * HID * 4, count * 4),

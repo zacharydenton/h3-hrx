@@ -357,8 +357,7 @@ impl AdapterRuntime {
             &p.finish,
             Some(prof),
             "adapter finish",
-            [(rows * p.result_width).div_ceil(256) as u32, 1, 1],
-            [THREADS, 1, 1],
+            &[tokens],
             &[tokens],
             &[self.base.binding(), self.delta.binding(), output, gate, cls],
             &[

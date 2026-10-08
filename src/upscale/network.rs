@@ -448,25 +448,17 @@ impl Upscaler {
             &stat,
             Some(p),
             "upscale groupnorm stats",
-            [1, 32, 1],
-            [lanes, 1, 1],
+            &[1],
             &[1],
             &[x.binding(), stats.binding()],
             &[bytes, 256],
         )?;
-        let apply_tile = if rows * self.channels >= 65536 && (self.channels / 32).is_multiple_of(4)
-        {
-            1024
-        } else {
-            256
-        };
         dispatch::checked(
             s,
             &apply,
             Some(p),
             "upscale groupnorm silu",
-            [(rows * self.channels).div_ceil(apply_tile) as u32, 1, 1],
-            [256, 1, 1],
+            &[1],
             &[1],
             &[
                 x.binding(),
@@ -739,18 +731,12 @@ fn pointwise(
         .map(|(k, v)| (format!("h3.{name}.{k}"), v.to_string()))
         .collect();
     let kernel = c.get(s, name, &format!("h3_{name}"), &cfg)?;
-    let tile = if name == "upscale_temporal" {
-        1024
-    } else {
-        256
-    };
     dispatch::checked(
         s,
         &kernel,
         Some(p),
         name,
-        [count.div_ceil(tile) as u32, 1, 1],
-        [256, 1, 1],
+        &[count as u32],
         &[count as u32],
         views,
         sizes,

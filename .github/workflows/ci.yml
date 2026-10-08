@@ -44,13 +44,5 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --no-deps
-      - name: Verify source package against pinned HRX
-        run: |
-          read -r hrx_git hrx_rev < <(
-            cargo metadata --locked --no-deps --format-version 1 |
-              jq -r '.packages[] | select(.name == "h3-hrx") | .dependencies[] | select(.name == "hrx-rs") | .source | ltrimstr("git+") | split("?rev=") | @tsv'
-          )
-          # Cargo packages replace Git dependencies with registry versions.
-          cargo package --locked \
-            --config "patch.crates-io.hrx-rs.git=\"$hrx_git\"" \
-            --config "patch.crates-io.hrx-rs.rev=\"$hrx_rev\""
+      - name: Verify source package against published HRX
+        run: cargo package --locked

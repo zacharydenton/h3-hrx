@@ -91,7 +91,15 @@ fn trim(s: &str) -> String {
 ///
 /// The queue behind it is `hrx::loom::Kernels`, which is where this crate's version of it went.
 #[derive(Clone)]
-pub struct Kernel(hrx::loom::Pending);
+pub struct Kernel {
+    pending: hrx::loom::Pending,
+    launch: Arc<Mutex<LaunchCache>>,
+}
+#[derive(Default)]
+struct LaunchCache {
+    program: Option<hrx::loom::LaunchProgram>,
+    configs: HashMap<([u64; 2], usize), hrx::loom::LaunchConfig>,
+}
 
 impl Kernel {
     /// The loaded kernel, if its batch has already been built.
@@ -99,13 +107,46 @@ impl Kernel {
     /// For callers with no stream to build one on — recording into a graph, which cannot load an
     /// executable. Everywhere else wants [`Kernel::resolve`].
     pub(crate) fn built(&self) -> Option<&hrx::Kernel> {
-        self.0.built()
+        self.pending.built()
+    }
+
+    /// Evaluate the model's explicit workload indices through the artifact's launch program.
+    /// Workload indices are independent of the device's scalar argument ABI.
+    pub(crate) fn launch_config(
+        &self,
+        kernel: &hrx::Kernel,
+        workload: &[u32],
+    ) -> Result<hrx::loom::LaunchConfig> {
+        if workload.len() > 2 {
+            return Err(Error::Io("H3 workloads have at most two indices".into()));
+        }
+        let count = workload.len();
+        let mut bits = [0; 2];
+        for (slot, value) in bits.iter_mut().zip(workload) {
+            *slot = u64::from(*value);
+        }
+        let mut cache = self.launch.lock().expect("launch cache poisoned");
+        if let Some(config) = cache.configs.get(&(bits, count)) {
+            return Ok(*config);
+        }
+        if cache.program.is_none() {
+            cache.program = Some(kernel.launch_program()?);
+        }
+        let config = cache.program.as_mut().unwrap().evaluate(&bits[..count])?;
+        if config.workgroup_cluster_size != [1; 3] {
+            return Err(Error::Io("H3 kernels require ordinary workgroups".into()));
+        }
+        if cache.configs.len() == 256 {
+            cache.configs.clear();
+        }
+        cache.configs.insert((bits, count), config);
+        Ok(config)
     }
 
     /// The loaded kernel, building the outstanding batch if this is the first call that needs it.
     pub(crate) fn resolve(&self, stream: &mut hrx::Stream) -> Result<&hrx::Kernel> {
         // Safety: every requested source is this repository's own, checked in or embedded.
-        Ok(unsafe { self.0.resolve(stream) }?)
+        Ok(unsafe { self.pending.resolve(stream) }?)
     }
 }
 
@@ -120,16 +161,38 @@ fn workers() -> usize {
         .min(8)
 }
 
-#[derive(Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 struct RequestKey {
     stem: String,
     symbol: String,
     config: Cfg,
 }
 
+/// Compiler controls applied to every model in a session.
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    pub workers: Option<std::num::NonZeroUsize>,
+    pub processor_mode: hrx::loom::ProcessorMode,
+    /// Diagnostics use report-only instrumentation; the session rejects reported failures.
+    pub sanitizer: hrx::loom::SanitizerChecks,
+    pub sanitizer_runtime: hrx::fabric::SanitizerRuntimeOptions,
+    /// Explicit destination for compiler reports; no files are emitted by default.
+    pub reports: Option<PathBuf>,
+    /// Explicit destination for bounded text pass traces, including cache-hit recompiles.
+    pub traces: Option<PathBuf>,
+}
+impl Options {
+    pub fn sanitized(&self) -> bool {
+        self.sanitizer != hrx::loom::SanitizerChecks::default()
+    }
+}
+
 /// Model-specific source selection and pending requests. HRX owns compilation,
 /// artifact integrity and the loaded executable cache.
 pub struct Compiler {
+    requested: Mutex<HashMap<(usize, RequestKey), Kernel>>,
+    options: Options,
+    instrumented: Mutex<Vec<hrx::loom::Pending>>,
     library: Option<PathBuf>,
     sources: PathBuf,
     reports: Option<PathBuf>,
@@ -139,10 +202,23 @@ pub struct Compiler {
 }
 impl Compiler {
     pub fn new(library: Option<PathBuf>, sources: impl Into<PathBuf>) -> Self {
+        Self::with_options(library, sources, Options::default())
+    }
+    pub fn with_options(
+        library: Option<PathBuf>,
+        sources: impl Into<PathBuf>,
+        options: Options,
+    ) -> Self {
         Self {
+            reports: options
+                .reports
+                .clone()
+                .or_else(|| std::env::var_os("H3_COMPILE_REPORT_DIR").map(PathBuf::from)),
+            options,
+            instrumented: Mutex::new(Vec::new()),
+            requested: Mutex::new(HashMap::new()),
             library,
             sources: sources.into(),
-            reports: std::env::var_os("H3_COMPILE_REPORT_DIR").map(PathBuf::from),
             source_cache: Mutex::new(HashMap::new()),
             kernels: OnceLock::new(),
         }
@@ -171,7 +247,19 @@ impl Compiler {
         }
         let options = hrx::loom::CompilerOptions {
             target: target.cloned().unwrap_or_default(),
-            workers: std::num::NonZeroUsize::new(workers()).expect("at least one worker"),
+            workers: self
+                .options
+                .workers
+                .unwrap_or_else(|| std::num::NonZeroUsize::new(workers()).unwrap()),
+            processor_mode: self.options.processor_mode,
+            sanitizer: hrx::loom::SanitizerOptions {
+                checks: self.options.sanitizer,
+                reporting: if self.options.sanitized() {
+                    hrx::loom::SanitizerReporting::ReportOnly
+                } else {
+                    hrx::loom::SanitizerReporting::Default
+                },
+            },
             ..Default::default()
         };
         let compiler = hrx::loom::Compiler::shared(self.library.as_deref(), options)?;
@@ -240,6 +328,12 @@ impl Compiler {
             symbol: symbol.into(),
             config: canonical,
         };
+        self.kernels(Some(stream.target()))?;
+        let mut requested = self.requested.lock().expect("request cache poisoned");
+        let cache_key = (stream.id(), key.clone());
+        if let Some(kernel) = requested.get(&cache_key) {
+            return Ok(kernel.clone());
+        }
         // Sources are immutable within this Compiler. Equal keys include every
         // specialization input; hits skip source lookup and hashing entirely.
         let pending = unsafe {
@@ -250,6 +344,26 @@ impl Compiler {
                         .map_err(|e| hrx::Error::Message(e.to_string()))?;
                     let mut spec = hrx::loom::Specialization::new(&key.symbol);
                     spec.replace_config(key.config.iter().cloned().collect());
+                    if let Some(directory) = &self.options.traces {
+                        let compiler = self
+                            .kernels(Some(stream.target()))
+                            .map_err(|e| hrx::Error::Message(e.to_string()))?
+                            .kernels()
+                            .compiler();
+                        let module = compiler.module(&source);
+                        std::fs::create_dir_all(directory)?;
+                        let path =
+                            directory.join(format!("{}-{}.txt", key.symbol, module.key(&spec)?));
+                        let mut file = File::create(path)?;
+                        module.compile_traced(
+                            &spec,
+                            &hrx::loom::TraceOptions {
+                                format: hrx::loom::TraceFormat::Text,
+                                ..Default::default()
+                            },
+                            &mut file,
+                        )?;
+                    }
                     if let Some(directory) = &self.reports {
                         let compiler = self
                             .kernels(Some(stream.target()))
@@ -274,6 +388,8 @@ impl Compiler {
                             "resources": report.entries()?, "wait_reasons": report.wait_reasons()?,
                             "guidance": report.guidance()?, "diagnostics": artifact.diagnostics(),
                             "report": report,
+                            "manifest": artifact.manifest(),
+                            "expansions": report.expansions()?,
                         });
                         let path = directory.join(format!(
                             "{}-{}.json",
@@ -289,7 +405,56 @@ impl Compiler {
                     Ok((source, spec))
                 })
         }?;
-        Ok(Kernel(pending))
+        if self.options.sanitized() {
+            self.instrumented
+                .lock()
+                .expect("diagnostic list poisoned")
+                .push(pending.clone());
+        }
+        let kernel = Kernel {
+            pending,
+            launch: Arc::new(Mutex::new(LaunchCache::default())),
+        };
+        requested.insert(cache_key, kernel.clone());
+        Ok(kernel)
+    }
+
+    /// Drain diagnostics only after all stream work has retired. Fail closed when
+    /// feedback overflowed; a truncated report set is still an invalid result.
+    pub(crate) fn check_sanitizers(&self, stream: &mut hrx::Stream) -> Result<()> {
+        if !self.options.sanitized() {
+            return Ok(());
+        }
+        stream.synchronize()?;
+        let mut failures = Vec::new();
+        for pending in self
+            .instrumented
+            .lock()
+            .expect("diagnostic list poisoned")
+            .iter()
+        {
+            if let Some(kernel) = pending.built() {
+                match kernel.sanitizer_reports() {
+                    Ok(reports) if !reports.reports.is_empty() || reports.dropped != 0 => failures
+                        .push(format!(
+                            "{}: {:?}; dropped {}",
+                            kernel.symbol(),
+                            reports.reports,
+                            reports.dropped
+                        )),
+                    Ok(_) | Err(hrx::Error::Unsupported(_)) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Io(format!(
+                "kernel sanitizer failure: {}",
+                failures.join("\n")
+            )))
+        }
     }
 
     /// Build every kernel asked for so far.
@@ -466,5 +631,189 @@ mod tests {
         let c = Compiler::new(Some(PathBuf::from("definitely-not-on-path-h3")), &sources);
         let message = c.tag("k", "s", &vec![]).unwrap_err().to_string();
         assert!(message.contains("definitely-not-on-path-h3"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    #[test]
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires Loom and gfx1151")]
+    fn aql_sanitizers_cover_eager_and_recorded_h3_dispatch() -> Result<()> {
+        let options = Options {
+            sanitizer: hrx::loom::SanitizerChecks {
+                access: true,
+                value: true,
+                operation: true,
+                race: true,
+            },
+            ..Default::default()
+        };
+        let mut stream = hrx::Device::open(0)?.stream_with_options(hrx::StreamOptions {
+            compute_engine: hrx::execution::ComputeEngine::Aql {
+                maximum_private_bytes: 4096,
+            },
+            sanitizer: Some(options.sanitizer_runtime.clone()),
+            ..Default::default()
+        })?;
+        let compiler = Compiler::with_options(None, PathBuf::new(), options);
+        let config = vec![
+            ("h3.axpy_f32.a".into(), "2".into()),
+            ("h3.axpy_f32.b".into(), "1".into()),
+        ];
+        let k = compiler.get(&mut stream, "axpy_f32", "h3_axpy_f32", &config)?;
+        let x = stream.allocate_from(bytemuck::cast_slice(&[3f32; 65]))?;
+        let y = stream.allocate_from(bytemuck::cast_slice(&[1f32; 65]))?;
+        crate::dispatch::checked(
+            &mut stream,
+            &k,
+            None,
+            "axpy",
+            &[65],
+            &[65],
+            &[x.binding(), y.binding()],
+            &[260, 260],
+        )?;
+        compiler.check_sanitizers(&mut stream)?;
+        let mut graph = stream.owned_graph()?;
+        crate::dispatch::emit(
+            &mut crate::dispatch::Sink::Graph {
+                graph: &mut graph,
+                after: Default::default(),
+            },
+            &k,
+            None,
+            "axpy",
+            &[65],
+            &[65],
+            &[x.binding(), y.binding()],
+            &[260, 260],
+        )?;
+        let mut graph = graph.finish()?;
+        for _ in 0..2 {
+            stream.launch(&mut graph)?;
+            compiler.check_sanitizers(&mut stream)?;
+        }
+        let mut output = [0f32; 65];
+        stream.read_blocking(y.binding(), bytemuck::cast_slice_mut(&mut output))?;
+        assert_eq!(output, [19.; 65]);
+        // Warm requests retain the same launch evaluator and workload cache.
+        let again = compiler.get(&mut stream, "axpy_f32", "h3_axpy_f32", &config)?;
+        assert!(Arc::ptr_eq(&k.launch, &again.launch));
+        Ok(())
+    }
+
+    #[test]
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires Loom and gfx1151")]
+    fn reported_address_assertions_fail_the_stage_and_are_drained() -> Result<()> {
+        let source = r#"
+amdgpu.target<gfx1151> @target {subgroup_size = 32}
+kernel.def target(@target) @h3_axpy_f32(%count: index) {
+  %one = index.constant 1 : index
+  %threads = index.constant 64 : index
+  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%count: index, %input: buffer) {
+  %zero = index.constant 0 : offset
+  %lane = kernel.workitem.id<x> : index
+  %global = buffer.assume.memory_space<global> %input : buffer
+  %view = buffer.view %global[%zero] : buffer -> view<64xi8>
+  sanitizer.assert.access<read> %view[%lane] : view<64xi8>
+  kernel.return
+}
+"#;
+        let directory = tempfile::tempdir().unwrap();
+        write(&directory.path().join("axpy_f32.loom"), source.as_bytes()).unwrap();
+        let options = Options {
+            sanitizer: hrx::loom::SanitizerChecks {
+                access: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut stream = hrx::Device::open(0)?.stream_with_options(hrx::StreamOptions {
+            compute_engine: hrx::execution::ComputeEngine::Aql {
+                maximum_private_bytes: 0,
+            },
+            sanitizer: Some(options.sanitizer_runtime.clone()),
+            ..Default::default()
+        })?;
+        let compiler = Compiler::with_options(None, directory.path(), options);
+        let kernel = compiler.get(&mut stream, "axpy_f32", "h3_axpy_f32", &vec![])?;
+        let input = stream.allocate(32)?;
+        // The kernel only asserts addresses; it never dereferences invalid bytes.
+        crate::dispatch::checked(
+            &mut stream,
+            &kernel,
+            None,
+            "assert",
+            &[64],
+            &[64],
+            &[input.binding()],
+            &[32],
+        )?;
+        let error = compiler
+            .check_sanitizers(&mut stream)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("InvalidAccess"), "{error}");
+        compiler.check_sanitizers(&mut stream)?;
+        Ok(())
+    }
+    #[test]
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires Loom and gfx1151")]
+    fn processor_modes_and_requested_compiler_diagnostics_are_applied() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let mut stream = hrx::Stream::open()?;
+        let x = stream.allocate_from(bytemuck::cast_slice(&[3f32; 1]))?;
+        let y = stream.allocate(4)?;
+        let config = vec![
+            ("h3.axpy_f32.a".into(), "2".into()),
+            ("h3.axpy_f32.b".into(), "1".into()),
+        ];
+        let mut keys = std::collections::HashSet::new();
+        for mode in [
+            hrx::loom::ProcessorMode::Default,
+            hrx::loom::ProcessorMode::ComputeUnit,
+            hrx::loom::ProcessorMode::WorkgroupProcessor,
+        ] {
+            let compiler = Compiler::with_options(
+                None,
+                PathBuf::new(),
+                Options {
+                    processor_mode: mode,
+                    workers: std::num::NonZeroUsize::new(2),
+                    reports: Some(directory.path().join("reports")),
+                    traces: Some(directory.path().join("traces")),
+                    ..Default::default()
+                },
+            );
+            stream.fill(y.binding(), 0)?;
+            let k = compiler.get(&mut stream, "axpy_f32", "h3_axpy_f32", &config)?;
+            assert!(keys.insert(compiler.tag("axpy_f32", "h3_axpy_f32", &config)?));
+            crate::dispatch::checked(
+                &mut stream,
+                &k,
+                None,
+                "mode",
+                &[1],
+                &[1],
+                &[x.binding(), y.binding()],
+                &[4, 4],
+            )?;
+            let mut output = [0f32; 1];
+            stream.read_blocking(y.binding(), bytemuck::cast_slice_mut(&mut output))?;
+            assert_eq!(output, [6.]);
+        }
+        for name in ["reports", "traces"] {
+            let files: Vec<_> = std::fs::read_dir(directory.path().join(name))
+                .unwrap()
+                .collect();
+            assert_eq!(files.len(), 3);
+            for file in files {
+                assert!(file.unwrap().metadata().unwrap().len() > 0);
+            }
+        }
+        Ok(())
     }
 }

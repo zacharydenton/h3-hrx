@@ -56,6 +56,8 @@ pub struct Config {
     /// Empty selects the sources embedded in this model package.
     pub kernel_sources: std::path::PathBuf,
     pub loom_library: Option<std::path::PathBuf>,
+    /// Compilation modes and optional bounded runtime diagnostics.
+    pub compiler: crate::compile::Options,
     /// the DiT attention's QK operands
     pub attention: crate::dit::Attention,
 }
@@ -74,6 +76,7 @@ impl Default for Config {
             loras: Vec::new(),
             kernel_sources: std::path::PathBuf::new(),
             loom_library: None,
+            compiler: Default::default(),
             attention: crate::dit::Attention::default(),
         }
     }
@@ -212,7 +215,13 @@ impl Session {
         // SAFETY: stages use only State's private stream/owners; synchronous host
         // outputs never expose device pointers. NativeSession fences on success,
         // errors and panic, retaining all owners if completion is uncertain.
-        unsafe { self.native.run(stage) }?
+        unsafe {
+            self.native.run(|state| {
+                let result = stage(state);
+                state.compiler.check_sanitizers(&mut state.stream)?;
+                result
+            })
+        }?
     }
 
     /// Shared scheduling and allocation domain. Native bytes appear in the
@@ -585,7 +594,11 @@ impl State {
     ) -> Result<Self> {
         // An empty `kernel_sources` selects the sources embedded in this package. Compiled
         // artifacts go wherever HRX keeps them, which is one cache per user for every consumer.
-        let compiler = Compiler::new(config.loom_library.clone(), config.kernel_sources.clone());
+        let compiler = Compiler::with_options(
+            config.loom_library.clone(),
+            config.kernel_sources.clone(),
+            config.compiler.clone(),
+        );
         let units = if options.residency == ResidencyPolicy::Budgeted {
             let manager = context
                 .runtime()
@@ -600,10 +613,12 @@ impl State {
         } else {
             None
         };
-        let mut stream = hrx::Device::open(context.runtime().gpu()?.index())?.stream()?;
-        if let Some(budget) = context.runtime().memory_budget() {
-            stream = stream.with_memory_budget(budget.clone());
-        }
+        let stream = context.runtime().stream(
+            config
+                .compiler
+                .sanitized()
+                .then(|| config.compiler.sanitizer_runtime.clone()),
+        )?;
         Ok(Self {
             stream,
             compiler,
@@ -1461,6 +1476,7 @@ mod tests {
             latent_upscaler: None,
             kernel_sources: "kernels".into(),
             loom_library: None,
+            compiler: Default::default(),
             attention,
         }
     }

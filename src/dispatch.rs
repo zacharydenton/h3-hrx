@@ -1,8 +1,8 @@
 //! The kernel builders the stacks dispatch through: the prepare family that produces a GEMM's A
 //! operand, and the GEMM family itself.
 //!
-//! Each one decides its stem, its configuration and its launch geometry from the shape it is built
-//! for. Those decisions are the ones `model.rs` holds, so the operand a plan laid out and the operand a
+//! Each one decides its stem, configuration and workload indices from the model shape.
+//! The compiler supplies launch geometry. Those decisions are the ones `model.rs` holds, so the operand a plan laid out and the operand a
 //! kernel reads agree on their pitch.
 use crate::compile::{num, Cfg, Compiler};
 use crate::model::*;
@@ -144,8 +144,7 @@ pub(crate) fn checked(
     kernel: &crate::compile::Kernel,
     profile: Option<&mut Profile>,
     stage: &str,
-    grid: [u32; 3],
-    block: [u32; 3],
+    workload: &[u32],
     scalars: &[u32],
     bindings: &[View<'_>],
     required: &[usize],
@@ -155,8 +154,7 @@ pub(crate) fn checked(
         kernel,
         profile,
         stage,
-        grid,
-        block,
+        workload,
         scalars,
         bindings,
         required,
@@ -234,23 +232,25 @@ pub(crate) fn graph_enabled(profile: &Profile) -> bool {
 }
 
 /// A launch whose bindings have been checked, sent wherever `sink` says.
+/// `workload` supplies the launch function's indices; `scalars` supplies the device
+/// entry's indices. Attention, for example, uses `[tokens, heads]` for its workload
+/// and `[tokens]` for its device arguments. Geometry comes only from the artifact.
 #[allow(clippy::too_many_arguments)]
 pub fn emit<'g>(
     sink: &mut Sink<'_, 'g>,
     kernel: &'g crate::compile::Kernel,
     profile: Option<&mut Profile>,
     stage: &str,
-    grid: [u32; 3],
-    block: [u32; 3],
+    workload: &[u32],
     scalars: &[u32],
     bindings: &[View<'g>],
     required: &[usize],
 ) -> Result<()> {
-    debug_assert_eq!(
-        bindings.len(),
-        required.len(),
-        "{stage}: a bound per binding"
-    );
+    if bindings.len() != required.len() {
+        return Err(crate::compile::Error::Io(format!(
+            "{stage}: expected a bound for every binding"
+        )));
+    }
     for (i, (view, need)) in bindings.iter().zip(required).enumerate() {
         if view.len() < *need {
             return Err(crate::compile::Error::Io(format!(
@@ -263,10 +263,13 @@ pub fn emit<'g>(
         Sink::Stream(stream) => {
             // The kernel is built here if its batch has not been built already, which is what makes
             // the handle safe to hold: nothing can dispatch one that was never compiled.
-            let kernel = kernel.resolve(stream)?;
+            let loaded = kernel.resolve(stream)?;
+            let config = kernel.launch_config(loaded, workload)?;
+            let (grid, block) = (config.workgroup_count, config.workgroup_size);
+            let kernel = loaded;
             // Safety: every binding is at least as long as the extent this kernel was compiled to
-            // address, checked immediately above, and the grid, block and scalars come from the same
-            // builder that compiled it.
+            // address, checked immediately above. The compiler evaluates geometry from the
+            // model workload; the builder supplies declaration-order scalar arguments.
             unsafe {
                 launch(
                     stream, kernel, profile, stage, grid, block, scalars, bindings,
@@ -276,12 +279,15 @@ pub fn emit<'g>(
         Sink::Graph { graph, after } => {
             // Recording cannot build a kernel: there is no stream to load it onto. A recording is
             // therefore made after the same work has run once, which is what leaves them all built.
-            let kernel = kernel.built().ok_or_else(|| {
+            let loaded = kernel.built().ok_or_else(|| {
                 crate::compile::Error::Io(format!("{stage}: recorded before its kernel was built"))
             })?;
+            let config = kernel.launch_config(loaded, workload)?;
+            let (grid, block) = (config.workgroup_count, config.workgroup_size);
+            let kernel = loaded;
             let constants = hrx::Constants::indices(kernel, scalars)?;
-            // Safety: as the eager arm — the bindings are checked above and the geometry is the
-            // builder's own. Fixed for every replay, which is what the caller records for.
+            // Safety: as the eager arm, with compiler-authored geometry and checked bindings.
+            // Workload, scalar arguments and addresses stay fixed for every replay.
             let node = unsafe {
                 graph.dispatch(after.as_slice(), kernel, grid, block, &constants, bindings)?
             };
@@ -472,7 +478,6 @@ impl ActivationType {
 /// write rows and nothing else.
 pub struct Prepare {
     kernel: crate::compile::Kernel,
-    lanes: usize,
     form: String,
     input_type: ActivationType,
     elem: String,
@@ -598,7 +603,6 @@ impl Prepare {
         let kernel = c.get(stream, &module, &format!("h3_{stem}"), &cfg)?;
         Ok(Self {
             kernel,
-            lanes,
             form: form.into(),
             input_type,
             elem: elem.into(),
@@ -668,8 +672,7 @@ impl Prepare {
             &self.kernel,
             profile,
             stage,
-            [tokens, 1, 1],
-            [self.lanes as u32, 1, 1],
+            &[tokens],
             &[tokens],
             args.views(),
             args.need(),
@@ -685,9 +688,6 @@ pub struct Gemm {
     bias: bool,
     elem: String,
     m_group: u32,
-    m_tile: usize,
-    n_tile: usize,
-    threads: u32,
     /// the extents the kernel was compiled from, kept so `run` can bound its bindings. The output
     /// is narrower than N in the SwiGLU forms, where the gate consumes half the columns, and it is
     /// its storage width follows the explicitly selected output type.
@@ -803,9 +803,6 @@ impl Gemm {
                 "decoder GEMM requires the biased f16 family and N divisible by 256".into(),
             ));
         }
-        let m_tile = if fast { 128 } else { 256 };
-        let n_tile = if wide || fast { 256 } else { 128 };
-        let threads = if wide { 512 } else { THREADS };
         let m_group = if fast {
             vae_fast_m_group_for(tokens, k_size, n_size)
         } else {
@@ -872,9 +869,6 @@ impl Gemm {
             bias,
             elem: elem.into(),
             m_group,
-            m_tile,
-            n_tile,
-            threads,
             k_stride: if k_stride != 0 { k_stride } else { k_size },
             classes,
             out_width,
@@ -952,12 +946,7 @@ impl Gemm {
             &self.kernel,
             profile,
             stage,
-            [
-                (self.n / self.n_tile) as u32,
-                gemm_grid_y(t, self.m_group, self.m_tile),
-                1,
-            ],
-            [self.threads, 1, 1],
+            &[tokens],
             &[tokens],
             args.views(),
             args.need(),
@@ -1105,8 +1094,7 @@ impl Conv3d {
             &self.kernel,
             profile,
             stage,
-            [(self.cout_pad / 64) as u32, m.div_ceil(64) as u32, 1],
-            [256, 1, 1],
+            &[m as u32],
             &[m as u32],
             args.views(),
             args.need(),
@@ -1119,7 +1107,6 @@ impl Conv3d {
 /// The split is not an optimisation detail — the statistics are over a whole (frame, group) plane, so
 /// they have to land before any element is scaled.
 pub struct GroupNormSilu {
-    apply_tile: usize,
     stats: crate::compile::Kernel,
     silu: crate::compile::Kernel,
     frames: usize,
@@ -1154,11 +1141,6 @@ impl GroupNormSilu {
             (format!("{na}eps"), num(1e-6)),
         ];
         Ok(Self {
-            apply_tile: if (channels / 32).is_multiple_of(4) {
-                1024
-            } else {
-                256
-            },
             stats: c.get(stream, "gn_stats_f16", "h3_gn_stats_f16", &stats_cfg)?,
             silu: c.get(stream, "gn_silu_f16", "h3_gn_silu_f16", &silu_cfg)?,
             frames,
@@ -1187,8 +1169,7 @@ impl GroupNormSilu {
             &self.stats,
             profile.as_deref_mut(),
             stage,
-            [self.frames as u32, 32, 1],
-            [32, 1, 1],
+            &[self.frames as u32],
             &[self.frames as u32],
             &[x, stats],
             &[plane, stats_bytes],
@@ -1198,12 +1179,7 @@ impl GroupNormSilu {
             &self.silu,
             profile,
             stage,
-            [
-                (self.rows * self.channels).div_ceil(self.apply_tile) as u32,
-                1,
-                1,
-            ],
-            [256, 1, 1],
+            &[self.frames as u32],
             &[self.frames as u32],
             &[x, stats, gamma, beta, out],
             &[
@@ -1261,8 +1237,7 @@ impl Matmul {
             &self.kernel,
             profile,
             stage,
-            [(self.n_size / 64) as u32, rows.div_ceil(64) as u32, 1],
-            [256, 1, 1],
+            &[rows as u32],
             &[rows as u32],
             &[a, w, b, out],
             &[
@@ -1346,8 +1321,7 @@ impl MatmulF32 {
             &self.kernel,
             profile,
             stage,
-            [self.n.div_ceil(256) as u32, m as u32, 1],
-            [THREADS, 1, 1],
+            &[m as u32],
             &[m as u32],
             &[x, w, b, out],
             &[
@@ -1385,8 +1359,7 @@ pub fn axpy(
         &kernel,
         profile,
         stage,
-        [count.div_ceil(256) as u32, 1, 1],
-        [THREADS, 1, 1],
+        &[count as u32],
         &[count as u32],
         &[x, y],
         &[count * 4, count * 4],
@@ -1472,8 +1445,7 @@ impl Matmul16 {
             &self.kernel,
             profile,
             stage,
-            [(self.n / 64) as u32, m.div_ceil(64) as u32, 1],
-            [256, 1, 1],
+            &[m as u32],
             &[m as u32],
             args.views(),
             args.need(),
@@ -1488,7 +1460,6 @@ impl Matmul16 {
 pub struct NormMod {
     kernel: crate::compile::Kernel,
     width: usize,
-    lanes: usize,
     classes: usize,
 }
 
@@ -1513,7 +1484,6 @@ impl NormMod {
         Ok(Self {
             kernel: c.get(stream, "norm_mod_f32", "h3_norm_mod_f32", &cfg)?,
             width,
-            lanes,
             classes,
         })
     }
@@ -1535,8 +1505,7 @@ impl NormMod {
             &self.kernel,
             profile,
             stage,
-            [rows as u32, 1, 1],
-            [self.lanes as u32, 1, 1],
+            &[rows as u32],
             &[rows as u32],
             &[x, weight, table, cls.against(stage, rows, self.classes)?],
             &[
@@ -1584,8 +1553,7 @@ impl LayerNorm16 {
             &self.kernel,
             profile,
             "vision layernorm",
-            [rows as u32, 1, 1],
-            [32, 1, 1],
+            &[rows as u32],
             &[rows as u32],
             &[x16, w, b, out32],
             &[

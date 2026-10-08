@@ -1,11 +1,11 @@
 # Shared HRX integration
 
 H3 uses `hrx-rs` for native loading, allocation, dispatch, graphs, compilation and
-artifact caching. `Cargo.toml` pins commit `8f0e084` for direct weight initialization,
-which is newer than the 0.8.16 release. Model code owns tensor
+artifact caching. H3 uses the published HRX 0.9.0 crate.
+Model code owns tensor
 layouts, source selection and numerical behavior; `Session` is the public API.
 H3 does not enable HRX's optional NPU feature.
-Consumers sharing HRX contexts should use the same Git revision.
+Consumers sharing HRX contexts must resolve the same HRX crate instance.
 
 ## Provisioning and overrides
 
@@ -24,16 +24,14 @@ Caches live under `$XDG_CACHE_HOME/hrx`, or `~/.cache/hrx` when unset.
 `hrx gc [DAYS]` removes obsolete bundles and kernels unused for that many days
 (default 30). Cache hits refresh last-use timestamps.
 
-For local HRX development, add this patch to `.cargo/config.toml`:
+For local HRX development, override the registry dependency without changing the
+manifest or committing a local lockfile:
 
-```toml
-[patch."https://github.com/zacharydenton/hrx-rs"]
-hrx-rs = { path = "../hrx-rs" }
+```sh
+cargo check --config 'patch.crates-io.hrx-rs.path="../hrx-rs"'
 ```
 
-Restore the pinned dependency before committing lockfiles. HRX's
-`scripts/check-consumers.py` tests committed consumer snapshots against a
-candidate checkout.
+CI and package verification use the published dependency recorded in `Cargo.lock`.
 
 ## Compilation and dispatch
 
@@ -44,8 +42,17 @@ target.
 
 Kernel requests are batched until `Compiler::flush` or the first launch.
 HRX owns parallel compilation and verifies cached artifacts. Cache identity
-covers compiler, source, export, target and configuration. Warm requests reuse
-prepared exports and bindings.
+covers compiler, source, export, target, processor mode, sanitizer settings and configuration. Warm requests reuse
+prepared exports and bindings. H3 evaluates the artifact's native launch function
+for each distinct workload and caches the result; eager and graph dispatch use
+the same compiler-authored workgroup dimensions. Model code supplies workload
+indices and verifies tensor extents.
+
+`Config::compiler` controls worker count, CU/WGP scheduling, sanitizer classes,
+and optional report/trace destinations. Reports include the native manifest,
+resource guidance and source expansions. Pass traces use bounded text output and
+force a fresh compilation even for a cached specialization. Diagnostic output is
+opt-in; put it under `target/` or outside the checkout.
 
 Weights use HRX's `allocate_from` to initialize and publish owned GPU buffers
 directly. Repacking uses at most 256 MiB of temporary host storage for row recipes;
@@ -64,7 +71,11 @@ block 0 and its metric run eagerly; the host chooses between replaying blocks
 
 `H3_PROFILE` and `H3_DUMP_BLOCKS` select eager execution even after a graph is
 cached. Replacing sequence/block storage or a VAE grid invalidates the associated
-recordings. A model and its graphs remain bound to their creating stream.
+recordings. A model and its graphs remain bound to their creating stream. The stream inherits
+the context's compute and copy engines as well as its GPU and memory budget.
+PM4 retains native graph batching. AQL and SDMA replay prepared commands in order;
+engine transitions wait for completion on the host. Device-clock graph profiling
+requires PM4 with compute copies; host profiling works with either engine.
 
 Addresses, constants and launch geometry are fixed at recording time; tensor
 contents can change in the same allocations. Dependencies order scratch reuse.
@@ -84,3 +95,11 @@ cancellation, eviction and callback constraints.
 [Rustler](../clients/README.md) workers own their sessions and accept jobs through
 a bounded queue. The Python parity tools invoke an ignored Rust fixture test; neither
 integration adds a Python or Rustler dependency to the inference library.
+
+## Model-specific engine boundaries
+
+H3 keeps immutable checkpoint mappings and directly initializes repacked weights
+through HRX. GPU-authored storage rings do not replace these model-aware packing
+recipes or provide automatic weight paging. Likewise, resident XDNA sessions
+require NPU kernels and tensor layouts that H3 does not currently provide. H3 does
+not expose storage-ring or NPU switches that would leave inference unchanged.

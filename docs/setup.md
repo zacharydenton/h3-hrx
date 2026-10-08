@@ -17,6 +17,8 @@ Allow memory for activations and staging as well as model weights.
 
 ## Toolchain and build
 
+HRX 0.9.0 resolves from crates.io; a sibling source checkout is unnecessary.
+
 ```sh
 cargo build --locked --release --bin h3
 # Or install onto Cargo's binary path:
@@ -27,7 +29,7 @@ The first GPU operation downloads and verifies HRX's pinned native bundle.
 To provision it ahead of time using the version in `Cargo.lock`:
 
 ```sh
-cargo install --locked --git https://github.com/zacharydenton/hrx-rs --rev 8f0e084a9efd69ec0045b5cd7d032852d048195d hrx-rs
+cargo install --locked hrx-rs --version 0.9.0
 hrx prepare
 hrx doctor
 ```

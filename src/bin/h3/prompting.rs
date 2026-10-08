@@ -244,6 +244,7 @@ pub fn refmod_entries(
         })
     };
     let config = Config {
+        compiler: cli.runtime.compiler(),
         video_vae: if visual {
             Some(resolve(&cli.video_vae, h3_hrx::models::VIDEO_VAE)?)
         } else {
@@ -265,10 +266,9 @@ pub fn refmod_entries(
     let budget = super::memory_budget_bytes(cli)?
         .map(hrx::residency::ResidencyManager::new)
         .transpose()?;
-    let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
-        memory_budget: budget.as_ref().map(|b| b.budget()),
-        ..Default::default()
-    })?;
+    let context = hrx::inference::ModelContext::new(
+        cli.runtime.options(budget.as_ref().map(|b| b.budget()))?,
+    )?;
     // The CLI never modifies the VAE files during this session.
     let mut session = unsafe {
         Session::new_in(

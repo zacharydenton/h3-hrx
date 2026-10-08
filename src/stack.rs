@@ -181,7 +181,6 @@ pub struct Stack {
     gemm_down: Gemm,
 
     qkv_rope: Option<crate::compile::Kernel>,
-    qkv_group: u32,
     rope: Option<crate::compile::Kernel>,
     attention: crate::compile::Kernel,
     world_attention: Option<(crate::compile::Kernel, hrx::Buffer)>,
@@ -395,9 +394,9 @@ impl Stack {
             && d.kv_heads == 32
             && d.head_dim == 64
             && d.rope_dim == 48;
-        let (mut qkv_rope, mut qkv_group, mut gemm_qkv) = (None, 1u32, None);
+        let (mut qkv_rope, mut gemm_qkv) = (None, None);
         if fused_qkv {
-            qkv_group = vae_fast_m_group_for(tokens, d.hidden, 3 * d.hidden);
+            let qkv_group = vae_fast_m_group_for(tokens, d.hidden, 3 * d.hidden);
             let stem = "gemm_f16_qkvropehm_256b";
             let ns = format!("h3.{stem}.");
             qkv_rope = Some(c.get(
@@ -784,7 +783,6 @@ impl Stack {
             gemm_out,
             gemm_down,
             qkv_rope,
-            qkv_group,
             rope,
             attention,
             world_attention: None,
@@ -1036,12 +1034,7 @@ impl Stack {
                     kernel,
                     Some(prof),
                     "gemm qkv + rope",
-                    [
-                        (self.d.qkv() / 256) as u32,
-                        gemm_grid_y(self.tokens, self.qkv_group, 128),
-                        1,
-                    ],
-                    [THREADS, 1, 1],
+                    &[t],
                     &[t],
                     &[
                         self.a_q.binding(),
@@ -1104,8 +1097,7 @@ impl Stack {
                         self.rope.as_ref().expect("built when not fused"),
                         Some(prof),
                         "qk norm + rope",
-                        [t, 1, 1],
-                        [THREADS, 1, 1],
+                        &[t],
                         &[t],
                         &[self.fused.binding(), qnorm, knorm, cos, sin, q, k, v],
                         &[
@@ -1324,8 +1316,7 @@ impl Stack {
                 kernel,
                 Some(prof),
                 "fused attention operands",
-                [t, 1, 1],
-                [THREADS, 1, 1],
+                &[t],
                 &[t],
                 &[self.fused.binding(), weight, cos, sin, codes, scales],
                 &[
@@ -1340,23 +1331,12 @@ impl Stack {
             ends[i] = sink.head();
         }
         sink.resume(before);
-        let tile = transpose_qkv_tile(self.d.inner());
         emit(
             sink,
             self.transpose.as_ref().unwrap(),
             Some(prof),
             "fused V transpose",
-            [
-                (self.d.inner() / tile) as u32,
-                // Projection scratch may contain NaNs in the masked tail.
-                if iq.vt.is_none() {
-                    self.capacity.div_ceil(tile) as u32
-                } else {
-                    t.div_ceil(tile as u32)
-                },
-                1,
-            ],
-            [THREADS, 1, 1],
+            &[t],
             &[t],
             &[self.fused.binding(), self.vt_view(iq)],
             &[rows * self.d.qkv() * 2, self.d.inner() * self.capacity * 2],
@@ -1427,31 +1407,24 @@ impl Stack {
         k: View<'g>,
         v: View<'g>,
     ) -> Result<()> {
-        let query_block = 16 * self.waves as u32;
         // every operand here is one of the capacity-sized allocations made in `build`, at the same
         // stride the kernel was compiled with
         let cap = self.capacity;
         let rows = t as usize;
         let out = rows * self.attn_width * 2;
         let Some(int_qk) = &self.int_qk else {
-            let grid = if self.d.causal {
-                [t.div_ceil(16), self.d.kv_heads as u32, 1]
+            let heads = if self.d.causal {
+                self.d.kv_heads
             } else {
-                [t.div_ceil(query_block), self.d.heads as u32, 1]
-            };
-            let block = if self.d.causal {
-                [THREADS, 1, 1]
-            } else {
-                [32 * self.waves as u32, 1, 1]
-            };
+                self.d.heads
+            } as u32;
             if let Some((kernel, routing)) = &self.world_attention {
                 return emit(
                     sink,
                     kernel,
                     Some(prof),
                     "world attention",
-                    grid,
-                    block,
+                    &[t, heads],
                     &[t],
                     &[q, k, v, self.attn.binding(), routing.binding()],
                     &[
@@ -1468,8 +1441,7 @@ impl Stack {
                 &self.attention,
                 Some(prof),
                 "attention",
-                grid,
-                block,
+                &[t, heads],
                 &[t],
                 &[q, k, v, self.attn.binding()],
                 &[
@@ -1491,8 +1463,7 @@ impl Stack {
                     self.colmean.as_ref().expect("built with integer QK"),
                     Some(prof),
                     "attention operands",
-                    [(self.d.inner() / 256) as u32, 1, 1],
-                    [THREADS, 1, 1],
+                    &[t],
                     &[t],
                     &[k, int_qk.kmean.binding()],
                     &[rows * self.d.inner() * 2, self.d.inner() * 4],
@@ -1518,8 +1489,7 @@ impl Stack {
                 self.prep_q.as_ref().expect("built with integer QK"),
                 Some(prof),
                 "attention operands",
-                [t, 1, 1],
-                [THREADS, 1, 1],
+                &[t],
                 &[t],
                 &[
                     q,
@@ -1536,8 +1506,7 @@ impl Stack {
                 self.prep_k.as_ref().expect("built with integer QK"),
                 Some(prof),
                 "attention operands",
-                [t, 1, 1],
-                [THREADS, 1, 1],
+                &[t],
                 &[t],
                 &[
                     k,
@@ -1558,28 +1527,12 @@ impl Stack {
             } else {
                 (v, self.d.inner())
             };
-            let tile = if self.direct_v {
-                transpose_qkv_tile(self.d.inner())
-            } else {
-                32
-            };
             emit(
                 sink,
                 self.transpose.as_ref().expect("built with integer QK"),
                 Some(prof),
                 "attention operands",
-                [
-                    (self.d.inner() / tile) as u32,
-                    // Reused projection bytes can contain arbitrary half values.
-                    // Rewrite the entire V capacity so masked keys cannot see NaNs.
-                    if int_qk.vt.is_none() {
-                        cap.div_ceil(tile) as u32
-                    } else {
-                        t.div_ceil(tile as u32)
-                    },
-                    1,
-                ],
-                [THREADS, 1, 1],
+                &[t],
                 &[t],
                 &[v_source, self.vt_view(int_qk)],
                 &[rows * v_stride * 2, self.d.inner() * cap * 2],
@@ -1592,8 +1545,7 @@ impl Stack {
             &self.attention,
             Some(prof),
             "attention",
-            [t.div_ceil(query_block), self.d.heads as u32, 1],
-            [32 * self.waves as u32, 1, 1],
+            &[t, self.d.heads as u32],
             &[t],
             &[
                 int_qk.qi.binding(),

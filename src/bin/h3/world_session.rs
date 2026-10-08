@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(clap::Args)]
 pub struct Args {
+    #[command(flatten)]
+    runtime: super::runtime::RuntimeArgs,
     /// Initial observation for a new world
     #[arg(long, required_unless_present = "resume", conflicts_with = "resume")]
     first_frame: Option<PathBuf>,
@@ -146,6 +148,7 @@ fn status(state: &WorldState) {
 }
 
 pub fn run(args: Args) -> Result<()> {
+    args.runtime.options(None)?;
     let save = args
         .state
         .as_ref()
@@ -243,6 +246,7 @@ pub fn run(args: Args) -> Result<()> {
     let adapter_digest = hrx::bundle::file_digest(&adapter)?;
     state.bind_adapter(&adapter_digest)?;
     let config = Config {
+        compiler: args.runtime.compiler(),
         dit: Some(resolve(&args.dit, h3_hrx::models::DIT_FL2VA)?),
         te: Some(resolve(&args.te, h3_hrx::models::TE)?),
         video_vae: Some(resolve(&args.video_vae, h3_hrx::models::VIDEO_VAE)?),
@@ -261,10 +265,7 @@ pub fn run(args: Args) -> Result<()> {
             .context("memory budget overflow")?,
     )?;
     let manager = hrx::residency::ResidencyManager::new(bytes)?;
-    let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
-        memory_budget: Some(manager.budget()),
-        ..Default::default()
-    })?;
+    let context = hrx::inference::ModelContext::new(args.runtime.options(Some(manager.budget()))?)?;
     // SAFETY: this command never modifies the resolved checkpoint files.
     let mut session = unsafe {
         Session::new_in(

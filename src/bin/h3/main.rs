@@ -18,6 +18,8 @@ mod world_session;
 
 use h3_hrx::resize;
 
+mod runtime;
+
 use h3_hrx::{
     Attention as Attn16, Clip, Config, DenoiseParams, Keyframe, LatentGrid, Noise, Presented,
     Reference, Sampler as Sampler16, Session, Tokenizer,
@@ -99,6 +101,8 @@ impl std::ops::DerefMut for Cli {
 }
 #[derive(clap::Args)]
 struct GenerationArgs {
+    #[command(flatten)]
+    runtime: runtime::RuntimeArgs,
     /// Learned 3D latent upscale followed by reference-conditioned ER-SDE refinement
     #[arg(long)]
     upscale: bool,
@@ -585,6 +589,9 @@ fn run(mut cli: Cli) -> Result<()> {
         }
         None => {}
     }
+    cli.runtime
+        .options(None)
+        .map_err(|error| UsageError(error.to_string()))?;
     let generator = prompting::generator(&cli)?;
     let upstream = cli.refmod_presentation == Some(RefmodPresentation::Upstream)
         || cli.generate_prompt
@@ -931,6 +938,7 @@ fn run(mut cli: Cli) -> Result<()> {
         loras,
         kernel_sources: sources,
         loom_library,
+        compiler: cli.runtime.compiler(),
         attention: match cli.attn {
             Attn::F16 => Attn16::F16,
             Attn::I8 => Attn16::I8,
@@ -944,10 +952,10 @@ fn run(mut cli: Cli) -> Result<()> {
     let residency_manager = memory_budget_bytes(&cli)?
         .map(hrx::residency::ResidencyManager::new)
         .transpose()?;
-    let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
-        memory_budget: residency_manager.as_ref().map(|manager| manager.budget()),
-        ..Default::default()
-    })?;
+    let context = hrx::inference::ModelContext::new(
+        cli.runtime
+            .options(residency_manager.as_ref().map(|manager| manager.budget()))?,
+    )?;
     let mut session = unsafe {
         Session::new_in(
             config,

@@ -8,7 +8,6 @@
 use crate::compile::{Cfg, Compiler};
 use crate::dispatch::{axpy, checked, MatmulF32, Profile};
 use crate::error::{invalid, other, Result};
-use crate::model::THREADS;
 use crate::weights::Weights;
 use hrx::View;
 
@@ -85,8 +84,7 @@ fn conv_s(
         &k,
         Some(prof),
         stage,
-        [out_len.div_ceil(256) as u32, cout as u32, 1],
-        [if tiled { 64 } else { THREADS }, 1, 1],
+        &scalars[..if tiled { 1 } else { 2 }],
         &scalars[..if tiled { 1 } else { 2 }],
         &[x, w, b, out],
         &[
@@ -122,8 +120,7 @@ fn snake_plain(
         &k,
         Some(prof),
         "aenc snake",
-        [len.div_ceil(256) as u32, channels as u32, 1],
-        [THREADS, 1, 1],
+        &[len as u32],
         &[len as u32],
         &[x, alpha, out],
         &[channels * len * 4, channels * 4, channels * len * 4],
@@ -154,8 +151,7 @@ fn layernorm(
         &k,
         Some(prof),
         "aenc layernorm",
-        [rows as u32, 1, 1],
-        [32, 1, 1],
+        &[rows as u32],
         &[rows as u32],
         &[x, w, b, out],
         &[rows * width * 4, width * 4, width * 4, rows * width * 4],
@@ -181,8 +177,7 @@ fn transpose(
         &k,
         Some(prof),
         "aenc transpose",
-        [(rows * cols).div_ceil(256) as u32, 1, 1],
-        [THREADS, 1, 1],
+        &[rows as u32],
         &[rows as u32],
         &[x, out],
         &[rows * cols * 4, rows * cols * 4],
@@ -257,26 +252,12 @@ fn conv4(
         (format!("{ns}len_bound"), round256(len).to_string()),
     ];
     let k = c.get(stream, stem, &format!("h3_{stem}"), &cfg)?;
-    // Packed convolutions share inputs across eight output channels. Narrow
-    // prefetch keeps one sample per lane; the fallback retains four samples.
-    let (span, outputs) = if narrow {
-        (64, cout)
-    } else if channel_lanes {
-        (8, cout / 8)
-    } else if prefetched {
-        (64, cout / 8)
-    } else if blocked {
-        (128, cout / 8)
-    } else {
-        (256, cout)
-    };
     checked(
         stream,
         &k,
         Some(prof),
         stage,
-        [len.div_ceil(span) as u32, outputs as u32, 1],
-        [64, 1, 1],
+        &[len as u32],
         &[len as u32],
         &[x, w, b, out],
         &[
@@ -383,8 +364,7 @@ impl AudioVae {
             &kernel,
             Some(prof),
             "audio snake",
-            [len.div_ceil(64) as u32, channels as u32, 1],
-            [64, 1, 1],
+            &[len as u32],
             &[len as u32],
             &[x, fir.binding(), alpha, beta, out],
             &[
@@ -517,11 +497,6 @@ impl AudioVae {
                         (format!("{ns}len_bound"), round256(olen).to_string()),
                     ];
                     let kt = c.get(stream, stem, &format!("h3_{stem}"), &cfg)?;
-                    let (threads, outputs) = if blocked {
-                        (64, cout / 16)
-                    } else {
-                        (THREADS, cout)
-                    };
                     let d = self.dec.as_ref().expect("sized above");
                     let held_1 = self.weights.at(
                         stream,
@@ -536,8 +511,7 @@ impl AudioVae {
                         &kt,
                         Some(prof),
                         "audio upsample",
-                        [olen.div_ceil(threads as usize) as u32, outputs as u32, 1],
-                        [threads, 1, 1],
+                        &[len as u32, olen as u32],
                         &[len as u32, olen as u32],
                         &[
                             d.h.binding(),
@@ -1015,8 +989,7 @@ impl AudioVae {
                     &k,
                     Some(prof),
                     "aenc attention",
-                    [t.div_ceil(256) as u32, 8, 1],
-                    [THREADS, 1, 1],
+                    &[t as u32],
                     &[t as u32],
                     &[qkv.binding(), pattn.binding()],
                     &[t * 3 * 8 * 256 * 4, 8 * t * t * 4],
@@ -1036,8 +1009,7 @@ impl AudioVae {
                     &k,
                     Some(prof),
                     "aenc attention",
-                    [t as u32, 1, 1],
-                    [32, 1, 1],
+                    &[t as u32],
                     &[t as u32],
                     &[qkv.binding(), pattn.binding(), pool.binding()],
                     &[t * 3 * 8 * 256 * 4, 8 * t * t * 4, t * (256 / 8) * 4],
@@ -1125,8 +1097,7 @@ impl AudioVae {
                     &k,
                     Some(prof),
                     "aenc geglu",
-                    [(t * 64).div_ceil(256) as u32, 1, 1],
-                    [THREADS, 1, 1],
+                    &[(t * 64) as u32],
                     &[(t * 64) as u32],
                     &[a0.binding(), a1.binding(), g.binding()],
                     &[t * 64 * 4, t * 64 * 4, t * 64 * 4],

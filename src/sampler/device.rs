@@ -75,6 +75,7 @@ impl Euler {
             (&self.video_kernel, &self.video, video),
         ] {
             let kernel = handle.resolve(stream)?;
+            let launch = handle.launch_config(kernel, &[])?;
             let mut constants = hrx::Constants::new();
             constants.push(sigma)?;
             constants.push(ratio)?;
@@ -84,8 +85,8 @@ impl Euler {
             unsafe {
                 stream.dispatch(
                     kernel,
-                    [(buffer.bytes() / 4).div_ceil(256) as u32, 1, 1],
-                    [256, 1, 1],
+                    launch.workgroup_count,
+                    launch.workgroup_size,
                     &constants,
                     &[buffer.binding(), head],
                 )?;

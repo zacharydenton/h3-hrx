@@ -29,8 +29,8 @@ retains allocations that may still be in flight.
 
 ## Shared allocation budgets
 
-`Session::new_in(config, options, &context)` selects the context's GPU and
-optional `RuntimeOptions::memory_budget`. All five lazy units (text encoder,
+`Session::new_in(config, options, &context)` selects the context's GPU, compute
+and copy engines, and optional `RuntimeOptions::memory_budget`. All five lazy units (text encoder,
 DiT, video VAE, audio VAE and latent upscaler) charge native weights, growing workspace and
 upload/readback staging before allocation. Charges survive queued uses and
 recorded graphs, and are released only when their storage is safe to destroy.
@@ -53,7 +53,7 @@ or cancelled stages fence before returning units to the cache. Session teardown
 unregisters all model units so mapped checkpoints do not outlive its safety contract.
 
 StageScoped leaves the native stream's bounded staging cache resident between
-calls; dropping the session releases it too. Compiler/code-object memory, native
+calls; dropping the session releases it too. Ordinary compiler/code-object memory, native
 allocator rounding and checkpoint mappings are not part of this byte ceiling.
 Each public inference stage uses HRX's `NativeSession` to reserve the context's
 compute lane and replay its original stream-bound graphs. Earlier submissions
@@ -121,3 +121,33 @@ and proposes cache thresholds to evaluate on the same inputs.
 Developer switches `H3_FUSED_OPERANDS=1` and `H3_REUSE_SCRATCH=1` enable pending
 operand-fusion and scratch-lifetime experiments; neither changes the default
 until its parity and timing gates pass.
+
+## Native engines and compiler controls
+
+PM4 compute with compute copies remains the default. Every inference CLI command
+accepts `--gpu`, `--compute-engine pm4|aql`, `--copy-engine compute|sdma`,
+`--aql-private-bytes`, `--processor-mode default|cu|wgp`, and `--compile-workers`.
+These settings apply to the session's actual stream, including recorded graphs.
+SDMA uses coherent allocation backing and host fences at engine transitions;
+measure end-to-end latency before choosing it for a workload.
+
+For library callers, set `RuntimeOptions::compute_engine` and `copy_engine` on the
+`ModelContext` passed to `Session::new_in`. Compiler choices live in
+`Config::compiler`. `Session::new` uses default runtime engines; use `new_in` for
+AQL, SDMA, or a nondefault GPU.
+
+`--sanitize access,value,operation,race --compute-engine aql` enables report-only
+instrumentation. Completed stages drain reports and return an error for any
+failure or dropped feedback, including graph replay. Library callers use
+`Config::compiler.sanitizer` and can bound report/shadow storage through
+`sanitizer_runtime`; CLI equivalents are `--sanitizer-report-bytes` and
+`--sanitizer-shadow-bytes`. AQL scratch and diagnostic allocations share the context's
+budget. Instrumentation changes compilation/cache identity and adds substantial
+runtime cost. Address checks cover whole bound allocations, not individual
+slices. Race checks cover workgroup/LDS accesses, not cross-workgroup or
+cross-queue races.
+
+Use `--compile-reports target/compiler-reports` for detailed compiler reports or
+`--compile-traces target/compiler-traces` for bounded text pass traces. Neither
+writes files unless requested. CU/WGP mode changes need their own numerical and
+performance checks; selecting a mode does not establish a speedup.

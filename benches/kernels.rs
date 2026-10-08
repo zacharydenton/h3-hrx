@@ -193,8 +193,7 @@ fn rotary_preparation(c: &mut Criterion) {
                             &kernel,
                             Some(&mut profile),
                             "qk norm + rope",
-                            [tokens as u32, 1, 1],
-                            [256, 1, 1],
+                            &[tokens as u32],
                             &[tokens as u32],
                             &bindings,
                             &required,
@@ -288,8 +287,7 @@ fn attention_preparation(c: &mut Criterion) {
                         &kernel,
                         Some(&mut profile),
                         "prepare attention operands",
-                        [tokens as u32, 1, 1],
-                        [256, 1, 1],
+                        &[tokens as u32],
                         &[tokens as u32],
                         &bindings,
                         &required,
@@ -430,8 +428,7 @@ fn fused_qk_preparation(c: &mut Criterion) {
                                 &rope,
                                 Some(&mut profile),
                                 "qk norm + rope",
-                                [tokens as u32, 1, 1],
-                                [256, 1, 1],
+                                &[tokens as u32],
                                 &[tokens as u32],
                                 &views,
                                 &views.map(|v| v.len()),
@@ -453,8 +450,7 @@ fn fused_qk_preparation(c: &mut Criterion) {
                                     &combined[head],
                                     Some(&mut profile),
                                     "fused QK preparation",
-                                    [tokens as u32, 1, 1],
-                                    [256, 1, 1],
+                                    &[tokens as u32],
                                     &[tokens as u32],
                                     &views,
                                     &views.map(|v| v.len()),
@@ -472,8 +468,7 @@ fn fused_qk_preparation(c: &mut Criterion) {
                                     &separate[head],
                                     Some(&mut profile),
                                     "separate QK preparation",
-                                    [tokens as u32, 1, 1],
-                                    [256, 1, 1],
+                                    &[tokens as u32],
                                     &[tokens as u32],
                                     &views,
                                     &views.map(|v| v.len()),
@@ -579,9 +574,8 @@ fn quantized_attention(c: &mut Criterion) {
                     &kernel,
                     Some(&mut profile),
                     "attention",
-                    [tokens.div_ceil(128) as u32, HEADS as u32, 1],
-                    [256, 1, 1],
                     &[tokens as u32, HEADS as u32],
+                    &[tokens as u32],
                     &bindings,
                     &required,
                 )
@@ -648,8 +642,7 @@ fn attention_output_preparation(c: &mut Criterion) {
                     &reference,
                     None,
                     "reference",
-                    [tokens as u32, 1, 1],
-                    [128, 1, 1],
+                    &[tokens as u32],
                     &[tokens as u32],
                     &bindings,
                     &required,
@@ -667,8 +660,7 @@ fn attention_output_preparation(c: &mut Criterion) {
                         &kernel,
                         Some(&mut profile),
                         "prepare out input",
-                        [tokens as u32, 1, 1],
-                        [lanes as u32, 1, 1],
+                        &[tokens as u32],
                         &[tokens as u32],
                         &bindings,
                         &required,
@@ -748,8 +740,7 @@ fn normalization_preparation(c: &mut Criterion) {
                     &reference,
                     None,
                     "reference",
-                    [tokens as u32, 1, 1],
-                    [96, 1, 1],
+                    &[tokens as u32],
                     &[tokens as u32],
                     &bindings,
                     &required,
@@ -767,8 +758,7 @@ fn normalization_preparation(c: &mut Criterion) {
                         &kernel,
                         Some(&mut profile),
                         "prepare norm",
-                        [tokens as u32, 1, 1],
-                        [lanes as u32, 1, 1],
+                        &[tokens as u32],
                         &[tokens as u32],
                         &bindings,
                         &required,
@@ -1061,11 +1051,6 @@ fn attention_transpose(c: &mut Criterion) {
                     let out = upload(&mut stream, &vec![0xff; capacity * INNER * 2]);
                     let bindings = [x.binding(), out.binding()];
                     let required = bindings.map(|view| view.len());
-                    let tile = if direct {
-                        h3_hrx::model::transpose_qkv_tile(INNER)
-                    } else {
-                        32
-                    };
                     let mut profile = Profile::from_env();
                     let mut run = |stream: &mut Stream| {
                         emit(
@@ -1073,8 +1058,7 @@ fn attention_transpose(c: &mut Criterion) {
                             &kernel,
                             Some(&mut profile),
                             "transpose V",
-                            [(INNER / tile) as u32, capacity.div_ceil(tile) as u32, 1],
-                            [256, 1, 1],
+                            &[tokens as u32],
                             &[tokens as u32],
                             &bindings,
                             &required,
@@ -1290,20 +1274,13 @@ fn audio_convolution(c: &mut Criterion) {
                                layout: &str,
                                w: &Buffer| {
                         let tiled = layout != "scalar";
-                        let (span, outputs) = match layout {
-                            "packed_channels" => (128, cout / 8),
-                            "packed_prefetch" => (64, cout / 8),
-                            "packed_k3" => (8, cout / 8),
-                            _ => (256, cout),
-                        };
                         let scalars = [out_len as u32, len as u32];
                         h3_hrx::dispatch::emit(
                             &mut Sink::Stream(stream),
                             kernel,
                             None,
                             "audio convolution",
-                            [out_len.div_ceil(span) as u32, outputs as u32, 1],
-                            [if tiled { 64 } else { 256 }, 1, 1],
+                            &scalars[..if tiled { 1 } else { 2 }],
                             &scalars[..if tiled { 1 } else { 2 }],
                             &[x.binding(), w.binding(), bias.binding(), out.binding()],
                             &[
@@ -1455,8 +1432,7 @@ fn groupnorm_statistics(c: &mut Criterion) {
                     &kernel,
                     Some(&mut profile),
                     "video groupnorm stats",
-                    [frames as u32, 32, 1],
-                    [32, 1, 1],
+                    &[frames as u32],
                     &[frames as u32],
                     &[x.binding(), out.binding()],
                     &[input.len() * 2, frames * 32 * 2 * 4],
@@ -1524,11 +1500,6 @@ fn groupnorm_apply(c: &mut Criterion) {
             let gamma = upload(&mut stream, bytemuck::cast_slice(&gamma));
             let beta = upload(&mut stream, bytemuck::cast_slice(&beta));
             let out = stream.allocate_zeroed(count * 2).unwrap();
-            let tile = if (channels / 32).is_multiple_of(4) {
-                1024
-            } else {
-                256
-            };
             let mut profile = Profile::from_env();
             let mut run = |stream: &mut Stream| {
                 emit(
@@ -1536,8 +1507,7 @@ fn groupnorm_apply(c: &mut Criterion) {
                     &kernel,
                     Some(&mut profile),
                     "video groupnorm apply",
-                    [count.div_ceil(tile) as u32, 1, 1],
-                    [256, 1, 1],
+                    &[frames as u32],
                     &[frames as u32],
                     &[
                         x.binding(),

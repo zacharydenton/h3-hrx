@@ -10,7 +10,6 @@ pub(crate) struct Projection {
     weights: hrx::Buffer,
     bias: hrx::Buffer,
     maps: Vec<hrx::Buffer>,
-    count: usize,
     output_bytes: usize,
 }
 
@@ -101,7 +100,6 @@ impl Projection {
             weights,
             bias,
             maps,
-            count,
             output_bytes: count * timesteps * 4,
         })
     }
@@ -116,6 +114,7 @@ impl Projection {
             return invalid("AdaLN output or timestep shape mismatch");
         }
         let kernel = self.kernel.resolve(stream)?;
+        let launch = self.kernel.launch_config(kernel, &[])?;
         for (te, map) in timesteps.iter().zip(&self.maps) {
             let mut constants = hrx::Constants::new();
             for &value in te {
@@ -127,8 +126,8 @@ impl Projection {
             unsafe {
                 stream.dispatch(
                     kernel,
-                    [self.count.div_ceil(256) as u32, 1, 1],
-                    [256, 1, 1],
+                    launch.workgroup_count,
+                    launch.workgroup_size,
                     &constants,
                     &[
                         self.weights.binding(),

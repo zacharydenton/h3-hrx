@@ -12,18 +12,11 @@ cargo check --locked --no-default-features
 cargo check --locked --manifest-path clients/rust/Cargo.toml
 cargo check --locked --manifest-path clients/rustler/Cargo.toml
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
-read -r hrx_git hrx_rev < <(
-  cargo metadata --locked --no-deps --format-version 1 |
-    jq -r '.packages[] | select(.name == "h3-hrx") | .dependencies[] | select(.name == "hrx-rs") | .source | ltrimstr("git+") | split("?rev=") | @tsv'
-)
-cargo package --locked \
-  --config "patch.crates-io.hrx-rs.git=\"$hrx_git\"" \
-  --config "patch.crates-io.hrx-rs.rev=\"$hrx_rev\""
+cargo package --locked
 ```
 
 CPU CI runs these checks. Packaging verifies that the embedded kernels and
-tokenizer are included and the archive builds against the pinned HRX revision.
-The package check uses Bash and jq.
+tokenizer are included and the archive builds against published HRX 0.9.0.
 
 On Strix Halo with the native bundle, checkpoints and reference dumps available:
 
@@ -47,10 +40,8 @@ h3 --width 864 --height 480 --frames 124 --steps 31 --seed 7 \
 
 ## Publication
 
-H3 currently requires HRX's Git-only `allocate_from` API. Cargo strips Git
-dependencies when packaging, so CI applies the same revision during archive
-verification. A crates.io release requires a published HRX version containing
-that API and a successful unpatched `cargo package --locked`.
+H3 depends on the published HRX 0.9.0 crate and its pinned native bundle.
+Verify the package without local dependency overrides before publishing.
 
 Check the version, package contents, README links, Apache-2.0 code license,
 separate model terms and [asset attribution](../assets/README.md).
