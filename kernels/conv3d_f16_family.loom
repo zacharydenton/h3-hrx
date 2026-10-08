@@ -264,116 +264,125 @@ template.def<@h3.shared_conv3d_f16_wmma_add> @h3_body_conv3d_f16_wmma_add(%m_siz
   } else {
     scf.yield %zero_packet : vector<[%packet_width]xf16>
   }
-  %acc0, %acc1, %a_values_last, %w_values_last = scf.for %k_base = [%k_start to %k_size step %tile_k](%run0 = %acc_init0 : vector<8xf32>, %run1 = %acc_init1 : vector<8xf32>, %a_cur = %a_values_first : vector<[%packet_width]xf16>, %w_cur = %w_values_first : vector<[%packet_width]xf16>) -> (vector<8xf32>, vector<8xf32>, vector<[%packet_width]xf16>, vector<[%packet_width]xf16>) {
-    vector.store %a_cur, %a_stage_view[%load_row, %load_k] : vector<[%packet_width]xf16>, view<64x[%stage_pitch]xf16>
-    vector.store %w_cur, %w_stage_view[%load_row, %load_k] : vector<[%packet_width]xf16>, view<64x[%stage_pitch]xf16>
-    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-    %k_next = index.add %k_base, %tile_k : index
-    %source_k_next = index.add %k_next, %load_k : index
-    %row_next = index.add %load_row, %c0 : index
-    %source_m_next = index.add %base_m, %row_next : index
-    %m_in_range_next = index.cmp ult, %source_m_next, %m_size : index
-    // Implicit im2col: this row of A is output voxel (t, yo, xo) and this column is tap (dt, dy, dx) of
-    // channel c. Zero before the first frame (causal) and beyond taps*Cin_pad; reflect padding in space.
-    %in_k_next = index.cmp ult, %source_k_next, %k_real : index
-    %gathers_next = scalar.andi %m_in_range_next, %in_k_next : i1
-    %a_values_next = scf.if %gathers_next -> (vector<[%packet_width]xf16>) {
-      %ys_next = index.add %h_ys0, %c0 : index
-      %xs_next = index.add %h_xs0, %c0 : index
-      %tb_next = index.add %h_tb0, %c0 : index
-      %tap_next = index.div %source_k_next, %cfg_cin_pad : index
-      %c_next = index.rem %source_k_next, %cfg_cin_pad : index
-      %dt_full_next = index.div %tap_next, %c9 : index
-      %rem9_next = index.rem %tap_next, %c9 : index
-      %dy_next = index.div %rem9_next, %c3 : index
-      %dx_next = index.rem %rem9_next, %c3 : index
-      %dt_next = scf.select %is_2d, %c2, %dt_full_next : index
-      %pad_t_next = scf.select %symmetric, %c1, %c2 : index
-      %tplus_next = index.add %tb_next, %dt_next : index
-      %tlo_next = index.cmp uge, %tplus_next, %pad_t_next : index
-      %tend_next = index.add %cfg_frames, %pad_t_next : index
-      %thi_next = index.cmp ult, %tplus_next, %tend_next : index
-      %tok_next = scalar.andi %tlo_next, %thi_next : i1
-      // space, stride 1: y0 = yo + dy in [0, H + 1] -> reflect(y0 - 1); stride 2: y0 = 2*yo + dy in [0, H] -> H maps to H - 2
-      %y0_next = index.add %ys_next, %dy_next : index
-      %x0_next = index.add %xs_next, %dx_next : index
-      %hm2_next = index.sub %cfg_height, %c2 : index
-      %wm2_next = index.sub %cfg_width, %c2 : index
-      %hp1_next = index.add %cfg_height, %c1 : index
-      %wp1_next = index.add %cfg_width, %c1 : index
-      // y0 - 1 only where y0 >= 1 (the branch proves it); y0 == 0 reflects to 1
-      %y_ge1_next = index.cmp uge, %y0_next, %c1 : index
-      %x_ge1_next = index.cmp uge, %x0_next, %c1 : index
-      %y_mid_next = scf.if %y_ge1_next -> (index) {
-        %ym_next = index.sub %y0_next, %c1 : index
-        scf.yield %ym_next : index
-      } else {
-        scf.yield %c1 : index
-      }
-      %x_mid_next = scf.if %x_ge1_next -> (index) {
-        %xm_next = index.sub %x0_next, %c1 : index
-        scf.yield %xm_next : index
-      } else {
-        scf.yield %c1 : index
-      }
-      %y_top_next = index.cmp eq, %y0_next, %hp1_next : index
-      %x_top_next = index.cmp eq, %x0_next, %wp1_next : index
-      %yi_s1_next = scf.select %y_top_next, %hm2_next, %y_mid_next : index
-      %xi_s1_next = scf.select %x_top_next, %wm2_next, %x_mid_next : index
-      %y_isH = index.cmp eq, %y0_next, %cfg_height : index
-      %x_isW = index.cmp eq, %x0_next, %cfg_width : index
-      %yi_s2_next = scf.select %y_isH, %hm2_next, %y0_next : index
-      %xi_s2_next = scf.select %x_isW, %wm2_next, %x0_next : index
-      %yi0_next = scf.select %is_s2, %yi_s2_next, %yi_s1_next : index
-      %xi0_next = scf.select %is_s2, %xi_s2_next, %xi_s1_next : index
+  // Group narrow 3-D encoder steps without enlarging the LDS tile. Wide tiles
+  // and compact downsampling retain their existing loop for register scheduling.
+  %keep_rolled = scalar.ori %reuse_operands, %full_history : i1
+  %group_candidate = scf.select %encoder_aligned, %c128, %tile_k : index
+  %group_k = scf.select %keep_rolled, %tile_k, %group_candidate : index
+  %acc0, %acc1, %a_values_last, %w_values_last = scf.for %k_block = [%k_start to %k_size step %group_k](%block0 = %acc_init0 : vector<8xf32>, %block1 = %acc_init1 : vector<8xf32>, %block_a = %a_values_first : vector<[%packet_width]xf16>, %block_w = %w_values_first : vector<[%packet_width]xf16>) -> (vector<8xf32>, vector<8xf32>, vector<[%packet_width]xf16>, vector<[%packet_width]xf16>) {
+    %block_next0, %block_next1, %block_next_a, %block_next_w = scf.for %k_offset = [%c0 to %group_k step %tile_k](%run0 = %block0 : vector<8xf32>, %run1 = %block1 : vector<8xf32>, %a_cur = %block_a : vector<[%packet_width]xf16>, %w_cur = %block_w : vector<[%packet_width]xf16>) -> (vector<8xf32>, vector<8xf32>, vector<[%packet_width]xf16>, vector<[%packet_width]xf16>) unroll {
+      %k_base = index.add %k_block, %k_offset : index
+      vector.store %a_cur, %a_stage_view[%load_row, %load_k] : vector<[%packet_width]xf16>, view<64x[%stage_pitch]xf16>
+      vector.store %w_cur, %w_stage_view[%load_row, %load_k] : vector<[%packet_width]xf16>, view<64x[%stage_pitch]xf16>
+      kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+      %k_next = index.add %k_base, %tile_k : index
+      %source_k_next = index.add %k_next, %load_k : index
+      %row_next = index.add %load_row, %c0 : index
+      %source_m_next = index.add %base_m, %row_next : index
+      %m_in_range_next = index.cmp ult, %source_m_next, %m_size : index
+      // Implicit im2col: this row of A is output voxel (t, yo, xo) and this column is tap (dt, dy, dx) of
+      // channel c. Zero before the first frame (causal) and beyond taps*Cin_pad; reflect padding in space.
+      %in_k_next = index.cmp ult, %source_k_next, %k_real : index
+      %gathers_next = scalar.andi %m_in_range_next, %in_k_next : i1
+      %a_values_next = scf.if %gathers_next -> (vector<[%packet_width]xf16>) {
+        %ys_next = index.add %h_ys0, %c0 : index
+        %xs_next = index.add %h_xs0, %c0 : index
+        %tb_next = index.add %h_tb0, %c0 : index
+        %tap_next = index.div %source_k_next, %cfg_cin_pad : index
+        %c_next = index.rem %source_k_next, %cfg_cin_pad : index
+        %dt_full_next = index.div %tap_next, %c9 : index
+        %rem9_next = index.rem %tap_next, %c9 : index
+        %dy_next = index.div %rem9_next, %c3 : index
+        %dx_next = index.rem %rem9_next, %c3 : index
+        %dt_next = scf.select %is_2d, %c2, %dt_full_next : index
+        %pad_t_next = scf.select %symmetric, %c1, %c2 : index
+        %tplus_next = index.add %tb_next, %dt_next : index
+        %tlo_next = index.cmp uge, %tplus_next, %pad_t_next : index
+        %tend_next = index.add %cfg_frames, %pad_t_next : index
+        %thi_next = index.cmp ult, %tplus_next, %tend_next : index
+        %tok_next = scalar.andi %tlo_next, %thi_next : i1
+        // space, stride 1: y0 = yo + dy in [0, H + 1] -> reflect(y0 - 1); stride 2: y0 = 2*yo + dy in [0, H] -> H maps to H - 2
+        %y0_next = index.add %ys_next, %dy_next : index
+        %x0_next = index.add %xs_next, %dx_next : index
+        %hm2_next = index.sub %cfg_height, %c2 : index
+        %wm2_next = index.sub %cfg_width, %c2 : index
+        %hp1_next = index.add %cfg_height, %c1 : index
+        %wp1_next = index.add %cfg_width, %c1 : index
+        // y0 - 1 only where y0 >= 1 (the branch proves it); y0 == 0 reflects to 1
+        %y_ge1_next = index.cmp uge, %y0_next, %c1 : index
+        %x_ge1_next = index.cmp uge, %x0_next, %c1 : index
+        %y_mid_next = scf.if %y_ge1_next -> (index) {
+          %ym_next = index.sub %y0_next, %c1 : index
+          scf.yield %ym_next : index
+        } else {
+          scf.yield %c1 : index
+        }
+        %x_mid_next = scf.if %x_ge1_next -> (index) {
+          %xm_next = index.sub %x0_next, %c1 : index
+          scf.yield %xm_next : index
+        } else {
+          scf.yield %c1 : index
+        }
+        %y_top_next = index.cmp eq, %y0_next, %hp1_next : index
+        %x_top_next = index.cmp eq, %x0_next, %wp1_next : index
+        %yi_s1_next = scf.select %y_top_next, %hm2_next, %y_mid_next : index
+        %xi_s1_next = scf.select %x_top_next, %wm2_next, %x_mid_next : index
+        %y_isH = index.cmp eq, %y0_next, %cfg_height : index
+        %x_isW = index.cmp eq, %x0_next, %cfg_width : index
+        %yi_s2_next = scf.select %y_isH, %hm2_next, %y0_next : index
+        %xi_s2_next = scf.select %x_isW, %wm2_next, %x0_next : index
+        %yi0_next = scf.select %is_s2, %yi_s2_next, %yi_s1_next : index
+        %xi0_next = scf.select %is_s2, %xi_s2_next, %xi_s1_next : index
         %ylo_next = index.cmp uge, %y0_next, %c1 : index
-      %xlo_next = index.cmp uge, %x0_next, %c1 : index
-      %yhi_next = index.cmp ule, %y0_next, %cfg_height : index
-      %xhi_next = index.cmp ule, %x0_next, %cfg_width : index
-      %yok_next = scalar.andi %ylo_next, %yhi_next : i1
-      %xok_next = scalar.andi %xlo_next, %xhi_next : i1
-      %xyok_next = scalar.andi %yok_next, %xok_next : i1
-      %allok_next = scalar.andi %tok_next, %xyok_next : i1
-      %t_ok_next = scf.select %symmetric, %allok_next, %tok_next : i1
-    %loaded_next = scf.if %t_ok_next -> (vector<[%packet_width]xf16>) {
-        %ti0_next = index.sub %tplus_next, %pad_t_next : index
-        %ti_next = index.assume %ti0_next [lt(%ti0_next, %cfg_frames)] : index
-        %yi_next = index.assume %yi0_next [lt(%yi0_next, %cfg_height)] : index
-        %xi_next = index.assume %xi0_next [lt(%xi0_next, %cfg_width)] : index
-        %row_t_next = index.mul %ti_next, %cfg_height : index
-        %row_y0_next = index.add %row_t_next, %yi_next : index
-        %row_yw_next = index.mul %row_y0_next, %cfg_width : index
-        %in_row0_next = index.add %row_yw_next, %xi_next : index
-        %in_row_next = index.assume %in_row0_next [range(%in_row0_next, 0, 2097151), lt(%in_row0_next, %in_rows_total)] : index
-        %c_col_next = index.assume %c_next [le(%c_next, %c_limit), mul(%c_next, 8)] : index
-        %v_next = vector.load %a_view[%in_row_next, %c_col_next] : view<[%in_rows_total]x[%cfg_cin_stride]xf16> -> vector<[%packet_width]xf16>
-        scf.yield %v_next : vector<[%packet_width]xf16>
+        %xlo_next = index.cmp uge, %x0_next, %c1 : index
+        %yhi_next = index.cmp ule, %y0_next, %cfg_height : index
+        %xhi_next = index.cmp ule, %x0_next, %cfg_width : index
+        %yok_next = scalar.andi %ylo_next, %yhi_next : i1
+        %xok_next = scalar.andi %xlo_next, %xhi_next : i1
+        %xyok_next = scalar.andi %yok_next, %xok_next : i1
+        %allok_next = scalar.andi %tok_next, %xyok_next : i1
+        %t_ok_next = scf.select %symmetric, %allok_next, %tok_next : i1
+        %loaded_next = scf.if %t_ok_next -> (vector<[%packet_width]xf16>) {
+          %ti0_next = index.sub %tplus_next, %pad_t_next : index
+          %ti_next = index.assume %ti0_next [lt(%ti0_next, %cfg_frames)] : index
+          %yi_next = index.assume %yi0_next [lt(%yi0_next, %cfg_height)] : index
+          %xi_next = index.assume %xi0_next [lt(%xi0_next, %cfg_width)] : index
+          %row_t_next = index.mul %ti_next, %cfg_height : index
+          %row_y0_next = index.add %row_t_next, %yi_next : index
+          %row_yw_next = index.mul %row_y0_next, %cfg_width : index
+          %in_row0_next = index.add %row_yw_next, %xi_next : index
+          %in_row_next = index.assume %in_row0_next [range(%in_row0_next, 0, 2097151), lt(%in_row0_next, %in_rows_total)] : index
+          %c_col_next = index.assume %c_next [le(%c_next, %c_limit), mul(%c_next, 8)] : index
+          %v_next = vector.load %a_view[%in_row_next, %c_col_next] : view<[%in_rows_total]x[%cfg_cin_stride]xf16> -> vector<[%packet_width]xf16>
+          scf.yield %v_next : vector<[%packet_width]xf16>
+        } else {
+          scf.yield %zero_packet : vector<[%packet_width]xf16>
+        }
+        scf.yield %loaded_next : vector<[%packet_width]xf16>
       } else {
         scf.yield %zero_packet : vector<[%packet_width]xf16>
       }
-      scf.yield %loaded_next : vector<[%packet_width]xf16>
-    } else {
-      scf.yield %zero_packet : vector<[%packet_width]xf16>
+      %source_n_next = index.add %base_n, %row_next : index
+      %w_in_k_next = index.cmp ult, %source_k_next, %k_size : index
+      %w_values_next = scf.if %w_in_k_next -> (vector<[%packet_width]xf16>) {
+        %w_k_next = index.assume %source_k_next [lt(%source_k_next, %k_size)] : index
+        %w_loaded_next = vector.load %w_view[%source_n_next, %w_k_next] : view<[%n_size]x[%k_size]xf16> -> vector<[%packet_width]xf16>
+        scf.yield %w_loaded_next : vector<[%packet_width]xf16>
+      } else {
+        scf.yield %zero_packet : vector<[%packet_width]xf16>
+      }
+      %next0, %next1 = scf.for %k_half = [%c0 to %tile_k step %c16](%half0 = %run0 : vector<8xf32>, %half1 = %run1 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>) unroll {
+        %lhs = vector.fragment.load<lhs> %a_stage_view[%wave_row, %k_half] shape [%m, %k] : view<64x[%stage_pitch]xf16> -> vector<16xf16>
+        %rhs0 = vector.fragment.load<rhs> %w_fragment_view[%k_half, %wave_col] shape [%k, %n] : view<[%tile_k]x64xf16, %w_fragment_layout> -> vector<16xf16>
+        %rhs1 = vector.fragment.load<rhs> %w_fragment_view[%k_half, %wave_col1] shape [%k, %n] : view<[%tile_k]x64xf16, %w_fragment_layout> -> vector<16xf16>
+        %out0 = vector.mma %lhs, %rhs0, %half0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+        %out1 = vector.mma %lhs, %rhs1, %half1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+        scf.yield %out0, %out1 : vector<8xf32>, vector<8xf32>
+      }
+      kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
+      scf.yield %next0, %next1, %a_values_next, %w_values_next : vector<8xf32>, vector<8xf32>, vector<[%packet_width]xf16>, vector<[%packet_width]xf16>
     }
-    %source_n_next = index.add %base_n, %row_next : index
-    %w_in_k_next = index.cmp ult, %source_k_next, %k_size : index
-    %w_values_next = scf.if %w_in_k_next -> (vector<[%packet_width]xf16>) {
-      %w_k_next = index.assume %source_k_next [lt(%source_k_next, %k_size)] : index
-      %w_loaded_next = vector.load %w_view[%source_n_next, %w_k_next] : view<[%n_size]x[%k_size]xf16> -> vector<[%packet_width]xf16>
-      scf.yield %w_loaded_next : vector<[%packet_width]xf16>
-    } else {
-      scf.yield %zero_packet : vector<[%packet_width]xf16>
-    }
-    %next0, %next1 = scf.for %k_half = [%c0 to %tile_k step %c16](%half0 = %run0 : vector<8xf32>, %half1 = %run1 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>) unroll {
-      %lhs = vector.fragment.load<lhs> %a_stage_view[%wave_row, %k_half] shape [%m, %k] : view<64x[%stage_pitch]xf16> -> vector<16xf16>
-      %rhs0 = vector.fragment.load<rhs> %w_fragment_view[%k_half, %wave_col] shape [%k, %n] : view<[%tile_k]x64xf16, %w_fragment_layout> -> vector<16xf16>
-      %rhs1 = vector.fragment.load<rhs> %w_fragment_view[%k_half, %wave_col1] shape [%k, %n] : view<[%tile_k]x64xf16, %w_fragment_layout> -> vector<16xf16>
-      %out0 = vector.mma %lhs, %rhs0, %half0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
-      %out1 = vector.mma %lhs, %rhs1, %half1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
-      scf.yield %out0, %out1 : vector<8xf32>, vector<8xf32>
-    }
-    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-    scf.yield %next0, %next1, %a_values_next, %w_values_next : vector<8xf32>, vector<8xf32>, vector<[%packet_width]xf16>, vector<[%packet_width]xf16>
+    scf.yield %block_next0, %block_next1, %block_next_a, %block_next_w : vector<8xf32>, vector<8xf32>, vector<[%packet_width]xf16>, vector<[%packet_width]xf16>
   }
 
   // Publish through LDS: each lane takes two vector4 slices of the 16x16 tile.
