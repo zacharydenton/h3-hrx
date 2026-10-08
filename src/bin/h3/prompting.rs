@@ -245,6 +245,7 @@ pub fn refmod_entries(
     };
     let config = Config {
         compiler: cli.runtime.compiler(),
+        weight_io: cli.runtime.weight_io(),
         video_vae: if visual {
             Some(resolve(&cli.video_vae, h3_hrx::models::VIDEO_VAE)?)
         } else {

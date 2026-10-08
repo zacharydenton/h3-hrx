@@ -16,7 +16,7 @@ cargo package --locked
 ```
 
 CPU CI runs these checks. Packaging verifies that the embedded kernels and
-tokenizer are included and the archive builds against published HRX 0.9.0.
+tokenizer are included and the archive builds against published HRX 0.10.0.
 
 On Strix Halo with the native bundle, checkpoints and reference dumps available:
 
@@ -40,7 +40,7 @@ h3 --width 864 --height 480 --frames 124 --steps 31 --seed 7 \
 
 ## Publication
 
-H3 depends on the published HRX 0.9.0 crate and its pinned native bundle.
+H3 depends on the published HRX 0.10.0 crate and its pinned native bundle.
 Verify the package without local dependency overrides before publishing.
 
 Check the version, package contents, README links, Apache-2.0 code license,

@@ -66,6 +66,7 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
             h3_hrx::plan::dit::plan,
         )
     }?;
+    let weights = support::configure_weights(weights);
     let constants = Constants::new(&mut stream)?;
     let dims = StackDims {
         hidden: HID,

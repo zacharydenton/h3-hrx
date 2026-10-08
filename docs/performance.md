@@ -12,6 +12,7 @@ Each native engine/compiler configuration has its own subdirectory there.
 | Target | Coverage |
 | --- | --- |
 | `host` | Short/long tokenization, mixed-media presentation, image resizing, RefMod loading/strength/copies, packed sequence layout |
+| `attention` | Head-128 FP16 four/eight-wave tile comparisons across ragged lengths and the 4096-token boundary, checked against sampled FP64 attention |
 | `kernels` | FP32 Hadamard preparation, INT8 attention preparation in both layouts, V transpose, INT8/BF16 GEMMs including all four DiT projections through 37,977 rows, cached/rotating weights, eager/graph dispatch |
 | `models` | Resident one-block INT8 DiT eager/graph comparison through 37,977 tokens including partial tiles, a complete 50-block 768p sequence, and short audio roundtrip |
 | `stages` | Complete text encoder plus token refiner, vision tower, video encode/decode, audio encode/decode, complete 50-block denoising trajectories with Euler and ResMultistep |
@@ -429,3 +430,28 @@ budget to accommodate the extra input and readback.
 Packing cases use the released input, residual-block and output convolution
 weights without opening a GPU. They check every packed byte and padding byte
 against the original checkpoint layout outside timing.
+
+## Storage and profiler comparisons
+
+Set `H3_BENCH_WEIGHT_IO=mapped|native-buffered|native-direct` and
+`H3_BENCH_STORAGE_PROGRESS=sqpoll|wait` for lifecycle and model loading tests.
+Each route has a separate Criterion directory. `H3_BENCH_STORAGE_STATISTICS=1`
+collects native loading intervals; `H3_BENCH_DETAILS=1` prints completed tensor
+loading times and counters outside the measured interval. Cold-file tests evict
+only their private disk fixtures. Keep at least seven alternating independent
+samples before comparing medians; measure warm loading and resident inference
+as well as cold loading before changing defaults.
+
+`scripts/profile.py --output target/profile/run1 -- <benchmark command>` captures
+host memory, disk/NUMA counters, AMD SMI state, child CPU time and faults around a
+native H3 device-clock profile. Use `--profiler rocprofv3` or `pc-sampling` for an
+explicit ROCprofiler run. These are separate diagnostic runs, not latency samples.
+The summary counts actual dispatch records; raw native HRX queues may have no
+ROCprofiler coverage. Kernel replay is unsuitable for file I/O and resident
+exchanges because their external side effects cannot be restored between passes.
+
+Build `cargo bench --bench lifecycle --no-run`, then pass its executable to
+`scripts/compare-storage.py <executable> --output target/storage-comparison/run1`.
+The script discards one warmup per route and rotates route order for seven
+independent samples. Use `--filter pack_and_upload` for warm loading and
+`--progress wait` for the deferred-work path.

@@ -46,7 +46,11 @@ pub fn criterion() -> Criterion {
             target.join("criterion")
         });
     Criterion::default()
-        .output_directory(&root.join(engine_settings().id()))
+        .output_directory(&root.join(engine_settings().id()).join(format!(
+            "{:?}-{:?}",
+            weight_io().mode,
+            weight_io().progress
+        )))
         .sample_size(10)
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3))
@@ -137,12 +141,42 @@ pub fn compiler_options() -> h3_hrx::compile::Options {
     }
 }
 
+pub fn weight_io() -> h3_hrx::weights::WeightIo {
+    use h3_hrx::weights::{WeightIo, WeightIoMode};
+    WeightIo {
+        mode: match std::env::var("H3_BENCH_WEIGHT_IO")
+            .as_deref()
+            .unwrap_or("mapped")
+        {
+            "mapped" => WeightIoMode::Mapped,
+            "native-buffered" => WeightIoMode::NativeBuffered,
+            "native-direct" => WeightIoMode::NativeDirect,
+            _ => panic!("H3_BENCH_WEIGHT_IO must be mapped, native-buffered, or native-direct"),
+        },
+        progress: match std::env::var("H3_BENCH_STORAGE_PROGRESS")
+            .as_deref()
+            .unwrap_or("sqpoll")
+        {
+            "sqpoll" => hrx::storage::StorageProgress::Sqpoll,
+            "wait" => hrx::storage::StorageProgress::Wait,
+            _ => panic!("H3_BENCH_STORAGE_PROGRESS must be sqpoll or wait"),
+        },
+        statistics: std::env::var_os("H3_BENCH_STORAGE_STATISTICS").is_some(),
+    }
+}
+
+pub fn configure_weights(mut weights: h3_hrx::weights::Weights) -> h3_hrx::weights::Weights {
+    weights.set_io(weight_io(), &compiler()).unwrap();
+    weights
+}
+
 pub fn runtime_options(
     memory_budget: Option<hrx::residency::MemoryBudget>,
 ) -> hrx::execution::RuntimeOptions {
     let settings = engine_settings();
     hrx::execution::RuntimeOptions {
         gpu_index: settings.gpu,
+        native_lifetime: weight_io().native_lifetime(),
         compute_engine: if settings.compute == "aql" {
             hrx::execution::ComputeEngine::Aql {
                 maximum_private_bytes: settings.private_bytes,
@@ -162,7 +196,7 @@ pub fn runtime_options(
 
 pub fn stream(budget: Option<hrx::residency::MemoryBudget>) -> hrx::Stream {
     let options = runtime_options(budget);
-    hrx::Device::open(options.gpu_index)
+    hrx::Device::open_with_lifetime(options.gpu_index, options.native_lifetime)
         .unwrap()
         .stream_with_options(hrx::StreamOptions {
             compute_engine: options.compute_engine,
@@ -196,6 +230,11 @@ pub fn configure_cli(command: &mut std::process::Command) {
         ])
         .arg("--aql-private-bytes")
         .arg(settings.private_bytes.to_string());
+    command
+        .arg("--weight-io")
+        .arg(std::env::var("H3_BENCH_WEIGHT_IO").unwrap_or_else(|_| "mapped".into()))
+        .arg("--storage-progress")
+        .arg(std::env::var("H3_BENCH_STORAGE_PROGRESS").unwrap_or_else(|_| "sqpoll".into()));
     if let Some(workers) = settings.workers {
         command.arg("--compile-workers").arg(workers.to_string());
     }
@@ -218,6 +257,7 @@ pub fn config(references: bool) -> Config {
         kernel_sources: sources(),
         attention: attention(),
         compiler: compiler_options(),
+        weight_io: weight_io(),
         ..Default::default()
     }
 }

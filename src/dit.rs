@@ -91,6 +91,21 @@ pub struct Dit {
 }
 
 impl Dit {
+    /// Native loading counters for this model's current weights.
+    pub fn weight_io_statistics(&self) -> Option<crate::weights::WeightStatistics> {
+        self.weights.io_statistics()
+    }
+
+    /// Select the weight loading route before preparing model tensors.
+    pub fn set_weight_io(
+        &mut self,
+        io: crate::weights::WeightIo,
+        compiler: &crate::compile::Compiler,
+    ) -> Result<()> {
+        self.weights.set_io(io, compiler)?;
+        Ok(())
+    }
+
     /// # Safety
     ///
     /// Maps the checkpoint; see [`crate::Session::new`].

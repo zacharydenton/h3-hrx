@@ -60,6 +60,8 @@ pub struct Config {
     pub compiler: crate::compile::Options,
     /// the DiT attention's QK operands
     pub attention: crate::dit::Attention,
+    /// Explicit checkpoint loading route; mapped loading remains the default.
+    pub weight_io: crate::weights::WeightIo,
 }
 
 impl Default for Config {
@@ -78,6 +80,7 @@ impl Default for Config {
             loom_library: None,
             compiler: Default::default(),
             attention: crate::dit::Attention::default(),
+            weight_io: Default::default(),
         }
     }
 }
@@ -167,7 +170,10 @@ impl Session {
     /// The checkpoint immutability requirements of [`Session::new`] apply for the
     /// entire session, including files temporarily released and reopened later.
     pub unsafe fn new_with_options(config: Config, options: SessionOptions) -> Result<Self> {
-        let context = hrx::inference::ModelContext::new(Default::default())?;
+        let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
+            native_lifetime: config.weight_io.native_lifetime(),
+            ..Default::default()
+        })?;
         // SAFETY: forwarded unchanged from this constructor's contract.
         unsafe { Self::new_in(config, options, &context) }
     }
@@ -187,6 +193,11 @@ impl Session {
         options: SessionOptions,
         context: &hrx::inference::ModelContext,
     ) -> Result<Self> {
+        if config.weight_io.mode != crate::weights::WeightIoMode::Mapped
+            && context.runtime().native_lifetime() != hrx::fabric::NativeLifetime::Process
+        {
+            return invalid("native weight I/O requires a process-lifetime HRX context");
+        }
         if config.loras.iter().any(|l| !l.strength.is_finite()) {
             return invalid("LoRA strength must be finite");
         }
@@ -238,6 +249,48 @@ impl Session {
     /// Drain and reset optional `H3_PROFILE` diagnostic stage timings.
     pub fn profile_report(&mut self) -> Result<Option<String>> {
         self.scheduled(|state| Ok(state.profile_report()))
+    }
+
+    /// Loading counters for currently checked-out model units. Evicted or cached
+    /// units are absent; querying does not reload them or reserve the compute lane.
+    pub fn weight_io_statistics(
+        &self,
+    ) -> Result<Vec<(&'static str, crate::weights::WeightStatistics)>> {
+        let state = self.native.state()?;
+        Ok([
+            (
+                "dit",
+                state
+                    .dit
+                    .as_ref()
+                    .and_then(|m| m.model.weight_io_statistics()),
+            ),
+            (
+                "text",
+                state
+                    .te
+                    .as_ref()
+                    .and_then(TextEncoder::weight_io_statistics),
+            ),
+            (
+                "video",
+                state.vvae.as_ref().and_then(VideoVae::weight_io_statistics),
+            ),
+            (
+                "audio",
+                state.avae.as_ref().and_then(AudioVae::weight_io_statistics),
+            ),
+            (
+                "upscaler",
+                state
+                    .upscaler
+                    .as_ref()
+                    .and_then(crate::upscale::Upscaler::weight_io_statistics),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, stats)| stats.map(|stats| (name, stats)))
+        .collect())
     }
 
     /// Attention width selected when this session was opened.
@@ -480,7 +533,9 @@ impl Session {
                     };
                     crate::trace::checkpoint("latent_upscaler", &path);
                     // SAFETY: Session's immutable checkpoint contract includes this model.
-                    state.upscaler = Some(unsafe { crate::upscale::Upscaler::open(path) }?);
+                    let mut model = unsafe { crate::upscale::Upscaler::open(path) }?;
+                    model.set_weight_io(state.config.weight_io, &state.compiler)?;
+                    state.upscaler = Some(model);
                 }
                 let (shape, video) = state.upscaler.as_ref().expect("opened").run(
                     &mut state.stream,
@@ -710,6 +765,7 @@ impl State {
                 unsafe { crate::adapter::Adapter::open_loras(&self.config.loras) }?
             };
             let mut dit = unsafe { Dit::open(&mut self.stream, &path) }?;
+            dit.set_weight_io(self.config.weight_io, &self.compiler)?;
             if let Some(adapter) = adapter {
                 dit.set_adapter(adapter);
             }
@@ -726,7 +782,9 @@ impl State {
             let path = checkpoint_path(&self.config.te, crate::models::TE)?;
             crate::trace::checkpoint("te", &path);
             // Safety: the caller's, taken at Session::new.
-            self.te = Some(unsafe { TextEncoder::open(&mut self.stream, &path) }?);
+            let mut model = unsafe { TextEncoder::open(&mut self.stream, &path) }?;
+            model.set_weight_io(self.config.weight_io, &self.compiler)?;
+            self.te = Some(model);
         }
         Ok(self.te.as_mut().expect("opened above"))
     }
@@ -739,7 +797,9 @@ impl State {
             let path = checkpoint_path(&self.config.video_vae, crate::models::VIDEO_VAE)?;
             crate::trace::checkpoint("video_vae", &path);
             // Safety: the caller's, taken at Session::new.
-            self.vvae = Some(unsafe { VideoVae::open(&mut self.stream, &path) }?);
+            let mut model = unsafe { VideoVae::open(&mut self.stream, &path) }?;
+            model.set_weight_io(self.config.weight_io, &self.compiler)?;
+            self.vvae = Some(model);
         }
         Ok(self.vvae.as_mut().expect("opened above"))
     }
@@ -752,7 +812,9 @@ impl State {
             let path = checkpoint_path(&self.config.audio_vae, crate::models::AUDIO_VAE)?;
             crate::trace::checkpoint("audio_vae", &path);
             // Safety: the caller's, taken at Session::new.
-            self.avae = Some(unsafe { AudioVae::open(&mut self.stream, &path) }?);
+            let mut model = unsafe { AudioVae::open(&mut self.stream, &path) }?;
+            model.set_weight_io(self.config.weight_io, &self.compiler)?;
+            self.avae = Some(model);
         }
         Ok(self.avae.as_mut().expect("opened above"))
     }
@@ -1467,6 +1529,7 @@ mod tests {
 
     fn config(attention: crate::dit::Attention) -> Config {
         Config {
+            weight_io: Default::default(),
             loras: Vec::new(),
             dit: None,
             base_weights: false,

@@ -177,6 +177,40 @@ impl Checkpoint {
             .expect("checkpoint entry belongs to this file")
     }
 
+    /// Retained backing files in the same order used by `file_range`.
+    pub(crate) fn storage_files(&self) -> hrx::Result<Vec<std::fs::File>> {
+        std::iter::once(&self.file)
+            .chain(self.shards.iter().map(|(_, file)| file))
+            .map(|file| {
+                file.backing_file()
+                    .expect("mapped checkpoint")
+                    .try_clone()
+                    .map_err(Into::into)
+            })
+            .collect()
+    }
+
+    /// Resolve a synthetic shard offset to its file index and absolute byte offset.
+    pub(crate) fn file_range(
+        &self,
+        entry: &Entry,
+        offset: usize,
+        bytes: usize,
+    ) -> hrx::Result<(usize, u64)> {
+        let (index, base, file) = self
+            .shards
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, (base, _))| entry.offset >= *base)
+            .map(|(i, (base, file))| (i + 1, *base, file))
+            .unwrap_or((0, 0, &self.file));
+        let mut local = entry.clone();
+        local.offset -= base;
+        let (_, offset) = file.file_range(&local, offset, bytes)?;
+        Ok((index, offset))
+    }
+
     /// Hint the kernel to read a range ahead of a sequential pass over it.
     pub fn will_need(&self, range: &[u8]) {
         self.file.will_need_bytes(range);

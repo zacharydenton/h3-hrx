@@ -939,6 +939,7 @@ fn run(mut cli: Cli) -> Result<()> {
         kernel_sources: sources,
         loom_library,
         compiler: cli.runtime.compiler(),
+        weight_io: cli.runtime.weight_io(),
         attention: match cli.attn {
             Attn::F16 => Attn16::F16,
             Attn::I8 => Attn16::I8,
@@ -1157,6 +1158,7 @@ fn run(mut cli: Cli) -> Result<()> {
     }
     let (video, audio) = (latents.video, latents.audio);
     eprintln!("denoised in {:.1} s", t0.elapsed().as_secs_f64());
+    cli.runtime.report_storage(&session)?;
     if let Some(report) = session.profile_report()? {
         eprintln!("  denoise stages ({report})");
     }
@@ -1197,6 +1199,7 @@ fn run(mut cli: Cli) -> Result<()> {
     let mut samples = vec![0.0f32; shape.audio_samples()];
     session.decode_audio(&audio, shape.audio_t as usize, &mut samples)?;
     eprintln!("decoded in {:.1} s", t0.elapsed().as_secs_f64());
+    cli.runtime.report_storage(&session)?;
     if let Some(report) = session.profile_report()? {
         eprintln!("  decode stages ({report})");
     }

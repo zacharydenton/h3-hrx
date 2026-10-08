@@ -65,12 +65,21 @@ fn loading(c: &mut Criterion) {
                 for _ in 0..iterations {
                     // A fresh owner prevents Weights::at's memoized device buffer from turning
                     // this into a lookup benchmark. Mapping/plan construction is excluded here.
-                    let weights = unsafe { Weights::open(&path, plan) }.unwrap();
+                    let weights =
+                        support::configure_weights(unsafe { Weights::open(&path, plan) }.unwrap());
                     let size = weights.recipe(tensor).unwrap().device_bytes();
                     let start = Instant::now();
                     let buffer = weights.at(&mut stream, tensor, size).unwrap();
                     stream.synchronize().unwrap();
-                    elapsed += start.elapsed();
+                    let measured = start.elapsed();
+                    elapsed += measured;
+                    if std::env::var_os("H3_BENCH_DETAILS").is_some() {
+                        eprintln!(
+                            "weight-load {name}/{tensor}: {:.6} ms; {:?}",
+                            measured.as_secs_f64() * 1000.,
+                            weights.io_statistics()
+                        );
+                    }
                     let actual = support::read(&mut stream, buffer.binding());
                     assert_eq!(actual, weights.assemble(tensor).unwrap());
                 }
@@ -135,7 +144,8 @@ fn block_loading(c: &mut Criterion) {
                 let mut elapsed = Duration::ZERO;
                 for _ in 0..iterations {
                     // SAFETY: benchmarks require immutable checkpoint files.
-                    let weights = unsafe { Weights::open(&path, plan) }.unwrap();
+                    let weights =
+                        support::configure_weights(unsafe { Weights::open(&path, plan) }.unwrap());
                     let start = Instant::now();
                     let buffers: Vec<_> = tensors
                         .iter()
@@ -269,10 +279,19 @@ fn cold_loading(c: &mut Criterion) {
                         })
                     }
                     .unwrap();
+                    let weights = support::configure_weights(weights);
                     let start = Instant::now();
                     let buffer = weights.at(&mut stream, tensor, size).unwrap();
                     stream.synchronize().unwrap();
-                    elapsed += start.elapsed();
+                    let measured = start.elapsed();
+                    elapsed += measured;
+                    if std::env::var_os("H3_BENCH_DETAILS").is_some() {
+                        eprintln!(
+                            "weight-load {name}/{tensor}: {:.6} ms; {:?}",
+                            measured.as_secs_f64() * 1000.,
+                            weights.io_statistics()
+                        );
+                    }
                     let actual = support::read(&mut stream, buffer.binding());
                     assert_eq!(actual, weights.assemble(tensor).unwrap());
                 }

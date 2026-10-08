@@ -6,9 +6,11 @@
 //!
 //! Recipes are declarative and resolved against the checkpoint when they are assembled, so a recipe
 //! table can be built and validated at open without reading a byte of tensor data.
+mod native;
 use crate::checkpoint::Checkpoint;
 use half::{bf16, f16};
 use hrx::artifacts::safetensors::{DType as Dtype, Entry};
+pub use native::{WeightIo, WeightIoMode, WeightStatistics};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -18,6 +20,8 @@ pub enum Error {
     Checkpoint(#[from] crate::checkpoint::Error),
     #[error(transparent)]
     Artifact(#[from] hrx::Error),
+    #[error(transparent)]
+    Compiler(#[from] crate::compile::Error),
     #[error("no recipe for tensor {0}")]
     NoRecipe(String),
     #[error("{0}")]
@@ -149,6 +153,9 @@ impl Recipe {
 /// One checkpoint, the recipe table a plan built over it, and whatever has reached the device.
 pub struct Weights {
     file: Checkpoint,
+    io: WeightIo,
+    io_compiler: Option<crate::compile::Compiler>,
+    native: Mutex<Option<native::Loader>>,
     recipes: BTreeMap<String, Recipe>,
     /// Uploaded on first use and kept for the session, behind a lock so the session can be moved
     /// between threads.
@@ -173,9 +180,32 @@ impl Weights {
         plan(&file, &mut recipes)?;
         Ok(Self {
             file,
+            io: WeightIo::default(),
+            io_compiler: None,
+            native: Mutex::new(None),
             recipes,
             uploaded: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Select loading before the first tensor is uploaded. Resident tensors keep their layout.
+    pub fn set_io(&mut self, io: WeightIo, compiler: &crate::compile::Compiler) -> Result<()> {
+        if !self.uploaded.get_mut().expect("not poisoned").is_empty() {
+            return layout("weight I/O must be selected before loading tensors");
+        }
+        self.native = Mutex::new(None);
+        self.io = io;
+        self.io_compiler = Some(compiler.fork());
+        Ok(())
+    }
+
+    /// Loading counters for the native route, if it has been used.
+    pub fn io_statistics(&self) -> Option<WeightStatistics> {
+        self.native
+            .lock()
+            .expect("not poisoned")
+            .as_ref()
+            .map(native::Loader::statistics)
     }
 
     pub fn device_bytes(&self) -> usize {
@@ -198,6 +228,9 @@ impl Weights {
         plan(&file, &mut recipes)?;
         Ok(Self {
             file,
+            io: WeightIo::default(),
+            io_compiler: None,
+            native: Mutex::new(None),
             recipes,
             uploaded: Mutex::new(BTreeMap::new()),
         })
@@ -284,6 +317,21 @@ impl Weights {
     }
 
     fn load(&self, stream: &mut hrx::Stream, recipe: &Recipe) -> Result<hrx::Buffer> {
+        if self.io.mode != WeightIoMode::Mapped && matches!(recipe, Recipe::Rows { .. }) {
+            let mut loader = self.native.lock().expect("not poisoned");
+            if loader.is_none() {
+                *loader = Some(native::Loader::new(
+                    stream,
+                    &self.file,
+                    self.io,
+                    self.io_compiler
+                        .as_ref()
+                        .expect("selected native loading")
+                        .fork(),
+                )?);
+            }
+            return loader.as_mut().unwrap().load(stream, &self.file, recipe);
+        }
         let device = |e: hrx::Error| Error::Device(e.to_string());
         let initialize = |bytes: &[u8]| {
             if bytes.is_empty() {

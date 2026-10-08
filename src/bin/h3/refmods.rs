@@ -183,6 +183,7 @@ fn create(args: Create) -> Result<()> {
     let context = hrx::inference::ModelContext::new(args.runtime.options(None)?)?;
     let config = Config {
         compiler: args.runtime.compiler(),
+        weight_io: args.runtime.weight_io(),
         video_vae: if decoded.is_empty() {
             None
         } else {

@@ -29,8 +29,31 @@ enum Check {
     Race,
 }
 
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum WeightIo {
+    #[default]
+    Mapped,
+    NativeBuffered,
+    NativeDirect,
+}
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum StorageProgress {
+    #[default]
+    Sqpoll,
+    Wait,
+}
+
 #[derive(clap::Args)]
 pub(super) struct RuntimeArgs {
+    /// Checkpoint loading route; native-direct requires filesystem direct-I/O support
+    #[arg(long, value_enum, default_value = "mapped")]
+    weight_io: WeightIo,
+    /// Kernel progress policy for native weight I/O
+    #[arg(long, value_enum, default_value = "sqpoll")]
+    storage_progress: StorageProgress,
+    /// Collect host-observed native loading phase timings
+    #[arg(long)]
+    weight_io_statistics: bool,
     /// GPU ordinal in HRX's native device enumeration
     #[arg(long, default_value_t = 0)]
     gpu: i32,
@@ -65,6 +88,31 @@ pub(super) struct RuntimeArgs {
     compile_traces: Option<PathBuf>,
 }
 impl RuntimeArgs {
+    pub(super) fn weight_io(&self) -> h3_hrx::weights::WeightIo {
+        use h3_hrx::weights::WeightIoMode;
+        h3_hrx::weights::WeightIo {
+            mode: match self.weight_io {
+                WeightIo::Mapped => WeightIoMode::Mapped,
+                WeightIo::NativeBuffered => WeightIoMode::NativeBuffered,
+                WeightIo::NativeDirect => WeightIoMode::NativeDirect,
+            },
+            progress: match self.storage_progress {
+                StorageProgress::Sqpoll => hrx::storage::StorageProgress::Sqpoll,
+                StorageProgress::Wait => hrx::storage::StorageProgress::Wait,
+            },
+            statistics: self.weight_io_statistics,
+        }
+    }
+
+    pub(super) fn report_storage(&self, session: &h3_hrx::Session) -> anyhow::Result<()> {
+        if self.weight_io_statistics {
+            for (name, stats) in session.weight_io_statistics()? {
+                eprintln!("weight I/O {name}: {} tensors, {} logical bytes, {} physical requests, {:?} total, {:?} read wait, {:?} consumer wait, {:?} service CPU",
+                    stats.tensors,stats.logical_bytes,stats.storage.physical_requests,stats.total,stats.read_wait,stats.consumer_wait,stats.storage.service_cpu_time);
+            }
+        }
+        Ok(())
+    }
     pub(super) fn compiler(&self) -> h3_hrx::compile::Options {
         let mut sanitizer = hrx::loom::SanitizerChecks::default();
         for check in &self.sanitize {
@@ -112,6 +160,7 @@ impl RuntimeArgs {
         );
         Ok(hrx::execution::RuntimeOptions {
             gpu_index: self.gpu,
+            native_lifetime: self.weight_io().native_lifetime(),
             compute_engine: match self.compute_engine {
                 Compute::Pm4 => hrx::execution::ComputeEngine::Pm4,
                 Compute::Aql => hrx::execution::ComputeEngine::Aql {
@@ -174,6 +223,43 @@ mod tests {
             }
         );
         assert!(compiler.reports.is_none() && compiler.traces.is_none());
+    }
+
+    #[test]
+    fn storage_selection_reaches_runtime_and_loader() {
+        use h3_hrx::weights::WeightIoMode;
+        for (flag, mode, lifetime) in [
+            (
+                "mapped",
+                WeightIoMode::Mapped,
+                hrx::fabric::NativeLifetime::Instance,
+            ),
+            (
+                "native-buffered",
+                WeightIoMode::NativeBuffered,
+                hrx::fabric::NativeLifetime::Process,
+            ),
+            (
+                "native-direct",
+                WeightIoMode::NativeDirect,
+                hrx::fabric::NativeLifetime::Process,
+            ),
+        ] {
+            let cli = super::super::Cli::try_parse_from([
+                "h3",
+                "--weight-io",
+                flag,
+                "--storage-progress",
+                "wait",
+            ])
+            .unwrap();
+            assert_eq!(cli.runtime.weight_io().mode, mode);
+            assert_eq!(
+                cli.runtime.weight_io().progress,
+                hrx::storage::StorageProgress::Wait
+            );
+            assert_eq!(cli.runtime.options(None).unwrap().native_lifetime, lifetime);
+        }
     }
 
     #[test]

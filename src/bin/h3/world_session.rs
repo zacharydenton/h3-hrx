@@ -247,6 +247,7 @@ pub fn run(args: Args) -> Result<()> {
     state.bind_adapter(&adapter_digest)?;
     let config = Config {
         compiler: args.runtime.compiler(),
+        weight_io: args.runtime.weight_io(),
         dit: Some(resolve(&args.dit, h3_hrx::models::DIT_FL2VA)?),
         te: Some(resolve(&args.te, h3_hrx::models::TE)?),
         video_vae: Some(resolve(&args.video_vae, h3_hrx::models::VIDEO_VAE)?),

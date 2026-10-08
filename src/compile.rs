@@ -201,6 +201,15 @@ pub struct Compiler {
     kernels: OnceLock<hrx::loom::KeyedKernels<RequestKey>>,
 }
 impl Compiler {
+    /// Copy source/compiler selection for an independently owned loader cache.
+    pub(crate) fn fork(&self) -> Self {
+        Self::with_options(
+            self.library.clone(),
+            self.sources.clone(),
+            self.options.clone(),
+        )
+    }
+
     pub fn new(library: Option<PathBuf>, sources: impl Into<PathBuf>) -> Self {
         Self::with_options(library, sources, Options::default())
     }

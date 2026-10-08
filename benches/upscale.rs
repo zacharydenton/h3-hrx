@@ -25,7 +25,10 @@ fn upscale(c: &mut Criterion) {
                 .unwrap()
         });
         b.iter(|| {
-            let model = unsafe { Upscaler::open(&*path) }.unwrap();
+            let mut model = unsafe { Upscaler::open(&*path) }.unwrap();
+            model
+                .set_weight_io(support::weight_io(), &support::compiler())
+                .unwrap();
             std::hint::black_box(model.device_bytes());
         });
     });

@@ -151,3 +151,25 @@ Use `--compile-reports target/compiler-reports` for detailed compiler reports or
 `--compile-traces target/compiler-traces` for bounded text pass traces. Neither
 writes files unless requested. CU/WGP mode changes need their own numerical and
 performance checks; selecting a mode does not establish a speedup.
+
+## Checkpoint I/O
+
+`--weight-io mapped|native-buffered|native-direct` selects the loading route.
+Mapped loading remains the default. Native modes use HRX's GPU-authored io_uring
+session and four retained 16 MiB payload slots. Contiguous, gathered, interleaved
+and pitched row recipes preserve their encoded bytes; built recipes continue to
+run on the CPU. Loaded tensors remain resident under the selected residency policy.
+
+`--storage-progress sqpoll|wait` selects kernel polling or eventfd/deferred-work
+service. Direct mode requires filesystem direct-I/O support and fails explicitly
+when unavailable. This uses registered system pages, not discrete VRAM peer DMA.
+`--weight-io-statistics` collects host-observed loading intervals and reports
+counters for the current model units. Native storage capacity is charged to the
+shared allocation budget in addition to resident weights and execution scratch.
+
+Rust callers set `Config::weight_io`. `Session::new` selects the required native
+lifetime; applications supplying a `ModelContext` must choose
+`RuntimeOptions::native_lifetime = NativeLifetime::Process` for native loading.
+Low-level model users pass their compiler to `set_weight_io` before preparing
+weights; row kernels share its source selection, reports and sanitizer options. Query
+`Weights::io_statistics` or `Session::weight_io_statistics` for typed counters.

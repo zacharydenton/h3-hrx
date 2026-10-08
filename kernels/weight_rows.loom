@@ -1,0 +1,41 @@
+// Byte-preserving pitched rows. Constants are explicitly i32; no dtype conversion.
+config.decl @h3.weight_rows.row_bytes : %value: index where [range(%value, 1, 2147483647)]
+config.decl @h3.weight_rows.pitch_bytes : %value: index where [range(%value, 1, 2147483647)]
+kernel.def export("h3_weight_rows") @h3_weight_rows(%count: index) {
+  %one = index.constant 1 : index
+  %width = index.constant 256 : index
+  %round = index.constant 255 : index
+  %rounded = index.add %count, %round : index
+  %groups = index.div %rounded, %width : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%width, %one, %one) : index
+} launch(%input: buffer, %output: buffer, %count32: i32, %first32: i32, %span32: i32) {
+  %zero = index.constant 0 : offset
+  %width = index.constant 256 : index
+  %count_raw = index.cast %count32 : i32 to index
+  %count = index.assume %count_raw [range(%count_raw, 1, 2147483647)] : index
+  %first_raw = index.cast %first32 : i32 to index
+  %first = index.assume %first_raw [range(%first_raw, 0, 2147483647)] : index
+  %row = config.get @h3.weight_rows.row_bytes : index
+  %pitch = config.get @h3.weight_rows.pitch_bytes : index
+  %span_raw = index.cast %span32 : i32 to index
+  %span = index.assume %span_raw [range(%span_raw, 1, 2147483647)] : index
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %group, %width : index
+  %i = index.add %base, %lane : index
+  %src = buffer.view %input[%zero] : buffer -> view<[%count]xi8>
+  %dst = buffer.view %output[%zero] : buffer -> view<[%span]xi8>
+  %active = index.cmp ult, %i, %count : index
+  scf.if %active {
+    %at_raw = index.add %first, %i : index
+    %at = index.assume %at_raw [range(%at_raw, 0, 2147483647)] : index
+    %r = index.div %at, %row : index
+    %c = index.rem %at, %row : index
+    %start = index.mul %r, %pitch : index
+    %out = index.add %start, %c : index
+    %value = view.load %src[%i] : view<[%count]xi8> -> i8
+    %checked = index.assume %out [range(%out, 0, 2147483647), lt(%out, %span)] : index
+    view.store %value, %dst[%checked] : i8, view<[%span]xi8>
+  }
+  kernel.return
+}

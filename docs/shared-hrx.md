@@ -1,7 +1,7 @@
 # Shared HRX integration
 
 H3 uses `hrx-rs` for native loading, allocation, dispatch, graphs, compilation and
-artifact caching. H3 uses the published HRX 0.9.0 crate.
+artifact caching. H3 uses the published HRX 0.10.0 crate.
 Model code owns tensor
 layouts, source selection and numerical behavior; `Session` is the public API.
 H3 does not enable HRX's optional NPU feature.

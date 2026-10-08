@@ -36,6 +36,10 @@ prompt-generation = ["dep:reqwest", "dep:base64", "dep:png", "dep:regex"]
 gpu-tests = []
 
 [[bench]]
+name = "attention"
+harness = false
+
+[[bench]]
 name = "kernels"
 harness = false
 
@@ -75,7 +79,7 @@ test = true
 
 [dependencies]
 # allocate_from avoids a staging copy and a redundant initialization pass for weights.
-hrx = { package = "hrx-rs", version = "0.9.0" }
+hrx = { package = "hrx-rs", version = "0.10.0" }
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"
 thiserror = "2"
