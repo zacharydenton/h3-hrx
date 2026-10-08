@@ -93,7 +93,7 @@ The second command uses Torch on the CPU with original tensor order. It compares
 QKV, attention, complete blocks and projections supplied with native attention
 input. Use a Python environment with the dependencies of the reference tool.
 
-## Comparing kernel families
+## Comparing kernels
 
 Production Loom modules share schedules across compatible exports. To compare
 an arithmetic-preserving change, snapshot a baseline with matching bindings and
@@ -107,7 +107,8 @@ export H3_KERNEL_BASELINE="$PWD/build/kernel-baseline/kernels"
 cargo test --locked --test kernels --release -- --test-threads=1 --nocapture
 ```
 
-The harness compares every binding byte-for-byte before its CPU-oracle check.
+The harness compares every binding byte-for-byte before its CPU-oracle check,
+including standalone kernels whose module and export names match.
 Use a filtered test if only some exports have a compatible baseline. Intentional
 precision changes need independent validation instead of byte equality.
 

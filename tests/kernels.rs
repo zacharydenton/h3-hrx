@@ -53,29 +53,27 @@ impl Harness {
                 .collect(),
         );
         let path = self.compiler.module(&source).compile(&request).unwrap();
-        let baseline = std::env::var_os("H3_KERNEL_BASELINE")
-            .filter(|_| module != stem)
-            .map(|dir| {
-                let source_path = Path::new(&dir).join(format!("{stem}.loom"));
-                let source_path = if source_path.is_file() {
-                    source_path
+        let baseline = std::env::var_os("H3_KERNEL_BASELINE").map(|dir| {
+            let source_path = Path::new(&dir).join(format!("{stem}.loom"));
+            let source_path = if source_path.is_file() {
+                source_path
+            } else {
+                Path::new(&dir).join(format!("{module}.loom"))
+            };
+            let source = std::fs::read_to_string(source_path).expect("baseline kernel source");
+            let mut old = hrx::loom::Specialization::new(&symbol);
+            old.replace_config(request.configuration().clone());
+            let old_path = self.compiler.module(&source).compile(&old).unwrap();
+            eprintln!(
+                "artifact {stem}: {}",
+                if old_path.bytes() == path.bytes() {
+                    "identical"
                 } else {
-                    Path::new(&dir).join(format!("{module}.loom"))
-                };
-                let source = std::fs::read_to_string(source_path).expect("baseline kernel source");
-                let mut old = hrx::loom::Specialization::new(&symbol);
-                old.replace_config(request.configuration().clone());
-                let old_path = self.compiler.module(&source).compile(&old).unwrap();
-                eprintln!(
-                    "artifact {stem}: {}",
-                    if old_path.bytes() == path.bytes() {
-                        "identical"
-                    } else {
-                        "changed"
-                    }
-                );
-                old_path
-            });
+                    "changed"
+                }
+            );
+            old_path
+        });
         // Safety: trusted checked-in source compiled through HRX. Every test below
         // sizes the bindings from the same dimensions passed as kernel configuration.
         let kernel = unsafe { self.stream.load_artifact(&path).unwrap() };

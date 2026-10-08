@@ -176,10 +176,13 @@ fn stages(c: &mut Criterion) {
     ));
     for (name, stage, w, h, length) in cases {
         let mut fixture = None;
-        group.bench_function(name, |b| {
+        group.bench_function(&name, |b| {
             let (fixture, expected) = fixture.get_or_insert_with(|| {
                 let mut fixture = Fixture::new(stage, w, h, length);
                 let expected = fixture.run().digest();
+                if std::env::var_os("H3_BENCH_DETAILS").is_some() {
+                    eprintln!("{name} output sha256: {expected}");
+                }
                 (fixture, expected)
             });
             measure(

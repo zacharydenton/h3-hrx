@@ -89,9 +89,11 @@ H3_BENCH_PROCESSOR_MODE=cu \
   cargo bench --locked --bench kernels -- attention_i8qkhm/37977
 ```
 
-`H3_BENCH_DETAILS=1` prints attention and DiT output hashes outside timing for
+`H3_BENCH_DETAILS=1` prints attention, DiT and stage output hashes outside timing for
 cross-configuration comparisons, plus completed DiT forward counts and latency
 (also in `--test` mode). Every run checks repeated execution for identical output.
+These replay checks compare against the run's own warmup; compare the printed
+digests when changing native engines or compiler modes.
 Use `H3_COMPILE_REPORT_DIR` for HRX's resource/wait reports and
 `H3_PROFILE=device` for GPU profiling; collect latency separately from diagnostics.
 Device-clock profiling requires PM4 with compute copies; `H3_PROFILE=1` uses
