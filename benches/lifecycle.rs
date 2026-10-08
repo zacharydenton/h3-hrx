@@ -174,24 +174,44 @@ fn cold_loading(c: &mut Criterion) {
     use std::{io::Write, os::fd::AsRawFd};
 
     let mut group = c.benchmark_group("checkpoint/cold_file");
-    for (tensor, size) in [
-        ("blocks.0.qkv.q", QKV * HID),
-        ("blocks.0.gu.q", 2 * FFN * HID),
+    for (name, relative, plan, tensor, size) in [
+        (
+            "dit",
+            h3_hrx::models::DIT_FL2VA,
+            plan::dit::plan as Plan,
+            "blocks.0.qkv.q",
+            QKV * HID,
+        ),
+        (
+            "dit",
+            h3_hrx::models::DIT_FL2VA,
+            plan::dit::plan as Plan,
+            "blocks.0.gu.q",
+            2 * FFN * HID,
+        ),
+        (
+            "text",
+            h3_hrx::models::TE,
+            plan::te::plan as Plan,
+            "blocks.0.qkv.q",
+            (TE_HEADS + 2 * TE_KV) * HEAD_DIM * gemm_pitch(TE_HID, 8),
+        ),
+        (
+            "text",
+            h3_hrx::models::TE,
+            plan::te::plan as Plan,
+            "blocks.0.gu.q",
+            2 * TE_FFN * gemm_pitch(TE_HID, 8),
+        ),
     ] {
         group.throughput(Throughput::Bytes(size as u64));
-        group.bench_function(tensor, |b| {
+        group.bench_function(format!("{name}/{tensor}"), |b| {
             // /tmp may be tmpfs. Use the workspace filesystem for the disk fixture.
             let dir = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
             let path = dir.path().join("weights.safetensors");
             let (rows, row_bytes, pitch_bytes, segments) = {
                 // SAFETY: benchmark checkpoints remain immutable while mapped.
-                let source = unsafe {
-                    Weights::open(
-                        support::checkpoint(h3_hrx::models::DIT_FL2VA),
-                        plan::dit::plan,
-                    )
-                }
-                .unwrap();
+                let source = unsafe { Weights::open(support::checkpoint(relative), plan) }.unwrap();
                 let Recipe::Rows {
                     rows,
                     row_bytes,
@@ -201,19 +221,35 @@ fn cold_loading(c: &mut Criterion) {
                 else {
                     panic!("expected a row recipe");
                 };
-                // Both cases use one source tensor, even when its rows are permuted.
-                let name = &segments[0].tensor;
-                assert!(segments.iter().all(|s| &s.tensor == name));
-                let entry = source.file().at(name).unwrap();
-                let header = serde_json::to_vec(&serde_json::json!({ name: {
-                    "dtype":"I8", "shape":entry.shape, "data_offsets":[0,entry.bytes]
-                }}))
-                .unwrap();
+                // Text QKV and gate/up gather several separate source tensors.
+                // Keep those source tensors separate and in checkpoint order.
+                let names: std::collections::BTreeSet<_> =
+                    segments.iter().map(|s| &s.tensor).collect();
+                let mut entries: Vec<_> = names
+                    .into_iter()
+                    .map(|name| (name, source.file().at(name).unwrap()))
+                    .collect();
+                entries.sort_by_key(|(_, entry)| entry.offset);
+                let mut header = serde_json::Map::new();
+                let mut offset = 0;
+                for (name, entry) in &entries {
+                    header.insert(
+                        (*name).clone(),
+                        serde_json::json!({
+                            "dtype":"I8", "shape":entry.shape,
+                            "data_offsets":[offset, offset + entry.bytes]
+                        }),
+                    );
+                    offset += entry.bytes;
+                }
+                let header = serde_json::to_vec(&header).unwrap();
                 let mut file = std::fs::File::create(&path).unwrap();
                 file.write_all(&(header.len() as u64).to_le_bytes())
                     .unwrap();
                 file.write_all(&header).unwrap();
-                file.write_all(source.file().bytes(entry)).unwrap();
+                for (_, entry) in entries {
+                    file.write_all(source.file().bytes(entry)).unwrap();
+                }
                 file.sync_all().unwrap();
                 (*rows, *row_bytes, *pitch_bytes, segments.clone())
             };

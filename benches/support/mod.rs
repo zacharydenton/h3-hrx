@@ -4,10 +4,26 @@ use criterion::{Bencher, Criterion};
 use h3_hrx::{Config, DenoiseParams, ResidencyPolicy, Session, SessionOptions};
 use std::{
     path::PathBuf,
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
 pub const PROMPT: &str = "A red fox walks through a snowy forest at dawn. The camera slowly follows. Soft wind and footsteps in snow.";
+
+pub fn prompt() -> &'static str {
+    static TEXT: OnceLock<String> = OnceLock::new();
+    TEXT.get_or_init(|| match std::env::var_os("H3_BENCH_PROMPT_FILE") {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).expect("read H3_BENCH_PROMPT_FILE");
+            assert!(
+                !text.trim().is_empty(),
+                "benchmark prompt must not be empty"
+            );
+            text
+        }
+        None => PROMPT.into(),
+    })
+}
 
 pub fn criterion() -> Criterion {
     Criterion::default()
@@ -100,14 +116,25 @@ pub fn params() -> (String, DenoiseParams) {
         "768p" => (1344, 768, 124, 21),
         _ => panic!("H3_BENCH_PROFILE must be smoke, 480p or 768p"),
     };
+    let steps: usize = std::env::var("H3_BENCH_STEPS")
+        .map(|s| s.parse().expect("integer sigma-point count"))
+        .unwrap_or(steps);
+    assert!(
+        (2..=1000).contains(&steps),
+        "H3_BENCH_STEPS must be 2..=1000"
+    );
+    let seed: u64 = std::env::var("H3_BENCH_SEED")
+        .map(|s| s.parse().expect("unsigned integer seed"))
+        .unwrap_or(7);
+    let digest = hrx::bundle::digest(prompt().as_bytes());
     (
-        profile,
+        format!("{profile}/steps{steps}/seed{seed}/prompt-{}", &digest[..12]),
         DenoiseParams {
             width,
             height,
             frames,
             steps,
-            seed: 7,
+            seed,
             ..Default::default()
         },
     )

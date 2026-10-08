@@ -242,7 +242,11 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
 fn models(c: &mut Criterion) {
     c.bench_function("audio/roundtrip/3200", |b| audio(b).unwrap());
     let mut group = c.benchmark_group("dit_stack");
-    for tokens in [256, 1024, 1025, 2048, 2049, 4096, 4097, 8192, 8193] {
+    // 480p/768p, 124 frames, 267 text + 414 audio rows: 15,666/37,977 total.
+    // Long attention has quadratic cost and different cache behavior.
+    for tokens in [
+        256, 1024, 1025, 2048, 2049, 4096, 4097, 8192, 8193, 15666, 37977,
+    ] {
         for graph in [false, true] {
             let mode = if graph { "graph" } else { "eager" };
             group.bench_function(format!("{mode}/{tokens}/1_layer"), |b| {
@@ -250,6 +254,12 @@ fn models(c: &mut Criterion) {
             });
         }
     }
+    // Stream every checkpoint block through the same activation workspace. A
+    // repeated single block cannot measure the full denoiser's weight traffic.
+    group.sampling_mode(criterion::SamplingMode::Flat);
+    group.bench_function("eager/37977/50_layers", |b| {
+        stack(b, 37977, BLOCKS, false).unwrap()
+    });
     group.finish();
 }
 

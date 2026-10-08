@@ -52,7 +52,7 @@ impl Fixture {
             Stage::AudioEncode => support::values(2 * length, 0.2),
             Stage::AudioDecode => support::values(64 * length, 0.5),
         };
-        let tokens = Tokenizer::new().unwrap().encode(support::PROMPT).unwrap();
+        let tokens = Tokenizer::new().unwrap().encode(support::prompt()).unwrap();
         let ids = if matches!(stage, Stage::Text) {
             tokens.into_iter().cycle().take(length).collect()
         } else {
@@ -121,7 +121,7 @@ impl Fixture {
     }
 }
 fn stages(c: &mut Criterion) {
-    let (_, params) = support::params();
+    let (profile, params) = support::params();
     let mut cases = vec![
         ("text_refiner/32_tokens".into(), Stage::Text, 64, 64, 32),
         ("text_refiner/512_tokens".into(), Stage::Text, 64, 64, 512),
@@ -170,7 +170,7 @@ fn stages(c: &mut Criterion) {
     cases.sort_by(|a, b| a.0.cmp(&b.0));
     cases.dedup_by(|a, b| a.0 == b.0);
     let mut group = c.benchmark_group(format!(
-        "stages/{:?}/{}",
+        "stages/{profile}/{:?}/{}",
         support::residency(),
         support::execution_id()
     ));
@@ -208,7 +208,7 @@ fn denoise(c: &mut Criterion) {
             let (_runtime, session, ids, expected) = state.get_or_insert_with(|| {
                 let runtime = Runtime::new();
                 let mut session = runtime.warm_session(false);
-                let ids = Tokenizer::new().unwrap().encode(support::PROMPT).unwrap();
+                let ids = Tokenizer::new().unwrap().encode(support::prompt()).unwrap();
                 let out = session
                     .denoise(&ids, &params, h3_hrx::Noise::default(), &[], &[], None)
                     .unwrap();

@@ -334,7 +334,7 @@ impl Render {
             }
         }
         let presentation =
-            PreparedPresentation::new(&self.tokenizer, &entries, support::PROMPT, &self.shape)
+            PreparedPresentation::new(&self.tokenizer, &entries, support::prompt(), &self.shape)
                 .unwrap();
         let latents = if self.case.kind == Kind::World {
             let schedule =

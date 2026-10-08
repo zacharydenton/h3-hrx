@@ -152,14 +152,16 @@ fn cli(c: &mut Criterion) {
                         .arg(params.frames.to_string())
                         .arg("--steps")
                         .arg(params.steps.to_string())
-                        .args(["--seed", "7", "--sampler", "res_multistep", "--attn"])
+                        .arg("--seed")
+                        .arg(params.seed.to_string())
+                        .args(["--sampler", "res_multistep", "--attn"])
                         .arg(match support::attention().bits() {
                             8 => "i8",
                             4 => "i4",
                             _ => "f16",
                         })
                         .arg("-p")
-                        .arg(support::PROMPT)
+                        .arg(support::prompt())
                         .arg("--out")
                         .arg(&render.mp4);
                     if references {

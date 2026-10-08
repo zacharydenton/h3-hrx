@@ -10,8 +10,8 @@ Results and baselines belong in ignored `target/criterion/`, never in Git.
 | Target | Coverage |
 | --- | --- |
 | `host` | Short/long tokenization, mixed-media presentation, image resizing, RefMod loading/strength/copies, packed sequence layout |
-| `kernels` | FP32 Hadamard preparation, INT8 attention preparation in both layouts, V transpose, INT8/BF16 GEMMs with FP32 outputs including DiT projection dimensions, cached/rotating weights, eager/graph dispatch |
-| `models` | Resident one-block DiT eager/graph comparison through 8,193 tokens, covering both integer attention layouts and partial tiles, and short audio roundtrip |
+| `kernels` | FP32 Hadamard preparation, INT8 attention preparation in both layouts, V transpose, INT8/BF16 GEMMs including all four DiT projections through 37,977 rows, cached/rotating weights, eager/graph dispatch |
+| `models` | Resident one-block INT8 DiT eager/graph comparison through 37,977 tokens including partial tiles, a complete 50-block 768p sequence, and short audio roundtrip |
 | `stages` | Complete text encoder plus token refiner, vision tower, video encode/decode, audio encode/decode, complete 50-block denoising trajectories with Euler and ResMultistep |
 | `lifecycle` | Mapping/planning, tensor packing and completed uploads, block loading throughput, cold-file loading, forced audio eviction/reload |
 | `pipeline` | Complete text, first/last-frame, image/audio reference, video/audio reference, RefMod, LoRA, Turbo and World renders; cache observation/reuse; WAV and H.264/AAC output; fresh CLI processes |
@@ -74,6 +74,14 @@ claims. Criterion requires at least ten samples: full-size renders can take
 hours per workload. The default command includes every variant; filters are
 available for focused work.
 
+The kernel and `models` targets have their own shape matrices, including
+production sequence lengths regardless of this profile. The default `models`
+suite includes `dit_stack/eager/37977/50_layers`; its repeated full-stack
+measurements can take tens of minutes. This case streams all 50 checkpoint
+blocks through one activation workspace. It measures the resident backbone
+with synthetic inputs and modulation tables; conditioning, sampler updates,
+decoding and model loading remain covered by the stage and render targets.
+
 ```sh
 H3_BENCH_PROFILE=480p cargo bench --locked --bench pipeline -- text/res_multistep/warm_session
 H3_BENCH_PROFILE=768p cargo bench --locked --bench stages -- denoise/
@@ -81,15 +89,78 @@ H3_GRAPH=1 cargo bench --locked --bench pipeline -- text/res_multistep/warm_sess
 H3_BENCH_ATTN=f16 cargo bench --locked --bench stages -- denoise/
 ```
 
-`H3_BENCH_ATTN` selects `i8` (default), `f16`, or experimental `i4` attention.
+To reproduce a particular ordinary H3 render, `H3_BENCH_PROMPT_FILE` supplies
+the verbatim prompt to denoise/render benchmarks, `H3_BENCH_STEPS` overrides
+the sigma-point count, and `H3_BENCH_SEED` overrides the seed (default 7).
+Profile-based benchmark names include the step count, seed and prompt-content
+digest so these workloads do not share a baseline accidentally. For example:
+
+```sh
+H3_BENCH_PROFILE=768p H3_BENCH_STEPS=31 H3_BENCH_SEED=0 \
+  H3_BENCH_PROMPT_FILE=/path/to/prompt.txt H3_BENCH_BUDGET_GIB=48 \
+  cargo bench --locked --bench pipeline -- 'cli/768p/.*/text/cold_process' --test
+```
+
+`--test` executes the case once without Criterion's sampling/warmup campaign;
+use the CLI under an external wall-clock timer for a single end-to-end timing.
+Omit `--test` to collect Criterion samples. The usual profiles still use 20
+evaluations; the CLI's unqualified default uses 30.
+
+## Interpreting improvements
+
+Choose the target render before choosing a kernel. Rank its profiled stages by
+their share of elapsed time: video encoding is absent from text-only generation,
+and a large decoder speedup can have little effect when denoising dominates.
+Attention scales quadratically with sequence length, while projection work
+scales linearly. Small-sequence rankings therefore do not predict 768p rankings.
+
+Validate a candidate at the full-size kernel, block, 50-block stack and render
+levels. Rotating matrices help expose weight traffic, but do not reproduce the
+full model's working set or its sequence of activation reads and writes. Require
+a repeatable improvement at the next level before attributing a local gain to
+render performance. Preserve numerical checks and compare the same attention,
+sampler, prompt, references, evaluation count, residency policy and memory cap.
+
+Report startup and resident sampling separately. `cold_session` and
+`cold_process` recreate their named object; they do not evict the filesystem or
+compiler caches. Setup runs, replay checks and Criterion warmups can warm both.
+The `lifecycle` cold-file cases measure DiT and text-encoder QKV/gate-up packing
+and uploads from private evicted files, including multi-tensor recipes. They
+do not measure whole-model cold startup. Device profiling
+serializes launches and adds timestamp overhead, so use unprofiled runs for
+latency comparisons. Alternate baseline/candidate runs on shared hardware and
+report timing variation; a noisy full render does not establish a regression
+or a speedup by itself.
+
+Keep the Rust dependency revision, native HRX bundle and Loom compiler fixed
+within a comparison. Compiler changes can alter register pressure and occupancy
+even when the kernel source is unchanged. Record those identities with results
+outside the repository. When comparing kernels in one process, reuse the same
+input, weight and output allocations and alternate execution order; separate
+workspaces introduce another variable on this UMA device. Include sustained
+full-stack measurements: a brief warm microbenchmark does not capture the
+clocks, memory pressure or contention of a long render.
+
+## Runtime controls
+
+`H3_BENCH_ATTN` selects `i8` (default), `f16`, or experimental `i4` attention
+for stage/render targets. The `models` DiT cases use INT8 attention.
 `H3_GRAPH` is read once by the runtime: compare it in separate processes.
-Case names include attention, graph mode and the allocation budget to keep
+Stage/render case names include attention, graph mode and the allocation budget to keep
 incompatible baselines separate. `H3_BENCH_BUDGET_GIB` defaults to 64 for the
 stage/render/lifecycle/memory suite and 32 for the `models` benchmarks. Profile
 a single DiT block with a smaller cap:
 
 ```sh
 H3_BENCH_BUDGET_GIB=2 H3_PROFILE=device cargo bench --locked --bench models -- dit_stack/eager/2048 --test
+```
+
+For a production-size bottleneck ranking, profile the 768p block or all 50
+blocks. The full stack needs additional host-memory headroom beyond its cap:
+
+```sh
+H3_BENCH_BUDGET_GIB=12 H3_PROFILE=device cargo bench --locked --bench models -- 'dit_stack/eager/37977/1_layer$' --test
+H3_BENCH_BUDGET_GIB=32 H3_PROFILE=device cargo bench --locked --bench models -- 'dit_stack/eager/37977/50_layers$' --test
 ```
 
 DiT fuses Q/K normalization, rotary embedding and INT8 preparation from 4,096
@@ -175,7 +246,7 @@ that execution path; it is not a quality-qualified cache preset.
   prevent a cached lookup from replacing the transfer. `load_block` measures the
   four large projections of one DiT, text or video transformer block, with byte
   throughput and exact readback checks. OS file caches remain available.
-  On Linux, `cold_file` copies representative DiT tensors to a private checkpoint
+  On Linux, `cold_file` copies representative DiT and text-encoder tensors to a private checkpoint
   under `target/`, flushes it, and evicts only that fixture before each iteration.
   It times allocation, disk faults, packing and completed upload; fixture setup,
   eviction and validation are excluded. Use a disk-backed workspace for this case.
@@ -183,7 +254,7 @@ that execution path; it is not a quality-qualified cache preset.
   applying pressure, releasing it, and reloading/decoding the audio model.
 
 Replay digests, finite checks and ffprobe validation run outside latency timing.
-Model inputs are deterministic synthetic fixtures; full rendering uses seed 7.
+Model inputs are deterministic synthetic fixtures; full rendering defaults to seed 7.
 Native output replay is checked for exact equality. Encoded frame counts follow
 the production muxer's `-shortest` behavior: rounded audio can trim a partial
 final video-frame interval (the five-frame smoke render encodes four frames).

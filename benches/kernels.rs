@@ -514,12 +514,19 @@ fn quantized_attention(c: &mut Criterion) {
     use h3_hrx::model::{HEADS, INNER};
     let mut group = c.benchmark_group("attention_i8qkhm");
     for tokens in [
-        1usize, 129, 256, 257, 2048, 4095, 4096, 4097, 8192, 8193, 16384, 16385,
+        1usize, 129, 256, 257, 2048, 4095, 4096, 4097, 8192, 8193, 15666, 16384, 16385, 32768,
+        37977,
     ] {
         group.throughput(Throughput::Elements((4 * tokens * tokens * INNER) as u64));
         group.bench_function(BenchmarkId::from_parameter(tokens), |b| {
             // Long attention inputs and outputs exceed 512 MiB; keep each case bounded.
-            let budget = if tokens > 8192 { 1 << 30 } else { 512 << 20 };
+            let budget = if tokens > 16384 {
+                2 << 30
+            } else if tokens > 8192 {
+                1 << 30
+            } else {
+                512 << 20
+            };
             let manager = hrx::residency::ResidencyManager::new(budget).unwrap();
             let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
             let compiler = compiler();
@@ -864,7 +871,7 @@ fn gemm(c: &mut Criterion) {
     for elem in ["i8", "bf16"] {
         let mut shapes = vec![("f32", 2048, 2048, 6144), ("swiglu", 2048, 2048, 16384)];
         if elem == "i8" {
-            use h3_hrx::model::{FFN, HID, QKV};
+            use h3_hrx::model::{FFN, HID, INNER, QKV};
             for m in [256, 2048] {
                 shapes.extend([
                     ("f32", m, HID, QKV),
@@ -885,6 +892,15 @@ fn gemm(c: &mut Criterion) {
             for m in [1025, 4097] {
                 shapes.extend([("swiglu", m, HID, 2 * FFN), ("resid", m, FFN, HID)]);
             }
+            // Full-clip activation traffic for all four DiT projections.
+            for m in [15666, 37977] {
+                shapes.extend([
+                    ("plain", m, HID, QKV),
+                    ("resid", m, INNER, HID),
+                    ("swiglu", m, HID, 2 * FFN),
+                    ("resid", m, FFN, HID),
+                ]);
+            }
         }
         for (mode, m, k, n) in shapes {
             for rotating in [false, true] {
@@ -892,7 +908,9 @@ fn gemm(c: &mut Criterion) {
                 group.throughput(Throughput::Elements((2 * m * k * n) as u64));
                 group.bench_function(format!("{elem}/{mode}/{storage}/{m}x{k}x{n}"), |b| {
                     // Long FP32 SwiGLU outputs plus the rotating weights exceed 512 MiB.
-                    let budget = if mode == "swiglu" && m >= 4096 {
+                    let budget = if m >= 15666 {
+                        4 << 30
+                    } else if mode == "swiglu" && m >= 4096 {
                         1 << 30
                     } else {
                         512 << 20
