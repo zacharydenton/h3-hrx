@@ -1683,6 +1683,87 @@ fn check_head_major_attention(token_counts: &[usize]) {
     }
 }
 
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
+fn decoder_feed_forward_preserves_bias_gate_layout_and_padding() {
+    let mut h = Harness::new();
+    for (m, k, n) in [
+        (1usize, 64usize, 256usize),
+        (129, 128, 512),
+        (257, 128, 256),
+    ] {
+        for group in [1usize, 4] {
+            let stride = k + 64;
+            let width = n / 2;
+            let output_stride = width + 128;
+            let a: Vec<_> = values(m * stride, 0.3)
+                .into_iter()
+                .map(f16::from_f32)
+                .collect();
+            let w: Vec<_> = values(n * stride, 0.2)
+                .into_iter()
+                .map(f16::from_f32)
+                .collect();
+            let bias = values(n, 0.1);
+            let data = vec![
+                bytes(&a),
+                bytes(&w),
+                bytes(&vec![f16::from_f32(123.); m * output_stride + 64]),
+                bytes(&bias),
+            ];
+            let stem = "gemm_f16_fast_swiglu_256b_gs";
+            let out = h.run(
+                stem,
+                &cfg(&[
+                    ("k_size", k),
+                    ("n_size", n),
+                    ("k_stride", stride),
+                    ("out_stride", output_stride),
+                    ("m_group", group),
+                ]),
+                [
+                    (n / 256) as u32,
+                    (m.div_ceil(128).div_ceil(group) * group) as u32,
+                    1,
+                ],
+                256,
+                &[m as u64],
+                &data,
+            );
+            let got = halves(&out[2], false);
+            for row in 0..m {
+                let dot = |col: usize| {
+                    (0..k)
+                        .map(|i| a[row * stride + i].to_f64() * w[col * stride + i].to_f64())
+                        .sum::<f64>()
+                        + f64::from(bias[col])
+                };
+                let want: Vec<_> = (0..width)
+                    .map(|col| {
+                        let first = (col / 16) * 32 + col % 16;
+                        let up = dot(first);
+                        let gate = dot(first + 16);
+                        gate / (1. + (-gate).exp()) * up
+                    })
+                    .collect();
+                close(
+                    &got[row * output_stride..row * output_stride + width],
+                    &want,
+                    3e-3,
+                    3e-3,
+                );
+                assert!(got[row * output_stride + width..(row + 1) * output_stride]
+                    .iter()
+                    .all(|&v| v == 123.));
+            }
+            assert!(got[m * output_stride..].iter().all(|&v| v == 123.));
+        }
+    }
+}
+
 /// The f16 and bf16 GEMM families: the video VAE decoder's operands and the refiner's, which the
 /// int4/int8 test above does not reach. Same three modes and the same epilogues, but the operands
 /// arrive as stored floats with no per-row scale, so the reference rounds through the stored width

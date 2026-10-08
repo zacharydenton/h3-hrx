@@ -785,6 +785,80 @@ fn normalization_preparation(c: &mut Criterion) {
     group.finish();
 }
 
+fn decoder_feed_forward(c: &mut Criterion) {
+    let mut group = c.benchmark_group("decoder_feed_forward");
+    let (k, n) = (2048, 16384);
+    let stride = h3_hrx::model::gemm_pitch(k, 16);
+    let output_stride = h3_hrx::model::gemm_pitch(n / 2, 16);
+    for m in [117usize, 773, 1797, 2049] {
+        for rotating in [false, true] {
+            let storage = if rotating { "rotating" } else { "cached" };
+            group.bench_function(format!("{storage}/{m}"), |b| {
+                let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+                let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                let compiler = compiler();
+                let op = Gemm::build(
+                    &compiler,
+                    &mut stream,
+                    "swiglu",
+                    "f16",
+                    true,
+                    false,
+                    k,
+                    n,
+                    m,
+                    1,
+                    stride,
+                    Tile::Fast,
+                    output_stride,
+                )
+                .unwrap();
+                compiler.flush(&mut stream).unwrap();
+                let values = |count, seed| {
+                    (0..count)
+                        .flat_map(|i| {
+                            f16::from_f32(((i * 37 + seed) % 127) as f32 / 1024. - 0.0625)
+                                .to_le_bytes()
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let a = upload(&mut stream, &values(m * stride, 3));
+                let w = values(n * stride, 17);
+                let ring: Vec<_> = (0..if rotating { 2 } else { 1 })
+                    .map(|_| upload(&mut stream, &w))
+                    .collect();
+                let bias = upload(&mut stream, bytemuck::cast_slice(&vec![0.01f32; n]));
+                let out = stream.allocate_zeroed(m * output_stride * 2).unwrap();
+                let run = |stream: &mut Stream, index: usize| {
+                    op.run(
+                        stream,
+                        None,
+                        "decoder ff",
+                        m as u32,
+                        a.binding(),
+                        ring[index].binding(),
+                        None,
+                        out.binding(),
+                        None,
+                        Some(bias.binding()),
+                    )
+                    .unwrap();
+                    stream.synchronize().unwrap();
+                };
+                run(&mut stream, 0);
+                let expected = check_f16(&mut stream, &out);
+                let mut index = 0;
+                b.iter(|| {
+                    run(&mut stream, index);
+                    index = (index + 1) % ring.len();
+                });
+                assert_eq!(check_f16(&mut stream, &out), expected);
+            });
+        }
+    }
+    group.finish();
+}
+
 fn gemm(c: &mut Criterion) {
     let mut group = c.benchmark_group("gemm");
     for elem in ["i8", "bf16"] {
@@ -1584,6 +1658,6 @@ criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10).warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3));
-    targets = video_convolution, groupnorm_apply, groupnorm_statistics, preparation, rotary_preparation, attention_preparation, fused_qk_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
+    targets = decoder_feed_forward, video_convolution, groupnorm_apply, groupnorm_statistics, preparation, rotary_preparation, attention_preparation, fused_qk_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
 }
 criterion_main!(benches);
