@@ -1,8 +1,8 @@
 // Shared bodies; exported wrappers retain the original launch and configuration contracts.
 
-template.decl @h3.shared_attention_mha8_lds_f16_wmma(%token_count: index, %q: buffer, %k: buffer, %v: buffer, %out: buffer, %cfg_q_stride: index, %cfg_kv_stride: index, %cfg_out_stride: index, %cfg_tokens: index, %cfg_token_capacity: index, %cfg_scale: f32, %waves: index, %split_staging: i1, %q_tile_offset: offset, %lds_bytes: offset)
+template.decl @h3.shared_attention_mha8_lds_f16_wmma(%token_count: index, %q: buffer, %k: buffer, %v: buffer, %out: buffer, %cfg_q_stride: index, %cfg_kv_stride: index, %cfg_out_stride: index, %cfg_tokens: index, %cfg_token_capacity: index, %cfg_scale: f32, %waves: index, %split_staging: i1, %q_tile_offset: offset, %lds_bytes: offset, %padded80: i1)
 
-template.def<@h3.shared_attention_mha8_lds_f16_wmma> @h3_body_attention_mha8_lds_f16_wmma(%token_count: index, %q: buffer, %k: buffer, %v: buffer, %out: buffer, %cfg_q_stride: index, %cfg_kv_stride: index, %cfg_out_stride: index, %cfg_tokens: index, %cfg_token_capacity: index, %cfg_scale: f32, %waves: index, %split_staging: i1, %q_tile_offset: offset, %lds_bytes: offset) {
+template.def<@h3.shared_attention_mha8_lds_f16_wmma> @h3_body_attention_mha8_lds_f16_wmma(%token_count: index, %q: buffer, %k: buffer, %v: buffer, %out: buffer, %cfg_q_stride: index, %cfg_kv_stride: index, %cfg_out_stride: index, %cfg_tokens: index, %cfg_token_capacity: index, %cfg_scale: f32, %waves: index, %split_staging: i1, %q_tile_offset: offset, %lds_bytes: offset, %padded80: i1) {
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
   %c2 = index.constant 2 : index
@@ -32,13 +32,25 @@ template.def<@h3.shared_attention_mha8_lds_f16_wmma> @h3_body_attention_mha8_lds
   %c_nf = index.constant 8 : index
   %c0_offset = index.constant 0 : offset
   %k_tile_offset = index.constant 0 : offset
-  %v_tile_offset = index.constant 4352 : offset
-  %scratch_offset = index.constant 10496 : offset
+  %v_full = index.constant 4352 : offset
+  %v_narrow = index.constant 2816 : offset
+  %v_tile_offset = scf.select %padded80, %v_narrow, %v_full : offset
+  %scratch_full = index.constant 10496 : offset
+  %scratch_narrow = index.constant 6656 : offset
+  %scratch_offset = scf.select %padded80, %scratch_narrow, %scratch_full : offset
+  %c88 = index.constant 88 : index
+  %c24 = index.constant 24 : index
+  %c72 = index.constant 72 : index
+  %k_pitch = scf.select %padded80, %c88, %c136 : index
+  %v_depth = scf.select %padded80, %c80, %c128 : index
+  %q_pitch = scf.select %padded80, %c24, %c72 : index
   // the result stage aliases the K/V tiles: it is used only after the loop's final barrier
   %result_offset = index.constant 0 : offset
   %m = index.constant 16 : index
   %n = index.constant 16 : index
   %k_frag = index.constant 16 : index
+  %true = scalar.constant true : i1
+  %zero_half = vector.constant 0.0 : vector<16xf16>
   %zero_f32 = scalar.constant 0.0 : f32
   %negative_large = scalar.constant -1000000000.0 : f32
   %zero_acc = vector.constant 0.0 : vector<8xf32>
@@ -103,9 +115,9 @@ template.def<@h3.shared_attention_mha8_lds_f16_wmma> @h3_body_attention_mha8_lds
   %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%token_count]x[%cfg_out_stride]xf16>
 
   %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
-  // K and V tiles: 16 keys x 128 channels, rows padded to 136 halves
-  %k_tile = buffer.view %lds[%k_tile_offset] : buffer -> view<16x136xf16>
-  %v_tile = buffer.view %lds[%v_tile_offset] : buffer -> view<128x24xf16>
+  // K and transposed V tiles: 16 keys, with padded LDS row pitches
+  %k_tile = buffer.view %lds[%k_tile_offset] : buffer -> view<16x[%k_pitch]xf16>
+  %v_tile = buffer.view %lds[%v_tile_offset] : buffer -> view<[%v_depth]x24xf16>
   %wave_scratch_bytes = index.constant 512 : offset
   %wave_scratch_offset0 = index.scale %wave, %wave_scratch_bytes : index, offset -> offset
   %wave_scratch_offset = index.add %scratch_offset, %wave_scratch_offset0 : offset
@@ -135,26 +147,33 @@ template.def<@h3.shared_attention_mha8_lds_f16_wmma> @h3_body_attention_mha8_lds
   %init = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
   %key_tile_count = index.add %tiles_per_image, %c0 : index
 
-  %wave_q_bytes = index.constant 2304 : offset
+  %q_full_bytes = index.constant 2304 : offset
+  %q_narrow_bytes = index.constant 768 : offset
+  %wave_q_bytes = scf.select %padded80, %q_narrow_bytes, %q_full_bytes : offset
   %wave_q_offset0 = index.scale %wave, %wave_q_bytes : index, offset -> offset
   %wave_q_offset = index.add %q_tile_offset, %wave_q_offset0 : offset
-  %q_tile = buffer.view %lds[%wave_q_offset] : buffer -> view<16x72xf16>
-  // stage this wave's 16 query rows x 64 channels once: 2 chunks of 16 halves per lane
-  %q_chunks = index.constant 4 : index
-  %q_chunk_iters = index.constant 2 : index
+  %q_tile = buffer.view %lds[%wave_q_offset] : buffer -> view<16x[%q_pitch]xf16>
+  // Keep Q channels [0, 64) in registers; stage the remaining 16 or 64 once.
+  %q_chunks = scf.select %padded80, %c1, %c4 : index
+  %q_chunk_iters = scf.select %padded80, %c1, %c2 : index
+  %q_packets = index.mul %q_chunks, %c16 : index
   scf.for %qi = [%c0 to %q_chunk_iters step %c1] {
     %qid0 = index.mul %qi, %c32 : index
     %qid = index.add %qid0, %lane : index
-    %qrow = index.div %qid, %q_chunks : index
-    %qchunk0 = index.rem %qid, %q_chunks : index
-    %qchunk = index.mul %qchunk0, %c16 : index
-    %qrow_global0 = index.add %query_origin0, %qrow : index
-    %qrow_global = index.assume %qrow_global0 [lt(%qrow_global0, %cfg_token_capacity)] : index
-    %qcol0 = index.add %head_base0, %qchunk : index
-    %qcol1 = index.add %qcol0, %c64 : index
-    %qcol = index.assume %qcol1 [le(%qcol1, %q_col_limit), mul(%qcol1, 16)] : index
-    %q_chunk = vector.load %q_view[%qrow_global, %qcol] : view<[%cfg_token_capacity]x[%cfg_q_stride]xf16> -> vector<16xf16>
-    vector.store %q_chunk, %q_tile[%qrow, %qchunk] : vector<16xf16>, view<16x72xf16>
+    %q_active_narrow = index.cmp ult, %qid, %q_packets : index
+    %q_active = scf.select %padded80, %q_active_narrow, %true : i1
+    scf.if %q_active {
+      %qrow = index.div %qid, %q_chunks : index
+      %qchunk0 = index.rem %qid, %q_chunks : index
+      %qchunk = index.mul %qchunk0, %c16 : index
+      %qrow_global0 = index.add %query_origin0, %qrow : index
+      %qrow_global = index.assume %qrow_global0 [lt(%qrow_global0, %cfg_token_capacity)] : index
+      %qcol0 = index.add %head_base0, %qchunk : index
+      %qcol1 = index.add %qcol0, %c64 : index
+      %qcol = index.assume %qcol1 [le(%qcol1, %q_col_limit), mul(%qcol1, 16)] : index
+      %q_chunk = vector.load %q_view[%qrow_global, %qcol] : view<[%cfg_token_capacity]x[%cfg_q_stride]xf16> -> vector<16xf16>
+      vector.store %q_chunk, %q_tile[%qrow, %qchunk] : vector<16xf16>, view<16x[%q_pitch]xf16>
+    }
   }
   kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
   %q_channel0 = index.add %head_base0, %c0 : index
@@ -168,160 +187,187 @@ template.def<@h3.shared_attention_mha8_lds_f16_wmma> @h3_body_attention_mha8_lds
   %final_max, %final_sum, %final0, %final1, %final2, %final3, %final4, %final5, %final6, %final7 = scf.for %key_tile = [%c0 to %key_tile_count step %c1](%row_max = %negative_vector : vector<8xf32>, %row_sum = %zero_vector : vector<8xf32>, %acc0 = %init : vector<8xf32>, %acc1 = %init : vector<8xf32>, %acc2 = %init : vector<8xf32>, %acc3 = %init : vector<8xf32>, %acc4 = %init : vector<8xf32>, %acc5 = %init : vector<8xf32>, %acc6 = %init : vector<8xf32>, %acc7 = %init : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
     %key_origin1 = index.mul %key_tile, %c16 : index
     %key_origin0 = index.assume %key_origin1 [le(%key_origin1, %tile_origin_limit), mul(%key_origin1, 16)] : index
+    %stage_k_narrow = index.cmp ult, %st_chunk, %v_depth : index
+    %stage_k = scf.select %padded80, %stage_k_narrow, %true : i1
+    %stage_v_narrow = index.cmp ult, %st_chunk_v, %v_depth : index
+    %stage_v = scf.select %padded80, %stage_v_narrow, %true : i1
     scf.if %split_staging {
       // stage K and V tiles (rows past the sequence are zero headroom)
       scf.if %st_is_k {
-        %st_row0 = index.add %key_origin0, %st_key : index
-        %st_row = index.assume %st_row0 [lt(%st_row0, %cfg_token_capacity)] : index
-        %k_chunk = vector.load %k_view[%st_row, %st_col] : view<[%cfg_token_capacity]x[%cfg_kv_stride]xf16> -> vector<16xf16>
-        vector.store %k_chunk, %k_tile[%st_key, %st_chunk] : vector<16xf16>, view<16x136xf16>
+        scf.if %stage_k {
+          %st_row0 = index.add %key_origin0, %st_key : index
+          %st_row = index.assume %st_row0 [lt(%st_row0, %cfg_token_capacity)] : index
+          %k_chunk = vector.load %k_view[%st_row, %st_col] : view<[%cfg_token_capacity]x[%cfg_kv_stride]xf16> -> vector<16xf16>
+          vector.store %k_chunk, %k_tile[%st_key, %st_chunk] : vector<16xf16>, view<16x[%k_pitch]xf16>
+        }
       } else {
-        %st_row_v0 = index.add %key_origin0, %st_key_v : index
-        %st_row_v = index.assume %st_row_v0 [lt(%st_row_v0, %cfg_token_capacity)] : index
-        %v_chunk = vector.load %v_view[%st_row_v, %st_col_v] : view<[%cfg_token_capacity]x[%cfg_kv_stride]xf16> -> vector<16xf16>
-        %ve0 = vector.extract %v_chunk[0] : vector<16xf16> -> f16
-        %vr0 = index.add %st_chunk_v, %cj0 : index
-        view.store %ve0, %v_tile[%vr0, %st_key_v] : f16, view<128x24xf16>
-        %ve1 = vector.extract %v_chunk[1] : vector<16xf16> -> f16
-        %vr1 = index.add %st_chunk_v, %cj1 : index
-        view.store %ve1, %v_tile[%vr1, %st_key_v] : f16, view<128x24xf16>
-        %ve2 = vector.extract %v_chunk[2] : vector<16xf16> -> f16
-        %vr2 = index.add %st_chunk_v, %cj2 : index
-        view.store %ve2, %v_tile[%vr2, %st_key_v] : f16, view<128x24xf16>
-        %ve3 = vector.extract %v_chunk[3] : vector<16xf16> -> f16
-        %vr3 = index.add %st_chunk_v, %cj3 : index
-        view.store %ve3, %v_tile[%vr3, %st_key_v] : f16, view<128x24xf16>
-        %ve4 = vector.extract %v_chunk[4] : vector<16xf16> -> f16
-        %vr4 = index.add %st_chunk_v, %cj4 : index
-        view.store %ve4, %v_tile[%vr4, %st_key_v] : f16, view<128x24xf16>
-        %ve5 = vector.extract %v_chunk[5] : vector<16xf16> -> f16
-        %vr5 = index.add %st_chunk_v, %cj5 : index
-        view.store %ve5, %v_tile[%vr5, %st_key_v] : f16, view<128x24xf16>
-        %ve6 = vector.extract %v_chunk[6] : vector<16xf16> -> f16
-        %vr6 = index.add %st_chunk_v, %cj6 : index
-        view.store %ve6, %v_tile[%vr6, %st_key_v] : f16, view<128x24xf16>
-        %ve7 = vector.extract %v_chunk[7] : vector<16xf16> -> f16
-        %vr7 = index.add %st_chunk_v, %cj7 : index
-        view.store %ve7, %v_tile[%vr7, %st_key_v] : f16, view<128x24xf16>
-        %ve8 = vector.extract %v_chunk[8] : vector<16xf16> -> f16
-        %vr8 = index.add %st_chunk_v, %cj8 : index
-        view.store %ve8, %v_tile[%vr8, %st_key_v] : f16, view<128x24xf16>
-        %ve9 = vector.extract %v_chunk[9] : vector<16xf16> -> f16
-        %vr9 = index.add %st_chunk_v, %cj9 : index
-        view.store %ve9, %v_tile[%vr9, %st_key_v] : f16, view<128x24xf16>
-        %ve10 = vector.extract %v_chunk[10] : vector<16xf16> -> f16
-        %vr10 = index.add %st_chunk_v, %cj10 : index
-        view.store %ve10, %v_tile[%vr10, %st_key_v] : f16, view<128x24xf16>
-        %ve11 = vector.extract %v_chunk[11] : vector<16xf16> -> f16
-        %vr11 = index.add %st_chunk_v, %cj11 : index
-        view.store %ve11, %v_tile[%vr11, %st_key_v] : f16, view<128x24xf16>
-        %ve12 = vector.extract %v_chunk[12] : vector<16xf16> -> f16
-        %vr12 = index.add %st_chunk_v, %cj12 : index
-        view.store %ve12, %v_tile[%vr12, %st_key_v] : f16, view<128x24xf16>
-        %ve13 = vector.extract %v_chunk[13] : vector<16xf16> -> f16
-        %vr13 = index.add %st_chunk_v, %cj13 : index
-        view.store %ve13, %v_tile[%vr13, %st_key_v] : f16, view<128x24xf16>
-        %ve14 = vector.extract %v_chunk[14] : vector<16xf16> -> f16
-        %vr14 = index.add %st_chunk_v, %cj14 : index
-        view.store %ve14, %v_tile[%vr14, %st_key_v] : f16, view<128x24xf16>
-        %ve15 = vector.extract %v_chunk[15] : vector<16xf16> -> f16
-        %vr15 = index.add %st_chunk_v, %cj15 : index
-        view.store %ve15, %v_tile[%vr15, %st_key_v] : f16, view<128x24xf16>
+        scf.if %stage_v {
+          %st_row_v0 = index.add %key_origin0, %st_key_v : index
+          %st_row_v = index.assume %st_row_v0 [lt(%st_row_v0, %cfg_token_capacity)] : index
+          %v_chunk = vector.load %v_view[%st_row_v, %st_col_v] : view<[%cfg_token_capacity]x[%cfg_kv_stride]xf16> -> vector<16xf16>
+          %ve0 = vector.extract %v_chunk[0] : vector<16xf16> -> f16
+          %vr0 = index.add %st_chunk_v, %cj0 : index
+          view.store %ve0, %v_tile[%vr0, %st_key_v] : f16, view<[%v_depth]x24xf16>
+          %ve1 = vector.extract %v_chunk[1] : vector<16xf16> -> f16
+          %vr1 = index.add %st_chunk_v, %cj1 : index
+          view.store %ve1, %v_tile[%vr1, %st_key_v] : f16, view<[%v_depth]x24xf16>
+          %ve2 = vector.extract %v_chunk[2] : vector<16xf16> -> f16
+          %vr2 = index.add %st_chunk_v, %cj2 : index
+          view.store %ve2, %v_tile[%vr2, %st_key_v] : f16, view<[%v_depth]x24xf16>
+          %ve3 = vector.extract %v_chunk[3] : vector<16xf16> -> f16
+          %vr3 = index.add %st_chunk_v, %cj3 : index
+          view.store %ve3, %v_tile[%vr3, %st_key_v] : f16, view<[%v_depth]x24xf16>
+          %ve4 = vector.extract %v_chunk[4] : vector<16xf16> -> f16
+          %vr4 = index.add %st_chunk_v, %cj4 : index
+          view.store %ve4, %v_tile[%vr4, %st_key_v] : f16, view<[%v_depth]x24xf16>
+          %ve5 = vector.extract %v_chunk[5] : vector<16xf16> -> f16
+          %vr5 = index.add %st_chunk_v, %cj5 : index
+          view.store %ve5, %v_tile[%vr5, %st_key_v] : f16, view<[%v_depth]x24xf16>
+          %ve6 = vector.extract %v_chunk[6] : vector<16xf16> -> f16
+          %vr6 = index.add %st_chunk_v, %cj6 : index
+          view.store %ve6, %v_tile[%vr6, %st_key_v] : f16, view<[%v_depth]x24xf16>
+          %ve7 = vector.extract %v_chunk[7] : vector<16xf16> -> f16
+          %vr7 = index.add %st_chunk_v, %cj7 : index
+          view.store %ve7, %v_tile[%vr7, %st_key_v] : f16, view<[%v_depth]x24xf16>
+          %ve8 = vector.extract %v_chunk[8] : vector<16xf16> -> f16
+          %vr8 = index.add %st_chunk_v, %cj8 : index
+          view.store %ve8, %v_tile[%vr8, %st_key_v] : f16, view<[%v_depth]x24xf16>
+          %ve9 = vector.extract %v_chunk[9] : vector<16xf16> -> f16
+          %vr9 = index.add %st_chunk_v, %cj9 : index
+          view.store %ve9, %v_tile[%vr9, %st_key_v] : f16, view<[%v_depth]x24xf16>
+          %ve10 = vector.extract %v_chunk[10] : vector<16xf16> -> f16
+          %vr10 = index.add %st_chunk_v, %cj10 : index
+          view.store %ve10, %v_tile[%vr10, %st_key_v] : f16, view<[%v_depth]x24xf16>
+          %ve11 = vector.extract %v_chunk[11] : vector<16xf16> -> f16
+          %vr11 = index.add %st_chunk_v, %cj11 : index
+          view.store %ve11, %v_tile[%vr11, %st_key_v] : f16, view<[%v_depth]x24xf16>
+          %ve12 = vector.extract %v_chunk[12] : vector<16xf16> -> f16
+          %vr12 = index.add %st_chunk_v, %cj12 : index
+          view.store %ve12, %v_tile[%vr12, %st_key_v] : f16, view<[%v_depth]x24xf16>
+          %ve13 = vector.extract %v_chunk[13] : vector<16xf16> -> f16
+          %vr13 = index.add %st_chunk_v, %cj13 : index
+          view.store %ve13, %v_tile[%vr13, %st_key_v] : f16, view<[%v_depth]x24xf16>
+          %ve14 = vector.extract %v_chunk[14] : vector<16xf16> -> f16
+          %vr14 = index.add %st_chunk_v, %cj14 : index
+          view.store %ve14, %v_tile[%vr14, %st_key_v] : f16, view<[%v_depth]x24xf16>
+          %ve15 = vector.extract %v_chunk[15] : vector<16xf16> -> f16
+          %vr15 = index.add %st_chunk_v, %cj15 : index
+          view.store %ve15, %v_tile[%vr15, %st_key_v] : f16, view<[%v_depth]x24xf16>
+        }
       }
     } else {
       // stage K and V tiles (rows past the sequence are zero headroom)
-      %st_row0 = index.add %key_origin0, %st_key : index
-      %st_row = index.assume %st_row0 [lt(%st_row0, %cfg_token_capacity)] : index
-      %k_chunk = vector.load %k_view[%st_row, %st_col] : view<[%cfg_token_capacity]x[%cfg_kv_stride]xf16> -> vector<16xf16>
-      %st_row_v0 = index.add %key_origin0, %st_key_v : index
-      %st_row_v = index.assume %st_row_v0 [lt(%st_row_v0, %cfg_token_capacity)] : index
-      %v_chunk = vector.load %v_view[%st_row_v, %st_col_v] : view<[%cfg_token_capacity]x[%cfg_kv_stride]xf16> -> vector<16xf16>
-      vector.store %k_chunk, %k_tile[%st_key, %st_chunk] : vector<16xf16>, view<16x136xf16>
-      %ve0 = vector.extract %v_chunk[0] : vector<16xf16> -> f16
-      %vr0 = index.add %st_chunk_v, %cj0 : index
-      view.store %ve0, %v_tile[%vr0, %st_key_v] : f16, view<128x24xf16>
-      %ve1 = vector.extract %v_chunk[1] : vector<16xf16> -> f16
-      %vr1 = index.add %st_chunk_v, %cj1 : index
-      view.store %ve1, %v_tile[%vr1, %st_key_v] : f16, view<128x24xf16>
-      %ve2 = vector.extract %v_chunk[2] : vector<16xf16> -> f16
-      %vr2 = index.add %st_chunk_v, %cj2 : index
-      view.store %ve2, %v_tile[%vr2, %st_key_v] : f16, view<128x24xf16>
-      %ve3 = vector.extract %v_chunk[3] : vector<16xf16> -> f16
-      %vr3 = index.add %st_chunk_v, %cj3 : index
-      view.store %ve3, %v_tile[%vr3, %st_key_v] : f16, view<128x24xf16>
-      %ve4 = vector.extract %v_chunk[4] : vector<16xf16> -> f16
-      %vr4 = index.add %st_chunk_v, %cj4 : index
-      view.store %ve4, %v_tile[%vr4, %st_key_v] : f16, view<128x24xf16>
-      %ve5 = vector.extract %v_chunk[5] : vector<16xf16> -> f16
-      %vr5 = index.add %st_chunk_v, %cj5 : index
-      view.store %ve5, %v_tile[%vr5, %st_key_v] : f16, view<128x24xf16>
-      %ve6 = vector.extract %v_chunk[6] : vector<16xf16> -> f16
-      %vr6 = index.add %st_chunk_v, %cj6 : index
-      view.store %ve6, %v_tile[%vr6, %st_key_v] : f16, view<128x24xf16>
-      %ve7 = vector.extract %v_chunk[7] : vector<16xf16> -> f16
-      %vr7 = index.add %st_chunk_v, %cj7 : index
-      view.store %ve7, %v_tile[%vr7, %st_key_v] : f16, view<128x24xf16>
-      %ve8 = vector.extract %v_chunk[8] : vector<16xf16> -> f16
-      %vr8 = index.add %st_chunk_v, %cj8 : index
-      view.store %ve8, %v_tile[%vr8, %st_key_v] : f16, view<128x24xf16>
-      %ve9 = vector.extract %v_chunk[9] : vector<16xf16> -> f16
-      %vr9 = index.add %st_chunk_v, %cj9 : index
-      view.store %ve9, %v_tile[%vr9, %st_key_v] : f16, view<128x24xf16>
-      %ve10 = vector.extract %v_chunk[10] : vector<16xf16> -> f16
-      %vr10 = index.add %st_chunk_v, %cj10 : index
-      view.store %ve10, %v_tile[%vr10, %st_key_v] : f16, view<128x24xf16>
-      %ve11 = vector.extract %v_chunk[11] : vector<16xf16> -> f16
-      %vr11 = index.add %st_chunk_v, %cj11 : index
-      view.store %ve11, %v_tile[%vr11, %st_key_v] : f16, view<128x24xf16>
-      %ve12 = vector.extract %v_chunk[12] : vector<16xf16> -> f16
-      %vr12 = index.add %st_chunk_v, %cj12 : index
-      view.store %ve12, %v_tile[%vr12, %st_key_v] : f16, view<128x24xf16>
-      %ve13 = vector.extract %v_chunk[13] : vector<16xf16> -> f16
-      %vr13 = index.add %st_chunk_v, %cj13 : index
-      view.store %ve13, %v_tile[%vr13, %st_key_v] : f16, view<128x24xf16>
-      %ve14 = vector.extract %v_chunk[14] : vector<16xf16> -> f16
-      %vr14 = index.add %st_chunk_v, %cj14 : index
-      view.store %ve14, %v_tile[%vr14, %st_key_v] : f16, view<128x24xf16>
-      %ve15 = vector.extract %v_chunk[15] : vector<16xf16> -> f16
-      %vr15 = index.add %st_chunk_v, %cj15 : index
-      view.store %ve15, %v_tile[%vr15, %st_key_v] : f16, view<128x24xf16>
+      %k_chunk = scf.if %stage_k -> (vector<16xf16>) {
+        %st_row0 = index.add %key_origin0, %st_key : index
+        %st_row = index.assume %st_row0 [lt(%st_row0, %cfg_token_capacity)] : index
+        %k_loaded = vector.load %k_view[%st_row, %st_col] : view<[%cfg_token_capacity]x[%cfg_kv_stride]xf16> -> vector<16xf16>
+        scf.yield %k_loaded : vector<16xf16>
+      } else {
+        scf.yield %zero_half : vector<16xf16>
+      }
+      %v_chunk = scf.if %stage_v -> (vector<16xf16>) {
+        %st_row_v0 = index.add %key_origin0, %st_key_v : index
+        %st_row_v = index.assume %st_row_v0 [lt(%st_row_v0, %cfg_token_capacity)] : index
+        %v_loaded = vector.load %v_view[%st_row_v, %st_col_v] : view<[%cfg_token_capacity]x[%cfg_kv_stride]xf16> -> vector<16xf16>
+        scf.yield %v_loaded : vector<16xf16>
+      } else {
+        scf.yield %zero_half : vector<16xf16>
+      }
+      scf.if %stage_k {
+        vector.store %k_chunk, %k_tile[%st_key, %st_chunk] : vector<16xf16>, view<16x[%k_pitch]xf16>
+      }
+      scf.if %stage_v {
+        %ve0 = vector.extract %v_chunk[0] : vector<16xf16> -> f16
+        %vr0 = index.add %st_chunk_v, %cj0 : index
+        view.store %ve0, %v_tile[%vr0, %st_key_v] : f16, view<[%v_depth]x24xf16>
+        %ve1 = vector.extract %v_chunk[1] : vector<16xf16> -> f16
+        %vr1 = index.add %st_chunk_v, %cj1 : index
+        view.store %ve1, %v_tile[%vr1, %st_key_v] : f16, view<[%v_depth]x24xf16>
+        %ve2 = vector.extract %v_chunk[2] : vector<16xf16> -> f16
+        %vr2 = index.add %st_chunk_v, %cj2 : index
+        view.store %ve2, %v_tile[%vr2, %st_key_v] : f16, view<[%v_depth]x24xf16>
+        %ve3 = vector.extract %v_chunk[3] : vector<16xf16> -> f16
+        %vr3 = index.add %st_chunk_v, %cj3 : index
+        view.store %ve3, %v_tile[%vr3, %st_key_v] : f16, view<[%v_depth]x24xf16>
+        %ve4 = vector.extract %v_chunk[4] : vector<16xf16> -> f16
+        %vr4 = index.add %st_chunk_v, %cj4 : index
+        view.store %ve4, %v_tile[%vr4, %st_key_v] : f16, view<[%v_depth]x24xf16>
+        %ve5 = vector.extract %v_chunk[5] : vector<16xf16> -> f16
+        %vr5 = index.add %st_chunk_v, %cj5 : index
+        view.store %ve5, %v_tile[%vr5, %st_key_v] : f16, view<[%v_depth]x24xf16>
+        %ve6 = vector.extract %v_chunk[6] : vector<16xf16> -> f16
+        %vr6 = index.add %st_chunk_v, %cj6 : index
+        view.store %ve6, %v_tile[%vr6, %st_key_v] : f16, view<[%v_depth]x24xf16>
+        %ve7 = vector.extract %v_chunk[7] : vector<16xf16> -> f16
+        %vr7 = index.add %st_chunk_v, %cj7 : index
+        view.store %ve7, %v_tile[%vr7, %st_key_v] : f16, view<[%v_depth]x24xf16>
+        %ve8 = vector.extract %v_chunk[8] : vector<16xf16> -> f16
+        %vr8 = index.add %st_chunk_v, %cj8 : index
+        view.store %ve8, %v_tile[%vr8, %st_key_v] : f16, view<[%v_depth]x24xf16>
+        %ve9 = vector.extract %v_chunk[9] : vector<16xf16> -> f16
+        %vr9 = index.add %st_chunk_v, %cj9 : index
+        view.store %ve9, %v_tile[%vr9, %st_key_v] : f16, view<[%v_depth]x24xf16>
+        %ve10 = vector.extract %v_chunk[10] : vector<16xf16> -> f16
+        %vr10 = index.add %st_chunk_v, %cj10 : index
+        view.store %ve10, %v_tile[%vr10, %st_key_v] : f16, view<[%v_depth]x24xf16>
+        %ve11 = vector.extract %v_chunk[11] : vector<16xf16> -> f16
+        %vr11 = index.add %st_chunk_v, %cj11 : index
+        view.store %ve11, %v_tile[%vr11, %st_key_v] : f16, view<[%v_depth]x24xf16>
+        %ve12 = vector.extract %v_chunk[12] : vector<16xf16> -> f16
+        %vr12 = index.add %st_chunk_v, %cj12 : index
+        view.store %ve12, %v_tile[%vr12, %st_key_v] : f16, view<[%v_depth]x24xf16>
+        %ve13 = vector.extract %v_chunk[13] : vector<16xf16> -> f16
+        %vr13 = index.add %st_chunk_v, %cj13 : index
+        view.store %ve13, %v_tile[%vr13, %st_key_v] : f16, view<[%v_depth]x24xf16>
+        %ve14 = vector.extract %v_chunk[14] : vector<16xf16> -> f16
+        %vr14 = index.add %st_chunk_v, %cj14 : index
+        view.store %ve14, %v_tile[%vr14, %st_key_v] : f16, view<[%v_depth]x24xf16>
+        %ve15 = vector.extract %v_chunk[15] : vector<16xf16> -> f16
+        %vr15 = index.add %st_chunk_v, %cj15 : index
+        view.store %ve15, %v_tile[%vr15, %st_key_v] : f16, view<[%v_depth]x24xf16>
+      }
     }
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
     %local_key = index.add %key_origin0, %lane_column : index
     %key_valid = index.cmp ult, %local_key, %cfg_tokens : index
-    %k_data0 = vector.load %k_tile[%lane_column, %c0] : view<16x136xf16> -> vector<16xf16>
+    %k_data0 = vector.load %k_tile[%lane_column, %c0] : view<16x[%k_pitch]xf16> -> vector<16xf16>
     %rhs0 = vector.fragment<rhs> %k_data0 shape [%k_frag, %n] : vector<16xf16>
     %qk0 = vector.mma %lhs0, %rhs0, %init : vector<16xf16>, vector<16xf16>, vector<8xf32>
-    %k_data1 = vector.load %k_tile[%lane_column, %c16] : view<16x136xf16> -> vector<16xf16>
+    %k_data1 = vector.load %k_tile[%lane_column, %c16] : view<16x[%k_pitch]xf16> -> vector<16xf16>
     %rhs1 = vector.fragment<rhs> %k_data1 shape [%k_frag, %n] : vector<16xf16>
     %qk1 = vector.mma %lhs1, %rhs1, %qk0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
-    %k_data2 = vector.load %k_tile[%lane_column, %c32] : view<16x136xf16> -> vector<16xf16>
+    %k_data2 = vector.load %k_tile[%lane_column, %c32] : view<16x[%k_pitch]xf16> -> vector<16xf16>
     %rhs2 = vector.fragment<rhs> %k_data2 shape [%k_frag, %n] : vector<16xf16>
     %qk2 = vector.mma %lhs2, %rhs2, %qk1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
-    %k_data3 = vector.load %k_tile[%lane_column, %c48] : view<16x136xf16> -> vector<16xf16>
+    %k_data3 = vector.load %k_tile[%lane_column, %c48] : view<16x[%k_pitch]xf16> -> vector<16xf16>
     %rhs3 = vector.fragment<rhs> %k_data3 shape [%k_frag, %n] : vector<16xf16>
     %qk3 = vector.mma %lhs3, %rhs3, %qk2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
-    %q_data4 = vector.load %q_tile[%lane_column, %c0] : view<16x72xf16> -> vector<16xf16>
+    %q_data4 = vector.load %q_tile[%lane_column, %c0] : view<16x[%q_pitch]xf16> -> vector<16xf16>
     %lhs4 = vector.fragment<lhs> %q_data4 shape [%m, %k_frag] : vector<16xf16>
-    %k_data4 = vector.load %k_tile[%lane_column, %c64] : view<16x136xf16> -> vector<16xf16>
+    %k_data4 = vector.load %k_tile[%lane_column, %c64] : view<16x[%k_pitch]xf16> -> vector<16xf16>
     %rhs4 = vector.fragment<rhs> %k_data4 shape [%k_frag, %n] : vector<16xf16>
     %qk4 = vector.mma %lhs4, %rhs4, %qk3 : vector<16xf16>, vector<16xf16>, vector<8xf32>
-    %q_data5 = vector.load %q_tile[%lane_column, %c16] : view<16x72xf16> -> vector<16xf16>
-    %lhs5 = vector.fragment<lhs> %q_data5 shape [%m, %k_frag] : vector<16xf16>
-    %k_data5 = vector.load %k_tile[%lane_column, %c80] : view<16x136xf16> -> vector<16xf16>
-    %rhs5 = vector.fragment<rhs> %k_data5 shape [%k_frag, %n] : vector<16xf16>
-    %qk5 = vector.mma %lhs5, %rhs5, %qk4 : vector<16xf16>, vector<16xf16>, vector<8xf32>
-    %q_data6 = vector.load %q_tile[%lane_column, %c32] : view<16x72xf16> -> vector<16xf16>
-    %lhs6 = vector.fragment<lhs> %q_data6 shape [%m, %k_frag] : vector<16xf16>
-    %k_data6 = vector.load %k_tile[%lane_column, %c96] : view<16x136xf16> -> vector<16xf16>
-    %rhs6 = vector.fragment<rhs> %k_data6 shape [%k_frag, %n] : vector<16xf16>
-    %qk6 = vector.mma %lhs6, %rhs6, %qk5 : vector<16xf16>, vector<16xf16>, vector<8xf32>
-    %q_data7 = vector.load %q_tile[%lane_column, %c48] : view<16x72xf16> -> vector<16xf16>
-    %lhs7 = vector.fragment<lhs> %q_data7 shape [%m, %k_frag] : vector<16xf16>
-    %k_data7 = vector.load %k_tile[%lane_column, %c112] : view<16x136xf16> -> vector<16xf16>
-    %rhs7 = vector.fragment<rhs> %k_data7 shape [%k_frag, %n] : vector<16xf16>
-    %raw_scores = vector.mma %lhs7, %rhs7, %qk6 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %raw_scores = scf.if %padded80 -> (vector<8xf32>) {
+      scf.yield %qk4 : vector<8xf32>
+    } else {
+      %q_data5 = vector.load %q_tile[%lane_column, %c16] : view<16x[%q_pitch]xf16> -> vector<16xf16>
+      %lhs5 = vector.fragment<lhs> %q_data5 shape [%m, %k_frag] : vector<16xf16>
+      %k_data5 = vector.load %k_tile[%lane_column, %c80] : view<16x[%k_pitch]xf16> -> vector<16xf16>
+      %rhs5 = vector.fragment<rhs> %k_data5 shape [%k_frag, %n] : vector<16xf16>
+      %qk5 = vector.mma %lhs5, %rhs5, %qk4 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %q_data6 = vector.load %q_tile[%lane_column, %c32] : view<16x[%q_pitch]xf16> -> vector<16xf16>
+      %lhs6 = vector.fragment<lhs> %q_data6 shape [%m, %k_frag] : vector<16xf16>
+      %k_data6 = vector.load %k_tile[%lane_column, %c96] : view<16x[%k_pitch]xf16> -> vector<16xf16>
+      %rhs6 = vector.fragment<rhs> %k_data6 shape [%k_frag, %n] : vector<16xf16>
+      %qk6 = vector.mma %lhs6, %rhs6, %qk5 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      %q_data7 = vector.load %q_tile[%lane_column, %c48] : view<16x[%q_pitch]xf16> -> vector<16xf16>
+      %lhs7 = vector.fragment<lhs> %q_data7 shape [%m, %k_frag] : vector<16xf16>
+      %k_data7 = vector.load %k_tile[%lane_column, %c112] : view<16x[%k_pitch]xf16> -> vector<16xf16>
+      %rhs7 = vector.fragment<rhs> %k_data7 shape [%k_frag, %n] : vector<16xf16>
+      %raw_full = vector.mma %lhs7, %rhs7, %qk6 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      scf.yield %raw_full : vector<8xf32>
+    }
     %scaled0 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %raw_scores, %scale_vector : vector<8xf32>
     %scaled = scf.if %key_valid -> (vector<8xf32>) {
       scf.yield %scaled0 : vector<8xf32>
@@ -352,29 +398,44 @@ template.def<@h3.shared_attention_mha8_lds_f16_wmma> @h3_body_attention_mha8_lds
     kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
     %probability = vector.fragment.load<lhs> %scratch_view[%c0, %c0] shape [%m, %k_frag] : view<16x16xf16> -> vector<16xf16>
     %vrow0 = index.add %lane_column, %c0 : index
-    %v_data0 = vector.load %v_tile[%vrow0, %c0] : view<128x24xf16> -> vector<16xf16>
+    %v_data0 = vector.load %v_tile[%vrow0, %c0] : view<[%v_depth]x24xf16> -> vector<16xf16>
     %v0 = vector.fragment<rhs> %v_data0 shape [%k_frag, %n] : vector<16xf16>
     %vrow1 = index.add %lane_column, %c16 : index
-    %v_data1 = vector.load %v_tile[%vrow1, %c0] : view<128x24xf16> -> vector<16xf16>
+    %v_data1 = vector.load %v_tile[%vrow1, %c0] : view<[%v_depth]x24xf16> -> vector<16xf16>
     %v1 = vector.fragment<rhs> %v_data1 shape [%k_frag, %n] : vector<16xf16>
     %vrow2 = index.add %lane_column, %c32 : index
-    %v_data2 = vector.load %v_tile[%vrow2, %c0] : view<128x24xf16> -> vector<16xf16>
+    %v_data2 = vector.load %v_tile[%vrow2, %c0] : view<[%v_depth]x24xf16> -> vector<16xf16>
     %v2 = vector.fragment<rhs> %v_data2 shape [%k_frag, %n] : vector<16xf16>
     %vrow3 = index.add %lane_column, %c48 : index
-    %v_data3 = vector.load %v_tile[%vrow3, %c0] : view<128x24xf16> -> vector<16xf16>
+    %v_data3 = vector.load %v_tile[%vrow3, %c0] : view<[%v_depth]x24xf16> -> vector<16xf16>
     %v3 = vector.fragment<rhs> %v_data3 shape [%k_frag, %n] : vector<16xf16>
     %vrow4 = index.add %lane_column, %c64 : index
-    %v_data4 = vector.load %v_tile[%vrow4, %c0] : view<128x24xf16> -> vector<16xf16>
+    %v_data4 = vector.load %v_tile[%vrow4, %c0] : view<[%v_depth]x24xf16> -> vector<16xf16>
     %v4 = vector.fragment<rhs> %v_data4 shape [%k_frag, %n] : vector<16xf16>
-    %vrow5 = index.add %lane_column, %c80 : index
-    %v_data5 = vector.load %v_tile[%vrow5, %c0] : view<128x24xf16> -> vector<16xf16>
-    %v5 = vector.fragment<rhs> %v_data5 shape [%k_frag, %n] : vector<16xf16>
-    %vrow6 = index.add %lane_column, %c96 : index
-    %v_data6 = vector.load %v_tile[%vrow6, %c0] : view<128x24xf16> -> vector<16xf16>
-    %v6 = vector.fragment<rhs> %v_data6 shape [%k_frag, %n] : vector<16xf16>
-    %vrow7 = index.add %lane_column, %c112 : index
-    %v_data7 = vector.load %v_tile[%vrow7, %c0] : view<128x24xf16> -> vector<16xf16>
-    %v7 = vector.fragment<rhs> %v_data7 shape [%k_frag, %n] : vector<16xf16>
+    %v5 = scf.if %padded80 -> (vector<16xf16>) {
+      scf.yield %zero_half : vector<16xf16>
+    } else {
+      %vrow5 = index.add %lane_column, %c80 : index
+      %v_data5 = vector.load %v_tile[%vrow5, %c0] : view<[%v_depth]x24xf16> -> vector<16xf16>
+      %v5_full = vector.fragment<rhs> %v_data5 shape [%k_frag, %n] : vector<16xf16>
+      scf.yield %v5_full : vector<16xf16>
+    }
+    %v6 = scf.if %padded80 -> (vector<16xf16>) {
+      scf.yield %zero_half : vector<16xf16>
+    } else {
+      %vrow6 = index.add %lane_column, %c96 : index
+      %v_data6 = vector.load %v_tile[%vrow6, %c0] : view<[%v_depth]x24xf16> -> vector<16xf16>
+      %v6_full = vector.fragment<rhs> %v_data6 shape [%k_frag, %n] : vector<16xf16>
+      scf.yield %v6_full : vector<16xf16>
+    }
+    %v7 = scf.if %padded80 -> (vector<16xf16>) {
+      scf.yield %zero_half : vector<16xf16>
+    } else {
+      %vrow7 = index.add %lane_column, %c112 : index
+      %v_data7 = vector.load %v_tile[%vrow7, %c0] : view<[%v_depth]x24xf16> -> vector<16xf16>
+      %v7_full = vector.fragment<rhs> %v_data7 shape [%k_frag, %n] : vector<16xf16>
+      scf.yield %v7_full : vector<16xf16>
+    }
     %rescaled0 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %acc0, %selected_old_scale : vector<8xf32>
     %rescaled1 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %acc1, %selected_old_scale : vector<8xf32>
     %rescaled2 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %acc2, %selected_old_scale : vector<8xf32>
@@ -388,9 +449,24 @@ template.def<@h3.shared_attention_mha8_lds_f16_wmma> @h3_body_attention_mha8_lds
     %next2 = vector.mma %probability, %v2, %rescaled2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
     %next3 = vector.mma %probability, %v3, %rescaled3 : vector<16xf16>, vector<16xf16>, vector<8xf32>
     %next4 = vector.mma %probability, %v4, %rescaled4 : vector<16xf16>, vector<16xf16>, vector<8xf32>
-    %next5 = vector.mma %probability, %v5, %rescaled5 : vector<16xf16>, vector<16xf16>, vector<8xf32>
-    %next6 = vector.mma %probability, %v6, %rescaled6 : vector<16xf16>, vector<16xf16>, vector<8xf32>
-    %next7 = vector.mma %probability, %v7, %rescaled7 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+    %next5 = scf.if %padded80 -> (vector<8xf32>) {
+      scf.yield %zero_vector : vector<8xf32>
+    } else {
+      %next5_full = vector.mma %probability, %v5, %rescaled5 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      scf.yield %next5_full : vector<8xf32>
+    }
+    %next6 = scf.if %padded80 -> (vector<8xf32>) {
+      scf.yield %zero_vector : vector<8xf32>
+    } else {
+      %next6_full = vector.mma %probability, %v6, %rescaled6 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      scf.yield %next6_full : vector<8xf32>
+    }
+    %next7 = scf.if %padded80 -> (vector<8xf32>) {
+      scf.yield %zero_vector : vector<8xf32>
+    } else {
+      %next7_full = vector.mma %probability, %v7, %rescaled7 : vector<16xf16>, vector<16xf16>, vector<8xf32>
+      scf.yield %next7_full : vector<8xf32>
+    }
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
     scf.yield %next_max, %next_sum, %next0, %next1, %next2, %next3, %next4, %next5, %next6, %next7 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
   }
@@ -498,7 +574,8 @@ kernel.def target(@h3_attention_mha_lds_f16_wmma_gfx11) export("h3_attention_mha
   %split_staging = scalar.constant false : i1
   %q_tile_offset = index.constant 12544 : offset
   %lds_bytes = index.constant 21760 : offset
-  template.apply<@h3.shared_attention_mha8_lds_f16_wmma>(%token_count, %q, %k, %v, %out, %cfg_q_stride, %cfg_kv_stride, %cfg_out_stride, %cfg_tokens, %cfg_token_capacity, %cfg_scale, %waves, %split_staging, %q_tile_offset, %lds_bytes) : (index, buffer, buffer, buffer, buffer, index, index, index, index, index, f32, index, i1, offset, offset)
+  %padded80 = scalar.constant false : i1
+  template.apply<@h3.shared_attention_mha8_lds_f16_wmma>(%token_count, %q, %k, %v, %out, %cfg_q_stride, %cfg_kv_stride, %cfg_out_stride, %cfg_tokens, %cfg_token_capacity, %cfg_scale, %waves, %split_staging, %q_tile_offset, %lds_bytes, %padded80) : (index, buffer, buffer, buffer, buffer, index, index, index, index, index, f32, index, i1, offset, offset, i1)
   kernel.return
 }
 
@@ -542,6 +619,48 @@ kernel.def target(@h3_attention_mha8_lds_f16_wmma_gfx11) export("h3_attention_mh
   %split_staging = scalar.constant true : i1
   %q_tile_offset = index.constant 14592 : offset
   %lds_bytes = index.constant 33024 : offset
-  template.apply<@h3.shared_attention_mha8_lds_f16_wmma>(%token_count, %q, %k, %v, %out, %cfg_q_stride, %cfg_kv_stride, %cfg_out_stride, %cfg_tokens, %cfg_token_capacity, %cfg_scale, %waves, %split_staging, %q_tile_offset, %lds_bytes) : (index, buffer, buffer, buffer, buffer, index, index, index, index, index, f32, index, i1, offset, offset)
+  %padded80 = scalar.constant false : i1
+  template.apply<@h3.shared_attention_mha8_lds_f16_wmma>(%token_count, %q, %k, %v, %out, %cfg_q_stride, %cfg_kv_stride, %cfg_out_stride, %cfg_tokens, %cfg_token_capacity, %cfg_scale, %waves, %split_staging, %q_tile_offset, %lds_bytes, %padded80) : (index, buffer, buffer, buffer, buffer, index, index, index, index, index, f32, index, i1, offset, offset, i1)
+  kernel.return
+}
+
+// 80 populated channels in each 128-channel head. Q, K and V channels
+// [80, 128) must be zero; the output preserves the 128-channel padded layout.
+amdgpu.target<gfx11-generic> @h3_attention_mha80_lds_f16_wmma_gfx11 {subgroup_size = 32}
+
+config.decl @h3.attention_mha80_lds_f16_wmma.q_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
+
+config.decl @h3.attention_mha80_lds_f16_wmma.kv_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
+
+config.decl @h3.attention_mha80_lds_f16_wmma.out_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
+
+config.decl @h3.attention_mha80_lds_f16_wmma.tokens : %value: index where [range(%value, 1, 1048576)]
+
+config.decl @h3.attention_mha80_lds_f16_wmma.token_capacity : %value: index where [range(%value, 32, 1048576), mul(%value, 16)]
+
+config.decl @h3.attention_mha80_lds_f16_wmma.scale : f32
+
+kernel.def target(@h3_attention_mha80_lds_f16_wmma_gfx11) export("h3_attention_mha80_lds_f16_wmma") @h3_attention_mha80_lds_f16_wmma(%token_count: index, %kv_head_count: index) {
+  %c1 = index.constant 1 : index
+  %c63 = index.constant 63 : index
+  %c64 = index.constant 64 : index
+  %c128 = index.constant 128 : index
+  %tokens0 = config.get @h3.attention_mha80_lds_f16_wmma.tokens : index
+  %rounded = index.add %tokens0, %c63 : index
+  %tiles = index.div %rounded, %c64 : index
+  kernel.launch.config workgroups(%tiles, %kv_head_count, %c1) workgroup_size(%c128, %c1, %c1) : index
+} launch(%token_count: index, %q: buffer, %k: buffer, %v: buffer, %out: buffer) {
+  %cfg_q_stride = config.get @h3.attention_mha80_lds_f16_wmma.q_stride : index
+  %cfg_kv_stride = config.get @h3.attention_mha80_lds_f16_wmma.kv_stride : index
+  %cfg_out_stride = config.get @h3.attention_mha80_lds_f16_wmma.out_stride : index
+  %cfg_tokens = config.get @h3.attention_mha80_lds_f16_wmma.tokens : index
+  %cfg_token_capacity = config.get @h3.attention_mha80_lds_f16_wmma.token_capacity : index
+  %cfg_scale = config.get @h3.attention_mha80_lds_f16_wmma.scale : f32
+  %waves = index.constant 4 : index
+  %split_staging = scalar.constant false : i1
+  %q_tile_offset = index.constant 8704 : offset
+  %lds_bytes = index.constant 11776 : offset
+  %padded80 = scalar.constant true : i1
+  template.apply<@h3.shared_attention_mha8_lds_f16_wmma>(%token_count, %q, %k, %v, %out, %cfg_q_stride, %cfg_kv_stride, %cfg_out_stride, %cfg_tokens, %cfg_token_capacity, %cfg_scale, %waves, %split_staging, %q_tile_offset, %lds_bytes, %padded80) : (index, buffer, buffer, buffer, buffer, index, index, index, index, index, f32, index, i1, offset, offset, i1)
   kernel.return
 }

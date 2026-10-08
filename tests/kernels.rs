@@ -1219,6 +1219,108 @@ fn quantized_gemms_match_integer_dot_products_bias_and_residual_classes() {
 /// workgroup of `16 * waves` query rows per head, `q`/`k`/`v` contiguous `[capacity][stride]` f16
 /// with zero headroom past `tokens`, and `gqa8c` is the text encoder's causal 8-query-per-kv layout.
 #[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires provisioned HRX")]
+fn padded_attention_matches_full_heads_and_sampled_cpu_softmax() {
+    let mut h = Harness::new();
+    for (tokens, heads, active) in [
+        (1usize, 1usize, 72usize),
+        (17, 3, 80),
+        (63, 2, 72),
+        (65, 3, 80),
+        (129, 2, 72),
+        (4032, 16, 72),
+    ] {
+        let stride = heads * 128;
+        let capacity = tokens.div_ceil(64).max(1) * 64;
+        let operand = |seed| {
+            (0..capacity * stride)
+                .map(|i| {
+                    if i < tokens * stride && i % 128 < active {
+                        f16::from_f32((((i * 73 + seed) % 997) as f32 - 498.) / 256.)
+                    } else {
+                        f16::ZERO
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let (q, k, v) = (operand(3), operand(17), operand(37));
+        let scale = 1. / (active as f64).sqrt();
+        let mut config = cfg(&[
+            ("q_stride", stride),
+            ("kv_stride", stride),
+            ("out_stride", stride),
+            ("tokens", tokens),
+            ("token_capacity", capacity),
+        ]);
+        config.push(("scale", h3_hrx::compile::num(scale)));
+        let output_bytes = tokens * stride * 2;
+        let data = [
+            bytes(&q),
+            bytes(&k),
+            bytes(&v),
+            vec![0xa5; output_bytes + 256],
+        ];
+        let mut outputs = Vec::new();
+        for stem in ["attention_mha_lds_f16_wmma", "attention_mha80_lds_f16_wmma"] {
+            let out = h.run_module(
+                "attention_mha_family",
+                stem,
+                &config,
+                [tokens.div_ceil(64) as u32, heads as u32, 1],
+                128,
+                &[tokens as u64],
+                &data,
+            );
+            for i in 0..3 {
+                assert_eq!(out[i], data[i]);
+            }
+            assert!(out[3][output_bytes..].iter().all(|&b| b == 0xa5));
+            outputs.push(out[3].clone());
+        }
+        assert_eq!(outputs[0], outputs[1], "tokens={tokens}, active={active}");
+        let actual = halves(&outputs[1][..output_bytes], false);
+        for (i, &value) in actual.iter().enumerate() {
+            assert!(value.is_finite());
+            if i % 128 >= active {
+                assert_eq!(value, 0.);
+            }
+        }
+        for row in [0, tokens / 2, tokens - 1] {
+            for head in [0, heads - 1] {
+                let scores: Vec<_> = (0..tokens)
+                    .map(|key| {
+                        (0..active)
+                            .map(|ch| {
+                                q[row * stride + head * 128 + ch].to_f64()
+                                    * k[key * stride + head * 128 + ch].to_f64()
+                            })
+                            .sum::<f64>()
+                            * scale
+                    })
+                    .collect();
+                let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let weights: Vec<_> = scores.iter().map(|score| (score - max).exp()).collect();
+                let total: f64 = weights.iter().sum();
+                for ch in [0, 31, 64, active - 1, active, 127] {
+                    let want = weights
+                        .iter()
+                        .enumerate()
+                        .map(|(key, &w)| w * v[key * stride + head * 128 + ch].to_f64())
+                        .sum::<f64>()
+                        / total;
+                    close(
+                        &[actual[row * stride + head * 128 + ch]],
+                        &[want],
+                        3e-3,
+                        1e-2,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires gfx1151 and provisioned HRX"

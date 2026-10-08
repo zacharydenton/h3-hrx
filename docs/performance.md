@@ -12,7 +12,7 @@ Each native engine/compiler configuration has its own subdirectory there.
 | Target | Coverage |
 | --- | --- |
 | `host` | Short/long tokenization, mixed-media presentation, image resizing, RefMod loading/strength/copies, packed sequence layout |
-| `attention` | Head-128 FP16 four/eight-wave tile comparisons across ragged lengths and the 4096-token boundary, checked against sampled FP64 attention |
+| `attention` | Head-128 FP16 four/eight-wave tiles and 16-head vision attention with 72 populated channels, including 480p/768p token counts and ragged lengths, checked against sampled FP64 attention |
 | `kernels` | FP32 Hadamard preparation, INT8 attention preparation in both layouts, V transpose, INT8/BF16 GEMMs including all four DiT projections through 37,977 rows, cached/rotating weights, eager/graph dispatch |
 | `models` | Resident INT8 DiT eager/graph comparison through 37,977 tokens including partial tiles, a complete 50-block 768p sequence in both modes, and short audio roundtrip |
 | `stages` | Complete text encoder plus token refiner, vision tower, video encode/decode, audio encode/decode, complete 50-block denoising trajectories with Euler and ResMultistep |

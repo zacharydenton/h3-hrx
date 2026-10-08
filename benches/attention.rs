@@ -1,4 +1,4 @@
-//! Head-128 tile comparisons with an independent sampled FP64 attention oracle.
+//! Full and padded-head attention with an independent sampled FP64 oracle.
 mod support;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use h3_hrx::{
@@ -8,7 +8,14 @@ use h3_hrx::{
 use half::f16;
 use std::time::{Duration, Instant};
 
-fn reference(q: &[f16], k: &[f16], v: &[f16], tokens: usize, heads: usize) -> Vec<(usize, f64)> {
+fn reference(
+    q: &[f16],
+    k: &[f16],
+    v: &[f16],
+    tokens: usize,
+    heads: usize,
+    active: usize,
+) -> Vec<(usize, f64)> {
     let stride = heads * 128;
     let mut expected = Vec::new();
     for row in [0, tokens / 2, tokens - 1] {
@@ -21,7 +28,7 @@ fn reference(q: &[f16], k: &[f16], v: &[f16], tokens: usize, heads: usize) -> Ve
                             * k[key * stride + head * 128 + c].to_f64()
                     })
                     .sum::<f64>()
-                    / 128f64.sqrt();
+                    / (active as f64).sqrt();
                 scores.push(score);
             }
             let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -44,15 +51,29 @@ fn reference(q: &[f16], k: &[f16], v: &[f16], tokens: usize, heads: usize) -> Ve
     expected
 }
 fn attention(c: &mut Criterion) {
-    let mut group = c.benchmark_group("attention_f16_tiles");
-    for tokens in [257usize, 2048, 4095, 4096, 4097, 8193] {
-        let heads = 4;
+    attention_layout(c, false);
+    attention_layout(c, true);
+}
+fn attention_layout(c: &mut Criterion, vision: bool) {
+    let mut group = c.benchmark_group(if vision {
+        "attention_vision"
+    } else {
+        "attention_f16_tiles"
+    });
+    let token_counts = if vision {
+        [16usize, 65, 257, 1620, 4032, 8193]
+    } else {
+        [257usize, 2048, 4095, 4096, 4097, 8193]
+    };
+    for tokens in token_counts {
+        let heads = if vision { 16 } else { 4 };
+        let active = if vision { 72 } else { 128 };
         let stride = heads * 128;
         let capacity = (tokens + 16).div_ceil(128) * 128;
         let values = |seed: usize| {
             (0..capacity * stride)
                 .map(|i| {
-                    if i < tokens * stride {
+                    if i < tokens * stride && i % 128 < active {
                         f16::from_f32((((i * 73 + seed) % 997) as f32 - 498.) / 512.)
                     } else {
                         f16::ZERO
@@ -63,28 +84,33 @@ fn attention(c: &mut Criterion) {
         let q = values(3);
         let k = values(17);
         let v = values(37);
-        let expected = reference(&q, &k, &v, tokens, heads);
-        let mut waves = [4, 8];
+        let expected = reference(&q, &k, &v, tokens, heads, active);
+        let mut variants = if vision {
+            [
+                ("full128", "attention_mha_lds_f16_wmma"),
+                ("padded80", "attention_mha80_lds_f16_wmma"),
+            ]
+        } else {
+            [
+                ("waves4", "attention_mha_lds_f16_wmma"),
+                ("waves8", "attention_mha8_lds_f16_wmma"),
+            ]
+        };
         if std::env::var_os("H3_BENCH_ATTENTION_REVERSE").is_some() {
-            waves.reverse();
+            variants.reverse();
         }
-        for waves in waves {
-            group.bench_function(BenchmarkId::new(format!("waves{waves}"), tokens), |b| {
+        for (variant, stem) in variants {
+            group.bench_function(BenchmarkId::new(variant, tokens), |b| {
                 let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
                 let mut stream = support::stream(Some(manager.budget()));
                 let compiler = support::compiler();
-                let stem = if waves == 4 {
-                    "attention_mha_lds_f16_wmma"
-                } else {
-                    "attention_mha8_lds_f16_wmma"
-                };
                 let cfg: Cfg = [
                     ("q_stride", stride.to_string()),
                     ("kv_stride", stride.to_string()),
                     ("out_stride", stride.to_string()),
                     ("tokens", tokens.to_string()),
                     ("token_capacity", capacity.to_string()),
-                    ("scale", num(1. / 128f64.sqrt())),
+                    ("scale", num(1. / (active as f64).sqrt())),
                 ]
                 .into_iter()
                 .map(|(k, v)| (format!("h3.{stem}.{k}"), v))
@@ -110,7 +136,11 @@ fn attention(c: &mut Criterion) {
                         &mut Sink::Stream(stream),
                         &kernel,
                         Some(&mut profile),
-                        "head128 attention",
+                        if vision {
+                            "vision attention"
+                        } else {
+                            "head128 attention"
+                        },
                         &[tokens as u32, heads as u32],
                         &[tokens as u32],
                         &bindings,
@@ -126,10 +156,10 @@ fn attention(c: &mut Criterion) {
                         f16::from_le_bytes([actual[index * 2], actual[index * 2 + 1]]).to_f64();
                     assert!(
                         got.is_finite() && (got - want).abs() <= 0.003 + 0.01 * want.abs(),
-                        "{tokens}/{waves}/{index}: {got} vs {want}"
+                        "{tokens}/{variant}/{index}: {got} vs {want}"
                     );
                 }
-                support::report_digest(&format!("attention_f16/{tokens}/{waves}"), &actual);
+                support::report_digest(&format!("attention_f16/{tokens}/{variant}"), &actual);
                 b.iter_custom(|iterations| {
                     let mut elapsed = Duration::ZERO;
                     for _ in 0..iterations {
@@ -139,7 +169,7 @@ fn attention(c: &mut Criterion) {
                     }
                     if std::env::var_os("H3_BENCH_DETAILS").is_some() {
                         eprintln!(
-                            "attention-tile {tokens}/{waves}: {:.6} ms",
+                            "attention-tile {tokens}/{variant}: {:.6} ms",
                             elapsed.as_secs_f64() * 1000. / iterations as f64
                         );
                     }
@@ -148,7 +178,7 @@ fn attention(c: &mut Criterion) {
                 assert_eq!(support::read(&mut stream, output.binding()), actual);
                 let report = profile.report(0.0);
                 if !report.is_empty() {
-                    eprintln!("attention profile {tokens}/{waves}: {report}");
+                    eprintln!("attention profile {tokens}/{variant}: {report}");
                 }
             });
         }

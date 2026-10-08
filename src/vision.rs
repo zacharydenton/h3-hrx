@@ -252,7 +252,9 @@ fn embed_frames(
         crate::transfer::fill(stream, b.slice(0, cap * VHEADS * VHDP * 2), 0)?;
     }
 
-    let ans = "h3.attention_mha_lds_f16_wmma.";
+    // Rotary preparation zeros channels [72, 128); attention can skip the
+    // final three 16-channel WMMA fragments while retaining the padded layout.
+    let ans = "h3.attention_mha80_lds_f16_wmma.";
     let attn_cfg: Cfg = vec![
         (format!("{ans}q_stride"), (VHEADS * VHDP).to_string()),
         (format!("{ans}kv_stride"), (VHEADS * VHDP).to_string()),
@@ -267,7 +269,7 @@ fn embed_frames(
     let attn = c.get(
         stream,
         "attention_mha_family",
-        "h3_attention_mha_lds_f16_wmma",
+        "h3_attention_mha80_lds_f16_wmma",
         &attn_cfg,
     )?;
     let rns = "h3.rope2d_qkv_f16.";
