@@ -240,6 +240,10 @@ that execution path; it is not a quality-qualified cache preset.
   buffers, including any per-call coordinate cache. Cases span 32px through
   landscape/portrait 768p, and the 3584px square maximum vision area. GPU uploads
   and output-buffer allocation are excluded.
+- **Vision rotary kernel:** `vision_rotary` measures resident FP32 QKV rotation,
+  FP16 conversion and head padding with the tower's 16 heads. Cases include
+  480p/768p token counts and partial workgroups. Compilation, allocation, uploads
+  and output verification are outside timing; complete tower timing is in `stages`.
 - **Vision tokens:** `vision_tokens_cpu` measures the CPU reference: copying
   prebuilt patch projections, FP32 position interpolation/addition, and
   allocation/conversion of FP16 residual rows. Cases span 32px through 768p in

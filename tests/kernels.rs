@@ -37,6 +37,27 @@ impl Harness {
         scalars: &[u64],
         data: &[Vec<u8>],
     ) -> Vec<Vec<u8>> {
+        self.run_geometry(module, stem, cfg, Some((grid, threads)), scalars, data)
+    }
+    // For kernels whose launch function and device entry take the same indices.
+    fn run_auto(
+        &mut self,
+        stem: &str,
+        cfg: &[(&str, String)],
+        scalars: &[u64],
+        data: &[Vec<u8>],
+    ) -> Vec<Vec<u8>> {
+        self.run_geometry(stem, stem, cfg, None, scalars, data)
+    }
+    fn run_geometry(
+        &mut self,
+        module: &str,
+        stem: &str,
+        cfg: &[(&str, String)],
+        geometry: Option<([u32; 3], u32)>,
+        scalars: &[u64],
+        data: &[Vec<u8>],
+    ) -> Vec<Vec<u8>> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let path = root.join("kernels").join(format!("{module}.loom"));
         let path = if path.is_file() {
@@ -77,6 +98,13 @@ impl Harness {
         // Safety: trusted checked-in source compiled through HRX. Every test below
         // sizes the bindings from the same dimensions passed as kernel configuration.
         let kernel = unsafe { self.stream.load_artifact(&path).unwrap() };
+        let launch = |kernel: &hrx::Kernel| match geometry {
+            Some((grid, threads)) => (grid, [threads, 1, 1]),
+            None => {
+                let config = kernel.launch_config(scalars).unwrap();
+                (config.workgroup_count, config.workgroup_size)
+            }
+        };
         let buffers: Vec<Buffer> = data
             .iter()
             .map(|bytes| self.stream.allocate(bytes.len()).unwrap())
@@ -87,9 +115,10 @@ impl Harness {
         let indices: Vec<_> = scalars.iter().map(|&v| u32::try_from(v).unwrap()).collect();
         let constants = Constants::indices(&kernel, &indices).unwrap();
         let bindings: Vec<_> = buffers.iter().map(Buffer::binding).collect();
+        let (grid, block) = launch(&kernel);
         unsafe {
             self.stream
-                .dispatch(&kernel, grid, [threads, 1, 1], &constants, &bindings)
+                .dispatch(&kernel, grid, block, &constants, &bindings)
                 .unwrap();
         }
         let reads: Vec<_> = bindings
@@ -106,9 +135,10 @@ impl Harness {
                 self.stream.upload(buffer.binding(), bytes).unwrap();
             }
             let old_constants = Constants::indices(&old, &indices).unwrap();
+            let (grid, block) = launch(&old);
             unsafe {
                 self.stream
-                    .dispatch(&old, grid, [threads, 1, 1], &old_constants, &bindings)
+                    .dispatch(&old, grid, block, &old_constants, &bindings)
                     .unwrap();
             }
             for (i, binding) in bindings.iter().enumerate() {
@@ -855,6 +885,75 @@ fn float_preparation_normalizes_large_values_and_respects_padded_pitch() {
                     if bf { 8e-3 } else { 2e-3 },
                 );
             }
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires provisioned HRX")]
+fn vision_rotary_preserves_fp32_pairs_padding_and_guards() {
+    let mut h = Harness::new();
+    for (tokens, heads, hd, pad) in [
+        (1usize, 1usize, 2usize, 32usize),
+        (3, 7, 70, 96),
+        (17, 3, 72, 128),
+        (3, 2, 80, 96),
+        (1, 16, 128, 128),
+        (5, 1, 256, 256),
+        (4032, 16, 72, 128),
+    ] {
+        let inner = heads * hd;
+        let half = hd / 2;
+        let input: Vec<f32> = (0..tokens * 3 * inner)
+            .map(|i| {
+                let v = ((i * 37 % 1009) as f32 - 504.) / 127.;
+                if i % 5 == 0 {
+                    v * 1000.
+                } else {
+                    v
+                }
+            })
+            .collect();
+        let angles = values(tokens * half, 3.);
+        let cos: Vec<_> = angles.iter().map(|v| v.cos()).collect();
+        let sin: Vec<_> = angles.iter().map(|v| v.sin()).collect();
+        let output_bytes = tokens * heads * pad * 2;
+        let mut data = vec![bytes(&input), bytes(&cos), bytes(&sin)];
+        data.extend((0..3).map(|_| vec![0xa5; output_bytes + 256]));
+        let out = h.run_auto(
+            "rope2d_qkv_f16",
+            &cfg(&[("heads", heads), ("hd", hd), ("hd_pad", pad)]),
+            &[tokens as u64],
+            &data,
+        );
+        for operand in 0..3 {
+            assert_eq!(out[operand], data[operand]);
+            let mut want = vec![f16::ZERO; tokens * heads * pad];
+            for t in 0..tokens {
+                for head in 0..heads {
+                    let base = t * 3 * inner + operand * inner + head * hd;
+                    for d in 0..hd {
+                        let x = input[base + d];
+                        let value = if operand == 2 {
+                            x
+                        } else {
+                            let j = d % half;
+                            let p = if d < half { d + half } else { d - half };
+                            let s = sin[t * half + j];
+                            input[base + p]
+                                .mul_add(if d < half { -s } else { s }, x * cos[t * half + j])
+                        };
+                        want[(t * heads + head) * pad + d] = f16::from_f32(value);
+                    }
+                }
+            }
+            assert!(want.iter().all(|v| v.is_finite()));
+            assert_eq!(
+                out[operand + 3][..output_bytes],
+                bytes(&want),
+                "tokens={tokens}, heads={heads}, hd={hd}, operand={operand}"
+            );
+            assert!(out[operand + 3][output_bytes..].iter().all(|&v| v == 0xa5));
         }
     }
 }

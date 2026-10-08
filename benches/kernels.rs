@@ -116,6 +116,74 @@ fn operand(count: usize, elem: &str, seed: usize) -> Vec<u8> {
     }
 }
 
+fn vision_rotary(c: &mut Criterion) {
+    use h3_hrx::dispatch::{emit, Profile};
+    use h3_hrx::model::{VHD, VHDP, VHEADS};
+    let mut group = c.benchmark_group("vision_rotary");
+    for tokens in [1usize, 16, 257, 1620, 4032, 8193] {
+        group.throughput(Throughput::Elements((tokens * 3 * VHEADS * VHD) as u64));
+        group.bench_function(BenchmarkId::from_parameter(tokens), |b| {
+            let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+            let mut stream = support::stream(Some(manager.budget()));
+            let compiler = compiler();
+            let kernel = compiler
+                .get(
+                    &mut stream,
+                    "rope2d_qkv_f16",
+                    "h3_rope2d_qkv_f16",
+                    &vec![
+                        ("h3.rope2d_qkv_f16.heads".into(), VHEADS.to_string()),
+                        ("h3.rope2d_qkv_f16.hd".into(), VHD.to_string()),
+                        ("h3.rope2d_qkv_f16.hd_pad".into(), VHDP.to_string()),
+                    ],
+                )
+                .unwrap();
+            compiler.flush(&mut stream).unwrap();
+            let input = support::values(tokens * 3 * VHEADS * VHD, 2.);
+            let angles = support::values(tokens * VHD / 2, 3.);
+            let cos: Vec<_> = angles.iter().map(|v| v.cos()).collect();
+            let sin: Vec<_> = angles.iter().map(|v| v.sin()).collect();
+            let input = upload(&mut stream, bytemuck::cast_slice(&input));
+            let cos = upload(&mut stream, bytemuck::cast_slice(&cos));
+            let sin = upload(&mut stream, bytemuck::cast_slice(&sin));
+            let outputs: Vec<_> = (0..3)
+                .map(|_| stream.allocate(tokens * VHEADS * VHDP * 2).unwrap())
+                .collect();
+            let bindings = [
+                input.binding(),
+                cos.binding(),
+                sin.binding(),
+                outputs[0].binding(),
+                outputs[1].binding(),
+                outputs[2].binding(),
+            ];
+            let required = bindings.map(|v| v.len());
+            let mut profile = Profile::from_env();
+            let mut run = |stream: &mut Stream| {
+                emit(
+                    &mut Sink::Stream(stream),
+                    &kernel,
+                    Some(&mut profile),
+                    "vision rope",
+                    &[tokens as u32],
+                    &[tokens as u32],
+                    &bindings,
+                    &required,
+                )
+                .unwrap();
+                stream.synchronize().unwrap();
+            };
+            run(&mut stream);
+            let expected: Vec<_> = outputs.iter().map(|v| check_f16(&mut stream, v)).collect();
+            b.iter(|| run(&mut stream));
+            for (output, expected) in outputs.iter().zip(expected) {
+                assert_eq!(support::read(&mut stream, output.binding()), expected);
+            }
+        });
+    }
+    group.finish();
+}
+
 fn rotary_preparation(c: &mut Criterion) {
     use h3_hrx::dispatch::{emit, Profile};
     use h3_hrx::model::{HEADS, INNER, QKV, ROPE_HALF};
@@ -1627,6 +1695,6 @@ fn video_convolution(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = support::criterion();
-    targets = decoder_feed_forward, video_convolution, groupnorm_apply, groupnorm_statistics, preparation, rotary_preparation, attention_preparation, fused_qk_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
+    targets = vision_rotary, decoder_feed_forward, video_convolution, groupnorm_apply, groupnorm_statistics, preparation, rotary_preparation, attention_preparation, fused_qk_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
 }
 criterion_main!(benches);
