@@ -54,12 +54,18 @@ impl Projection {
         let weights = stream.allocate(count * 8 * 4)?;
         let bias = stream.allocate(count * 4)?;
         for (layer, (w, b)) in w.iter().zip(b).enumerate() {
-            stream.upload_at(
+            crate::transfer::upload_at(
+                stream,
                 &weights,
                 layer * layer_count * 8 * 4,
                 crate::vvae::as_bytes(w),
             )?;
-            stream.upload_at(&bias, layer * layer_count * 4, crate::vvae::as_bytes(b))?;
+            crate::transfer::upload_at(
+                stream,
+                &bias,
+                layer * layer_count * 4,
+                crate::vvae::as_bytes(b),
+            )?;
         }
         let classes = timesteps * modalities;
         let rows = count / HID;
@@ -84,7 +90,7 @@ impl Projection {
             }
             let buffer = stream.allocate(map.len() * 4)?;
             let bytes: Vec<u8> = map.iter().flat_map(|row| row.to_ne_bytes()).collect();
-            stream.upload(buffer.binding(), &bytes)?;
+            crate::transfer::upload(stream, buffer.binding(), &bytes)?;
             maps.push(buffer);
         }
         let cfg = [

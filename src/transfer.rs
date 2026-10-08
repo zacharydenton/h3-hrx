@@ -1,14 +1,35 @@
-//! HRX's native transfer kernels accept at most `u32::MAX` bytes per launch.
-//! Long clips can exceed that in a single attention or residual buffer.
-use hrx::{Result, Stream, View};
+//! Bounded native transfers for large attention and residual buffers.
+use hrx::{Buffer, Result, Stream, View};
 
-// Preserve eight-byte alignment so aligned transfers use HRX's wide kernels.
-const CHUNK: usize = (u32::MAX as usize) & !7;
+// HRX 0.9 encodes one SDMA copy packet (7 dwords) per MiB. The minimum
+// supported ring is 4 KiB. Stay below half of it so command plus wrap padding
+// fits even at an unfavorable cursor; also allow cache packets and a fence.
+// This also stays below the compute transfer's u32 byte-count limit and
+// preserves eight-byte alignment for its wide kernels.
+const CHUNK: usize = 64 << 20;
 
 fn ranges(bytes: usize) -> impl Iterator<Item = (usize, usize)> {
     (0..bytes)
         .step_by(CHUNK)
         .map(move |offset| (offset, (bytes - offset).min(CHUNK)))
+}
+
+pub(crate) fn upload(stream: &mut Stream, dst: View<'_>, data: &[u8]) -> Result<()> {
+    // Validate the complete destination before submitting the first chunk.
+    let dst = dst.slice(0, data.len())?;
+    for (offset, bytes) in ranges(data.len()) {
+        stream.upload(dst.slice(offset, bytes)?, &data[offset..offset + bytes])?;
+    }
+    Ok(())
+}
+
+pub(crate) fn upload_at(
+    stream: &mut Stream,
+    dst: &Buffer,
+    offset: usize,
+    data: &[u8],
+) -> Result<()> {
+    upload(stream, dst.try_slice(offset, data.len())?, data)
 }
 
 pub(crate) fn fill(stream: &Stream, dst: View<'_>, value: u8) -> Result<()> {
@@ -58,6 +79,75 @@ mod tests {
                 end += length;
             }
             assert_eq!(end, bytes);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires provisioned HRX")]
+    fn sdma_transfers_cross_queue_capacity_without_touching_guards() {
+        for compute_engine in [
+            hrx::execution::ComputeEngine::Pm4,
+            hrx::execution::ComputeEngine::Aql {
+                maximum_private_bytes: 4096,
+            },
+        ] {
+            let manager = hrx::residency::ResidencyManager::new(2 << 30).unwrap();
+            {
+                let mut stream = hrx::Device::open(0)
+                    .unwrap()
+                    .stream_with_options(hrx::StreamOptions {
+                        compute_engine,
+                        copy_engine: hrx::execution::CopyEngine::Sdma,
+                        memory_budget: Some(manager.budget()),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                // Both fill and copy packet streams exceed a 4 KiB ring if
+                // submitted as one command. Unaligned ends exercise byte tails.
+                let bytes = (512 << 20) + 19;
+                let src = stream.allocate(bytes + 16).unwrap();
+                let dst = stream.allocate(bytes + 16).unwrap();
+                fill(&stream, src.binding(), 0x35).unwrap();
+                fill(&stream, dst.binding(), 0x79).unwrap();
+                let probes = [0, CHUNK - 4, CHUNK, 2 * CHUNK, bytes - 4];
+                for (i, offset) in probes.iter().enumerate() {
+                    stream
+                        .upload_blocking_at(&src, 1 + offset, &[i as u8; 4])
+                        .unwrap();
+                }
+                copy(&stream, dst.slice(3, bytes), src.slice(1, bytes)).unwrap();
+                for (i, offset) in probes.iter().enumerate() {
+                    let mut actual = [0; 4];
+                    stream
+                        .read_blocking_at(&dst, 3 + offset, &mut actual)
+                        .unwrap();
+                    assert_eq!(actual, [i as u8; 4], "at {offset}");
+                }
+                for (offset, expected) in [
+                    (2, 0x79),
+                    (3 + bytes, 0x79),
+                    (11, 0x35),
+                    (3 + CHUNK + 4, 0x35),
+                ] {
+                    let mut actual = [0];
+                    stream.read_blocking_at(&dst, offset, &mut actual).unwrap();
+                    assert_eq!(actual, [expected], "at {offset}");
+                }
+                let data: Vec<u8> = (0..bytes)
+                    .map(|i| (i.wrapping_mul(37) ^ (i >> 20)) as u8)
+                    .collect();
+                upload_at(&mut stream, &dst, 3, &data).unwrap();
+                let mut actual = vec![0; bytes];
+                stream.read_blocking_at(&dst, 3, &mut actual).unwrap();
+                assert_eq!(actual, data);
+                assert!(upload_at(&mut stream, &dst, 17, &data).is_err());
+                for offset in [2, 3 + bytes] {
+                    let mut guard = [0];
+                    stream.read_blocking_at(&dst, offset, &mut guard).unwrap();
+                    assert_eq!(guard, [0x79]);
+                }
+            }
+            assert_eq!(manager.statistics().reserved_bytes, 0);
         }
     }
 

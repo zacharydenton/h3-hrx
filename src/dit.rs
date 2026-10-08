@@ -201,7 +201,8 @@ impl Dit {
         // no rope: the identity rotation at every row
         let cos = stream.allocate(n * ROPE_HALF * 4)?;
         let sin = stream.allocate(n * ROPE_HALF * 4)?;
-        stream.upload(
+        crate::transfer::upload(
+            stream,
             cos.binding(),
             crate::vvae::as_bytes(&vec![1.0f32; n * ROPE_HALF]),
         )?;
@@ -957,7 +958,8 @@ impl Dit {
                 }
                 packed.extend_from_slice(&cache[tokens]);
             }
-            stream.upload_at(
+            crate::transfer::upload_at(
+                stream,
                 &self.seq.as_ref().expect("sized").x,
                 0,
                 crate::vvae::as_bytes(&packed),
@@ -979,8 +981,8 @@ impl Dit {
             // has no place for — 2 for a reference's video, 3 for its audio — so only the generated
             // span goes up, and the head binds it from row zero.
             seq.tcls.write(stream, &lay.tclass[lr..lr + na + nv], 2)?;
-            stream.upload_at(&seq.cos, 0, crate::vvae::as_bytes(&cos))?;
-            stream.upload_at(&seq.sin, 0, crate::vvae::as_bytes(&sin))?;
+            crate::transfer::upload_at(stream, &seq.cos, 0, crate::vvae::as_bytes(&cos))?;
+            crate::transfer::upload_at(stream, &seq.sin, 0, crate::vvae::as_bytes(&sin))?;
         }
         Ok(lay)
     }
@@ -1193,7 +1195,7 @@ impl Dit {
             }
             if res {
                 let seq = self.seq.as_ref().expect("sized above");
-                stream.upload_at(&seq.in32, 0, crate::vvae::as_bytes(&arows))?;
+                crate::transfer::upload_at(stream, &seq.in32, 0, crate::vvae::as_bytes(&arows))?;
             }
             let input = self
                 .euler
@@ -1203,7 +1205,7 @@ impl Dit {
             self.embed_f32(stream, prof, "audio in", lr, na, true, input)?;
             if res {
                 let seq = self.seq.as_ref().expect("sized above");
-                stream.upload_at(&seq.in32, 0, crate::vvae::as_bytes(&vrows))?;
+                crate::transfer::upload_at(stream, &seq.in32, 0, crate::vvae::as_bytes(&vrows))?;
             }
             let input = self
                 .euler
@@ -1513,7 +1515,8 @@ impl Dit {
                     }
                 }
                 let seq = self.seq.as_ref().expect("sized above");
-                stream.upload_at(
+                crate::transfer::upload_at(
+                    stream,
                     &seq.in32,
                     0,
                     crate::vvae::as_bytes(&in32[..sg.rows * AUDIO_CH]),
@@ -1532,7 +1535,8 @@ impl Dit {
                     seed,
                 );
                 let seq = self.seq.as_ref().expect("sized above");
-                stream.upload_at(
+                crate::transfer::upload_at(
+                    stream,
                     &seq.in32,
                     0,
                     crate::vvae::as_bytes(&in32[..sg.rows * VIDEO_PATCH]),

@@ -97,7 +97,7 @@ impl Constants {
     pub fn new(stream: &mut hrx::Stream) -> Result<Self> {
         let ones = stream.allocate(HID * 4)?;
         let row: Vec<u8> = (0..HID).flat_map(|_| 1.0f32.to_le_bytes()).collect();
-        stream.upload(ones.binding(), &row)?;
+        crate::transfer::upload(stream, ones.binding(), &row)?;
         let zeros = stream.allocate_zeroed(2 * TE_FFN * 4)?;
         Ok(Self {
             ones: Arc::new(ones),
@@ -1392,7 +1392,7 @@ impl Stack {
             rows[i * 2 + 1] = (-*code).max(0);
         }
         let buffer = stream.allocate(rows.len() * 4)?;
-        stream.upload(buffer.binding(), bytemuck::cast_slice(&rows))?;
+        crate::transfer::upload(stream, buffer.binding(), bytemuck::cast_slice(&rows))?;
         self.world_attention = Some((kernel, buffer));
         Ok(())
     }

@@ -447,7 +447,7 @@ impl AudioVae {
                 }
             }
             let d = self.dec.as_ref().expect("sized above");
-            stream.upload_at(&d.input, 0, crate::vvae::as_bytes(&input))?;
+            crate::transfer::upload_at(stream, &d.input, 0, crate::vvae::as_bytes(&input))?;
 
             let held_1 = self
                 .weights
@@ -787,7 +787,7 @@ impl AudioVae {
         for ch in 0..2 {
             host.fill(0.0);
             host[..n].copy_from_slice(&samples[ch * n..ch * n + n]);
-            stream.upload(x0.binding(), crate::vvae::as_bytes(&host))?;
+            crate::transfer::upload(stream, x0.binding(), crate::vvae::as_bytes(&host))?;
 
             let (mut len, mut dim) = (lp, 64usize);
             let hoisted_1 = w(stream, "aenc.conv_in.w", 64 * 7)?;

@@ -203,7 +203,7 @@ impl Loader {
         }
         let output = stream.allocate(bytes.max(1))?;
         if pitch_bytes != row_bytes {
-            stream.fill(output.binding(), 0)?;
+            crate::transfer::fill(stream, output.binding(), 0)?;
         }
         let mut pending = VecDeque::new();
         let mut copies = VecDeque::new();

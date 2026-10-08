@@ -317,8 +317,8 @@ impl VideoVae {
         rotary_tables(grid.ft, grid.h, grid.w, &mut cos_h, &mut sin_h);
         let cos = stream.allocate(t * VAE_ROPE_HALF * 4)?;
         let sin = stream.allocate(t * VAE_ROPE_HALF * 4)?;
-        stream.upload(cos.binding(), as_bytes(&cos_h))?;
-        stream.upload(sin.binding(), as_bytes(&sin_h))?;
+        crate::transfer::upload(stream, cos.binding(), as_bytes(&cos_h))?;
+        crate::transfer::upload(stream, sin.binding(), as_bytes(&sin_h))?;
 
         // the output norm's (scale, shift) table: no scale, the checkpoint's bias as the shift
         let norm_table = stream.allocate(2 * VAE_HID * 4)?;
@@ -409,7 +409,7 @@ impl VideoVae {
         let b = built.as_mut().expect("built above");
         grid.prepare_decoder_input(z, pq_w, pq_b, &mut b.stage_in);
 
-        stream.upload(b.in16.binding(), as_bytes_f16(&b.stage_in))?;
+        crate::transfer::upload(stream, b.in16.binding(), as_bytes_f16(&b.stage_in))?;
         crate::transfer::fill(stream, b.x.slice(0, nt * VAE_HID * 4), 0)?;
 
         let w_in = weights.at(stream, "vae.proj_in.w", VAE_HID * VAE_KIN * 2)?;
@@ -896,7 +896,7 @@ impl VideoVae {
         .prepare_encoder_input(y0, x0, th, tw, inrows);
 
         let x = &scratch.x;
-        stream.upload(x.binding(), as_bytes_f16(inrows))?;
+        crate::transfer::upload(stream, x.binding(), as_bytes_f16(inrows))?;
         let mut h = &scratch.h;
         let y = &scratch.y;
         let mut tmp = &scratch.tmp;

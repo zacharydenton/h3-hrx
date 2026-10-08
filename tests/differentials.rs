@@ -448,45 +448,51 @@ fn denoising_is_byte_stable_across_samplers() {
     not(feature = "gpu-tests"),
     ignore = "requires gfx1151 and cached audio/video VAEs"
 )]
-fn session_aql_and_sdma_preserve_media_decode_bytes_and_release_budget() {
-    for copy_engine in [
-        hrx::execution::CopyEngine::Compute,
-        hrx::execution::CopyEngine::Sdma,
+fn session_engines_preserve_media_decode_bytes_and_release_budget() {
+    for compute_engine in [
+        hrx::execution::ComputeEngine::Pm4,
+        hrx::execution::ComputeEngine::Aql {
+            maximum_private_bytes: 4096,
+        },
     ] {
-        let manager = hrx::residency::ResidencyManager::new(8 << 30).unwrap();
-        let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
-            compute_engine: hrx::execution::ComputeEngine::Aql {
-                maximum_private_bytes: 4096,
-            },
-            copy_engine,
-            memory_budget: Some(manager.budget()),
-            ..Default::default()
-        })
-        .unwrap();
-        {
-            // The cached checkpoint is immutable throughout this test.
-            let mut session =
-                unsafe { Session::new_in(Default::default(), Default::default(), &context) }
-                    .unwrap();
-            let latents = Normals(0xa0d10).take(2 * AUDIO_CH);
-            let mut samples = vec![0.; 2 * HOP];
-            session.decode_audio(&latents, 1, &mut samples).unwrap();
-            check(
-                digest_f32(&samples),
-                "841e6463f0859897dba1bf1b5a90cd8bb3d38242d5b9c27950516966ce6bfe82",
-                &format!("session AQL/{copy_engine:?}"),
-            );
-            let shape = shape_for(256, 256, 5).unwrap();
-            let latents = Normals(0x5eed)
-                .take(24 * shape.latent_t as usize * shape.lat_h as usize * shape.lat_w as usize);
-            let mut video = vec![0; shape.frames as usize * 256 * 256 * 3];
-            session.decode_video(&shape, &latents, &mut video).unwrap();
-            check(
-                hrx::bundle::digest(&video),
-                "2669b306545ddaf54536af4d792b06b0165f754bd1601fa922ffbd21f8eed98c",
-                &format!("video AQL/{copy_engine:?}"),
-            );
+        for copy_engine in [
+            hrx::execution::CopyEngine::Compute,
+            hrx::execution::CopyEngine::Sdma,
+        ] {
+            let manager = hrx::residency::ResidencyManager::new(8 << 30).unwrap();
+            let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
+                compute_engine,
+                copy_engine,
+                memory_budget: Some(manager.budget()),
+                ..Default::default()
+            })
+            .unwrap();
+            {
+                // The cached checkpoint is immutable throughout this test.
+                let mut session =
+                    unsafe { Session::new_in(Default::default(), Default::default(), &context) }
+                        .unwrap();
+                let latents = Normals(0xa0d10).take(2 * AUDIO_CH);
+                let mut samples = vec![0.; 2 * HOP];
+                session.decode_audio(&latents, 1, &mut samples).unwrap();
+                check(
+                    digest_f32(&samples),
+                    "841e6463f0859897dba1bf1b5a90cd8bb3d38242d5b9c27950516966ce6bfe82",
+                    &format!("audio {compute_engine:?}/{copy_engine:?}"),
+                );
+                let shape = shape_for(256, 256, 5).unwrap();
+                let latents = Normals(0x5eed).take(
+                    24 * shape.latent_t as usize * shape.lat_h as usize * shape.lat_w as usize,
+                );
+                let mut video = vec![0; shape.frames as usize * 256 * 256 * 3];
+                session.decode_video(&shape, &latents, &mut video).unwrap();
+                check(
+                    hrx::bundle::digest(&video),
+                    "2669b306545ddaf54536af4d792b06b0165f754bd1601fa922ffbd21f8eed98c",
+                    &format!("video {compute_engine:?}/{copy_engine:?}"),
+                );
+            }
+            assert_eq!(manager.statistics().reserved_bytes, 0);
         }
-        assert_eq!(manager.statistics().reserved_bytes, 0);
     }
 }

@@ -204,8 +204,8 @@ impl TextEncoder {
         rotary_tables(&positions, &mut cos_h, &mut sin_h);
         let cos = stream.allocate(t * TE_ROPE_HALF * 4)?;
         let sin = stream.allocate(t * TE_ROPE_HALF * 4)?;
-        stream.upload_at(&cos, 0, crate::vvae::as_bytes(&cos_h))?;
-        stream.upload_at(&sin, 0, crate::vvae::as_bytes(&sin_h))?;
+        crate::transfer::upload_at(stream, &cos, 0, crate::vvae::as_bytes(&cos_h))?;
+        crate::transfer::upload_at(stream, &sin, 0, crate::vvae::as_bytes(&sin_h))?;
 
         self.built = Some(Built {
             stack,
@@ -237,7 +237,7 @@ impl TextEncoder {
         let emb = self.embed(ids, spans)?;
         self.ensure(stream, c, n, spans)?;
         let b = self.built.as_mut().expect("built above");
-        stream.upload_at(&b.x, 0, crate::vvae::as_bytes(&emb))?;
+        crate::transfer::upload_at(stream, &b.x, 0, crate::vvae::as_bytes(&emb))?;
 
         let cond = self.constants.identity();
         let cond_fn = |_: usize| crate::stack::LayerCond { ..cond };
@@ -264,7 +264,8 @@ impl TextEncoder {
             for sp in spans {
                 let take = sp.at.count * TEXT_DIM;
                 let from = layer * take;
-                stream.upload_at(
+                crate::transfer::upload_at(
+                    stream,
                     &b.ds,
                     0,
                     crate::vvae::as_bytes(&sp.deepstack[from..from + take]),

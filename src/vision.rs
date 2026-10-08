@@ -137,7 +137,7 @@ fn embed_frames(
         crate::pixels::vision_patches(first, gh, gw, width)
     };
     let pa = stream.allocate(patches.len() * 4)?;
-    stream.upload(pa.binding(), crate::vvae::as_bytes(&patches))?;
+    crate::transfer::upload(stream, pa.binding(), crate::vvae::as_bytes(&patches))?;
     let x32 = stream.allocate(n * VHID * 4)?;
     let held_1 = weights.at(stream, "vis.patch.w", VHID * VISION_PATCH * 2)?;
     let held_2 = weights.at(stream, "vis.patch.b", VHID * 4)?;
@@ -159,14 +159,14 @@ fn embed_frames(
     stream.read_blocking(x32.binding(), crate::vvae::as_bytes_mut(&mut x0))?;
     let x16h = prepare_tokens(&mut x0, &pos, gh, gw);
     let x16 = stream.allocate(x16h.len() * 2)?;
-    stream.upload(x16.binding(), crate::vvae::as_bytes_f16(&x16h))?;
+    crate::transfer::upload(stream, x16.binding(), crate::vvae::as_bytes_f16(&x16h))?;
 
     let (mut cosv, mut sinv) = (vec![0.0f32; n * 36], vec![0.0f32; n * 36]);
     rotary_tables(gh, gw, &mut cosv, &mut sinv);
     let cosb = stream.allocate(cosv.len() * 4)?;
     let sinb = stream.allocate(sinv.len() * 4)?;
-    stream.upload(cosb.binding(), crate::vvae::as_bytes(&cosv))?;
-    stream.upload(sinb.binding(), crate::vvae::as_bytes(&sinv))?;
+    crate::transfer::upload(stream, cosb.binding(), crate::vvae::as_bytes(&cosv))?;
+    crate::transfer::upload(stream, sinb.binding(), crate::vvae::as_bytes(&sinv))?;
 
     let qkv_width = 3 * VHEADS * VHD;
     let ln = stream.allocate(n * VHID * 4)?;
@@ -183,7 +183,7 @@ fn embed_frames(
     // the residual GEMM's per-column scale, which this tower does not use: all ones
     let lam = stream.allocate(VMERGE * 4)?;
     let ones: Vec<f32> = vec![1.0; VMERGE];
-    stream.upload(lam.binding(), crate::vvae::as_bytes(&ones))?;
+    crate::transfer::upload(stream, lam.binding(), crate::vvae::as_bytes(&ones))?;
     // the rows past `n` are read by the attention and never written, so they start at zero
     for b in [&q16, &k16, &v16] {
         crate::transfer::fill(stream, b.slice(0, cap * VHEADS * VHDP * 2), 0)?;

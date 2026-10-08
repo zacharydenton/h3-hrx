@@ -55,8 +55,8 @@ impl Euler {
         {
             return invalid("Euler latent shape mismatch");
         }
-        stream.upload(self.audio.binding(), crate::vvae::as_bytes(audio))?;
-        stream.upload(self.video.binding(), crate::vvae::as_bytes(video))?;
+        crate::transfer::upload(stream, self.audio.binding(), crate::vvae::as_bytes(audio))?;
+        crate::transfer::upload(stream, self.video.binding(), crate::vvae::as_bytes(video))?;
         Ok(())
     }
 
