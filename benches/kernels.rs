@@ -1474,10 +1474,98 @@ fn groupnorm_apply(c: &mut Criterion) {
     group.finish();
 }
 
+fn video_convolution(c: &mut Criterion) {
+    use h3_hrx::dispatch::{Conv3d, Profile};
+    let mut group = c.benchmark_group("video_encoder_conv_f16");
+    for (frames, size, cin, cout, stride, tstride) in [
+        (1usize, 32usize, 8usize, 128usize, 1usize, 1usize),
+        (1, 32, 128, 128, 1, 1),
+        (1, 16, 128, 128, 1, 1),
+        (1, 18, 128, 128, 1, 1),
+        (17, 32, 128, 128, 1, 1),
+        (17, 64, 128, 128, 1, 1),
+        (17, 32, 128, 256, 2, 2),
+        (9, 16, 256, 256, 1, 1),
+        (9, 32, 256, 256, 1, 1),
+        (1, 34, 128, 128, 1, 1),
+        (5, 32, 512, 512, 1, 1),
+        (9, 16, 256, 512, 2, 2),
+        (5, 8, 512, 512, 1, 1),
+        (5, 4, 1024, 1024, 1, 1),
+    ] {
+        let taps = if frames == 1 { 1 } else { 3 };
+        let k = (9 * taps * cin).div_ceil(32) * 32;
+        for residual in [false, true] {
+            group.bench_function(
+                format!("{frames}x{size}x{cin}_{cout}/s{stride}t{tstride}/add_{residual}"),
+                |b| {
+                    let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+                    let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                    let compiler = compiler();
+                    let conv = Conv3d::build(
+                        &compiler,
+                        &mut stream,
+                        residual,
+                        frames,
+                        size,
+                        size,
+                        stride,
+                        tstride,
+                        taps,
+                        cin,
+                        cin,
+                        k,
+                        cout,
+                    )
+                    .unwrap();
+                    compiler.flush(&mut stream).unwrap();
+                    let rows = conv.rows();
+                    let half_values = |count: usize, seed: usize| {
+                        (0..count)
+                            .flat_map(|i| {
+                                f16::from_f32(((i * 37 + seed) % 101) as f32 / 200. - 0.25)
+                                    .to_le_bytes()
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    let input = half_values(frames * size * size * cin, 17);
+                    let weights = half_values(cout * k, 31);
+                    let bias: Vec<f32> = (0..cout).map(|i| (i % 7) as f32 / 100.).collect();
+                    let x = upload(&mut stream, &input);
+                    let w = upload(&mut stream, &weights);
+                    let bias = upload(&mut stream, bytemuck::cast_slice(&bias));
+                    let prior = upload(&mut stream, &half_values(rows * cout, 43));
+                    let out = stream.allocate_zeroed(rows * cout * 2).unwrap();
+                    let mut profile = Profile::from_env();
+                    let mut run = |stream: &mut Stream| {
+                        conv.run(
+                            stream,
+                            Some(&mut profile),
+                            "video encoder convolution",
+                            x.binding(),
+                            w.binding(),
+                            bias.binding(),
+                            out.binding(),
+                            residual.then(|| prior.binding()),
+                        )
+                        .unwrap();
+                        stream.synchronize().unwrap();
+                    };
+                    run(&mut stream);
+                    let expected = check_f16(&mut stream, &out);
+                    b.iter(|| run(&mut stream));
+                    assert_eq!(check_f16(&mut stream, &out), expected);
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10).warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3));
-    targets = groupnorm_apply, groupnorm_statistics, preparation, rotary_preparation, attention_preparation, fused_qk_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
+    targets = video_convolution, groupnorm_apply, groupnorm_statistics, preparation, rotary_preparation, attention_preparation, fused_qk_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
 }
 criterion_main!(benches);

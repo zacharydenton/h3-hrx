@@ -1966,115 +1966,130 @@ fn packed_attention_families_preserve_wave_layouts_and_skip_decisions() {
 )]
 fn convolution_family_matches_causal_reflected_gather_and_residual() {
     let mut h = Harness::new();
-    for taps in [1usize, 3] {
-        for stride in [1usize, 2] {
-            for residual in [false, true] {
-                let (frames, height, width, cin, pitch, n) =
-                    (3usize, 6usize, 6usize, 8usize, 16usize, 64usize);
-                let tstride = if taps == 1 { 1 } else { 2 };
-                let tout = (frames - 1) / tstride + 1;
-                let ho = height / stride;
-                let wo = width / stride;
-                let m = tout * ho * wo;
-                let k = (9 * taps * cin).div_ceil(32) * 32;
-                let input: Vec<_> = values(frames * height * width * pitch, 0.3)
-                    .into_iter()
-                    .map(f16::from_f32)
-                    .collect();
-                let weight: Vec<_> = values(n * k, 0.15).into_iter().map(f16::from_f32).collect();
-                let bias = values(n, 0.05);
-                let prior: Vec<_> = values(m * n, 0.1).into_iter().map(f16::from_f32).collect();
-                let reflect = |x: isize, size: usize| {
-                    if x < 0 {
-                        (-x) as usize
-                    } else if x as usize >= size {
-                        2 * size - 2 - x as usize
-                    } else {
-                        x as usize
-                    }
-                };
-                let mut want = vec![0.; m * n];
-                for row in 0..m {
-                    let t = row / (ho * wo);
-                    let y = row / wo % ho;
-                    let x = row % wo;
-                    for c in 0..n {
-                        let mut sum = f64::from(bias[c]);
-                        for dt in 0..taps {
-                            let ti = (t * tstride + if taps == 1 { 2 } else { dt }) as isize - 2;
-                            if ti < 0 {
-                                continue;
-                            }
-                            for dy in 0..3 {
-                                for dx in 0..3 {
-                                    let yi = reflect(
-                                        (y * stride + dy) as isize
-                                            - if stride == 1 { 1 } else { 0 },
-                                        height,
-                                    );
-                                    let xi = reflect(
-                                        (x * stride + dx) as isize
-                                            - if stride == 1 { 1 } else { 0 },
-                                        width,
-                                    );
-                                    for ch in 0..cin {
-                                        sum += input[((ti as usize * height + yi) * width + xi)
-                                            * pitch
-                                            + ch]
-                                            .to_f64()
-                                            * weight[c * k + ((dt * 3 + dy) * 3 + dx) * cin + ch]
-                                                .to_f64();
+    for (size, cin, pitch, extra_k) in [
+        (6usize, 8usize, 16usize, 0usize),
+        (6, 128, 136, 0),
+        (2, 256, 256, 0),
+        (2, 512, 512, 0),
+        (2, 1024, 1024, 0),
+        (2, 128, 128, 32),
+        (2, 136, 144, 0),
+    ] {
+        for taps in [1usize, 3] {
+            for stride in [1usize, 2] {
+                for residual in [false, true] {
+                    let (frames, height, width, n) = (3usize, size, size, 64usize);
+                    let tstride = if taps == 1 { 1 } else { 2 };
+                    let tout = (frames - 1) / tstride + 1;
+                    let ho = height / stride;
+                    let wo = width / stride;
+                    let m = tout * ho * wo;
+                    let k = (9 * taps * cin).div_ceil(32) * 32 + extra_k;
+                    // Dyadic operands keep even the longest FP32 dot exact, so the oracle
+                    // checks gathers and tails without a length-dependent error allowance.
+                    let input: Vec<_> = (0..frames * height * width * pitch)
+                        .map(|i| f16::from_f32(((i * 37 % 15) as f32 - 7.) / 32.))
+                        .collect();
+                    let weight: Vec<_> = (0..n * k)
+                        .map(|i| f16::from_f32(((i * 29 % 13) as f32 - 6.) / 64.))
+                        .collect();
+                    let bias = values(n, 0.05);
+                    let prior: Vec<_> = values(m * n, 0.1).into_iter().map(f16::from_f32).collect();
+                    let reflect = |x: isize, size: usize| {
+                        if x < 0 {
+                            (-x) as usize
+                        } else if x as usize >= size {
+                            2 * size - 2 - x as usize
+                        } else {
+                            x as usize
+                        }
+                    };
+                    let mut want = vec![0.; m * n];
+                    for row in 0..m {
+                        let t = row / (ho * wo);
+                        let y = row / wo % ho;
+                        let x = row % wo;
+                        for c in 0..n {
+                            let mut sum = f64::from(bias[c]);
+                            for dt in 0..taps {
+                                let ti =
+                                    (t * tstride + if taps == 1 { 2 } else { dt }) as isize - 2;
+                                if ti < 0 {
+                                    continue;
+                                }
+                                for dy in 0..3 {
+                                    for dx in 0..3 {
+                                        let yi = reflect(
+                                            (y * stride + dy) as isize
+                                                - if stride == 1 { 1 } else { 0 },
+                                            height,
+                                        );
+                                        let xi = reflect(
+                                            (x * stride + dx) as isize
+                                                - if stride == 1 { 1 } else { 0 },
+                                            width,
+                                        );
+                                        for ch in 0..cin {
+                                            sum += input[((ti as usize * height + yi) * width
+                                                + xi)
+                                                * pitch
+                                                + ch]
+                                                .to_f64()
+                                                * weight
+                                                    [c * k + ((dt * 3 + dy) * 3 + dx) * cin + ch]
+                                                    .to_f64();
+                                        }
                                     }
                                 }
                             }
+                            want[row * n + c] = sum
+                                + if residual {
+                                    prior[row * n + c].to_f64()
+                                } else {
+                                    0.
+                                };
                         }
-                        want[row * n + c] = sum
-                            + if residual {
-                                prior[row * n + c].to_f64()
-                            } else {
-                                0.
-                            };
                     }
+                    let stem = if residual {
+                        "conv3d_f16_wmma_add"
+                    } else {
+                        "conv3d_f16_wmma"
+                    };
+                    let config = cfg(&[
+                        ("frames", frames),
+                        ("height", height),
+                        ("width", width),
+                        ("stride", stride),
+                        ("tstride", tstride),
+                        ("taps_t", taps),
+                        ("cin_pad", cin),
+                        ("cin_stride", pitch),
+                        ("rows_bound", (frames * height * width).div_ceil(64) * 64),
+                        ("k_size", k),
+                        ("n_size", n),
+                    ]);
+                    let mut data = vec![
+                        bytes(&input),
+                        bytes(&weight),
+                        bytes(&bias),
+                        bytes(&vec![f16::from_f32(123.); m * n + 64]),
+                    ];
+                    if residual {
+                        data.push(bytes(&prior));
+                    }
+                    let out = h.run_module(
+                        "conv3d_f16_family",
+                        stem,
+                        &config,
+                        [1, m.div_ceil(64) as u32, 1],
+                        256,
+                        &[m as u64],
+                        &data,
+                    );
+                    let got = halves(&out[3], false);
+                    close(&got[..m * n], &want, 0.001, 0.002);
+                    assert!(got[m * n..].iter().all(|&v| v == 123.));
                 }
-                let stem = if residual {
-                    "conv3d_f16_wmma_add"
-                } else {
-                    "conv3d_f16_wmma"
-                };
-                let config = cfg(&[
-                    ("frames", frames),
-                    ("height", height),
-                    ("width", width),
-                    ("stride", stride),
-                    ("tstride", tstride),
-                    ("taps_t", taps),
-                    ("cin_pad", cin),
-                    ("cin_stride", pitch),
-                    ("rows_bound", (frames * height * width).div_ceil(64) * 64),
-                    ("k_size", k),
-                    ("n_size", n),
-                ]);
-                let mut data = vec![
-                    bytes(&input),
-                    bytes(&weight),
-                    bytes(&bias),
-                    bytes(&vec![f16::from_f32(123.); m * n + 64]),
-                ];
-                if residual {
-                    data.push(bytes(&prior));
-                }
-                let out = h.run_module(
-                    "conv3d_f16_family",
-                    stem,
-                    &config,
-                    [1, m.div_ceil(64) as u32, 1],
-                    256,
-                    &[m as u64],
-                    &data,
-                );
-                let got = halves(&out[3], false);
-                close(&got[..m * n], &want, 0.001, 0.002);
-                assert!(got[m * n..].iter().all(|&v| v == 123.));
             }
         }
     }

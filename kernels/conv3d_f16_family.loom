@@ -16,17 +16,30 @@ template.def<@h3.shared_conv3d_f16_wmma_add> @h3_body_conv3d_f16_wmma_add(%m_siz
   %c64 = index.constant 64 : index
   %c256 = index.constant 256 : index
   %c0_offset = index.constant 0 : offset
-  // The upscaler's 512-channel convolutions stage 128 reduction elements at a time.
+  // Small encoder planes favor 64 reduction elements per gather; larger planes
+  // retain the narrower tile for occupancy. Channel and K alignment avoid packet tails.
+  // Symmetric convolutions retain their 512-channel specialization.
   %c512 = index.constant 512 : index
   %wide_channels = index.cmp eq, %cfg_cin_pad, %c512 : index
-  %wide = scalar.andi %symmetric, %wide_channels : i1
-  %packet_width = scf.select %wide, %c32, %c8 : index
+  %c128 = index.constant 128 : index
+  %channel_rem = index.rem %cfg_cin_pad, %c128 : index
+  %k_rem = index.rem %k_size, %c128 : index
+  %channels_aligned = index.cmp eq, %channel_rem, %c0 : index
+  %k_aligned = index.cmp eq, %k_rem, %c0 : index
+  %encoder_aligned = scalar.andi %channels_aligned, %k_aligned : i1
+  %spatial_plane = index.mul %cfg_height, %cfg_width : index
+  %small_plane = index.cmp ule, %spatial_plane, %c256 : index
+  %encoder_wide = scalar.andi %encoder_aligned, %small_plane : i1
+  %wide = scf.select %symmetric, %wide_channels, %encoder_wide : i1
+  %wide_packet = scf.select %symmetric, %c32, %c16 : index
+  %packet_width = scf.select %wide, %wide_packet, %c8 : index
   %tile_k = index.mul %packet_width, %c4 : index
   %stage_pitch = index.add %tile_k, %c8 : index
   %stage_elements = index.mul %c64, %stage_pitch : index
   %two_bytes = index.constant 2 : offset
   %w_stage_offset = index.scale %stage_elements, %two_bytes : index, offset -> offset
-  %stage_bytes = index.constant 34816 : offset
+  %four_bytes = index.constant 4 : offset
+  %stage_bytes = index.scale %stage_elements, %four_bytes : index, offset -> offset
   %wave_result_bytes = index.constant 1024 : offset
   %m = index.constant 16 : index
   %n = index.constant 16 : index
