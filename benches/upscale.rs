@@ -248,9 +248,7 @@ fn components(c: &mut Criterion) {
     ] {
         c.bench_function(&format!("upscale/components/{stem}"), |b| {
             let manager = hrx::residency::ResidencyManager::new(256 << 20).unwrap();
-            let mut stream = hrx::Stream::open()
-                .unwrap()
-                .with_memory_budget(manager.budget());
+            let mut stream = support::stream(Some(manager.budget()));
             let compiler = hrx::loom::Compiler::resolve(None).unwrap();
             let source =
                 std::fs::read_to_string(support::sources().join(format!("{stem}.loom"))).unwrap();
@@ -361,9 +359,7 @@ fn components(c: &mut Criterion) {
     }
     c.bench_function("upscale/components/conv3d", |b| {
         let manager = hrx::residency::ResidencyManager::new(256 << 20).unwrap();
-        let mut stream = hrx::Stream::open()
-            .unwrap()
-            .with_memory_budget(manager.budget());
+        let mut stream = support::stream(Some(manager.budget()));
         let compiler = support::compiler();
         let k = 27 * channels;
         let conv = h3_hrx::dispatch::Conv3d::build_padding(
@@ -417,9 +413,7 @@ fn groupnorm_stats(c: &mut Criterion) {
         for lanes in [32usize, 128, 256, 512, 1024] {
             c.bench_function(&format!("upscale/groupnorm_stats/{rows}/{lanes}"), |b| {
                 let manager = hrx::residency::ResidencyManager::new(256 << 20).unwrap();
-                let mut stream = hrx::Stream::open()
-                    .unwrap()
-                    .with_memory_budget(manager.budget());
+                let mut stream = support::stream(Some(manager.budget()));
                 let compiler = support::compiler();
                 let cfg = [
                     ("channels", channels),
@@ -467,11 +461,7 @@ fn groupnorm_stats(c: &mut Criterion) {
                     stream.synchronize().unwrap();
                 };
                 run(&mut stream);
-                let expected = stream
-                    .read(out.binding())
-                    .unwrap()
-                    .wait(&mut stream)
-                    .unwrap();
+                let expected = support::read(&mut stream, out.binding());
                 for (g, pair) in expected.as_chunks::<8>().0.iter().enumerate() {
                     let mean = f32::from_le_bytes(pair[..4].try_into().unwrap()) as f64;
                     let variance = f32::from_le_bytes(pair[4..].try_into().unwrap()) as f64;
@@ -487,11 +477,7 @@ fn groupnorm_stats(c: &mut Criterion) {
                     );
                 }
                 b.iter(|| run(&mut stream));
-                let actual = stream
-                    .read(out.binding())
-                    .unwrap()
-                    .wait(&mut stream)
-                    .unwrap();
+                let actual = support::read(&mut stream, out.binding());
                 assert!(
                     actual == expected,
                     "GroupNorm replay changed for rows={rows}, lanes={lanes}"
@@ -520,9 +506,7 @@ fn convolution_cases(c: &mut Criterion, add: bool) {
         c.bench_function(&format!("upscale/{kind}/{frames}x{height}x{width}"), |b| {
             let manager =
                 hrx::residency::ResidencyManager::new((if add { 2 } else { 1 }) << 30).unwrap();
-            let mut stream = hrx::Stream::open()
-                .unwrap()
-                .with_memory_budget(manager.budget());
+            let mut stream = support::stream(Some(manager.budget()));
             let compiler = support::compiler();
             let channels = 512usize;
             let k = channels * 27;
@@ -583,11 +567,7 @@ fn convolution_cases(c: &mut Criterion, add: bool) {
                 stream.synchronize().unwrap();
             };
             run(&mut stream);
-            let expected = stream
-                .read(out.binding())
-                .unwrap()
-                .wait(&mut stream)
-                .unwrap();
+            let expected = support::read(&mut stream, out.binding());
             // Sample interiors, temporal/spatial boundaries, and the final tile against FP64.
             for row in [0, width - 1, height * width, rows / 2 + width + 1, rows - 1] {
                 let (t, y, x) = (row / (height * width), row / width % height, row % width);
@@ -635,11 +615,7 @@ fn convolution_cases(c: &mut Criterion, add: bool) {
                 .iter()
                 .all(|b| f16::from_le_bytes(*b).is_finite()));
             b.iter(|| run(&mut stream));
-            let actual = stream
-                .read(out.binding())
-                .unwrap()
-                .wait(&mut stream)
-                .unwrap();
+            let actual = support::read(&mut stream, out.binding());
             assert!(
                 actual == expected,
                 "convolution replay changed for {frames}x{height}x{width}"
@@ -655,9 +631,7 @@ fn temporal_convolutions(c: &mut Criterion) {
             let (channels, taps) = (512usize, 5usize);
             let count = frames * plane * channels;
             let manager = hrx::residency::ResidencyManager::new(1 << 30).unwrap();
-            let mut stream = hrx::Stream::open()
-                .unwrap()
-                .with_memory_budget(manager.budget());
+            let mut stream = support::stream(Some(manager.budget()));
             let compiler = hrx::loom::Compiler::resolve(None).unwrap();
             let source =
                 std::fs::read_to_string(support::sources().join("upscale_temporal.loom")).unwrap();
@@ -712,11 +686,7 @@ fn temporal_convolutions(c: &mut Criterion) {
                 stream.synchronize().unwrap();
             };
             run(&mut stream);
-            let expected = stream
-                .read(out.binding())
-                .unwrap()
-                .wait(&mut stream)
-                .unwrap();
+            let expected = support::read(&mut stream, out.binding());
             // Cover temporal padding, interior frames, spatial endpoints and packet boundaries.
             for t in [0, 1, frames / 2, frames - 2, frames - 1] {
                 for p in [0, plane / 2, plane - 1] {
@@ -746,11 +716,7 @@ fn temporal_convolutions(c: &mut Criterion) {
                 .all(|v| f16::from_le_bytes(*v).is_finite()));
             drop(input);
             b.iter(|| run(&mut stream));
-            let actual = stream
-                .read(out.binding())
-                .unwrap()
-                .wait(&mut stream)
-                .unwrap();
+            let actual = support::read(&mut stream, out.binding());
             assert!(
                 actual == expected,
                 "temporal replay changed for {frames}x{plane}"
@@ -767,9 +733,7 @@ fn groupnorm_apply(c: &mut Criterion) {
             let count = rows * channels;
             let tile = if count >= 65536 { 1024 } else { 256 };
             let manager = hrx::residency::ResidencyManager::new(1 << 30).unwrap();
-            let mut stream = hrx::Stream::open()
-                .unwrap()
-                .with_memory_budget(manager.budget());
+            let mut stream = support::stream(Some(manager.budget()));
             let compiler = hrx::loom::Compiler::resolve(None).unwrap();
             let source =
                 std::fs::read_to_string(support::sources().join("upscale_gn_silu.loom")).unwrap();
@@ -829,11 +793,7 @@ fn groupnorm_apply(c: &mut Criterion) {
                 stream.synchronize().unwrap();
             };
             run(&mut stream);
-            let expected = stream
-                .read(out.binding())
-                .unwrap()
-                .wait(&mut stream)
-                .unwrap();
+            let expected = support::read(&mut stream, out.binding());
             let half = |v| f16::from_f32(v).to_f32();
             for row in [0, 1, rows / 2, rows - 1] {
                 for ch in [0, 3, 4, 15, 16, channels / 2, channels - 1] {
@@ -861,11 +821,7 @@ fn groupnorm_apply(c: &mut Criterion) {
                 .all(|v| f16::from_le_bytes(*v).is_finite()));
             drop(input);
             b.iter(|| run(&mut stream));
-            let actual = stream
-                .read(out.binding())
-                .unwrap()
-                .wait(&mut stream)
-                .unwrap();
+            let actual = support::read(&mut stream, out.binding());
             assert!(
                 actual == expected,
                 "groupnorm apply replay changed for {rows} rows"

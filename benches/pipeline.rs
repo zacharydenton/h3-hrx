@@ -126,6 +126,7 @@ fn cli(c: &mut Criterion) {
                         .unwrap();
                     let render = render::Render::new(case, params, ResidencyPolicy::StageScoped);
                     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_h3"));
+                    support::configure_cli(&mut command);
                     command
                         .args([
                             "--offline",

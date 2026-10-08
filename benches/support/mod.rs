@@ -26,7 +26,27 @@ pub fn prompt() -> &'static str {
 }
 
 pub fn criterion() -> Criterion {
+    // Keep filters unchanged, but never compare different queue/compiler modes
+    // against one another automatically. Match Criterion's output-root lookup.
+    let root = std::env::var_os("CRITERION_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let target = std::env::var_os("CARGO_TARGET_DIR")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    let output = std::process::Command::new(std::env::var_os("CARGO")?)
+                        .args(["metadata", "--no-deps", "--format-version", "1"])
+                        .output()
+                        .ok()?;
+                    let metadata: serde_json::Value =
+                        serde_json::from_slice(&output.stdout).ok()?;
+                    Some(PathBuf::from(metadata["target_directory"].as_str()?))
+                })
+                .unwrap_or_else(|| PathBuf::from("target"));
+            target.join("criterion")
+        });
     Criterion::default()
+        .output_directory(&root.join(engine_settings().id()))
         .sample_size(10)
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3))
@@ -42,7 +62,143 @@ pub fn checkpoint(relative: &str) -> PathBuf {
 }
 
 pub fn compiler() -> h3_hrx::compile::Compiler {
-    h3_hrx::compile::Compiler::new(None, sources())
+    h3_hrx::compile::Compiler::with_options(None, sources(), compiler_options())
+}
+
+struct EngineSettings {
+    gpu: i32,
+    compute: String,
+    copy: String,
+    private_bytes: u32,
+    processor: String,
+    workers: Option<std::num::NonZeroUsize>,
+}
+
+impl EngineSettings {
+    fn id(&self) -> String {
+        format!(
+            "gpu{}-{}-{}-scratch{}-{}-workers{}",
+            self.gpu,
+            self.compute,
+            self.copy,
+            self.private_bytes,
+            self.processor,
+            self.workers
+                .map_or_else(|| "auto".into(), |n| n.to_string())
+        )
+    }
+}
+
+fn engine_settings() -> &'static EngineSettings {
+    static SETTINGS: OnceLock<EngineSettings> = OnceLock::new();
+    SETTINGS.get_or_init(|| {
+        let value = |key, default: &str| std::env::var(key).unwrap_or_else(|_| default.into());
+        let settings = EngineSettings {
+            gpu: value("H3_BENCH_GPU", "0")
+                .parse()
+                .expect("integer GPU ordinal"),
+            compute: value("H3_BENCH_COMPUTE_ENGINE", "pm4"),
+            copy: value("H3_BENCH_COPY_ENGINE", "compute"),
+            private_bytes: value("H3_BENCH_AQL_PRIVATE_BYTES", "4096")
+                .parse()
+                .expect("unsigned AQL scratch ceiling"),
+            processor: value("H3_BENCH_PROCESSOR_MODE", "default"),
+            workers: std::env::var("H3_BENCH_COMPILE_WORKERS")
+                .ok()
+                .map(|n| n.parse().expect("positive compiler worker count")),
+        };
+        assert!(settings.gpu >= 0, "H3_BENCH_GPU must be nonnegative");
+        assert!(
+            matches!(settings.compute.as_str(), "pm4" | "aql"),
+            "H3_BENCH_COMPUTE_ENGINE must be pm4 or aql"
+        );
+        assert!(
+            matches!(settings.copy.as_str(), "compute" | "sdma"),
+            "H3_BENCH_COPY_ENGINE must be compute or sdma"
+        );
+        assert!(
+            matches!(settings.processor.as_str(), "default" | "cu" | "wgp"),
+            "H3_BENCH_PROCESSOR_MODE must be default, cu or wgp"
+        );
+        settings
+    })
+}
+
+pub fn compiler_options() -> h3_hrx::compile::Options {
+    let settings = engine_settings();
+    h3_hrx::compile::Options {
+        workers: settings.workers,
+        processor_mode: match settings.processor.as_str() {
+            "cu" => hrx::loom::ProcessorMode::ComputeUnit,
+            "wgp" => hrx::loom::ProcessorMode::WorkgroupProcessor,
+            _ => hrx::loom::ProcessorMode::Default,
+        },
+        ..Default::default()
+    }
+}
+
+pub fn runtime_options(
+    memory_budget: Option<hrx::residency::MemoryBudget>,
+) -> hrx::execution::RuntimeOptions {
+    let settings = engine_settings();
+    hrx::execution::RuntimeOptions {
+        gpu_index: settings.gpu,
+        compute_engine: if settings.compute == "aql" {
+            hrx::execution::ComputeEngine::Aql {
+                maximum_private_bytes: settings.private_bytes,
+            }
+        } else {
+            hrx::execution::ComputeEngine::Pm4
+        },
+        copy_engine: if settings.copy == "sdma" {
+            hrx::execution::CopyEngine::Sdma
+        } else {
+            hrx::execution::CopyEngine::Compute
+        },
+        memory_budget,
+        ..Default::default()
+    }
+}
+
+pub fn stream(budget: Option<hrx::residency::MemoryBudget>) -> hrx::Stream {
+    let options = runtime_options(budget);
+    hrx::Device::open(options.gpu_index)
+        .unwrap()
+        .stream_with_options(hrx::StreamOptions {
+            compute_engine: options.compute_engine,
+            copy_engine: options.copy_engine,
+            memory_budget: options.memory_budget,
+            ..Default::default()
+        })
+        .unwrap()
+}
+
+/// Validation readback uses the same completed host access as H3 stages. Avoid
+/// a second GPU allocation/copy, whose raw SDMA command may exceed the ring.
+pub fn read(stream: &mut hrx::Stream, view: hrx::View<'_>) -> Vec<u8> {
+    let mut bytes = vec![0; view.len()];
+    stream.read_blocking(view, &mut bytes).unwrap();
+    bytes
+}
+
+pub fn configure_cli(command: &mut std::process::Command) {
+    let settings = engine_settings();
+    command
+        .arg("--gpu")
+        .arg(settings.gpu.to_string())
+        .args([
+            "--compute-engine",
+            &settings.compute,
+            "--copy-engine",
+            &settings.copy,
+            "--processor-mode",
+            &settings.processor,
+        ])
+        .arg("--aql-private-bytes")
+        .arg(settings.private_bytes.to_string());
+    if let Some(workers) = settings.workers {
+        command.arg("--compile-workers").arg(workers.to_string());
+    }
 }
 pub fn sources() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernels")
@@ -61,6 +217,7 @@ pub fn config(references: bool) -> Config {
         audio_vae: Some(checkpoint(h3_hrx::models::AUDIO_VAE)),
         kernel_sources: sources(),
         attention: attention(),
+        compiler: compiler_options(),
         ..Default::default()
     }
 }
@@ -147,14 +304,12 @@ pub struct Runtime {
 impl Runtime {
     pub fn new() -> Self {
         let manager = hrx::residency::ResidencyManager::new(budget_bytes()).unwrap();
-        let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
-            memory_budget: Some(manager.budget()),
-            ..Default::default()
-        })
-        .unwrap();
+        let context =
+            hrx::inference::ModelContext::new(runtime_options(Some(manager.budget()))).unwrap();
         Self { manager, context }
     }
-    pub fn session(&self, config: Config, options: SessionOptions) -> Session {
+    pub fn session(&self, mut config: Config, options: SessionOptions) -> Session {
+        config.compiler = compiler_options();
         // SAFETY: benchmark checkpoints and adapters must remain immutable for the process lifetime.
         unsafe { Session::new_in(config, options, &self.context) }.unwrap()
     }
@@ -189,6 +344,22 @@ pub fn finite(values: &[f32]) {
 pub fn digest(values: &[f32]) -> String {
     finite(values);
     hrx::bundle::digest(bytemuck::cast_slice(values))
+}
+
+/// Outside timing: compare identical workloads across native engines/compilers.
+pub fn report_digest(name: &str, bytes: &[u8]) {
+    if std::env::var_os("H3_BENCH_DETAILS").is_some() {
+        eprintln!("{name} output sha256: {}", hrx::bundle::digest(bytes));
+    }
+}
+
+pub fn report_elapsed(name: &str, iterations: u64, elapsed: Duration) {
+    if std::env::var_os("H3_BENCH_DETAILS").is_some() {
+        eprintln!(
+            "{name}: {iterations} completed forwards in {:.6} s",
+            elapsed.as_secs_f64()
+        );
+    }
 }
 
 /// The API returns completed host output. Validation and disposal are outside timing.

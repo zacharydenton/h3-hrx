@@ -1,19 +1,12 @@
 //! Resident GPU workloads. Compilation, allocation and readback are outside timing.
+mod support;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use h3_hrx::{
-    compile::Compiler,
-    dispatch::{ActivationType, Gemm, MatmulF32, Prepare, Sink, Tile},
-};
+use h3_hrx::dispatch::{ActivationType, Gemm, MatmulF32, Prepare, Sink, Tile};
 use half::{bf16, f16};
 use hrx::{Buffer, Stream};
-use std::{path::PathBuf, time::Duration};
+use std::time::Duration;
 
-fn compiler() -> Compiler {
-    Compiler::new(
-        None,
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernels"),
-    )
-}
+use support::compiler;
 
 fn upload(stream: &mut Stream, bytes: &[u8]) -> Buffer {
     stream.allocate_from(bytes).unwrap()
@@ -60,7 +53,7 @@ fn preparation(c: &mut Criterion) {
             |b| {
                 let budget = if tokens > 4096 { 1 << 30 } else { 512 << 20 };
                 let manager = hrx::residency::ResidencyManager::new(budget).unwrap();
-                let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                let mut stream = support::stream(Some(manager.budget()));
                 let compiler = compiler();
                 let prepare = Prepare::build_with_input(
                     &compiler,
@@ -138,7 +131,7 @@ fn rotary_preparation(c: &mut Criterion) {
                     // Long QKV inputs and the three FP16 outputs exceed 512 MiB.
                     let budget = if tokens > 4096 { 1 << 30 } else { 512 << 20 };
                     let manager = hrx::residency::ResidencyManager::new(budget).unwrap();
-                    let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                    let mut stream = support::stream(Some(manager.budget()));
                     let compiler = compiler();
                     let kernel = compiler
                         .get(
@@ -204,7 +197,7 @@ fn rotary_preparation(c: &mut Criterion) {
                     run(&mut stream);
                     let expected: Vec<_> = output
                         .iter()
-                        .map(|v| stream.read(v.binding()).unwrap().wait(&mut stream).unwrap())
+                        .map(|v| support::read(&mut stream, v.binding()))
                         .collect();
                     assert!(expected.iter().all(|v| v
                         .as_chunks::<2>()
@@ -213,11 +206,7 @@ fn rotary_preparation(c: &mut Criterion) {
                         .all(|&v| f16::from_le_bytes(v).is_finite())));
                     b.iter(|| run(&mut stream));
                     for (output, expected) in output.iter().zip(&expected) {
-                        let actual = stream
-                            .read(output.binding())
-                            .unwrap()
-                            .wait(&mut stream)
-                            .unwrap();
+                        let actual = support::read(&mut stream, output.binding());
                         assert_eq!(&actual, expected);
                     }
                 },
@@ -241,7 +230,7 @@ fn attention_preparation(c: &mut Criterion) {
             group.throughput(Throughput::Elements((tokens * INNER) as u64));
             group.bench_function(BenchmarkId::new(layout, tokens), |b| {
                 let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
-                let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                let mut stream = support::stream(Some(manager.budget()));
                 let compiler = compiler();
                 let capacity = tokens.div_ceil(32) * 32;
                 let stem = if head_major {
@@ -324,7 +313,7 @@ fn fused_qk_preparation(c: &mut Criterion) {
                 |b| {
                     // The reference needs both full-width FP16 intermediates.
                     let manager = hrx::residency::ResidencyManager::new(1 << 30).unwrap();
-                    let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                    let mut stream = support::stream(Some(manager.budget()));
                     let compiler = compiler();
                     let capacity = (tokens + 16).div_ceil(32) * 32;
                     let rope = compiler
@@ -482,16 +471,12 @@ fn fused_qk_preparation(c: &mut Criterion) {
                     let expected: Vec<_> = codes
                         .iter()
                         .chain(&scales)
-                        .map(|v| stream.read(v.binding()).unwrap().wait(&mut stream).unwrap())
+                        .map(|v| support::read(&mut stream, v.binding()))
                         .collect();
                     run(&mut stream, fused);
                     b.iter(|| run(&mut stream, fused));
                     for (buffer, expected) in codes.iter().chain(&scales).zip(expected) {
-                        let actual = stream
-                            .read(buffer.binding())
-                            .unwrap()
-                            .wait(&mut stream)
-                            .unwrap();
+                        let actual = support::read(&mut stream, buffer.binding());
                         assert!(
                             actual == expected,
                             "Q/K codes or scales differ: tokens={tokens}, fused={fused}"
@@ -523,7 +508,7 @@ fn quantized_attention(c: &mut Criterion) {
                 512 << 20
             };
             let manager = hrx::residency::ResidencyManager::new(budget).unwrap();
-            let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+            let mut stream = support::stream(Some(manager.budget()));
             let compiler = compiler();
             let capacity = (tokens + 16).div_ceil(128) * 128;
             let stem = "attention_i8qkhm_mha8_k64_lds_f16_wmma";
@@ -591,6 +576,7 @@ fn quantized_attention(c: &mut Criterion) {
                 .iter()
                 .all(|&v| f16::from_le_bytes(v).is_finite()));
             assert!(expected.iter().any(|&v| v != 0), "empty attention output");
+            support::report_digest(&format!("attention_i8qkhm/{tokens}"), &expected);
             b.iter(|| run(&mut stream));
             let mut actual = vec![0; expected.len()];
             stream.read_blocking(out.binding(), &mut actual).unwrap();
@@ -609,7 +595,7 @@ fn attention_output_preparation(c: &mut Criterion) {
             group.throughput(Throughput::Elements((tokens * INNER) as u64));
             group.bench_function(format!("{tokens}/lanes_{lanes}"), |b| {
                 let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
-                let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                let mut stream = support::stream(Some(manager.budget()));
                 let compiler = compiler();
                 let stride = gemm_pitch(INNER, 8);
                 let build = |stream: &mut Stream, lanes: usize| {
@@ -689,7 +675,7 @@ fn normalization_preparation(c: &mut Criterion) {
             group.throughput(Throughput::Elements((tokens * HID) as u64));
             group.bench_function(format!("{tokens}/lanes_{lanes}"), |b| {
                 let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
-                let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                let mut stream = support::stream(Some(manager.budget()));
                 let compiler = compiler();
                 let stride = gemm_pitch(HID, 8);
                 let build = |stream: &mut Stream, lanes: usize| {
@@ -792,7 +778,7 @@ fn decoder_feed_forward(c: &mut Criterion) {
             let storage = if rotating { "rotating" } else { "cached" };
             group.bench_function(format!("{storage}/{m}"), |b| {
                 let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
-                let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                let mut stream = support::stream(Some(manager.budget()));
                 let compiler = compiler();
                 let op = Gemm::build(
                     &compiler,
@@ -906,7 +892,7 @@ fn gemm(c: &mut Criterion) {
                         512 << 20
                     };
                     let manager = hrx::residency::ResidencyManager::new(budget).unwrap();
-                    let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                    let mut stream = support::stream(Some(manager.budget()));
                     let compiler = compiler();
                     let stride = h3_hrx::model::gemm_pitch(k, h3_hrx::model::elem_bits(elem));
                     let output_type = if mode == "plain" {
@@ -1022,7 +1008,7 @@ fn attention_transpose(c: &mut Criterion) {
                 BenchmarkId::new(if direct { "qkv" } else { "v" }, tokens),
                 |b| {
                     let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
-                    let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                    let mut stream = support::stream(Some(manager.budget()));
                     let compiler = compiler();
                     let stem = if direct {
                         "transpose_qkv_v_f16"
@@ -1095,7 +1081,7 @@ fn audio_qkv(c: &mut Criterion) {
         for packed in [false, true] {
             let layout = if packed { "packed" } else { "row_major" };
             group.bench_function(format!("{layout}/{m}x{k}x{n}"), |b| {
-                let mut stream = Stream::open().unwrap();
+                let mut stream = support::stream(None);
                 let compiler = compiler();
                 let plain = MatmulF32::build(&compiler, &mut stream, k, n).unwrap();
                 let op = if packed {
@@ -1208,7 +1194,7 @@ fn audio_convolution(c: &mut Criterion) {
                 format!("{layout}/{cin}x{cout}x{len}/k{ksize}_d{dilation}_s{step}"),
                 |b| {
                     let manager = hrx::residency::ResidencyManager::new(1 << 30).unwrap();
-                    let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                    let mut stream = support::stream(Some(manager.budget()));
                     let compiler = compiler();
                     let build = |stream: &mut Stream, layout: &str| {
                         let stem = match layout {
@@ -1315,7 +1301,7 @@ fn dispatch(c: &mut Criterion) {
         for graph_mode in [false, true] {
             let mode = if graph_mode { "graph" } else { "eager" };
             group.bench_function(BenchmarkId::new(mode, format!("{tokens}x{width}")), |b| {
-                let mut stream = Stream::open().unwrap();
+                let mut stream = support::stream(None);
                 let compiler = compiler();
                 let prepare = Prepare::build(
                     &compiler,
@@ -1379,11 +1365,7 @@ fn dispatch(c: &mut Criterion) {
                 };
                 run(&mut stream);
                 b.iter(|| run(&mut stream));
-                let actual = stream
-                    .read(out.binding())
-                    .unwrap()
-                    .wait(&mut stream)
-                    .unwrap();
+                let actual = support::read(&mut stream, out.binding());
                 assert_eq!(actual, bytemuck::cast_slice::<_, u8>(&input));
             });
         }
@@ -1406,7 +1388,7 @@ fn groupnorm_statistics(c: &mut Criterion) {
         group.throughput(Throughput::Elements((frames * plane * channels) as u64));
         group.bench_function(format!("{frames}x{plane}x{channels}"), |b| {
             let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
-            let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+            let mut stream = support::stream(Some(manager.budget()));
             let compiler = compiler();
             let cfg = [
                 ("channels", channels),
@@ -1468,7 +1450,7 @@ fn groupnorm_apply(c: &mut Criterion) {
         group.throughput(Throughput::Elements(count as u64));
         group.bench_function(format!("{frames}x{plane}x{channels}"), |b| {
             let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
-            let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+            let mut stream = support::stream(Some(manager.budget()));
             let compiler = compiler();
             let mut cfg = [
                 ("channels", channels),
@@ -1580,7 +1562,7 @@ fn video_convolution(c: &mut Criterion) {
                 format!("{frames}x{size}x{cin}_{cout}/s{stride}t{tstride}/add_{residual}"),
                 |b| {
                     let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
-                    let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+                    let mut stream = support::stream(Some(manager.budget()));
                     let compiler = compiler();
                     let conv = Conv3d::build(
                         &compiler,
@@ -1644,8 +1626,7 @@ fn video_convolution(c: &mut Criterion) {
 
 criterion_group! {
     name = benches;
-    config = Criterion::default().sample_size(10).warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(3));
+    config = support::criterion();
     targets = decoder_feed_forward, video_convolution, groupnorm_apply, groupnorm_statistics, preparation, rotary_preparation, attention_preparation, fused_qk_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
 }
 criterion_main!(benches);

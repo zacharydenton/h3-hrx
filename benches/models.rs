@@ -2,7 +2,6 @@
 mod support;
 use criterion::{criterion_group, criterion_main, Bencher, Criterion};
 use h3_hrx::{
-    compile::Compiler,
     dispatch::{Classes, Profile, Sink},
     model::*,
     stack::{Constants, LayerCond, Stack, StackDims},
@@ -11,7 +10,6 @@ use h3_hrx::{
 };
 use std::{
     hint::black_box,
-    path::PathBuf,
     time::{Duration, Instant},
 };
 use support::checkpoint;
@@ -21,14 +19,13 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 fn audio(b: &mut Bencher) -> Result<()> {
     let config = Config {
         audio_vae: Some(checkpoint(h3_hrx::models::AUDIO_VAE)),
-        kernel_sources: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernels"),
+        kernel_sources: support::sources(),
+        compiler: support::compiler_options(),
         ..Config::default()
     };
     let residency = hrx::residency::ResidencyManager::new(support::budget_bytes_or(32))?;
-    let context = hrx::inference::ModelContext::new(hrx::execution::RuntimeOptions {
-        memory_budget: Some(residency.budget()),
-        ..Default::default()
-    })?;
+    let context =
+        hrx::inference::ModelContext::new(support::runtime_options(Some(residency.budget())))?;
     // SAFETY: the caller supplies an immutable local model snapshot.
     let mut session = unsafe {
         Session::new_in(
@@ -60,11 +57,8 @@ fn audio(b: &mut Bencher) -> Result<()> {
 
 fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Result<()> {
     let residency = hrx::residency::ResidencyManager::new(support::budget_bytes_or(32))?;
-    let mut stream = hrx::Stream::open()?.with_memory_budget(residency.budget());
-    let compiler = Compiler::new(
-        None,
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernels"),
-    );
+    let mut stream = support::stream(Some(residency.budget()));
+    let compiler = support::compiler();
     // SAFETY: The caller supplies an immutable checkpoint for this process.
     let weights = unsafe {
         Weights::open(
@@ -166,6 +160,7 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
     )?;
     let mut expected = vec![0u8; input.len() * 4];
     stream.read_blocking(x.binding(), &mut expected)?;
+    support::report_digest(&format!("dit_stack/{tokens}/{layers}_layers"), &expected);
     assert!(expected
         .as_chunks::<4>()
         .0
@@ -221,6 +216,7 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
             stream.synchronize().unwrap();
             elapsed += start.elapsed();
         }
+        support::report_elapsed(&format!("dit_stack/{tokens}/{layers}_layers"), iterations, elapsed);
         let mut actual = vec![0u8; expected.len()];
         stream.read_blocking(x.binding(), &mut actual).unwrap();
         if actual != expected {
@@ -265,8 +261,7 @@ fn models(c: &mut Criterion) {
 
 criterion_group! {
     name = benches;
-    config = Criterion::default().sample_size(10).warm_up_time(Duration::from_secs(1))
-        .measurement_time(Duration::from_secs(3));
+    config = support::criterion();
     targets = models
 }
 criterion_main!(benches);

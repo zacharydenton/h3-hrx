@@ -59,9 +59,7 @@ fn loading(c: &mut Criterion) {
         group.bench_function(format!("{name}/pack_and_upload/{tensor}"), |b| {
             let path = support::checkpoint(relative);
             let manager = hrx::residency::ResidencyManager::new(support::budget_bytes()).unwrap();
-            let mut stream = hrx::Stream::open()
-                .unwrap()
-                .with_memory_budget(manager.budget());
+            let mut stream = support::stream(Some(manager.budget()));
             b.iter_custom(|iterations| {
                 let mut elapsed = Duration::ZERO;
                 for _ in 0..iterations {
@@ -73,11 +71,7 @@ fn loading(c: &mut Criterion) {
                     let buffer = weights.at(&mut stream, tensor, size).unwrap();
                     stream.synchronize().unwrap();
                     elapsed += start.elapsed();
-                    let actual = stream
-                        .read(buffer.binding())
-                        .unwrap()
-                        .wait(&mut stream)
-                        .unwrap();
+                    let actual = support::read(&mut stream, buffer.binding());
                     assert_eq!(actual, weights.assemble(tensor).unwrap());
                 }
                 elapsed
@@ -136,9 +130,7 @@ fn block_loading(c: &mut Criterion) {
         group.bench_function("load_block", |b| {
             let path = support::checkpoint(relative);
             let manager = hrx::residency::ResidencyManager::new(support::budget_bytes()).unwrap();
-            let mut stream = hrx::Stream::open()
-                .unwrap()
-                .with_memory_budget(manager.budget());
+            let mut stream = support::stream(Some(manager.budget()));
             b.iter_custom(|iterations| {
                 let mut elapsed = Duration::ZERO;
                 for _ in 0..iterations {
@@ -152,11 +144,7 @@ fn block_loading(c: &mut Criterion) {
                     stream.synchronize().unwrap();
                     elapsed += start.elapsed();
                     for ((tensor, _), buffer) in tensors.iter().zip(buffers) {
-                        let actual = stream
-                            .read(buffer.binding())
-                            .unwrap()
-                            .wait(&mut stream)
-                            .unwrap();
+                        let actual = support::read(&mut stream, buffer.binding());
                         assert_eq!(actual, weights.assemble(tensor).unwrap());
                     }
                 }
@@ -255,9 +243,7 @@ fn cold_loading(c: &mut Criterion) {
             };
             let file = std::fs::File::open(&path).unwrap();
             let manager = hrx::residency::ResidencyManager::new(support::budget_bytes()).unwrap();
-            let mut stream = hrx::Stream::open()
-                .unwrap()
-                .with_memory_budget(manager.budget());
+            let mut stream = support::stream(Some(manager.budget()));
             b.iter_custom(|iterations| {
                 let mut elapsed = Duration::ZERO;
                 for _ in 0..iterations {
@@ -287,11 +273,7 @@ fn cold_loading(c: &mut Criterion) {
                     let buffer = weights.at(&mut stream, tensor, size).unwrap();
                     stream.synchronize().unwrap();
                     elapsed += start.elapsed();
-                    let actual = stream
-                        .read(buffer.binding())
-                        .unwrap()
-                        .wait(&mut stream)
-                        .unwrap();
+                    let actual = support::read(&mut stream, buffer.binding());
                     assert_eq!(actual, weights.assemble(tensor).unwrap());
                 }
                 elapsed

@@ -4,6 +4,8 @@ The [Criterion](https://criterion-rs.github.io/book/) suite covers host preparat
 renders, loading, eviction, and sampled peak memory. Run `cargo bench` for the
 whole suite. Cargo runs benchmark executables sequentially; use an idle machine.
 Results and baselines belong in ignored `target/criterion/`, never in Git.
+Each native engine/compiler configuration has its own subdirectory there.
+`CRITERION_HOME` or Cargo's target directory overrides the output root.
 
 ## Targets and coverage
 
@@ -61,6 +63,41 @@ cargo bench --locked --bench pipeline -- cli/ --test
 ```
 
 ## Workload profiles and overrides
+
+All GPU targets, including fresh CLI processes, accept the same HRX controls:
+
+| Variable | Default | Values |
+| --- | --- | --- |
+| `H3_BENCH_GPU` | `0` | Nonnegative GPU ordinal |
+| `H3_BENCH_COMPUTE_ENGINE` | `pm4` | `pm4`, `aql` |
+| `H3_BENCH_COPY_ENGINE` | `compute` | `compute`, `sdma` |
+| `H3_BENCH_AQL_PRIVATE_BYTES` | `4096` | Scratch ceiling per workitem |
+| `H3_BENCH_PROCESSOR_MODE` | `default` | `default`, `cu`, `wgp` |
+| `H3_BENCH_COMPILE_WORKERS` | Automatic, at most 8 | Positive worker count |
+
+These controls apply before stream allocation and compilation. AQL scratch is
+charged to the workload's budget. Configuration-specific result directories keep
+Criterion from comparing different engines or processor modes automatically;
+benchmark names and filters stay the same. Native library overrides still need
+separate saved baselines, as do different compiler/runtime releases.
+
+```sh
+H3_BENCH_COMPUTE_ENGINE=aql H3_BENCH_COPY_ENGINE=sdma \
+  cargo bench --locked --bench models -- dit_stack/eager/37977/1_layer
+H3_BENCH_PROCESSOR_MODE=cu \
+  cargo bench --locked --bench kernels -- attention_i8qkhm/37977
+```
+
+`H3_BENCH_DETAILS=1` prints attention and DiT output hashes outside timing for
+cross-configuration comparisons, plus completed DiT forward counts and latency
+(also in `--test` mode). Every run checks repeated execution for identical output.
+Use `H3_COMPILE_REPORT_DIR` for HRX's resource/wait reports and
+`H3_PROFILE=device` for GPU profiling; collect latency separately from diagnostics.
+Device-clock profiling requires PM4 with compute copies; `H3_PROFILE=1` uses
+synchronized host timing with either engine.
+Queue or compiler changes must pass numerical checks and full-workload timing
+before becoming defaults. SDMA's coherent allocation policy can affect compute
+latency as well as transfers.
 
 | `H3_BENCH_PROFILE` | Canvas | Frames | Sigma points / model evaluations |
 | --- | --- | --- | --- |
