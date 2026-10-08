@@ -1381,10 +1381,103 @@ fn groupnorm_statistics(c: &mut Criterion) {
     group.finish();
 }
 
+fn groupnorm_apply(c: &mut Criterion) {
+    use h3_hrx::dispatch::{emit, Profile};
+    let mut group = c.benchmark_group("video_groupnorm_apply");
+    for (frames, plane, channels) in [
+        (1usize, 31usize, 32usize),
+        (1, 33, 128),
+        (17, 4096, 128),
+        (9, 1024, 256),
+        (5, 256, 512),
+        (5, 16, 1024),
+        (1, 65536, 128),
+        (1, 127, 512),
+        (1, 128, 512),
+        (2, 513, 192),
+    ] {
+        let count = frames * plane * channels;
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_function(format!("{frames}x{plane}x{channels}"), |b| {
+            let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+            let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+            let compiler = compiler();
+            let mut cfg = [
+                ("channels", channels),
+                ("groups", 32),
+                ("plane", plane),
+                ("rows_bound", (frames * plane).div_ceil(64) * 64),
+            ]
+            .map(|(key, value)| (format!("h3.gn_silu_f16.{key}"), value.to_string()))
+            .to_vec();
+            cfg.push(("h3.gn_silu_f16.eps".into(), "1e-6".into()));
+            let kernel = compiler
+                .get(&mut stream, "gn_silu_f16", "h3_gn_silu_f16", &cfg)
+                .unwrap();
+            compiler.flush(&mut stream).unwrap();
+            let input: Vec<f16> = (0..count)
+                .map(|i| f16::from_f32(((i * 17 % 127) as f32 - 63.) / 32.))
+                .collect();
+            let n = (plane * channels / 32) as f32;
+            let stats: Vec<f32> = (0..frames * 32)
+                .flat_map(|i| {
+                    let mean = (i % 7) as f32 / 8.;
+                    [mean * n, (mean * mean + 0.5) * n]
+                })
+                .collect();
+            let gamma: Vec<f32> = (0..channels).map(|i| (i % 13) as f32 / 13.).collect();
+            let beta: Vec<f32> = (0..channels).map(|i| (i % 7) as f32 / 14.).collect();
+            let x = upload(&mut stream, bytemuck::cast_slice(&input));
+            let stats = upload(&mut stream, bytemuck::cast_slice(&stats));
+            let gamma = upload(&mut stream, bytemuck::cast_slice(&gamma));
+            let beta = upload(&mut stream, bytemuck::cast_slice(&beta));
+            let out = stream.allocate_zeroed(count * 2).unwrap();
+            let tile = if (channels / 32).is_multiple_of(4) {
+                1024
+            } else {
+                256
+            };
+            let mut profile = Profile::from_env();
+            let mut run = |stream: &mut Stream| {
+                emit(
+                    &mut Sink::Stream(stream),
+                    &kernel,
+                    Some(&mut profile),
+                    "video groupnorm apply",
+                    [count.div_ceil(tile) as u32, 1, 1],
+                    [256, 1, 1],
+                    &[frames as u32],
+                    &[
+                        x.binding(),
+                        stats.binding(),
+                        gamma.binding(),
+                        beta.binding(),
+                        out.binding(),
+                    ],
+                    &[
+                        count * 2,
+                        frames * 32 * 2 * 4,
+                        channels * 4,
+                        channels * 4,
+                        count * 2,
+                    ],
+                )
+                .unwrap();
+                stream.synchronize().unwrap();
+            };
+            run(&mut stream);
+            let expected = check_f16(&mut stream, &out);
+            b.iter(|| run(&mut stream));
+            assert_eq!(check_f16(&mut stream, &out), expected);
+        });
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10).warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3));
-    targets = groupnorm_statistics, preparation, rotary_preparation, attention_preparation, fused_qk_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
+    targets = groupnorm_apply, groupnorm_statistics, preparation, rotary_preparation, attention_preparation, fused_qk_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
 }
 criterion_main!(benches);

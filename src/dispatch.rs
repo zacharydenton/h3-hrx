@@ -1119,6 +1119,7 @@ impl Conv3d {
 /// The split is not an optimisation detail — the statistics are over a whole (frame, group) plane, so
 /// they have to land before any element is scaled.
 pub struct GroupNormSilu {
+    apply_tile: usize,
     stats: crate::compile::Kernel,
     silu: crate::compile::Kernel,
     frames: usize,
@@ -1153,6 +1154,11 @@ impl GroupNormSilu {
             (format!("{na}eps"), num(1e-6)),
         ];
         Ok(Self {
+            apply_tile: if (channels / 32).is_multiple_of(4) {
+                1024
+            } else {
+                256
+            },
             stats: c.get(stream, "gn_stats_f16", "h3_gn_stats_f16", &stats_cfg)?,
             silu: c.get(stream, "gn_silu_f16", "h3_gn_silu_f16", &silu_cfg)?,
             frames,
@@ -1192,7 +1198,11 @@ impl GroupNormSilu {
             &self.silu,
             profile,
             stage,
-            [(self.rows * self.channels).div_ceil(256) as u32, 1, 1],
+            [
+                (self.rows * self.channels).div_ceil(self.apply_tile) as u32,
+                1,
+                1,
+            ],
             [256, 1, 1],
             &[self.frames as u32],
             &[x, stats, gamma, beta, out],

@@ -1,5 +1,6 @@
 // GroupNorm apply + SiLU on channels-last f16 rows [frames*plane][channels] from the (sum, sum of squares) statistics:
 //   y = (x - mean) * rsqrt(var + eps) * gamma[c] + beta[c];  out = y * sigmoid(y)
+// Share statistics across four adjacent channels when each packet stays inside its group.
 amdgpu.target<gfx11-generic> @h3_gn_silu_f16_gfx11 {subgroup_size = 32}
 
 config.decl @h3.gn_silu_f16.channels : %value: index where [range(%value, 32, 4096), mul(%value, 32)]
@@ -14,14 +15,22 @@ config.decl @h3.gn_silu_f16.eps : f32
 
 kernel.def target(@h3_gn_silu_f16_gfx11) export("h3_gn_silu_f16") @h3_gn_silu_f16(%frames: index) {
   %c1 = index.constant 1 : index
-  %c255 = index.constant 255 : index
+  %c0 = index.constant 0 : index
   %c256 = index.constant 256 : index
   %plane = config.get @h3.gn_silu_f16.plane : index
   %channels = config.get @h3.gn_silu_f16.channels : index
+  %norm_groups = config.get @h3.gn_silu_f16.groups : index
+  %per_group = index.div %channels, %norm_groups : index
+  %c4 = index.constant 4 : index
+  %rem = index.rem %per_group, %c4 : index
+  %aligned = index.cmp eq, %rem, %c0 : index
+  %packet = scf.select %aligned, %c4, %c1 : index
+  %tile = index.mul %c256, %packet : index
   %rows = index.mul %frames, %plane : index
   %count = index.mul %rows, %channels : index
-  %rounded = index.add %count, %c255 : index
-  %groups = index.div %rounded, %c256 : index
+  %tail = index.sub %tile, %c1 : index
+  %rounded = index.add %count, %tail : index
+  %groups = index.div %rounded, %tile : index
   kernel.launch.config workgroups(%groups, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
 } launch(%frames: index, %x: buffer, %stats: buffer, %gamma: buffer, %beta: buffer, %out: buffer) {
   %channels = config.get @h3.gn_silu_f16.channels : index
@@ -35,19 +44,24 @@ kernel.def target(@h3_gn_silu_f16_gfx11) export("h3_gn_silu_f16") @h3_gn_silu_f1
   %c256 = index.constant 256 : index
   %c0_offset = index.constant 0 : offset
   %zero = scalar.constant 0.0 : f32
-  %one = scalar.constant 1.0 : f32
   %frames_b = index.assume %frames [range(%frames, 1, 64)] : index
   %rows0 = index.mul %frames_b, %plane : index
   %rows = index.assume %rows0 [range(%rows0, 1, 2097152), le(%rows0, %rows_bound)] : index
   %count = index.mul %rows, %channels : index
   %per_group = index.div %channels, %groups : index
+  %c4 = index.constant 4 : index
+  %rem = index.rem %per_group, %c4 : index
+  %aligned = index.cmp eq, %rem, %c0 : index
+  %packet = scf.select %aligned, %c4, %c1 : index
+  %tile = index.mul %c256, %packet : index
   %n_elems0 = index.mul %plane, %per_group : index
   %n_elems_i = index.cast %n_elems0 : index to i32
   %n_elems = scalar.sitofp %n_elems_i : i32 to f32
   %wg = kernel.workgroup.id<x> : index
   %lane = kernel.workitem.id<x> : index
-  %base = index.mul %wg, %c256 : index
-  %i = index.add %base, %lane : index
+  %base = index.mul %wg, %tile : index
+  %lane_packet = index.mul %lane, %packet : index
+  %i = index.add %base, %lane_packet : index
   %x_global = buffer.assume.memory_space<global> %x : buffer
   %st_global = buffer.assume.memory_space<global> %stats : buffer
   %ga_global = buffer.assume.memory_space<global> %gamma : buffer
@@ -62,7 +76,9 @@ kernel.def target(@h3_gn_silu_f16_gfx11) export("h3_gn_silu_f16") @h3_gn_silu_f1
   scf.if %active {
     %row0 = index.div %i, %channels : index
     %row = index.assume %row0 [lt(%row0, %rows)] : index
-    %c = index.rem %i, %channels : index
+    %c_rem = index.rem %i, %channels : index
+    %last = index.sub %channels, %packet : index
+    %c = index.assume %c_rem [le(%c_rem, %last)] : index
     %t0 = index.div %row, %plane : index
     %t = index.assume %t0 [lt(%t0, %frames_b)] : index
     %g0 = index.div %c, %per_group : index
@@ -76,20 +92,23 @@ kernel.def target(@h3_gn_silu_f16_gfx11) export("h3_gn_silu_f16") @h3_gn_silu_f1
     %var = scalar.maxnumf %var0, %zero : f32
     %var_eps = scalar.addf %var, %eps : f32
     %rinv = scalar.rsqrtf %var_eps : f32
-    %v16 = view.load %x_view[%row, %c] : view<[%rows]x[%channels]xf16> -> f16
-    %v = scalar.extf %v16 : f16 to f32
-    %ga = view.load %ga_view[%c] : view<[%channels]xf32> -> f32
-    %be = view.load %be_view[%c] : view<[%channels]xf32> -> f32
-    %d = scalar.subf %v, %mean : f32
-    %nrm = scalar.mulf %d, %rinv : f32
-    %y = scalar.fmaf %nrm, %ga, %be : f32
-    %ny = scalar.negf %y : f32
-    %e = scalar.expf<afn> %ny : f32
-    %den = scalar.addf %one, %e : f32
-    %sig = scalar.divf %one, %den : f32
-    %r = scalar.mulf %y, %sig : f32
-    %r16 = scalar.fptrunc %r : f32 to f16
-    view.store %r16, %out_view[%row, %c] : f16, view<[%rows]x[%channels]xf16>
+    %mean_vec = vector.splat %mean : vector<[%packet]xf32>
+    %rinv_vec = vector.splat %rinv : vector<[%packet]xf32>
+    %one_vec = vector.constant 1.0 : vector<[%packet]xf32>
+    %v16 = vector.load %x_view[%row, %c] : view<[%rows]x[%channels]xf16> -> vector<[%packet]xf16>
+    %v = vector.extf %v16 : vector<[%packet]xf16> to vector<[%packet]xf32>
+    %ga = vector.load %ga_view[%c] : view<[%channels]xf32> -> vector<[%packet]xf32>
+    %be = vector.load %be_view[%c] : view<[%channels]xf32> -> vector<[%packet]xf32>
+    %d = vector.subf %v, %mean_vec : vector<[%packet]xf32>
+    %nrm = vector.mulf %d, %rinv_vec : vector<[%packet]xf32>
+    %y = vector.fmaf %nrm, %ga, %be : vector<[%packet]xf32>
+    %ny = vector.negf %y : vector<[%packet]xf32>
+    %e = vector.expf<afn> %ny : vector<[%packet]xf32>
+    %den = vector.addf %one_vec, %e : vector<[%packet]xf32>
+    %sig = vector.divf %one_vec, %den : vector<[%packet]xf32>
+    %r = vector.mulf %y, %sig : vector<[%packet]xf32>
+    %r16 = vector.fptrunc %r : vector<[%packet]xf32> to vector<[%packet]xf16>
+    vector.store %r16, %out_view[%row, %c] : vector<[%packet]xf16>, view<[%rows]x[%channels]xf16>
   }
   kernel.return
 }

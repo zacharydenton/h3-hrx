@@ -172,6 +172,84 @@ fn cfg(v: &[(&'static str, usize)]) -> Vec<(&'static str, String)> {
 }
 
 #[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires provisioned HRX")]
+fn groupnorm_apply_preserves_groups_channels_and_output_guards() {
+    let mut harness = Harness::new();
+    for (frames, plane, channels, groups) in [
+        (1usize, 1usize, 32usize, 32usize),
+        (2, 31, 64, 32),
+        (3, 33, 128, 32),
+        (2, 65, 160, 32),
+        (2, 513, 192, 32),
+        (1, 127, 512, 32),
+        (1, 128, 512, 32),
+        (2, 129, 512, 32),
+        (3, 17, 256, 64),
+        (2, 17, 1024, 16),
+        (1, 4096, 128, 32),
+    ] {
+        let count = frames * plane * channels;
+        let n = (plane * (channels / groups)) as f32;
+        for variance in [0., 0.5, -0.001] {
+            let input: Vec<f16> = values(count, 2.).into_iter().map(f16::from_f32).collect();
+            let stats: Vec<f32> = (0..frames * groups)
+                .flat_map(|i| {
+                    let mean = (i % 7) as f32 / 8.;
+                    [mean * n, (mean * mean + variance) * n]
+                })
+                .collect();
+            let gamma = values(channels, 0.7);
+            let beta = values(channels, 0.1);
+            let expected: Vec<f64> = (0..count)
+                .map(|i| {
+                    let ch = i % channels;
+                    let g = i / (plane * channels) * groups + ch / (channels / groups);
+                    let mean = stats[2 * g] / n;
+                    let var = (stats[2 * g + 1] / n - mean * mean).max(0.);
+                    let normalized = (input[i].to_f32() - mean) / (var + 1e-6).sqrt();
+                    let y = normalized.mul_add(gamma[ch], beta[ch]);
+                    f16::from_f32(y * (1. / (1. + (-y).exp()))).to_f64()
+                })
+                .collect();
+            let mut config = cfg(&[
+                ("channels", channels),
+                ("groups", groups),
+                ("plane", plane),
+                ("rows_bound", (frames * plane).div_ceil(64) * 64),
+            ]);
+            config.push(("eps", "1e-6".into()));
+            let tile = if (channels / groups).is_multiple_of(4) {
+                1024
+            } else {
+                256
+            };
+            let guard = f16::from_bits(0x3555);
+            let out = harness.run(
+                "gn_silu_f16",
+                &config,
+                [count.div_ceil(tile) as u32, 1, 1],
+                256,
+                &[frames as u64],
+                &[
+                    bytes(&input),
+                    bytes(&stats),
+                    bytes(&gamma),
+                    bytes(&beta),
+                    bytes(&vec![guard; count + 19]),
+                ],
+            );
+            close(
+                &halves(&out[4][..count * 2], false),
+                &expected,
+                0.001,
+                0.002,
+            );
+            assert_eq!(out[4][count * 2..], bytes(&[guard; 19]));
+        }
+    }
+}
+
+#[test]
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires gfx1151 and provisioned HRX"
