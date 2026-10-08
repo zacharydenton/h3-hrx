@@ -90,9 +90,16 @@ template.def<@h3.shared_conv3d_f16_wmma_add> @h3_body_conv3d_f16_wmma_add(%m_siz
   %residual_global = buffer.assume.memory_space<global> %residual : buffer
   %residual_view = buffer.view %residual_global[%c0_offset] : buffer -> view<[%m_size]x[%n_size]xf16>
 
-  // Wide tiles reuse the operand allocation for results after the final K-loop
-  // workgroup barrier. Narrow tiles keep their separate result region.
-  %a_stage, %w_stage, %result_stage, %w_offset = scf.if %wide -> (buffer, buffer, buffer, offset) {
+  // Small temporal downsampling planes and wide tiles reuse operands after the
+  // final K-loop workgroup barrier. Narrow operands have 10240 bytes for 8192
+  // bytes of disjoint wave results. Larger planes favor separate storage.
+  %c1024 = index.constant 1024 : index
+  %compact_plane = index.cmp ule, %spatial_plane, %c1024 : index
+  %is_t2 = index.cmp eq, %cfg_tstride, %c2 : index
+  %downsample = scalar.andi %is_s2, %is_t2 : i1
+  %compact_downsample = scalar.andi %compact_plane, %downsample : i1
+  %reuse_operands = scalar.ori %wide, %compact_downsample : i1
+  %a_stage, %w_stage, %result_stage, %w_offset = scf.if %reuse_operands -> (buffer, buffer, buffer, offset) {
     %shared = buffer.alloca<workgroup> align(16) %stage_bytes : buffer
     scf.yield %shared, %shared, %shared, %w_stage_offset : buffer, buffer, buffer, offset
   } else {
