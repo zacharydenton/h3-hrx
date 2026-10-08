@@ -1388,12 +1388,13 @@ pub fn axpy(
 /// The kind decides what happens after the multiply — `bias` stops there, `gelu` and `gelu_erf` apply
 /// their activation, and `resid` adds into an existing f16 stream. The two GELUs are not the same
 /// function and are not interchangeable: the tower's MLP uses the tanh approximation and its mergers
-/// the error function.
+/// the error function. `gelu_f16` narrows the GELU result to f16 at the final store.
 pub struct Matmul16 {
     kernel: crate::compile::Kernel,
     k: usize,
     n: usize,
     resid: bool,
+    output_half: bool,
 }
 
 impl Matmul16 {
@@ -1424,6 +1425,7 @@ impl Matmul16 {
             k,
             n,
             resid: kind == "resid",
+            output_half: matches!(kind, "resid" | "gelu_f16"),
         })
     }
 
@@ -1447,13 +1449,14 @@ impl Matmul16 {
             "only the resid form takes a lambda"
         );
         // the weight rows are bf16 as stored, and the bias and the residual form's lambda are one
-        // f32 per output column. The element width the other operands carry is the kind's: `resid`
-        // reads and writes the f16 stream, and the three that end a chain take f32 in and out.
-        let elem = if self.resid { 2 } else { 4 };
-        let mut args = Args::new(a, m * self.k * elem);
+        // f32 per output column. Only `resid` reads f16; `resid` and `gelu_f16`
+        // write f16. Accumulation and activation remain f32 in every form.
+        let input_elem = if self.resid { 2 } else { 4 };
+        let output_elem = if self.output_half { 2 } else { 4 };
+        let mut args = Args::new(a, m * self.k * input_elem);
         args.push(w, self.n * self.k * 2);
         args.push(bias, self.n * 4);
-        args.push(out, m * self.n * elem);
+        args.push(out, m * self.n * output_elem);
         if let Some(l) = lambda {
             args.push(l, self.n * 4);
         }

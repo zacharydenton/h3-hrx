@@ -239,7 +239,6 @@ fn embed_frames(
     let k16 = stream.allocate(cap * VHEADS * VHDP * 2)?;
     let v16 = stream.allocate(cap * VHEADS * VHDP * 2)?;
     let att16 = stream.allocate(cap * VHEADS * VHDP * 2)?;
-    let hid = stream.allocate(n * VMLP * 4)?;
     let hid16 = stream.allocate(n * VMLP * 2)?;
     let ln4 = stream.allocate(m * VMERGE * 4)?;
     let mid = stream.allocate(m * VMERGE * 4)?;
@@ -278,13 +277,12 @@ fn embed_frames(
         (format!("{rns}hd_pad"), VHDP.to_string()),
     ];
     let rope = c.get(stream, "rope2d_qkv_f16", "h3_rope2d_qkv_f16", &rope_cfg)?;
-    let cast = c.get(stream, "cast_f32_f16", "h3_cast_f32_f16", &Cfg::new())?;
 
     let norm = LayerNorm16::build(c, stream, VHID, 1e-6)?;
     let norm4 = LayerNorm16::build(c, stream, VMERGE, 1e-6)?;
     let g_qkv = Matmul16::build(c, stream, "bias", VHID, qkv_width)?;
     let g_proj = Matmul16::build(c, stream, "resid", VHEADS * VHDP, VHID)?;
-    let g_fc1 = Matmul16::build(c, stream, "gelu", VHID, VMLP)?;
+    let g_fc1 = Matmul16::build(c, stream, "gelu_f16", VHID, VMLP)?;
     let g_fc2 = Matmul16::build(c, stream, "resid", VMLP, VHID)?;
     let g_merge1 = Matmul16::build(c, stream, "gelu_erf", VMERGE, VMERGE)?;
     let g_merge2 = Matmul16::build(c, stream, "bias", VMERGE, VOUT)?;
@@ -388,18 +386,8 @@ fn embed_frames(
             ln.binding(),
             held_1.binding(),
             held_2.binding(),
-            hid.binding(),
+            hid16.binding(),
             None,
-        )?;
-        checked(
-            stream,
-            &cast,
-            Some(prof),
-            "vision cast",
-            &[(n * VMLP) as u32],
-            &[(n * VMLP) as u32],
-            &[hid.binding(), hid16.binding()],
-            &[n * VMLP * 4, n * VMLP * 2],
         )?;
         let held_1 = weights.at(stream, &format!("{b}fc2.w"), VHID * VMLP * 2)?;
         let held_2 = weights.at(stream, &format!("{b}fc2.b"), VHID * 4)?;

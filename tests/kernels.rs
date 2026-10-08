@@ -719,6 +719,66 @@ fn vision_bf16_matmuls_match_rounded_operands_and_epilogues() {
     not(feature = "gpu-tests"),
     ignore = "requires gfx1151 and provisioned HRX"
 )]
+fn vision_gelu_half_store_matches_separate_cast_and_preserves_guards() {
+    let mut h = Harness::new();
+    for (m, k, n) in [
+        (1usize, 32, 64),
+        (63, 128, 128),
+        (65, 128, 64),
+        (129, 1152, 4608),
+    ] {
+        let input = bytes(&values(m * k, 1.5));
+        let weights = bytes(
+            &values(n * k, 0.2)
+                .into_iter()
+                .map(bf16::from_f32)
+                .collect::<Vec<_>>(),
+        );
+        let bias = bytes(&values(n, 3.));
+        let mut data = vec![input, weights, bias, vec![0xa5; m * n * 4 + 256]];
+        let config = cfg(&[("k_size", k), ("n_size", n)]);
+        let grid = [n.div_ceil(64) as u32, m.div_ceil(64) as u32, 1];
+        let full = h.run_module(
+            "matmul_bf16_family",
+            "matmul_gelu_bf16_wmma",
+            &config,
+            grid,
+            256,
+            &[m as u64],
+            &data,
+        );
+        let want: Vec<_> = full[3][..m * n * 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&v| f16::from_f32(f32::from_le_bytes(v)))
+            .collect();
+        assert!(want.iter().all(|v| v.is_finite()));
+        assert!(full[3][m * n * 4..].iter().all(|&v| v == 0xa5));
+        data[3] = vec![0xa5; m * n * 2 + 256];
+        let half = h.run_module(
+            "matmul_bf16_family",
+            "matmul_gelu_f16_bf16_wmma",
+            &config,
+            grid,
+            256,
+            &[m as u64],
+            &data,
+        );
+        assert_eq!(half[3][..m * n * 2], bytes(&want), "{m}x{k}x{n}");
+        assert!(half[3][m * n * 2..].iter().all(|&v| v == 0xa5));
+        for i in 0..3 {
+            assert_eq!(full[i], data[i]);
+            assert_eq!(half[i], data[i]);
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn float_preparation_normalizes_large_values_and_respects_padded_pitch() {
     let mut h = Harness::new();
     for width in [256usize, 2048, 5376] {
