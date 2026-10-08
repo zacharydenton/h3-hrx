@@ -72,6 +72,75 @@ pub fn prepare_tokens(x: &mut [f32], pos: &[f32], gh: usize, gw: usize) -> Vec<h
     Vec::from_f32_slice(x)
 }
 
+// Four position-table rows followed by four FP32 coefficient bit patterns per
+// merge-ordered patch. Keep coordinate division on the host to match add_positions
+// exactly; the device performs the channel-wise arithmetic without contraction.
+fn position_map(gh: usize, gw: usize) -> Vec<u32> {
+    let g = VPOS_GRID;
+    let mut map = vec![0; gh * gw * 8];
+    for hy in 0..gh {
+        for wx in 0..gw {
+            let fh = hy as f32 * (g - 1) as f32 / (gh - 1) as f32;
+            let fw = wx as f32 * (g - 1) as f32 / (gw - 1) as f32;
+            let (h0, w0) = (fh as usize, fw as usize);
+            let (h1, w1) = ((h0 + 1).min(g - 1), (w0 + 1).min(g - 1));
+            let (dh, dw) = (fh - h0 as f32, fw - w0 as f32);
+            let pi = (((hy / 2) * (gw / 2) + wx / 2) * 2 + hy % 2) * 2 + wx % 2;
+            map[pi * 8..(pi + 1) * 8].copy_from_slice(&[
+                (h0 * g + w0) as u32,
+                (h0 * g + w1) as u32,
+                (h1 * g + w0) as u32,
+                (h1 * g + w1) as u32,
+                ((1.0 - dh) * (1.0 - dw)).to_bits(),
+                ((1.0 - dh) * dw).to_bits(),
+                (dh * (1.0 - dw)).to_bits(),
+                (dh * dw).to_bits(),
+            ]);
+        }
+    }
+    map
+}
+
+fn prepare_tokens_device(
+    stream: &mut hrx::Stream,
+    c: &Compiler,
+    prof: &mut Profile,
+    x: hrx::View<'_>,
+    pos: hrx::View<'_>,
+    gh: usize,
+    gw: usize,
+) -> Result<hrx::Buffer> {
+    let n = gh * gw;
+    let count = n.checked_mul(VHID).filter(|&count| count <= 1 << 30);
+    let Some(count) = count else {
+        return invalid("vision patch grid exceeds the position kernel's extent");
+    };
+    let map = stream.allocate_from(bytemuck::cast_slice(&position_map(gh, gw)))?;
+    let out = stream.allocate(n * VHID * 2)?;
+    let kernel = c.get(
+        stream,
+        "vision_positions",
+        "h3_vision_positions",
+        &Cfg::new(),
+    )?;
+    checked(
+        stream,
+        &kernel,
+        Some(prof),
+        "vision positions",
+        &[count as u32],
+        &[count as u32],
+        &[x, pos, map.binding(), out.binding()],
+        &[
+            n * VHID * 4,
+            VPOS_GRID * VPOS_GRID * VHID * 4,
+            n * 32,
+            n * VHID * 2,
+        ],
+    )?;
+    Ok(out)
+}
+
 /// Runs the tower over one image, reading its weights from the text encoder's checkpoint.
 ///
 /// `pixels` is `[height][width][3]` in `[0, 1]`. Both extents must be multiples of 32: 16 for the patch
@@ -153,13 +222,8 @@ fn embed_frames(
         None,
     )?;
 
-    // the position table is resampled on the host, then the stream narrows to f16 for the blocks
-    let pos = weights.host_f32("vis.pos", VPOS_GRID * VPOS_GRID * VHID)?;
-    let mut x0 = vec![0.0f32; n * VHID];
-    stream.read_blocking(x32.binding(), crate::vvae::as_bytes_mut(&mut x0))?;
-    let x16h = prepare_tokens(&mut x0, &pos, gh, gw);
-    let x16 = stream.allocate(x16h.len() * 2)?;
-    crate::transfer::upload(stream, x16.binding(), crate::vvae::as_bytes_f16(&x16h))?;
+    let pos = weights.at(stream, "vis.pos", VPOS_GRID * VPOS_GRID * VHID * 4)?;
+    let x16 = prepare_tokens_device(stream, c, prof, x32.binding(), pos.binding(), gh, gw)?;
 
     let (mut cosv, mut sinv) = (vec![0.0f32; n * 36], vec![0.0f32; n * 36]);
     rotary_tables(gh, gw, &mut cosv, &mut sinv);
@@ -456,6 +520,82 @@ fn embed_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires provisioned HRX")]
+    fn resident_positions_match_cpu_interpolation_and_half_rounding() -> Result<()> {
+        for sanitized in [false, true] {
+            let mut options = crate::compile::Options::default();
+            let mut stream_options = hrx::StreamOptions::default();
+            if sanitized {
+                options.sanitizer = hrx::loom::SanitizerChecks {
+                    access: true,
+                    value: true,
+                    operation: true,
+                    race: true,
+                };
+                stream_options.compute_engine = hrx::execution::ComputeEngine::Aql {
+                    maximum_private_bytes: 4096,
+                };
+                stream_options.sanitizer = Some(options.sanitizer_runtime.clone());
+            }
+            let mut stream = hrx::Device::open(0)?.stream_with_options(stream_options)?;
+            let compiler = Compiler::with_options(None, "", options);
+            let mut profile = Profile::default();
+            for zero_positions in [false, true] {
+                let positions: Vec<f32> = (0..VPOS_GRID * VPOS_GRID * VHID)
+                    .map(|i| {
+                        if zero_positions {
+                            0.0
+                        } else {
+                            ((i * 37 % 1009) as f32 - 504.0) / 127.0
+                        }
+                    })
+                    .collect();
+                let pos = stream.allocate_from(bytemuck::cast_slice(&positions))?;
+                for (gh, gw) in [(2, 2), (4, 6), (6, 4), (16, 18), (48, 84), (84, 48)] {
+                    if sanitized && gh * gw > 16 * 18 {
+                        continue;
+                    }
+                    let input: Vec<f32> = (0..gh * gw * VHID)
+                        .map(|i| {
+                            let bits = ((i / 2) as u16).wrapping_mul(37) % 0x7bff;
+                            let lo = half::f16::from_bits(bits).to_f32();
+                            let hi = half::f16::from_bits(bits + 1).to_f32();
+                            let value = if i & 1 == 0 { lo } else { (lo + hi) * 0.5 };
+                            if i & 2 == 0 {
+                                value
+                            } else {
+                                -value
+                            }
+                        })
+                        .collect();
+                    let x = stream.allocate_from(bytemuck::cast_slice(&input))?;
+                    let out = prepare_tokens_device(
+                        &mut stream,
+                        &compiler,
+                        &mut profile,
+                        x.binding(),
+                        pos.binding(),
+                        gh,
+                        gw,
+                    )?;
+                    compiler.check_sanitizers(&mut stream)?;
+                    let expected = prepare_tokens(&mut input.clone(), &positions, gh, gw);
+                    let mut actual = vec![half::f16::ZERO; input.len()];
+                    stream.read_blocking(out.binding(), bytemuck::cast_slice_mut(&mut actual))?;
+                    for (i, (got, want)) in actual.iter().zip(&expected).enumerate() {
+                        assert_eq!(
+                            got.to_bits(),
+                            want.to_bits(),
+                            "element {i}, grid {gh}x{gw}, zero positions: {zero_positions}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn token_preparation_preserves_fp32_positions_and_scalar_half_bits() {

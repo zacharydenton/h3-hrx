@@ -240,10 +240,12 @@ that execution path; it is not a quality-qualified cache preset.
   buffers, including any per-call coordinate cache. Cases span 32px through
   landscape/portrait 768p, and the 3584px square maximum vision area. GPU uploads
   and output-buffer allocation are excluded.
-- **Vision tokens:** `vision_tokens` measures copying prebuilt patch projections,
-  FP32 position interpolation/addition, and allocation/conversion of FP16 residual
-  rows. Cases span 32px through 768p in both orientations. GPU projection,
-  readback and upload are excluded.
+- **Vision tokens:** `vision_tokens_cpu` measures the CPU reference: copying
+  prebuilt patch projections, FP32 position interpolation/addition, and
+  allocation/conversion of FP16 residual rows. Cases span 32px through 768p in
+  both orientations. GPU projection,
+  readback and upload are excluded. The runtime keeps position addition and FP16
+  conversion on the device; the complete `stages/.../vision` cases include this path.
 - **Video encoder input:** `video_encoder_input` measures ImageNet normalization
   and FP16 packing into reused eight-channel staging rows. Cases cover stills,
   full 17-frame tiles, cropped source frames and narrow edge tiles. Allocation

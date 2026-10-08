@@ -1,0 +1,90 @@
+// Interpolate learned positions onto merge-ordered patch rows, add in FP32,
+// then narrow to FP16. Four table rows and four coefficient bit patterns per
+// patch are supplied by the host; preserve the CPU oracle's operation order.
+amdgpu.target<gfx11-generic> @h3_vision_positions_gfx11 {subgroup_size = 32}
+
+kernel.def target(@h3_vision_positions_gfx11) export("h3_vision_positions") @h3_vision_positions(%count: index) {
+  %one = index.constant 1 : index
+  %tile_minus_one = index.constant 1023 : index
+  %tile = index.constant 1024 : index
+  %threads = index.constant 256 : index
+  %rounded = index.add %count, %tile_minus_one : index
+  %groups = index.div %rounded, %tile : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%count: index, %x: buffer, %pos: buffer, %map: buffer, %out: buffer) {
+  %zero = index.constant 0 : index
+  %one = index.constant 1 : index
+  %two = index.constant 2 : index
+  %three = index.constant 3 : index
+  %four = index.constant 4 : index
+  %five = index.constant 5 : index
+  %six = index.constant 6 : index
+  %seven = index.constant 7 : index
+  %width = index.constant 1152 : index
+  %tile = index.constant 1024 : index
+  %offset = index.constant 0 : offset
+  %count_b = index.assume %count [range(%count, 1152, 1073741824)] : index
+  %rows = index.div %count_b, %width : index
+  %last = index.sub %count_b, %four : index
+  %wg = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %wg, %tile : index
+  %column = index.mul %lane, %four : index
+  %i = index.add %base, %column : index
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %pos_global = buffer.assume.memory_space<global> %pos : buffer
+  %map_global = buffer.assume.memory_space<global> %map : buffer
+  %out_global = buffer.assume.memory_space<global> %out : buffer
+  %xv = buffer.view %x_global[%offset] : buffer -> view<[%count_b]xf32>
+  %pv = buffer.view %pos_global[%offset] : buffer -> view<2304x1152xf32>
+  %mv = buffer.view %map_global[%offset] : buffer -> view<[%rows]x8xi32>
+  %ov = buffer.view %out_global[%offset] : buffer -> view<[%count_b]xf16>
+  %active = index.cmp ult, %i, %count_b : index
+  scf.if %active {
+    %ii = index.assume %i [le(%i, %last)] : index
+    %row_raw = index.div %ii, %width : index
+    %row = index.assume %row_raw [lt(%row_raw, %rows)] : index
+    %ch_raw = index.rem %ii, %width : index
+    %ch = index.assume %ch_raw [range(%ch_raw, 0, 1148)] : index
+    %ix0 = view.load %mv[%row, %zero] : view<[%rows]x8xi32> -> i32
+    %ix1 = view.load %mv[%row, %one] : view<[%rows]x8xi32> -> i32
+    %ix2 = view.load %mv[%row, %two] : view<[%rows]x8xi32> -> i32
+    %ix3 = view.load %mv[%row, %three] : view<[%rows]x8xi32> -> i32
+    %r0_raw = index.cast %ix0 : i32 to index
+    %r1_raw = index.cast %ix1 : i32 to index
+    %r2_raw = index.cast %ix2 : i32 to index
+    %r3_raw = index.cast %ix3 : i32 to index
+    %r0 = index.assume %r0_raw [range(%r0_raw, 0, 2303)] : index
+    %r1 = index.assume %r1_raw [range(%r1_raw, 0, 2303)] : index
+    %r2 = index.assume %r2_raw [range(%r2_raw, 0, 2303)] : index
+    %r3 = index.assume %r3_raw [range(%r3_raw, 0, 2303)] : index
+    %w0_bits = view.load %mv[%row, %four] : view<[%rows]x8xi32> -> i32
+    %w1_bits = view.load %mv[%row, %five] : view<[%rows]x8xi32> -> i32
+    %w2_bits = view.load %mv[%row, %six] : view<[%rows]x8xi32> -> i32
+    %w3_bits = view.load %mv[%row, %seven] : view<[%rows]x8xi32> -> i32
+    %w0 = scalar.bitcast %w0_bits : i32 to f32
+    %w1 = scalar.bitcast %w1_bits : i32 to f32
+    %w2 = scalar.bitcast %w2_bits : i32 to f32
+    %w3 = scalar.bitcast %w3_bits : i32 to f32
+    %wv0 = vector.splat %w0 : vector<4xf32>
+    %wv1 = vector.splat %w1 : vector<4xf32>
+    %wv2 = vector.splat %w2 : vector<4xf32>
+    %wv3 = vector.splat %w3 : vector<4xf32>
+    %p0 = vector.load %pv[%r0, %ch] : view<2304x1152xf32> -> vector<4xf32>
+    %p1 = vector.load %pv[%r1, %ch] : view<2304x1152xf32> -> vector<4xf32>
+    %p2 = vector.load %pv[%r2, %ch] : view<2304x1152xf32> -> vector<4xf32>
+    %p3 = vector.load %pv[%r3, %ch] : view<2304x1152xf32> -> vector<4xf32>
+    %v0 = vector.mulf %wv0, %p0 : vector<4xf32>
+    %v1 = vector.mulf %wv1, %p1 : vector<4xf32>
+    %v2 = vector.mulf %wv2, %p2 : vector<4xf32>
+    %v3 = vector.mulf %wv3, %p3 : vector<4xf32>
+    %s01 = vector.addf %v0, %v1 : vector<4xf32>
+    %s012 = vector.addf %s01, %v2 : vector<4xf32>
+    %s0123 = vector.addf %s012, %v3 : vector<4xf32>
+    %patch = vector.load %xv[%ii] : view<[%count_b]xf32> -> vector<4xf32>
+    %sum = vector.addf %patch, %s0123 : vector<4xf32>
+    %half = vector.fptrunc %sum : vector<4xf32> to vector<4xf16>
+    vector.store %half, %ov[%ii] : vector<4xf16>, view<[%count_b]xf16>
+  }
+  kernel.return
+}

@@ -292,7 +292,7 @@ fn vision_tokens(c: &mut Criterion) {
     use h3_hrx::model::{VHID, VPOS_GRID};
 
     let positions = support::values(VPOS_GRID * VPOS_GRID * VHID, 0.1);
-    let mut group = c.benchmark_group("vision_tokens");
+    let mut group = c.benchmark_group("vision_tokens_cpu");
     for (height, width) in [(32, 32), (256, 256), (480, 864), (768, 1344), (1344, 768)] {
         let (gh, gw) = (height / 16, width / 16);
         let projected = support::values(gh * gw * VHID, 0.5);
