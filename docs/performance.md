@@ -284,6 +284,19 @@ that execution path; it is not a quality-qualified cache preset.
   prevent a cached lookup from replacing the transfer. `load_block` measures the
   four large projections of one DiT, text or video transformer block, with byte
   throughput and exact readback checks. OS file caches remain available.
+  `checkpoint/dit/load_model` loads every planned DiT tensor under one weight
+  owner and keeps the full set resident through validation. It includes native
+  storage startup, allocation, packing and completed transfers, but excludes
+  mapping/plan construction, inference kernel compilation and tensor validation.
+  It uses a 32 GiB allocation budget by default (`H3_BENCH_BUDGET_GIB` overrides
+  it); allow additional host memory for one tensor's reference and readback.
+  Validation releases row-source mappings after each tensor, unless
+  `H3_KEEP_MAPPED` is set. Recipes are visited in name order, not inference
+  preparation order.
+  On Linux, `H3_BENCH_DETAILS=1` also reports process CPU time, page-fault and
+  input-block deltas for the loading interval, excluding validation. These help
+  distinguish cache effects from changes in the loader; a fresh owner does not
+  imply cold files.
   On Linux, `cold_file` copies representative DiT and text-encoder tensors to a private checkpoint
   under `target/`, flushes it, and evicts only that fixture before each iteration.
   It times allocation, disk faults, packing and completed upload; fixture setup,

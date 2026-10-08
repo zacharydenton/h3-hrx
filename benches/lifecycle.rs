@@ -173,6 +173,99 @@ fn block_loading(c: &mut Criterion) {
     }
 }
 
+/// Keep the full DiT resident to include shared loader state, small tensors and
+/// allocation pressure that a fresh four-projection block cannot represent.
+fn model_loading(c: &mut Criterion) {
+    let mut group = c.benchmark_group("checkpoint/dit");
+    group.sampling_mode(criterion::SamplingMode::Flat);
+    group.bench_function("load_model", |b| {
+        let path = support::checkpoint(h3_hrx::models::DIT_FL2VA);
+        let manager = hrx::residency::ResidencyManager::new(support::budget_bytes_or(32)).unwrap();
+        let mut stream = support::stream(Some(manager.budget()));
+        b.iter_custom(|iterations| {
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iterations {
+                // SAFETY: benchmarks require immutable checkpoint files.
+                let weights = support::configure_weights(
+                    unsafe { Weights::open(&path, plan::dit::plan) }.unwrap(),
+                );
+                let tensors: Vec<_> = weights
+                    .names()
+                    .map(|name| (name.clone(), weights.recipe(name).unwrap().device_bytes()))
+                    .collect();
+                let bytes: usize = tensors.iter().map(|(_, bytes)| bytes).sum();
+                let details = std::env::var_os("H3_BENCH_DETAILS").is_some();
+                #[cfg(target_os = "linux")]
+                let before = details.then(process_usage);
+                let start = Instant::now();
+                for (name, bytes) in &tensors {
+                    // Weights retains every allocation until the whole model is validated.
+                    black_box(weights.at(&mut stream, name, *bytes).unwrap());
+                }
+                stream.synchronize().unwrap();
+                let measured = start.elapsed();
+                #[cfg(target_os = "linux")]
+                let after = details.then(process_usage);
+                elapsed += measured;
+                if details {
+                    eprintln!(
+                        "weight-model dit: {:.6} ms; {} tensors; {} bytes; {:?}",
+                        measured.as_secs_f64() * 1000.,
+                        tensors.len(),
+                        bytes,
+                        weights.io_statistics()
+                    );
+                    #[cfg(target_os = "linux")]
+                    {
+                        let (before, after) = (before.unwrap(), after.unwrap());
+                        let ms = |time: libc::timeval| {
+                            time.tv_sec as f64 * 1000. + time.tv_usec as f64 / 1000.
+                        };
+                        eprintln!(
+                            "weight-model host: user={:.3} ms system={:.3} ms minor_faults={} major_faults={} input_blocks={}",
+                            ms(after.ru_utime) - ms(before.ru_utime),
+                            ms(after.ru_stime) - ms(before.ru_stime),
+                            after.ru_minflt - before.ru_minflt,
+                            after.ru_majflt - before.ru_majflt,
+                            after.ru_inblock - before.ru_inblock,
+                        );
+                    }
+                }
+                // Only one tensor's host reference/readback lives at a time.
+                // Validation is outside timing and includes encoded values and padding.
+                for (name, bytes) in &tensors {
+                    let buffer = weights.at(&mut stream, name, *bytes).unwrap();
+                    let actual = support::read(&mut stream, buffer.binding());
+                    assert_eq!(actual, weights.assemble(name).unwrap(), "{name}");
+                    if let h3_hrx::weights::Recipe::Rows { segments, .. } =
+                        weights.recipe(name).unwrap()
+                    {
+                        // Validation must not keep another model-sized set of mapped
+                        // pages resident beside the device weights. File cache survives.
+                        let sources: std::collections::BTreeSet<_> =
+                            segments.iter().map(|s| &s.tensor).collect();
+                        for source in sources {
+                            let file = weights.file();
+                            file.done_with(file.bytes(file.at(source).unwrap()));
+                        }
+                    }
+                }
+            }
+            elapsed
+        });
+    });
+    group.finish();
+}
+
+#[cfg(target_os = "linux")]
+fn process_usage() -> libc::rusage {
+    let mut usage = std::mem::MaybeUninit::uninit();
+    // SAFETY: getrusage initializes the full output structure on success.
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    assert_eq!(result, 0, "getrusage: {}", std::io::Error::last_os_error());
+    unsafe { usage.assume_init() }
+}
+
 /// Evict only a private disk fixture, never the shared checkpoint or global page cache.
 #[cfg(target_os = "linux")]
 fn cold_loading(c: &mut Criterion) {
@@ -355,5 +448,5 @@ fn eviction(c: &mut Criterion) {
         });
     });
 }
-criterion_group! { name = benches; config = support::criterion(); targets = loading, block_loading, cold_loading, eviction }
+criterion_group! { name = benches; config = support::criterion(); targets = loading, block_loading, model_loading, cold_loading, eviction }
 criterion_main!(benches);
