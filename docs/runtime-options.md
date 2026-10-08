@@ -160,12 +160,21 @@ session and four retained 16 MiB payload slots. Contiguous, gathered, interleave
 and pitched row recipes preserve their encoded bytes; built recipes continue to
 run on the CPU. Loaded tensors remain resident under the selected residency policy.
 
+`--storage-slots 1..64` and `--storage-slot-mib 1..64` override the native
+payload capacity. Larger slots reduce read/copy command counts; additional slots
+allow more overlap but retain more memory. Their product is the payload memory
+charge, excluding commands and resident weights. Rust callers use
+`WeightIo::slots` and `WeightIo::slot_bytes`; byte sizes must be page aligned.
+
 `--storage-progress sqpoll|wait` selects kernel polling or eventfd/deferred-work
 service. Direct mode requires filesystem direct-I/O support and fails explicitly
 when unavailable. This uses registered system pages, not discrete VRAM peer DMA.
 `--weight-io-statistics` collects host-observed loading intervals and reports
 counters for the current model units. Native storage capacity is charged to the
 shared allocation budget in addition to resident weights and execution scratch.
+The timings separate allocation, read submission/wait, consumer submission/wait,
+and completed-consumer retirement. They measure host time, including any blocking
+inside those calls, rather than isolated GPU copy duration.
 
 Rust callers set `Config::weight_io`. `Session::new` selects the required native
 lifetime; applications supplying a `ModelContext` must choose

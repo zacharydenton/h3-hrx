@@ -152,7 +152,15 @@ fn block_loading(c: &mut Criterion) {
                         .map(|(tensor, bytes)| weights.at(&mut stream, tensor, *bytes).unwrap())
                         .collect();
                     stream.synchronize().unwrap();
-                    elapsed += start.elapsed();
+                    let measured = start.elapsed();
+                    elapsed += measured;
+                    if std::env::var_os("H3_BENCH_DETAILS").is_some() {
+                        eprintln!(
+                            "weight-block {name}: {:.6} ms; {:?}",
+                            measured.as_secs_f64() * 1000.,
+                            weights.io_statistics()
+                        );
+                    }
                     for ((tensor, _), buffer) in tensors.iter().zip(buffers) {
                         let actual = support::read(&mut stream, buffer.binding());
                         assert_eq!(actual, weights.assemble(tensor).unwrap());

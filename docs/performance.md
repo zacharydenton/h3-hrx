@@ -435,23 +435,40 @@ against the original checkpoint layout outside timing.
 
 Set `H3_BENCH_WEIGHT_IO=mapped|native-buffered|native-direct` and
 `H3_BENCH_STORAGE_PROGRESS=sqpoll|wait` for lifecycle and model loading tests.
-Each route has a separate Criterion directory. `H3_BENCH_STORAGE_STATISTICS=1`
+`H3_BENCH_STORAGE_SLOTS` and `H3_BENCH_STORAGE_SLOT_MIB` each accept 1..64;
+unset values retain HRX's four 16 MiB slots. These controls reach fresh CLI
+processes too. Each route, capacity and statistics setting has a separate
+Criterion directory. `H3_BENCH_STORAGE_STATISTICS=1`
 collects native loading intervals; `H3_BENCH_DETAILS=1` prints completed tensor
 loading times and counters outside the measured interval. Cold-file tests evict
 only their private disk fixtures. Keep at least seven alternating independent
 samples before comparing medians; measure warm loading and resident inference
 as well as cold loading before changing defaults.
+The completed `weight-load`/`weight-block` durations include native session
+startup; `WeightStatistics::total` starts after that session is constructed.
+Do not treat fresh-session single-tensor latency as sustained whole-model
+throughput.
 
-`scripts/profile.py --output target/profile/run1 -- <benchmark command>` captures
-host memory, disk/NUMA counters, AMD SMI state, child CPU time and faults around a
-native H3 device-clock profile. Use `--profiler rocprofv3` or `pc-sampling` for an
-explicit ROCprofiler run. These are separate diagnostic runs, not latency samples.
-The summary counts actual dispatch records; raw native HRX queues may have no
-ROCprofiler coverage. Kernel replay is unsuitable for file I/O and resident
-exchanges because their external side effects cannot be restored between passes.
+Run comparisons directly through Criterion:
 
-Build `cargo bench --bench lifecycle --no-run`, then pass its executable to
-`scripts/compare-storage.py <executable> --output target/storage-comparison/run1`.
-The script discards one warmup per route and rotates route order for seven
-independent samples. Use `--filter pack_and_upload` for warm loading and
-`--progress wait` for the deferred-work path.
+```sh
+for mode in mapped native-buffered native-direct; do
+  H3_BENCH_WEIGHT_IO="$mode" cargo bench --locked --bench lifecycle -- checkpoint/cold_file
+done
+```
+
+Repeat in rotating route order, and use `pack_and_upload` for warm loading.
+For a separate diagnostic run, enable storage statistics and print the phases:
+
+```sh
+H3_BENCH_WEIGHT_IO=native-direct H3_BENCH_STORAGE_PROGRESS=wait \
+  H3_BENCH_STORAGE_STATISTICS=1 H3_BENCH_DETAILS=1 \
+  cargo bench --locked --bench lifecycle -- checkpoint/cold_file --test
+```
+
+`/usr/bin/time -v` can wrap a built benchmark executable to collect process CPU
+time, peak RSS and page faults. Use `H3_PROFILE=device` for HRX dispatch timing.
+Collect these separately from latency samples. Raw native HRX queues may have
+no ROCprofiler dispatch coverage; an empty trace is not evidence of idle GPU
+time. Kernel replay is unsuitable for file I/O because its external side
+effects cannot be restored between passes.

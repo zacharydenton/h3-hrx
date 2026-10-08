@@ -51,6 +51,12 @@ pub(super) struct RuntimeArgs {
     /// Kernel progress policy for native weight I/O
     #[arg(long, value_enum, default_value = "sqpoll")]
     storage_progress: StorageProgress,
+    /// Retained native I/O slots, charged to the memory budget (HRX default: 4)
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=64))]
+    storage_slots: Option<u32>,
+    /// MiB per native I/O slot (HRX default: 16)
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=64))]
+    storage_slot_mib: Option<u32>,
     /// Collect host-observed native loading phase timings
     #[arg(long)]
     weight_io_statistics: bool,
@@ -101,14 +107,19 @@ impl RuntimeArgs {
                 StorageProgress::Wait => hrx::storage::StorageProgress::Wait,
             },
             statistics: self.weight_io_statistics,
+            slots: self
+                .storage_slots
+                .and_then(|n| NonZeroUsize::new(n as usize)),
+            slot_bytes: self
+                .storage_slot_mib
+                .and_then(|n| NonZeroUsize::new((n as usize) << 20)),
         }
     }
 
     pub(super) fn report_storage(&self, session: &h3_hrx::Session) -> anyhow::Result<()> {
         if self.weight_io_statistics {
             for (name, stats) in session.weight_io_statistics()? {
-                eprintln!("weight I/O {name}: {} tensors, {} logical bytes, {} physical requests, {:?} total, {:?} read wait, {:?} consumer wait, {:?} service CPU",
-                    stats.tensors,stats.logical_bytes,stats.storage.physical_requests,stats.total,stats.read_wait,stats.consumer_wait,stats.storage.service_cpu_time);
+                eprintln!("weight I/O {name}: {stats:?}");
             }
         }
         Ok(())
@@ -251,6 +262,10 @@ mod tests {
                 flag,
                 "--storage-progress",
                 "wait",
+                "--storage-slots",
+                "2",
+                "--storage-slot-mib",
+                "64",
             ])
             .unwrap();
             assert_eq!(cli.runtime.weight_io().mode, mode);
@@ -259,6 +274,8 @@ mod tests {
                 hrx::storage::StorageProgress::Wait
             );
             assert_eq!(cli.runtime.options(None).unwrap().native_lifetime, lifetime);
+            assert_eq!(cli.runtime.weight_io().slots.unwrap().get(), 2);
+            assert_eq!(cli.runtime.weight_io().slot_bytes.unwrap().get(), 64 << 20);
         }
     }
 
@@ -272,6 +289,11 @@ mod tests {
             .to_string()
             .contains("requires"));
         assert!(super::super::Cli::try_parse_from(["h3", "--compile-workers", "0"]).is_err());
+        for flag in ["--storage-slots", "--storage-slot-mib"] {
+            for value in ["0", "65"] {
+                assert!(super::super::Cli::try_parse_from(["h3", flag, value]).is_err());
+            }
+        }
         let cli = super::super::Cli::try_parse_from(["h3", "--gpu=-1"]).unwrap();
         assert!(cli.runtime.options(None).is_err());
     }

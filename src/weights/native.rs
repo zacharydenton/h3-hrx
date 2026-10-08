@@ -5,6 +5,7 @@ use hrx::storage::{
 };
 use std::{
     collections::VecDeque,
+    num::NonZeroUsize,
     time::{Duration, Instant},
 };
 
@@ -20,6 +21,11 @@ pub enum WeightIoMode {
 pub struct WeightIo {
     pub mode: WeightIoMode,
     pub progress: StorageProgress,
+    /// Retained native I/O slots (1..=64). None uses HRX's default.
+    pub slots: Option<NonZeroUsize>,
+    /// Page-aligned bytes per slot, at most 64 MiB. None uses HRX's default.
+    /// The shared memory budget covers slots * slot_bytes plus native commands.
+    pub slot_bytes: Option<NonZeroUsize>,
     /// Collect host-observed loading phase durations.
     pub statistics: bool,
 }
@@ -32,13 +38,19 @@ impl WeightIo {
     }
 }
 
+/// Host-observed native loading phases; durations are collected only when requested.
 #[derive(Clone, Debug, Default)]
 pub struct WeightStatistics {
     pub tensors: u64,
     pub logical_bytes: u64,
     pub device_bytes: u64,
+    pub allocation: Option<Duration>,
+    pub read_submit: Option<Duration>,
     pub read_wait: Option<Duration>,
+    pub consumer_submit: Option<Duration>,
     pub consumer_wait: Option<Duration>,
+    pub consumer_retire: Option<Duration>,
+    /// Tensor loading time, excluding initial storage-session construction.
     pub total: Option<Duration>,
     pub storage: StorageStatistics,
 }
@@ -106,7 +118,12 @@ impl Loader {
                 mode,
                 progress: io.progress,
                 statistics: io.statistics,
-                ..Default::default()
+                slots: io
+                    .slots
+                    .map_or_else(|| StorageConfig::default().slots, NonZeroUsize::get),
+                slot_bytes: io
+                    .slot_bytes
+                    .map_or_else(|| StorageConfig::default().slot_bytes, NonZeroUsize::get),
             },
         )?;
         Ok(Self {
@@ -201,9 +218,13 @@ impl Loader {
             kernel.resolve(stream)?;
             self.gather.insert((*row_bytes, *pitch_bytes), kernel);
         }
+        let allocation = self.timed.then(Instant::now);
         let output = stream.allocate(bytes.max(1))?;
         if pitch_bytes != row_bytes {
             crate::transfer::fill(stream, output.binding(), 0)?;
+        }
+        if let Some(start) = allocation {
+            add(&mut self.statistics.allocation, start.elapsed());
         }
         let mut pending = VecDeque::new();
         let mut copies = VecDeque::new();
@@ -212,7 +233,12 @@ impl Loader {
             .peekable();
         loop {
             while let Some(chunk) = next.peek() {
-                match self.session.read(chunk.file, chunk.offset, chunk.bytes) {
+                let submitted = self.timed.then(Instant::now);
+                let result = self.session.read(chunk.file, chunk.offset, chunk.bytes);
+                if let Some(start) = submitted {
+                    add(&mut self.statistics.read_submit, start.elapsed());
+                }
+                match result {
                     Ok(ticket) => pending.push_back((next.next().unwrap(), ticket)),
                     Err(hrx::Error::Busy(_)) => break,
                     Err(error) => return Err(error.into()),
@@ -261,7 +287,11 @@ impl Loader {
                         Ok(())
                     };
                 // SAFETY: only the immediate, bounded consumers above use this source.
+                let submitted = self.timed.then(Instant::now);
                 let copy = unsafe { lease.enqueue(stream, consume) }?;
+                if let Some(start) = submitted {
+                    add(&mut self.statistics.consumer_submit, start.elapsed());
+                }
                 copies.push_back(copy);
             } else if let Some(mut copy) = copies.pop_front() {
                 let wait = Instant::now();
@@ -273,6 +303,7 @@ impl Loader {
                 break;
             }
             // Reclaim completed copies without waiting, allowing the next read to overlap.
+            let retired = self.timed.then(Instant::now);
             while copies
                 .front_mut()
                 .map(|copy| copy.is_complete())
@@ -280,6 +311,9 @@ impl Loader {
                 .unwrap_or(false)
             {
                 copies.pop_front();
+            }
+            if let Some(start) = retired {
+                add(&mut self.statistics.consumer_retire, start.elapsed());
             }
         }
         self.compiler.check_sanitizers(stream)?;
@@ -481,6 +515,8 @@ mod tests {
                                         mode,
                                         progress,
                                         statistics: true,
+                                        slots: NonZeroUsize::new(2),
+                                        slot_bytes: NonZeroUsize::new(8 << 20),
                                     },
                                     &crate::compile::Compiler::new(None, std::path::PathBuf::new()),
                                 )
@@ -503,8 +539,11 @@ mod tests {
                                 .is_err());
                             let stats = weights.io_statistics().unwrap();
                             assert_eq!(stats.tensors, 4);
-                            assert!(stats.storage.peak_slots <= 4);
+                            assert!(stats.storage.peak_slots <= 2);
                             assert!(stats.total.is_some());
+                            assert!(stats.allocation.is_some());
+                            assert!(stats.consumer_submit.is_some());
+                            assert!(stats.consumer_retire.is_some());
                         }
                         assert_eq!(manager.budget().reserved_bytes(), 0);
                     }

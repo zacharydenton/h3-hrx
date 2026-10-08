@@ -45,11 +45,16 @@ pub fn criterion() -> Criterion {
                 .unwrap_or_else(|| PathBuf::from("target"));
             target.join("criterion")
         });
+    let io = weight_io();
+    let storage = hrx::storage::StorageConfig::default();
     Criterion::default()
         .output_directory(&root.join(engine_settings().id()).join(format!(
-            "{:?}-{:?}",
-            weight_io().mode,
-            weight_io().progress
+            "{:?}-{:?}-slots{}-bytes{}-stats{}",
+            io.mode,
+            io.progress,
+            io.slots.map_or(storage.slots, std::num::NonZeroUsize::get),
+            io.slot_bytes.map_or(storage.slot_bytes, std::num::NonZeroUsize::get),
+            io.statistics,
         )))
         .sample_size(10)
         .warm_up_time(Duration::from_secs(1))
@@ -143,6 +148,13 @@ pub fn compiler_options() -> h3_hrx::compile::Options {
 
 pub fn weight_io() -> h3_hrx::weights::WeightIo {
     use h3_hrx::weights::{WeightIo, WeightIoMode};
+    let capacity = |key: &str, unit: usize| {
+        std::env::var(key).ok().map(|value| {
+            let n: usize = value.parse().expect("integer storage capacity");
+            assert!((1..=64).contains(&n), "{key} must be 1..=64");
+            std::num::NonZeroUsize::new(n * unit).unwrap()
+        })
+    };
     WeightIo {
         mode: match std::env::var("H3_BENCH_WEIGHT_IO")
             .as_deref()
@@ -162,6 +174,8 @@ pub fn weight_io() -> h3_hrx::weights::WeightIo {
             _ => panic!("H3_BENCH_STORAGE_PROGRESS must be sqpoll or wait"),
         },
         statistics: std::env::var_os("H3_BENCH_STORAGE_STATISTICS").is_some(),
+        slots: capacity("H3_BENCH_STORAGE_SLOTS", 1),
+        slot_bytes: capacity("H3_BENCH_STORAGE_SLOT_MIB", 1 << 20),
     }
 }
 
@@ -237,6 +251,18 @@ pub fn configure_cli(command: &mut std::process::Command) {
         .arg(std::env::var("H3_BENCH_STORAGE_PROGRESS").unwrap_or_else(|_| "sqpoll".into()));
     if let Some(workers) = settings.workers {
         command.arg("--compile-workers").arg(workers.to_string());
+    }
+    let io = weight_io();
+    if let Some(slots) = io.slots {
+        command.arg("--storage-slots").arg(slots.to_string());
+    }
+    if let Some(bytes) = io.slot_bytes {
+        command
+            .arg("--storage-slot-mib")
+            .arg((bytes.get() >> 20).to_string());
+    }
+    if io.statistics {
+        command.arg("--weight-io-statistics");
     }
 }
 pub fn sources() -> PathBuf {
