@@ -2441,6 +2441,19 @@ fn a_recorded_chain_replays_to_what_dispatching_it_produces() {
     ignore = "requires gfx1151 and provisioned HRX"
 )]
 fn recorded_branches_feed_their_consumer_on_every_replay() {
+    check_recorded_branches(false);
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
+fn profiled_branches_feed_their_consumer_on_every_replay() {
+    check_recorded_branches(true);
+}
+
+fn check_recorded_branches(profiled: bool) {
     use h3_hrx::compile::Compiler;
     use h3_hrx::dispatch::{Prepare, Sink};
     const ROWS: u32 = 64;
@@ -2453,10 +2466,19 @@ fn recorded_branches_feed_their_consumer_on_every_replay() {
     compiler.flush(&mut stream).unwrap();
     let buffers: Vec<_> = (0..4).map(|_| stream.allocate(BYTES).unwrap()).collect();
     let mut graph = stream.graph().unwrap();
+    let mut labels = Vec::new();
     {
-        let mut sink = Sink::Graph {
-            graph: &mut graph,
-            after: Default::default(),
+        let mut sink = if profiled {
+            Sink::ProfiledGraph {
+                graph: &mut graph,
+                after: Default::default(),
+                labels: &mut labels,
+            }
+        } else {
+            Sink::Graph {
+                graph: &mut graph,
+                after: Default::default(),
+            }
         };
         wide.emit(
             &mut sink,
@@ -2500,7 +2522,15 @@ fn recorded_branches_feed_their_consumer_on_every_replay() {
         )
         .unwrap();
     }
-    let mut replay = graph.finish().unwrap();
+    let mut replay = if profiled {
+        assert_eq!(
+            labels,
+            ["producer", "branch", "branch", "branch", "consumer"]
+        );
+        graph.finish_profiled(&labels).unwrap()
+    } else {
+        graph.finish().unwrap()
+    };
     for phase in 0..4 {
         let source: Vec<u8> = (0..BYTES / 2)
             .flat_map(|i| {
@@ -2513,7 +2543,23 @@ fn recorded_branches_feed_their_consumer_on_every_replay() {
         for buffer in &buffers[1..] {
             stream.fill(buffer.binding(), 0x7f).unwrap();
         }
-        stream.launch(&mut replay).unwrap();
+        if profiled {
+            let timings = stream.launch_profiled(&mut replay).unwrap();
+            assert_eq!(timings.execution, phase as u64 + 1);
+            assert_eq!(timings.intervals.len(), labels.len());
+            assert!(timings.frequency_hz > 0);
+            assert!(timings.interval_union_ms > 0.0);
+            assert!(timings.span_ms >= timings.interval_union_ms);
+            for (interval, label) in timings.intervals.iter().zip(&labels) {
+                assert_eq!(&interval.label, label);
+                assert!(interval.end_tick >= interval.start_tick);
+            }
+            for pair in timings.intervals.windows(2) {
+                assert!(pair[0].end_tick <= pair[1].start_tick);
+            }
+        } else {
+            stream.launch(&mut replay).unwrap();
+        }
         let mut actual = vec![0u8; BYTES];
         stream
             .read_blocking(buffers[3].binding(), &mut actual)

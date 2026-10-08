@@ -47,15 +47,29 @@ pub fn criterion() -> Criterion {
         });
     let io = weight_io();
     let storage = hrx::storage::StorageConfig::default();
+    let mut output = root.join(engine_settings().id()).join(format!(
+        "{:?}-{:?}-slots{}-bytes{}-stats{}",
+        io.mode,
+        io.progress,
+        io.slots.map_or(storage.slots, std::num::NonZeroUsize::get),
+        io.slot_bytes
+            .map_or(storage.slot_bytes, std::num::NonZeroUsize::get),
+        io.statistics,
+    ));
+    // Instrumentation changes dispatch ordering and adds waits/markers. Never
+    // overwrite or compare ordinary latency estimates with diagnostic samples.
+    let profile = std::env::var_os("H3_PROFILE");
+    if profile.as_ref().is_some_and(|v| !v.is_empty() && v != "0") {
+        output = output.join(
+            if profile.as_deref() == Some(std::ffi::OsStr::new("device")) {
+                "profile-device"
+            } else {
+                "profile-host"
+            },
+        );
+    }
     Criterion::default()
-        .output_directory(&root.join(engine_settings().id()).join(format!(
-            "{:?}-{:?}-slots{}-bytes{}-stats{}",
-            io.mode,
-            io.progress,
-            io.slots.map_or(storage.slots, std::num::NonZeroUsize::get),
-            io.slot_bytes.map_or(storage.slot_bytes, std::num::NonZeroUsize::get),
-            io.statistics,
-        )))
+        .output_directory(&output)
         .sample_size(10)
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3))

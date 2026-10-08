@@ -14,7 +14,7 @@ Each native engine/compiler configuration has its own subdirectory there.
 | `host` | Short/long tokenization, mixed-media presentation, image resizing, RefMod loading/strength/copies, packed sequence layout |
 | `attention` | Head-128 FP16 four/eight-wave tile comparisons across ragged lengths and the 4096-token boundary, checked against sampled FP64 attention |
 | `kernels` | FP32 Hadamard preparation, INT8 attention preparation in both layouts, V transpose, INT8/BF16 GEMMs including all four DiT projections through 37,977 rows, cached/rotating weights, eager/graph dispatch |
-| `models` | Resident one-block INT8 DiT eager/graph comparison through 37,977 tokens including partial tiles, a complete 50-block 768p sequence, and short audio roundtrip |
+| `models` | Resident INT8 DiT eager/graph comparison through 37,977 tokens including partial tiles, a complete 50-block 768p sequence in both modes, and short audio roundtrip |
 | `stages` | Complete text encoder plus token refiner, vision tower, video encode/decode, audio encode/decode, complete 50-block denoising trajectories with Euler and ResMultistep |
 | `lifecycle` | Mapping/planning, tensor packing and completed uploads, block loading throughput, cold-file loading, forced audio eviction/reload |
 | `pipeline` | Complete text, first/last-frame, image/audio reference, video/audio reference, RefMod, LoRA, Turbo and World renders; cache observation/reuse; WAV and H.264/AAC output; fresh CLI processes |
@@ -114,7 +114,7 @@ available for focused work.
 
 The kernel and `models` targets have their own shape matrices, including
 production sequence lengths regardless of this profile. The default `models`
-suite includes `dit_stack/eager/37977/50_layers`; its repeated full-stack
+suite includes `dit_stack/{eager,graph}/37977/50_layers`; its repeated full-stack
 measurements can take tens of minutes. This case streams all 50 checkpoint
 blocks through one activation workspace. It measures the resident backbone
 with synthetic inputs and modulation tables; conditioning, sampler updates,
@@ -356,6 +356,24 @@ The diagnostic graph serializes each dispatch and adds markers/barriers; these
 intervals locate costly kernels but do not measure ordinary graph overlap or
 hardware utilization. Unsupported timestamp capture fails explicitly.
 `H3_PROFILE=1` retains synchronized host timing instead.
+
+For `models` graph cases, `H3_PROFILE=device` instruments the whole recorded
+stack. `H3_GPU_GRAPH_PROFILE` reports all dispatch intervals in one device-clock
+timeline, its span and gaps, distinct retained allocation bytes, and enclosing
+replay host time. The graph keeps its dependency edges and avoids a separate
+host submission/readback for every dispatch. HRX still inserts completion
+barriers around each marker pair, so this remains a serialized diagnostic;
+use the same case without profiling to measure ordinary graph replay.
+Each timed batch's output is checked byte-for-byte against the eager reference
+outside timing. Both one-block and 50-block cases support this capture:
+
+```sh
+H3_BENCH_BUDGET_GIB=12 H3_PROFILE=device cargo bench --locked --bench models -- 'dit_stack/graph/37977/1_layer$' --test
+H3_BENCH_BUDGET_GIB=32 H3_PROFILE=device cargo bench --locked --bench models -- 'dit_stack/graph/37977/50_layers$' --test
+```
+
+Instrumented Criterion results use separate `profile-device` or `profile-host`
+subdirectories, so they cannot replace ordinary latency baselines.
 
 `H3_COMPILE_REPORT_DIR` writes one detailed Loom report per specialization,
 including resources, complete wait reasons and evidence-backed guidance.

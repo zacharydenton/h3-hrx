@@ -22,6 +22,11 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// Whether diagnostics use HRX device timestamps instead of host timing.
+    pub fn device_enabled(&self) -> bool {
+        self.on && self.device
+    }
+
     pub fn from_env() -> Self {
         Self {
             on: std::env::var_os("H3_PROFILE").is_some_and(|v| !v.is_empty() && v != "0"),
@@ -189,6 +194,15 @@ pub enum Sink<'s, 'g> {
         graph: &'s mut hrx::Graph<'g>,
         after: Dependencies,
     },
+    /// Record the same dependency graph and collect one label per dispatch for
+    /// `Graph::finish_profiled`. Use a fresh graph and empty labels together.
+    /// HRX's diagnostic markers still serialize execution; this removes the
+    /// per-dispatch host round trips, not the instrumentation barriers.
+    ProfiledGraph {
+        graph: &'s mut hrx::Graph<'g>,
+        after: Dependencies,
+        labels: &'s mut Vec<String>,
+    },
 }
 
 impl Sink<'_, '_> {
@@ -197,13 +211,13 @@ impl Sink<'_, '_> {
     pub fn head(&self) -> Dependencies {
         match self {
             Sink::Stream(_) => Dependencies::None,
-            Sink::Graph { after, .. } => *after,
+            Sink::Graph { after, .. } | Sink::ProfiledGraph { after, .. } => *after,
         }
     }
 
     /// Start a branch from these dependencies.
     pub fn resume(&mut self, dependencies: Dependencies) {
-        if let Sink::Graph { after, .. } = self {
+        if let Sink::Graph { after, .. } | Sink::ProfiledGraph { after, .. } = self {
             *after = dependencies;
         }
     }
@@ -211,7 +225,7 @@ impl Sink<'_, '_> {
     /// Have the next launch wait directly for three branch endings. This does
     /// not insert an empty native node or split the command-buffer partition.
     pub fn after_branches(&mut self, ends: [Dependencies; 3]) -> Result<()> {
-        if let Sink::Graph { after, .. } = self {
+        if let Sink::Graph { after, .. } | Sink::ProfiledGraph { after, .. } = self {
             let [Dependencies::One(a), Dependencies::One(b), Dependencies::One(c)] = ends else {
                 return Err(crate::compile::Error::Io(
                     "each branch must end in a dispatch".into(),
@@ -276,7 +290,7 @@ pub fn emit<'g>(
                 )
             }
         }
-        Sink::Graph { graph, after } => {
+        Sink::Graph { graph, after } | Sink::ProfiledGraph { graph, after, .. } => {
             // Recording cannot build a kernel: there is no stream to load it onto. A recording is
             // therefore made after the same work has run once, which is what leaves them all built.
             let loaded = kernel.built().ok_or_else(|| {
@@ -292,6 +306,9 @@ pub fn emit<'g>(
                 graph.dispatch(after.as_slice(), kernel, grid, block, &constants, bindings)?
             };
             *after = Dependencies::One(node);
+            if let Sink::ProfiledGraph { labels, .. } = sink {
+                labels.push(stage.to_string());
+            }
             Ok(())
         }
     }

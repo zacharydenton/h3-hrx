@@ -147,6 +147,12 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
 
     // Compile and warm the eager path before recording or timing.
     let mut profile = Profile::from_env();
+    let profile_graph = graph_mode && profile.device_enabled();
+    if graph_mode {
+        // The eager warmup is the numerical reference. Capture diagnostics on
+        // the graph itself, without per-dispatch host waits in this reference.
+        profile = Profile::default();
+    }
     stream.upload_blocking(x.binding(), bytemuck::cast_slice(&input))?;
     stack.forward(
         &mut stream,
@@ -167,13 +173,24 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
         .0
         .iter()
         .all(|v| f32::from_le_bytes(*v).is_finite()));
+    let mut retained_binding_bytes = 0;
     let mut graph = if graph_mode {
         let mut recording = stream.graph()?;
-        stack.emit(
-            &mut Sink::Graph {
+        let mut labels = Vec::new();
+        let mut sink = if profile_graph {
+            Sink::ProfiledGraph {
                 graph: &mut recording,
                 after: Default::default(),
-            },
+                labels: &mut labels,
+            }
+        } else {
+            Sink::Graph {
+                graph: &mut recording,
+                after: Default::default(),
+            }
+        };
+        stack.emit(
+            &mut sink,
             &mut profile,
             x.binding(),
             classes.all(),
@@ -184,7 +201,12 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
             None,
             false,
         )?;
-        Some(recording.finish()?)
+        retained_binding_bytes = recording.binding_bytes();
+        Some(if profile_graph {
+            recording.finish_profiled(&labels)?
+        } else {
+            recording.finish()?
+        })
     } else {
         None
     };
@@ -197,8 +219,13 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
                 .unwrap();
             stream.synchronize().unwrap();
             let start = Instant::now();
-            if let Some(recorded) = &mut graph {
-                stream.launch(recorded).unwrap();
+            let device = if let Some(recorded) = &mut graph {
+                if profile_graph {
+                    Some(stream.launch_profiled(recorded).unwrap())
+                } else {
+                    stream.launch(recorded).unwrap();
+                    None
+                }
             } else {
                 stack
                     .forward(
@@ -213,9 +240,19 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
                         None,
                     )
                     .unwrap();
-            }
+                None
+            };
             stream.synchronize().unwrap();
-            elapsed += start.elapsed();
+            let replay_time = start.elapsed();
+            elapsed += replay_time;
+            if let Some(device) = device {
+                eprintln!("H3_GPU_GRAPH_PROFILE {}", serde_json::json!({
+                    "workload": format!("dit_stack/{tokens}/{layers}_layers"),
+                    "retained_binding_bytes": retained_binding_bytes,
+                    "replay_host_ms": replay_time.as_secs_f64() * 1e3,
+                    "device": device,
+                }));
+            }
         }
         support::report_elapsed(&format!("dit_stack/{tokens}/{layers}_layers"), iterations, elapsed);
         let mut actual = vec![0u8; expected.len()];
@@ -254,9 +291,12 @@ fn models(c: &mut Criterion) {
     // Stream every checkpoint block through the same activation workspace. A
     // repeated single block cannot measure the full denoiser's weight traffic.
     group.sampling_mode(criterion::SamplingMode::Flat);
-    group.bench_function("eager/37977/50_layers", |b| {
-        stack(b, 37977, BLOCKS, false).unwrap()
-    });
+    for graph in [false, true] {
+        let mode = if graph { "graph" } else { "eager" };
+        group.bench_function(format!("{mode}/37977/50_layers"), |b| {
+            stack(b, 37977, BLOCKS, graph).unwrap()
+        });
+    }
     group.finish();
 }
 
