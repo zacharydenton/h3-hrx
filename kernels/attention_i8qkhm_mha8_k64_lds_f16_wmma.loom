@@ -101,6 +101,33 @@ low.func.def target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_w
   return %acc
 }
 
+// Pack the converted low halves directly, preserving conversion rounding while
+// avoiding the masks and shifts emitted for a vector fptrunc followed by bitcast.
+low.func.def target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_pack_half_words(%x: reg<amdgpu.vgpr x8>) -> (reg<amdgpu.vgpr x4>) asm {
+  %a0 = slice %x[0] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %b0 = slice %x[1] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %ha0 = v_cvt_f16_f32 %a0
+  %hb0 = v_cvt_f16_f32 %b0
+  %p0 = v_pack_b32_f16 %ha0, %hb0
+  %a1 = slice %x[2] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %b1 = slice %x[3] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %ha1 = v_cvt_f16_f32 %a1
+  %hb1 = v_cvt_f16_f32 %b1
+  %p1 = v_pack_b32_f16 %ha1, %hb1
+  %a2 = slice %x[4] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %b2 = slice %x[5] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %ha2 = v_cvt_f16_f32 %a2
+  %hb2 = v_cvt_f16_f32 %b2
+  %p2 = v_pack_b32_f16 %ha2, %hb2
+  %a3 = slice %x[6] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %b3 = slice %x[7] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %ha3 = v_cvt_f16_f32 %a3
+  %hb3 = v_cvt_f16_f32 %b3
+  %p3 = v_pack_b32_f16 %ha3, %hb3
+  %packed = concat(%p0, %p1, %p2, %p3) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x4>
+  return %packed
+}
+
 kernel.def target(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) export("h3_attention_i8qkhm_mha8_k64_lds_f16_wmma") @h3_attention_i8qkhm_mha8_k64_lds_f16_wmma(%token_count: index, %kv_head_count: index) {
   %c1 = index.constant 1 : index
   %c15 = index.constant 15 : index
@@ -804,20 +831,16 @@ kernel.def target(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) export("h3_a
       %local_sum = scalar.addf %local_sum_ab, %local_sum_cd : f32
       %scaled_sum = scalar.mulf %row_sum, %old_scale : f32
       %next_sum = scalar.addf %scaled_sum, %local_sum : f32
-      %weight_half = vector.fptrunc %weight : vector<8xf32> to vector<8xf16>
-      %weight_words = vector.bitcast %weight_half : vector<8xf16> to vector<4xi32>
+      %weight_words = low.invoke @h3_pack_half_words(%weight) : (vector<8xf32>) -> (vector<4xi32>)
       %other_words, %weight_ok = kernel.subgroup.shuffle<xor> %weight_words, %i32_16, %i32_32 : vector<4xi32>, i32, i32
       %probability = template.apply<@h3.pack_attention_probability>(%tokens0, %weight_words, %other_words, %lane_group_even, %pack_lo, %pack_hi) : (index, vector<4xi32>, vector<4xi32>, i1, i32, i32) -> (vector<16xf16>)
-      %weight_half_b = vector.fptrunc %weight_b : vector<8xf32> to vector<8xf16>
-      %weight_words_b = vector.bitcast %weight_half_b : vector<8xf16> to vector<4xi32>
+      %weight_words_b = low.invoke @h3_pack_half_words(%weight_b) : (vector<8xf32>) -> (vector<4xi32>)
       %other_words_b, %weight_ok_b = kernel.subgroup.shuffle<xor> %weight_words_b, %i32_16, %i32_32 : vector<4xi32>, i32, i32
       %probability_b = template.apply<@h3.pack_attention_probability>(%tokens0, %weight_words_b, %other_words_b, %lane_group_even, %pack_lo, %pack_hi) : (index, vector<4xi32>, vector<4xi32>, i1, i32, i32) -> (vector<16xf16>)
-      %weight_half_c = vector.fptrunc %weight_c : vector<8xf32> to vector<8xf16>
-      %weight_words_c = vector.bitcast %weight_half_c : vector<8xf16> to vector<4xi32>
+      %weight_words_c = low.invoke @h3_pack_half_words(%weight_c) : (vector<8xf32>) -> (vector<4xi32>)
       %other_words_c, %weight_ok_c = kernel.subgroup.shuffle<xor> %weight_words_c, %i32_16, %i32_32 : vector<4xi32>, i32, i32
       %probability_c = template.apply<@h3.pack_attention_probability>(%tokens0, %weight_words_c, %other_words_c, %lane_group_even, %pack_lo, %pack_hi) : (index, vector<4xi32>, vector<4xi32>, i1, i32, i32) -> (vector<16xf16>)
-      %weight_half_d = vector.fptrunc %weight_d : vector<8xf32> to vector<8xf16>
-      %weight_words_d = vector.bitcast %weight_half_d : vector<8xf16> to vector<4xi32>
+      %weight_words_d = low.invoke @h3_pack_half_words(%weight_d) : (vector<8xf32>) -> (vector<4xi32>)
       %other_words_d, %weight_ok_d = kernel.subgroup.shuffle<xor> %weight_words_d, %i32_16, %i32_32 : vector<4xi32>, i32, i32
       %probability_d = template.apply<@h3.pack_attention_probability>(%tokens0, %weight_words_d, %other_words_d, %lane_group_even, %pack_lo, %pack_hi) : (index, vector<4xi32>, vector<4xi32>, i1, i32, i32) -> (vector<16xf16>)
       %vrow0 = index.add %lane_column, %c0 : index
