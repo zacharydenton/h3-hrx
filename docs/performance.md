@@ -46,6 +46,11 @@ resident fixture persists across samples, with readback and exact replay checks
 outside timing. Native tests check FP64 results, constant and low-variance rows,
 both sides of the register-cache cutoff, scalar/vector stores and output guards.
 
+`cargo bench --bench attention` keeps each attention fixture resident across
+warmup and samples within a 512 MiB budget. A sampled FP64 oracle checks the
+initial output, and every sample checks exact replay outside timing. Use full
+vision stages to confirm that an isolated attention gain helps the tower.
+
 Video stage cases cross spatial tile overlaps horizontally and vertically and
 use 5/22/39/56 frames across temporal chunks. Audio cases cover the 800-sample
 hop and 255/256/257 latent-frame boundaries, plus a full 124-frame soundtrack.

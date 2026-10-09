@@ -50,6 +50,29 @@ fn reference(
     }
     expected
 }
+fn run(
+    stream: &mut hrx::Stream,
+    kernel: &h3_hrx::compile::Kernel,
+    profile: &mut Profile,
+    tokens: usize,
+    heads: usize,
+    bindings: &[hrx::View<'_>; 4],
+    stage: &str,
+) {
+    emit(
+        &mut Sink::Stream(stream),
+        kernel,
+        Some(profile),
+        stage,
+        &[tokens as u32, heads as u32],
+        &[tokens as u32],
+        bindings,
+        &bindings.map(|view| view.len()),
+    )
+    .unwrap();
+    stream.synchronize().unwrap();
+}
+
 fn attention(c: &mut Criterion) {
     attention_layout(c, false);
     attention_layout(c, true);
@@ -99,72 +122,79 @@ fn attention_layout(c: &mut Criterion, vision: bool) {
         if std::env::var_os("H3_BENCH_ATTENTION_REVERSE").is_some() {
             variants.reverse();
         }
+        let stage = if vision {
+            "vision attention"
+        } else {
+            "head128 attention"
+        };
         for (variant, stem) in variants {
+            // Keep buffers and compiled kernels across warmup and samples,
+            // including samples with a single measured dispatch.
+            let mut fixture = None;
             group.bench_function(BenchmarkId::new(variant, tokens), |b| {
-                let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
-                let mut stream = support::stream(Some(manager.budget()));
-                let compiler = support::compiler();
-                let cfg: Cfg = [
-                    ("q_stride", stride.to_string()),
-                    ("kv_stride", stride.to_string()),
-                    ("out_stride", stride.to_string()),
-                    ("tokens", tokens.to_string()),
-                    ("token_capacity", capacity.to_string()),
-                    ("scale", num(1. / (active as f64).sqrt())),
-                ]
-                .into_iter()
-                .map(|(k, v)| (format!("h3.{stem}.{k}"), v))
-                .collect();
-                let kernel = compiler
-                    .get(
-                        &mut stream,
-                        "attention_mha_family",
-                        &format!("h3_{stem}"),
-                        &cfg,
-                    )
-                    .unwrap();
-                compiler.flush(&mut stream).unwrap();
-                let q = stream.allocate_from(bytemuck::cast_slice(&q)).unwrap();
-                let k = stream.allocate_from(bytemuck::cast_slice(&k)).unwrap();
-                let v = stream.allocate_from(bytemuck::cast_slice(&v)).unwrap();
-                let output = stream.allocate(tokens * stride * 2).unwrap();
+                let (stream, kernel, q, k, v, output, actual, profile) = fixture
+                    .get_or_insert_with(|| {
+                        let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+                        let mut stream = support::stream(Some(manager.budget()));
+                        let compiler = support::compiler();
+                        let cfg: Cfg = [
+                            ("q_stride", stride.to_string()),
+                            ("kv_stride", stride.to_string()),
+                            ("out_stride", stride.to_string()),
+                            ("tokens", tokens.to_string()),
+                            ("token_capacity", capacity.to_string()),
+                            ("scale", num(1. / (active as f64).sqrt())),
+                        ]
+                        .into_iter()
+                        .map(|(k, v)| (format!("h3.{stem}.{k}"), v))
+                        .collect();
+                        let kernel = compiler
+                            .get(
+                                &mut stream,
+                                "attention_mha_family",
+                                &format!("h3_{stem}"),
+                                &cfg,
+                            )
+                            .unwrap();
+                        compiler.flush(&mut stream).unwrap();
+                        let q = stream.allocate_from(bytemuck::cast_slice(&q)).unwrap();
+                        let k = stream.allocate_from(bytemuck::cast_slice(&k)).unwrap();
+                        let v = stream.allocate_from(bytemuck::cast_slice(&v)).unwrap();
+                        let output = stream.allocate(tokens * stride * 2).unwrap();
+                        let bindings = [q.binding(), k.binding(), v.binding(), output.binding()];
+                        let mut profile = Profile::from_env();
+
+                        run(
+                            &mut stream,
+                            &kernel,
+                            &mut profile,
+                            tokens,
+                            heads,
+                            &bindings,
+                            stage,
+                        );
+                        let actual = support::read(&mut stream, output.binding());
+                        for &(index, want) in &expected {
+                            let got =
+                                f16::from_le_bytes([actual[index * 2], actual[index * 2 + 1]])
+                                    .to_f64();
+                            assert!(
+                                got.is_finite() && (got - want).abs() <= 0.003 + 0.01 * want.abs(),
+                                "{tokens}/{variant}/{index}: {got} vs {want}"
+                            );
+                        }
+                        support::report_digest(
+                            &format!("attention_f16/{tokens}/{variant}"),
+                            &actual,
+                        );
+                        (stream, kernel, q, k, v, output, actual, profile)
+                    });
                 let bindings = [q.binding(), k.binding(), v.binding(), output.binding()];
-                let required = bindings.map(|view| view.len());
-                let mut profile = Profile::from_env();
-                let mut run = |stream: &mut hrx::Stream| {
-                    emit(
-                        &mut Sink::Stream(stream),
-                        &kernel,
-                        Some(&mut profile),
-                        if vision {
-                            "vision attention"
-                        } else {
-                            "head128 attention"
-                        },
-                        &[tokens as u32, heads as u32],
-                        &[tokens as u32],
-                        &bindings,
-                        &required,
-                    )
-                    .unwrap();
-                    stream.synchronize().unwrap();
-                };
-                run(&mut stream);
-                let actual = support::read(&mut stream, output.binding());
-                for &(index, want) in &expected {
-                    let got =
-                        f16::from_le_bytes([actual[index * 2], actual[index * 2 + 1]]).to_f64();
-                    assert!(
-                        got.is_finite() && (got - want).abs() <= 0.003 + 0.01 * want.abs(),
-                        "{tokens}/{variant}/{index}: {got} vs {want}"
-                    );
-                }
-                support::report_digest(&format!("attention_f16/{tokens}/{variant}"), &actual);
                 b.iter_custom(|iterations| {
                     let mut elapsed = Duration::ZERO;
                     for _ in 0..iterations {
                         let start = Instant::now();
-                        run(&mut stream);
+                        run(stream, kernel, profile, tokens, heads, &bindings, stage);
                         elapsed += start.elapsed();
                     }
                     if std::env::var_os("H3_BENCH_DETAILS").is_some() {
@@ -175,10 +205,11 @@ fn attention_layout(c: &mut Criterion, vision: bool) {
                     }
                     elapsed
                 });
-                assert_eq!(support::read(&mut stream, output.binding()), actual);
+                assert_eq!(support::read(stream, output.binding()), *actual);
                 let report = profile.report(0.0);
                 if !report.is_empty() {
                     eprintln!("attention profile {tokens}/{variant}: {report}");
+                    profile.take();
                 }
             });
         }
