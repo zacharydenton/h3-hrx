@@ -211,3 +211,73 @@ pub fn bench(c: &mut Criterion) {
     }
     group.finish();
 }
+
+pub fn normalization(c: &mut Criterion) {
+    use h3_hrx::dispatch::LayerNorm16;
+
+    let mut group = c.benchmark_group("vision_layernorm");
+    for (rows, width) in [
+        (1usize, 32usize),
+        (17, 96),
+        (16, VHID),
+        (1620, VHID),
+        (4032, VHID),
+        (17, 1184),
+        (4, VMERGE),
+        (405, VMERGE),
+        (1008, VMERGE),
+        (17, 8192),
+    ] {
+        group.throughput(Throughput::Elements((rows * width) as u64));
+        let mut fixture = None;
+        group.bench_function(format!("{rows}x{width}"), |b| {
+            let (stream, norm, input, weights, bias, out, expected, profile) = fixture
+                .get_or_insert_with(|| {
+                    let manager = hrx::residency::ResidencyManager::new(512 << 20).unwrap();
+                    let mut stream = support::stream(Some(manager.budget()));
+                    let compiler = compiler();
+                    let norm = LayerNorm16::build(&compiler, &mut stream, width, 1e-6).unwrap();
+                    compiler.flush(&mut stream).unwrap();
+                    let values: Vec<_> = (0..rows * width)
+                        .map(|i| f16::from_f32(((i * 73 % 257) as f32 - 128.) / 97.))
+                        .collect();
+                    let input = upload(&mut stream, bytemuck::cast_slice(&values));
+                    let weights = upload(&mut stream, bytemuck::cast_slice(&vec![0.75f32; width]));
+                    let bias = upload(&mut stream, bytemuck::cast_slice(&vec![0.125f32; width]));
+                    let out = stream.allocate_zeroed(rows * width * 4).unwrap();
+                    let mut profile = Profile::from_env();
+                    norm.run(
+                        &mut stream,
+                        Some(&mut profile),
+                        rows,
+                        input.binding(),
+                        weights.binding(),
+                        bias.binding(),
+                        out.binding(),
+                    )
+                    .unwrap();
+                    let expected = check_f32(&mut stream, &out);
+                    (stream, norm, input, weights, bias, out, expected, profile)
+                });
+            b.iter(|| {
+                norm.run(
+                    stream,
+                    Some(&mut *profile),
+                    rows,
+                    input.binding(),
+                    weights.binding(),
+                    bias.binding(),
+                    out.binding(),
+                )
+                .unwrap();
+                stream.synchronize().unwrap();
+            });
+            assert_eq!(
+                check_f32(stream, out),
+                *expected,
+                "LayerNorm replay changed"
+            );
+        });
+    }
+    group.finish();
+}

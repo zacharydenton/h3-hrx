@@ -1697,6 +1697,6 @@ fn video_convolution(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = support::criterion();
-    targets = vision_rotary, decoder_feed_forward, video_convolution, groupnorm_apply, groupnorm_statistics, preparation, rotary_preparation, attention_preparation, fused_qk_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, vision::bench, audio_qkv, audio_convolution, dispatch
+    targets = vision_rotary, decoder_feed_forward, video_convolution, groupnorm_apply, groupnorm_statistics, preparation, rotary_preparation, attention_preparation, fused_qk_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, vision::bench, vision::normalization, audio_qkv, audio_convolution, dispatch
 }
 criterion_main!(benches);

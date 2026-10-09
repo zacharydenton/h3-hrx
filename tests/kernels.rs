@@ -672,6 +672,56 @@ fn float_matmul_addresses_rows_past_32768() {
     not(feature = "gpu-tests"),
     ignore = "requires gfx1151 and provisioned HRX"
 )]
+fn vision_layernorm_matches_cpu_and_preserves_guards() {
+    let mut h = Harness::new();
+    for width in [32usize, 96, 128, 1120, 1152, 1184, 1280, 4608, 8160, 8192] {
+        let rows = 5;
+        let input: Vec<_> = (0..rows * width)
+            .map(|i| {
+                f16::from_f32(match i / width {
+                    0 => 0.75,
+                    1 => 1. + ((i % 3) as f32 - 1.) / 1024.,
+                    2 => 10000.,
+                    _ => ((i * 73 % 257) as f32 - 128.) / 97.,
+                })
+            })
+            .collect();
+        let weights = values(width, 1.5);
+        let bias = values(width, 0.3);
+        let eps = 1e-6f32;
+        let mut want = Vec::with_capacity(rows * width);
+        for row in input.chunks_exact(width) {
+            let mean = row.iter().map(|v| v.to_f64()).sum::<f64>() / width as f64;
+            let variance =
+                row.iter().map(|v| (v.to_f64() - mean).powi(2)).sum::<f64>() / width as f64;
+            let inv = (variance + f64::from(eps)).sqrt().recip();
+            want.extend(row.iter().enumerate().map(|(col, v)| {
+                (v.to_f64() - mean) * inv * f64::from(weights[col]) + f64::from(bias[col])
+            }));
+        }
+        let output_bytes = rows * width * 4;
+        let data = [
+            bytes(&input),
+            bytes(&weights),
+            bytes(&bias),
+            vec![0xa5; output_bytes + 256],
+        ];
+        let mut config = cfg(&[("width", width)]);
+        config.push(("eps", "1e-6".into()));
+        let out = h.run_auto("layernorm_f16_f32", &config, &[rows as u64], &data);
+        close(&floats(&out[3][..output_bytes]), &want, 5e-4, 5e-4);
+        assert!(out[3][output_bytes..].iter().all(|&v| v == 0xa5));
+        for i in 0..3 {
+            assert_eq!(out[i], data[i], "width {width}, input {i}");
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn vision_bf16_matmuls_match_rounded_operands_and_epilogues() {
     let mut h = Harness::new();
     for (m, k, n) in [

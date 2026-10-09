@@ -37,6 +37,12 @@ correctness readback and residual restoration are outside timing.
 Use the complete `stages` vision cases
 to verify whether an isolated kernel improvement helps the tower.
 
+`cargo bench --bench kernels -- vision_layernorm/` covers the block and merger
+widths at 64px/480p/768p row counts, plus small and maximum-width cases. Its
+resident fixture persists across samples, with readback and exact replay checks
+outside timing. Native tests check FP64 results, constant and low-variance rows,
+both sides of the register-cache cutoff, scalar/vector stores and output guards.
+
 Video stage cases cross spatial tile overlaps horizontally and vertically and
 use 5/22/39/56 frames across temporal chunks. Audio cases cover the 800-sample
 hop and 255/256/257 latent-frame boundaries, plus a full 124-frame soundtrack.

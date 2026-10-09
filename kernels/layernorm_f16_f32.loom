@@ -1,4 +1,5 @@
-// LayerNorm over f16 rows [rows][width] (the vision tower's f16 residual stream) to f32 rows for the f16-weight GEMMs.
+// FP16 vision rows to FP32 LayerNorm outputs. Preserve the ordered FP32
+// sum, centered variance and affine transform.
 amdgpu.target<gfx11-generic> @h3_layernorm_f16_f32_gfx11 {subgroup_size = 32}
 
 config.decl @h3.layernorm_f16_f32.width : %value: index where [range(%value, 32, 8192), mul(%value, 32)]
@@ -29,25 +30,50 @@ kernel.def target(@h3_layernorm_f16_f32_gfx11) export("h3_layernorm_f16_f32") @h
   %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%rows_b]x[%width]xf16>
   %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%width]xf32>
   %b_view = buffer.view %b_global[%c0_offset] : buffer -> view<[%width]xf32>
-  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%width]xf32>
   %width_i = index.cast %width : index to i32
   %width_f = scalar.sitofp %width_i : i32 to f32
-  %sum = scf.for %j = [%c0 to %per_lane step %c1](%acc = %zero : f32) -> (f32) {
+  // Cache the block width in registers for both reductions. Wider merger
+  // rows keep separate reads to stay within the native register budget.
+  %cache_limit = index.constant 1152 : index
+  %cached = index.cmp ule, %width, %cache_limit : index
+  %cache_count = scf.select %cached, %per_lane, %c0 : index
+  %cache_size = scf.select %cached, %per_lane, %c1 : index
+  %input_zero = vector.constant 0.0 : vector<[%cache_size]xf16>
+  %inputs = scf.for %j = [%c0 to %cache_count step %c1](%values = %input_zero : vector<[%cache_size]xf16>) -> (vector<[%cache_size]xf16>) unroll {
+    %col0 = index.mul %j, %c32 : index
+    %col = index.add %col0, %lane : index
+    %v16 = view.load %x_view[%row, %col] : view<[%rows_b]x[%width]xf16> -> f16
+    %next = vector.insert %v16 into %values[%j] : f16, vector<[%cache_size]xf16>
+    scf.yield %next : vector<[%cache_size]xf16>
+  }
+  %sum = scf.for %j = [%c0 to %per_lane step %c1](%acc = %zero : f32) -> (f32) unroll {
     %col0 = index.mul %j, %c32 : index
     %col1 = index.add %col0, %lane : index
     %col = index.assume %col1 [lt(%col1, %width)] : index
-    %v16 = view.load %x_view[%row, %col] : view<[%rows_b]x[%width]xf16> -> f16
+    %v16 = scf.if %cached -> (f16) {
+      %stored = vector.extract %inputs[%j] : vector<[%cache_size]xf16> -> f16
+      scf.yield %stored : f16
+    } else {
+      %loaded = view.load %x_view[%row, %col] : view<[%rows_b]x[%width]xf16> -> f16
+      scf.yield %loaded : f16
+    }
     %v = scalar.extf %v16 : f16 to f32
     %s = scalar.addf %acc, %v : f32
     scf.yield %s : f32
   }
   %total = kernel.subgroup.reduce<addf> %sum : f32
   %mean = scalar.divf %total, %width_f : f32
-  %ss = scf.for %j = [%c0 to %per_lane step %c1](%acc = %zero : f32) -> (f32) {
+  %ss = scf.for %j = [%c0 to %per_lane step %c1](%acc = %zero : f32) -> (f32) unroll {
     %col0 = index.mul %j, %c32 : index
     %col1 = index.add %col0, %lane : index
     %col = index.assume %col1 [lt(%col1, %width)] : index
-    %v16 = view.load %x_view[%row, %col] : view<[%rows_b]x[%width]xf16> -> f16
+    %v16 = scf.if %cached -> (f16) {
+      %stored = vector.extract %inputs[%j] : vector<[%cache_size]xf16> -> f16
+      scf.yield %stored : f16
+    } else {
+      %loaded = view.load %x_view[%row, %col] : view<[%rows_b]x[%width]xf16> -> f16
+      scf.yield %loaded : f16
+    }
     %v = scalar.extf %v16 : f16 to f32
     %d = scalar.subf %v, %mean : f32
     %s = scalar.fmaf %d, %d, %acc : f32
@@ -58,18 +84,49 @@ kernel.def target(@h3_layernorm_f16_f32_gfx11) export("h3_layernorm_f16_f32") @h
   %var_eps = scalar.addf %var, %eps : f32
   %rinv = scalar.rsqrtf %var_eps : f32
   %out_row = buffer.view %out_global[%c0_offset] : buffer -> view<[%rows_b]x[%width]xf32>
-  scf.for %j = [%c0 to %per_lane step %c1] {
-    %col0 = index.mul %j, %c32 : index
-    %col1 = index.add %col0, %lane : index
-    %col = index.assume %col1 [lt(%col1, %width)] : index
-    %v16 = view.load %x_view[%row, %col] : view<[%rows_b]x[%width]xf16> -> f16
-    %v = scalar.extf %v16 : f16 to f32
-    %wv = view.load %w_view[%col] : view<[%width]xf32> -> f32
-    %bv = view.load %b_view[%col] : view<[%width]xf32> -> f32
-    %d = scalar.subf %v, %mean : f32
-    %nrm = scalar.mulf %d, %rinv : f32
-    %r = scalar.fmaf %nrm, %wv, %bv : f32
-    view.store %r, %out_row[%row, %col] : f32, view<[%rows_b]x[%width]xf32>
+  // The independent affine outputs can use contiguous vector packets without
+  // changing either reduction's lane assignment or accumulation order.
+  %c4 = index.constant 4 : index
+  %c128 = index.constant 128 : index
+  %tail = index.rem %width, %c128 : index
+  %vector_output = index.cmp eq, %tail, %c0 : index
+  scf.if %vector_output {
+    %packets = index.div %width, %c128 : index
+    %lane_col = index.mul %lane, %c4 : index
+    %mean4 = vector.splat %mean : vector<4xf32>
+    %rinv4 = vector.splat %rinv : vector<4xf32>
+    scf.for %j = [%c0 to %packets step %c1] unroll {
+      %packet_col = index.mul %j, %c128 : index
+      %col = index.add %packet_col, %lane_col : index
+      %v16 = vector.load %x_view[%row, %col] : view<[%rows_b]x[%width]xf16> -> vector<4xf16>
+      %v = vector.extf %v16 : vector<4xf16> to vector<4xf32>
+      %wv = vector.load %w_view[%col] : view<[%width]xf32> -> vector<4xf32>
+      %bv = vector.load %b_view[%col] : view<[%width]xf32> -> vector<4xf32>
+      %d = vector.subf %v, %mean4 : vector<4xf32>
+      %nrm = vector.mulf %d, %rinv4 : vector<4xf32>
+      %r = vector.fmaf %nrm, %wv, %bv : vector<4xf32>
+      vector.store %r, %out_row[%row, %col] : vector<4xf32>, view<[%rows_b]x[%width]xf32>
+    }
+  } else {
+    scf.for %j = [%c0 to %per_lane step %c1] unroll {
+      %col0 = index.mul %j, %c32 : index
+      %col1 = index.add %col0, %lane : index
+      %col = index.assume %col1 [lt(%col1, %width)] : index
+      %v16 = scf.if %cached -> (f16) {
+        %stored = vector.extract %inputs[%j] : vector<[%cache_size]xf16> -> f16
+        scf.yield %stored : f16
+      } else {
+        %loaded = view.load %x_view[%row, %col] : view<[%rows_b]x[%width]xf16> -> f16
+        scf.yield %loaded : f16
+      }
+      %v = scalar.extf %v16 : f16 to f32
+      %wv = view.load %w_view[%col] : view<[%width]xf32> -> f32
+      %bv = view.load %b_view[%col] : view<[%width]xf32> -> f32
+      %d = scalar.subf %v, %mean : f32
+      %nrm = scalar.mulf %d, %rinv : f32
+      %r = scalar.fmaf %nrm, %wv, %bv : f32
+      view.store %r, %out_row[%row, %col] : f32, view<[%rows_b]x[%width]xf32>
+    }
   }
   kernel.return
 }
