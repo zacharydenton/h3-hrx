@@ -98,6 +98,12 @@ impl Harness {
         // Safety: trusted checked-in source compiled through HRX. Every test below
         // sizes the bindings from the same dimensions passed as kernel configuration.
         let kernel = unsafe { self.stream.load_artifact(&path).unwrap() };
+        let info = kernel.info();
+        assert_eq!(
+            scalars.len(),
+            (info.parameter_count - info.binding_count) as usize,
+            "device index argument count for {stem}"
+        );
         let launch = |kernel: &hrx::Kernel| match geometry {
             Some((grid, threads)) => (grid, [threads, 1, 1]),
             None => {
@@ -1563,7 +1569,7 @@ fn attention_matches_scaled_dot_product_for_the_shipped_layouts() {
                 &config,
                 grid,
                 32 * waves as u32,
-                &[tokens as u64, kv_heads as u64],
+                &[tokens as u64],
                 &[bytes(&q), bytes(&k), bytes(&v), vec![0; tokens * qs * 2]],
             );
             let got = halves(&out[3], false);
@@ -1940,7 +1946,7 @@ fn int8_qk_attention_matches_the_attention_its_operands_define() {
                 &config,
                 [tokens.div_ceil(block) as u32, heads as u32, 1],
                 32 * waves as u32,
-                &[tokens as u64, heads as u64],
+                &[tokens as u64],
                 &[
                     bytes(&pad_words(&qw)),
                     bytes(&pad_scales(&qs)),
@@ -1964,7 +1970,8 @@ fn int8_qk_attention_matches_the_attention_its_operands_define() {
     ignore = "requires gfx1151 and provisioned HRX"
 )]
 fn head_major_int8_attention_handles_long_reference_sequences() {
-    check_head_major_attention(&[4096, 4097, 8193, 65537, 119585, 478340]);
+    check_head_major_attention(&[4096, 4097, 8193, 65537, 119585, 478340], 129);
+    check_head_major_attention(&[65537], 127);
 }
 
 #[test]
@@ -1973,18 +1980,21 @@ fn head_major_int8_attention_handles_long_reference_sequences() {
     ignore = "requires gfx1151 and provisioned HRX"
 )]
 fn head_major_int8_attention_handles_short_sequences_and_partial_tiles() {
-    check_head_major_attention(&[
-        1, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1024, 1025, 2048, 2049, 4095,
-    ]);
+    check_head_major_attention(
+        &[
+            1, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1024, 1025, 2048, 2049, 4095,
+        ],
+        usize::MAX,
+    );
 }
 
-fn check_head_major_attention(token_counts: &[usize]) {
+fn check_head_major_attention(token_counts: &[usize], query_limit: usize) {
     use rand::{Rng, SeedableRng};
     let mut h = Harness::new();
     let (heads, d) = (3usize, 128usize);
     let stride = heads * d;
     for &tokens in token_counts {
-        let queries = if tokens > 65536 { 128 } else { tokens };
+        let queries = if tokens > 65536 { query_limit } else { tokens };
         let capacity = (tokens + 16).div_ceil(256) * 256;
         let mut rng = rand_chacha::ChaCha12Rng::seed_from_u64(tokens as u64);
         let mut normal = || rng.sample::<f32, _>(rand_distr::StandardNormal);
@@ -2027,7 +2037,8 @@ fn check_head_major_attention(token_counts: &[usize]) {
                 &config,
                 [queries.div_ceil(128) as u32, heads as u32, 1],
                 256,
-                &[queries as u64, heads as u64],
+                // Heads determine the host grid; the device entry takes only token_count.
+                &[queries as u64],
                 &[
                     bytes(&q),
                     bytes(&qs),
@@ -2047,7 +2058,7 @@ fn check_head_major_attention(token_counts: &[usize]) {
             if let Some(previous) = &previous {
                 assert!(previous == &out[5], "unstable attention at {tokens} tokens");
             } else {
-                for row in [0, 15, 16, 31, 63, 64, 127, 128, 4095, tokens - 1]
+                for row in [0, 15, 16, 31, 63, 64, 127, 128, 4095, queries - 1]
                     .into_iter()
                     .filter(|&row| row < queries)
                 {
@@ -2411,7 +2422,7 @@ fn packed_attention_families_preserve_wave_layouts_and_skip_decisions() {
                     &config,
                     [tokens.div_ceil(block) as u32, heads as u32, 1],
                     32 * waves as u32,
-                    &[tokens as u64, heads as u64],
+                    &[tokens as u64],
                     &data,
                 );
                 close(
@@ -2429,7 +2440,7 @@ fn packed_attention_families_preserve_wave_layouts_and_skip_decisions() {
                         &config,
                         [tokens.div_ceil(block) as u32, heads as u32, 1],
                         32 * waves as u32,
-                        &[tokens as u64, heads as u64],
+                        &[tokens as u64],
                         &data,
                     );
                     assert!(halves(&out[5], false)[..tokens * stride]
@@ -4160,7 +4171,7 @@ fn world_attention_matches_directed_cpu_oracle() {
                 &config,
                 [tokens.div_ceil(16 * waves) as u32, 1, 1],
                 (32 * waves) as u32,
-                &[tokens as u64, 1],
+                &[tokens as u64],
                 &[
                     bytes(&q),
                     bytes(&k),
