@@ -128,6 +128,8 @@ impl TextEncoder {
     /// tower's embedding instead, and its token id is allowed to be negative — that is how a caller
     /// says "there is no token here", and it is the only case where a negative id is not an error.
     pub(crate) fn embed(&self, ids: &[i32], spans: &[Span<'_>]) -> Result<Vec<f32>> {
+        let (table, rows) = self.embedding_table()?;
+        validate_ids(ids, spans, rows)?;
         let n = ids.len();
         let mut emb = vec![0.0f32; n * TEXT_DIM];
         for sp in spans {
@@ -135,22 +137,9 @@ impl TextEncoder {
             emb[at..at + sp.at.count * TEXT_DIM].copy_from_slice(sp.merged);
         }
         // the table stays mapped and only the rows this prompt names are widened
-        let entry = self.weights.file().at_checked(
-            "model.embed_tokens.weight",
-            hrx::artifacts::safetensors::DType::BF16,
-            &[-1, TEXT_DIM as i64],
-        )?;
-        let table = self.weights.file().bytes(entry);
-        let rows = entry.shape[0];
         for (i, id) in ids.iter().enumerate() {
-            let covered = spans
-                .iter()
-                .any(|sp| i >= sp.at.start && i < sp.at.start + sp.at.count);
-            if *id < 0 && covered {
+            if *id < 0 {
                 continue;
-            }
-            if *id < 0 || *id as usize >= rows {
-                return invalid(format!("token id out of range: {id}"));
             }
             let src = *id as usize * TEXT_DIM * 2;
             for j in 0..TEXT_DIM {
@@ -159,6 +148,15 @@ impl TextEncoder {
             }
         }
         Ok(emb)
+    }
+
+    fn embedding_table(&self) -> Result<(&[u8], usize)> {
+        let entry = self.weights.file().at_checked(
+            "model.embed_tokens.weight",
+            hrx::artifacts::safetensors::DType::BF16,
+            &[-1, TEXT_DIM as i64],
+        )?;
+        Ok((self.weights.file().bytes(entry), entry.shape[0]))
     }
 
     fn ensure(
@@ -234,8 +232,11 @@ impl TextEncoder {
             }
         }
         let n = ids.len();
-        let emb = self.embed(ids, spans)?;
+        // Validate from metadata before loading the model. Scattered embedding reads
+        // can disable Linux mmap readahead for this file, so load weights first.
+        validate_ids(ids, spans, self.embedding_table()?.1)?;
         self.ensure(stream, c, n, spans)?;
+        let emb = self.embed(ids, spans)?;
         let b = self.built.as_mut().expect("built above");
         crate::transfer::upload_at(stream, &b.x, 0, crate::vvae::as_bytes(&emb))?;
 
@@ -289,6 +290,22 @@ impl TextEncoder {
     }
 }
 
+fn validate_ids(ids: &[i32], spans: &[Span<'_>], rows: usize) -> Result<()> {
+    for (i, &id) in ids.iter().enumerate() {
+        if id < 0
+            && spans
+                .iter()
+                .any(|sp| i >= sp.at.start && i < sp.at.start + sp.at.count)
+        {
+            continue;
+        }
+        if id < 0 || id as usize >= rows {
+            return invalid(format!("token id out of range: {id}"));
+        }
+    }
+    Ok(())
+}
+
 fn signature_spans(spans: &[Span<'_>]) -> Vec<VisionSpan> {
     spans.iter().map(|s| s.at).collect()
 }
@@ -296,6 +313,26 @@ fn signature_spans(spans: &[Span<'_>]) -> Vec<VisionSpan> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_validation_allows_negative_ids_only_inside_vision_spans() {
+        let spans = [Span {
+            at: VisionSpan {
+                start: 1,
+                count: 2,
+                merged_h: 1,
+                merged_w: 2,
+            },
+            merged: &[],
+            deepstack: &[],
+        }];
+        assert!(validate_ids(&[0, -1, -42, 3], &spans, 4).is_ok());
+        for ids in [[-1, 0, 0, 3], [0, 0, 0, -1], [0, 4, 0, 3], [0, 0, 0, 4]] {
+            assert!(validate_ids(&ids, &spans, 4).is_err(), "{ids:?}");
+        }
+        assert!(validate_ids(&[0, 3], &[], 4).is_ok());
+        assert!(validate_ids(&[-1], &[], 4).is_err());
+    }
 
     #[test]
     fn the_staging_buffer_holds_the_longest_span_allowed() {

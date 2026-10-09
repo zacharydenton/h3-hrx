@@ -196,6 +196,16 @@ latency comparisons. Alternate baseline/candidate runs on shared hardware and
 report timing variation; a noisy full render does not establish a regression
 or a speedup by itself.
 
+`cargo bench --bench stages -- conditioning/` measures a fresh stage-scoped
+session through text encoding and refinement, including model loading and
+compiler setup. It covers the selected prompt (including `H3_BENCH_PROMPT_FILE`)
+and the longer `tidal_sky` prompt, checking output digests across repetitions.
+Repeating a short prompt would not exercise the same scattered embedding reads.
+File and compiler caches remain available; use private
+checkpoint copies when controlling cold file-cache state. The warm `text_refiner`
+cases also include the selected prompt length. Whole-model loading alone does
+not reproduce the embedding reads that precede or follow weight preparation.
+
 Keep the Rust dependency revision, native HRX bundle and Loom compiler fixed
 within a comparison. Compiler changes can alter register pressure and occupancy
 even when the kernel source is unchanged. Record those identities with results

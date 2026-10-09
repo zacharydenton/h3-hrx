@@ -1,6 +1,7 @@
 mod support;
 use criterion::{criterion_group, criterion_main, Criterion};
-use h3_hrx::{Clip, Session, Shape, Tokenizer};
+use h3_hrx::{Clip, ResidencyPolicy, Session, SessionOptions, Shape, Tokenizer};
+use std::time::{Duration, Instant};
 use support::{measure, Runtime};
 
 #[derive(Clone, Copy)]
@@ -134,6 +135,18 @@ fn stages(c: &mut Criterion) {
             1,
         ),
     ];
+    let prompt_tokens = Tokenizer::new()
+        .unwrap()
+        .encode(support::prompt())
+        .unwrap()
+        .len();
+    cases.push((
+        format!("text_refiner/{prompt_tokens}_tokens"),
+        Stage::Text,
+        64,
+        64,
+        prompt_tokens,
+    ));
     for frames in [1, 5, 22] {
         cases.push((
             format!("video_encode/64x64x{frames}"),
@@ -194,6 +207,63 @@ fn stages(c: &mut Criterion) {
     }
     group.finish();
 }
+/// Fresh model residency, including checkpoint loading, compilation and text
+/// encoding/refinement. File-cache state is controlled separately by the caller.
+fn conditioning(c: &mut Criterion) {
+    let mut group = c.benchmark_group("conditioning");
+    group.sampling_mode(criterion::SamplingMode::Flat);
+    // A short prompt repeated to fill 512 rows touches too few distinct
+    // embedding pages to reproduce cold loading after scattered token reads.
+    for (case, prompt) in [
+        ("selected_prompt", support::prompt()),
+        ("long_prompt", include_str!("../docs/prompts/tidal_sky.txt")),
+    ] {
+        let digest = hrx::bundle::digest(prompt.as_bytes());
+        let name = format!(
+            "{}/cold_model/{case}/prompt-{}",
+            support::execution_id(),
+            &digest[..12]
+        );
+        let mut fixture = None;
+        group.bench_function(&name, |b| {
+            let (runtime, config, ids, expected) = fixture.get_or_insert_with(|| {
+                let ids = Tokenizer::new().unwrap().encode(prompt).unwrap();
+                if std::env::var_os("H3_BENCH_DETAILS").is_some() {
+                    let distinct = ids.iter().collect::<std::collections::BTreeSet<_>>().len();
+                    eprintln!("{name}: {} tokens, {distinct} distinct", ids.len());
+                }
+                (Runtime::new(), support::config(false), ids, None)
+            });
+            b.iter_custom(|iterations| {
+                let mut elapsed = Duration::ZERO;
+                for _ in 0..iterations {
+                    let start = Instant::now();
+                    let mut session = runtime.session(
+                        config.clone(),
+                        SessionOptions {
+                            residency: ResidencyPolicy::StageScoped,
+                            ..Default::default()
+                        },
+                    );
+                    let mut output = vec![0.; ids.len() * h3_hrx::model::HID];
+                    session.text_in(ids, &mut output).unwrap();
+                    elapsed += start.elapsed();
+                    let digest = support::digest(&output);
+                    if let Some(expected) = expected.as_ref() {
+                        assert_eq!(&digest, expected, "cold conditioning changed");
+                    } else {
+                        support::report_digest(&name, bytemuck::cast_slice(&output));
+                        *expected = Some(digest);
+                    }
+                }
+                support::report_elapsed(&name, iterations, elapsed);
+                elapsed
+            });
+        });
+    }
+    group.finish();
+}
+
 fn denoise(c: &mut Criterion) {
     let (profile, mut params) = support::params();
     let mut group = c.benchmark_group(format!(
@@ -236,5 +306,5 @@ fn denoise(c: &mut Criterion) {
     }
     group.finish();
 }
-criterion_group! { name = benches; config = support::criterion(); targets = stages, denoise }
+criterion_group! { name = benches; config = support::criterion(); targets = stages, conditioning, denoise }
 criterion_main!(benches);
