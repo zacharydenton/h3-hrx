@@ -15,6 +15,21 @@ use crate::stack::{Constants, Stack, StackDims};
 use crate::te::{Span, TextEncoder};
 use crate::weights::Weights;
 
+/// Await resident sampler work and retire its staging and budget leases.
+fn wait_for_step(stream: &mut hrx::Stream) -> Result<()> {
+    let started = std::time::Instant::now();
+    let mut completion = stream.submit()?;
+    while !completion.is_complete()? {
+        // Short tails finish promptly; long steps should not occupy a CPU core.
+        if started.elapsed() < std::time::Duration::from_micros(100) {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    Ok(())
+}
+
 /// The refiner: two H3-shaped blocks on bf16 rows with no rope, then a modulated norm.
 fn refiner_dims() -> StackDims {
     StackDims {
@@ -1328,7 +1343,7 @@ impl Dit {
             if let Some(cb) = progress.as_deref_mut() {
                 // Progress reports completed steps, including resident samplers.
                 if !host_sampler {
-                    stream.synchronize()?;
+                    wait_for_step(stream)?;
                 }
                 match cb(
                     step + 1,
@@ -1356,6 +1371,10 @@ impl Dit {
             }
         }
 
+        // Callers without progress callbacks also wait before reading device state.
+        if !host_sampler {
+            wait_for_step(stream)?;
+        }
         if resident_multistep {
             self.multistep
                 .as_ref()
