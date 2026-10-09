@@ -128,6 +128,34 @@ low.func.def target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_w
   return %packed
 }
 
+// Score multiplications have already quieted signaling NaNs; masks and seeds
+// are finite. Native maxima preserve number preference without quieting these
+// operands again. Keep the original reduction order and FP32 values.
+low.func.def target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_max_scores(%x: reg<amdgpu.vgpr x8>, %seed: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr>) asm {
+  %x0 = slice %x[0] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %m0 = v_max_f32 %seed, %x0
+  %x1 = slice %x[1] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %m1 = v_max_f32 %m0, %x1
+  %x2 = slice %x[2] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %m2 = v_max_f32 %m1, %x2
+  %x3 = slice %x[3] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %m3 = v_max_f32 %m2, %x3
+  %x4 = slice %x[4] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %m4 = v_max_f32 %m3, %x4
+  %x5 = slice %x[5] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %m5 = v_max_f32 %m4, %x5
+  %x6 = slice %x[6] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %m6 = v_max_f32 %m5, %x6
+  %x7 = slice %x[7] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %m7 = v_max_f32 %m6, %x7
+  return %m7
+}
+
+low.func.def target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_max_computed(%a: reg<amdgpu.vgpr>, %b: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr>) asm {
+  %m = v_max_f32 %a, %b
+  return %m
+}
+
 kernel.def target(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) export("h3_attention_i8qkhm_mha8_k64_lds_f16_wmma") @h3_attention_i8qkhm_mha8_k64_lds_f16_wmma(%token_count: index, %kv_head_count: index) {
   %c1 = index.constant 1 : index
   %c15 = index.constant 15 : index
@@ -800,16 +828,16 @@ kernel.def target(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) export("h3_a
       %ss7_d = scalar.mulf %sq7_d, %ks7_d : f32
       %ms7_d = scf.select %valid7_d, %ss7_d, %negative_large : f32
       %scaled_d = vector.from_elements %ms0_d, %ms1_d, %ms2_d, %ms3_d, %ms4_d, %ms5_d, %ms6_d, %ms7_d : vector<8xf32>
-      %local_max_a = vector.reduce<maxnumf> %scaled, %negative_large : vector<8xf32>, f32
-      %local_max_b = vector.reduce<maxnumf> %scaled_b, %negative_large : vector<8xf32>, f32
-      %local_max_c = vector.reduce<maxnumf> %scaled_c, %negative_large : vector<8xf32>, f32
-      %local_max_d = vector.reduce<maxnumf> %scaled_d, %negative_large : vector<8xf32>, f32
-      %local_max_ab = scalar.maxnumf %local_max_a, %local_max_b : f32
-      %local_max_cd = scalar.maxnumf %local_max_c, %local_max_d : f32
-      %local_max = scalar.maxnumf %local_max_ab, %local_max_cd : f32
+      %local_max_a = low.invoke @h3_max_scores(%scaled, %negative_large) : (vector<8xf32>, f32) -> (f32)
+      %local_max_b = low.invoke @h3_max_scores(%scaled_b, %negative_large) : (vector<8xf32>, f32) -> (f32)
+      %local_max_c = low.invoke @h3_max_scores(%scaled_c, %negative_large) : (vector<8xf32>, f32) -> (f32)
+      %local_max_d = low.invoke @h3_max_scores(%scaled_d, %negative_large) : (vector<8xf32>, f32) -> (f32)
+      %local_max_ab = low.invoke @h3_max_computed(%local_max_a, %local_max_b) : (f32, f32) -> (f32)
+      %local_max_cd = low.invoke @h3_max_computed(%local_max_c, %local_max_d) : (f32, f32) -> (f32)
+      %local_max = low.invoke @h3_max_computed(%local_max_ab, %local_max_cd) : (f32, f32) -> (f32)
       %other_max, %max_ok = kernel.subgroup.shuffle<xor> %local_max, %i32_16, %i32_32 : f32, i32, i32
-      %tile_max = scalar.maxnumf %local_max, %other_max : f32
-      %next_max = scalar.maxnumf %row_max, %tile_max : f32
+      %tile_max = low.invoke @h3_max_computed(%local_max, %other_max) : (f32, f32) -> (f32)
+      %next_max = low.invoke @h3_max_computed(%row_max, %tile_max) : (f32, f32) -> (f32)
       %max_vec = vector.splat %next_max : vector<8xf32>
       %delta = vector.subf %scaled, %max_vec : vector<8xf32>
       %weight = vector.exp2f<afn> %delta : vector<8xf32>
