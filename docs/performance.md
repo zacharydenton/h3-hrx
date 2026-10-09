@@ -316,10 +316,11 @@ that execution path; it is not a quality-qualified cache preset.
   prevent a cached lookup from replacing the transfer. `load_block` measures the
   four large projections of one DiT, text or video transformer block, with byte
   throughput and exact readback checks. OS file caches remain available.
-  `checkpoint/dit/load_model` loads every planned DiT tensor under one weight
-  owner and keeps the full set resident through validation. It includes native
-  storage startup, allocation, packing and completed transfers, but excludes
-  mapping/plan construction, inference kernel compilation and tensor validation.
+  `checkpoint/{dit,text}/load_model` loads every planned tensor of the selected
+  model under one weight owner and keeps the full set resident through validation.
+  It includes native storage startup, allocation, packing and completed transfers,
+  but excludes mapping/plan construction, inference kernel compilation and tensor
+  validation. The text plan also includes the vision tower's weights.
   It uses a 32 GiB allocation budget by default (`H3_BENCH_BUDGET_GIB` overrides
   it); allow additional host memory for one tensor's reference and readback.
   Validation releases row-source mappings after each tensor, unless
