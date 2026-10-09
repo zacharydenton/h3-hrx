@@ -437,7 +437,7 @@ impl Upscaler {
         let identity = vec![0.0; self.channels * 2];
         let modulation = modulation.unwrap_or(&identity);
         let mods = s.allocate(modulation.len() * 4)?;
-        crate::transfer::upload(s, mods.binding(), crate::vvae::as_bytes(modulation))?;
+        s.upload(mods.binding(), crate::vvae::as_bytes(modulation))?;
         let cfg = |stem: &str| {
             vec![
                 (format!("h3.{stem}.channels"), self.channels.to_string()),
@@ -515,8 +515,7 @@ impl Upscaler {
         let mut tmp = s.allocate(bytes)?;
         let stats = s.allocate(256)?;
         let src = s.allocate(input.len() * 2)?;
-        crate::transfer::upload(
-            s,
+        s.upload(
             src.binding(),
             &input
                 .iter()
@@ -556,15 +555,14 @@ impl Upscaler {
                 let (indices, weights) = resize_map(h, w, oh, ow);
                 let ix = s.allocate(indices.len() * 4)?;
                 let wt = s.allocate(weights.len() * 4)?;
-                crate::transfer::upload(
-                    s,
+                s.upload(
                     ix.binding(),
                     &indices
                         .iter()
                         .flat_map(|v| v.to_le_bytes())
                         .collect::<Vec<_>>(),
                 )?;
-                crate::transfer::upload(s, wt.binding(), crate::vvae::as_bytes(&weights))?;
+                s.upload(wt.binding(), crate::vvae::as_bytes(&weights))?;
                 pointwise(
                     s,
                     c,

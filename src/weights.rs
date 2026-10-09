@@ -419,26 +419,26 @@ impl Weights {
                             stage[dst..dst + row_bytes].copy_from_slice(&all[src..src + row_bytes]);
                             staged += 1;
                             if staged == per {
-                                crate::transfer::upload_at(
-                                    stream,
-                                    &buffer,
-                                    written * pitch_bytes,
-                                    &stage[..staged * pitch_bytes],
-                                )
-                                .map_err(|e| Error::Device(e.to_string()))?;
+                                stream
+                                    .upload_at(
+                                        &buffer,
+                                        written * pitch_bytes,
+                                        &stage[..staged * pitch_bytes],
+                                    )
+                                    .map_err(|e| Error::Device(e.to_string()))?;
                                 written += staged;
                                 staged = 0;
                             }
                         }
                     }
                     if staged > 0 {
-                        crate::transfer::upload_at(
-                            stream,
-                            &buffer,
-                            written * pitch_bytes,
-                            &stage[..staged * pitch_bytes],
-                        )
-                        .map_err(|e| Error::Device(e.to_string()))?;
+                        stream
+                            .upload_at(
+                                &buffer,
+                                written * pitch_bytes,
+                                &stage[..staged * pitch_bytes],
+                            )
+                            .map_err(|e| Error::Device(e.to_string()))?;
                         written += staged;
                     }
                     if written != *rows {

@@ -400,7 +400,7 @@ impl Classes {
     ) -> Result<()> {
         self.written = 0;
         checkable(values, classes, self.capacity)?;
-        crate::transfer::upload_at(stream, &self.buf, 0, bytemuck::cast_slice(values))?;
+        stream.upload_at(&self.buf, 0, bytemuck::cast_slice(values))?;
         self.written = values.len();
         self.bound = classes;
         Ok(())

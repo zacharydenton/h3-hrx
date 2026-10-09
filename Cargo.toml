@@ -78,8 +78,8 @@ name = "cache_calibrate"
 test = true
 
 [dependencies]
-# allocate_from avoids a staging copy and a redundant initialization pass for weights.
-hrx = { package = "hrx-rs", version = "0.10.0" }
+# Native large-transfer splitting landed after the 0.10.0 release.
+hrx = { package = "hrx-rs", git = "https://github.com/zacharydenton/hrx-rs.git", rev = "ddfbc1956cffa0ce53ed8fa35af8e7c1f094eed7" }
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"
 thiserror = "2"

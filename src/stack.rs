@@ -97,7 +97,7 @@ impl Constants {
     pub fn new(stream: &mut hrx::Stream) -> Result<Self> {
         let ones = stream.allocate(HID * 4)?;
         let row: Vec<u8> = (0..HID).flat_map(|_| 1.0f32.to_le_bytes()).collect();
-        crate::transfer::upload(stream, ones.binding(), &row)?;
+        stream.upload(ones.binding(), &row)?;
         let zeros = stream.allocate_zeroed(2 * TE_FFN * 4)?;
         Ok(Self {
             ones: Arc::new(ones),
@@ -713,13 +713,13 @@ impl Stack {
         } else {
             Some(stream.allocate(gu_bytes)?)
         };
-        crate::transfer::fill(stream, fused.slice(0, t * d.qkv() * 2), 0)?;
-        crate::transfer::fill(stream, attn.slice(0, t * attn_width * 2), 0)?;
+        stream.fill(fused.slice(0, t * d.qkv() * 2), 0)?;
+        stream.fill(attn.slice(0, t * attn_width * 2), 0)?;
         if let Some((q, k, v)) = &qkv_split {
-            crate::transfer::fill(stream, q.slice(0, t * d.inner() * 2), 0)?;
-            crate::transfer::fill(stream, k.slice(0, t * d.kv_inner() * 2), 0)?;
+            stream.fill(q.slice(0, t * d.inner() * 2), 0)?;
+            stream.fill(k.slice(0, t * d.kv_inner() * 2), 0)?;
             if let Some(v) = v {
-                crate::transfer::fill(stream, v.slice(0, t * d.kv_inner() * 2), 0)?;
+                stream.fill(v.slice(0, t * d.kv_inner() * 2), 0)?;
             }
         }
 
@@ -737,10 +737,10 @@ impl Stack {
             } else {
                 Some(stream.allocate_zeroed(vt_bytes)?)
             };
-            crate::transfer::fill(stream, qi.slice(0, t * d.heads * code_bytes), 0)?;
-            crate::transfer::fill(stream, ki.slice(0, t * d.heads * code_bytes), 0)?;
-            crate::transfer::fill(stream, qs.slice(0, t * d.heads * 4), 0)?;
-            crate::transfer::fill(stream, ks.slice(0, t * d.heads * 4), 0)?;
+            stream.fill(qi.slice(0, t * d.heads * code_bytes), 0)?;
+            stream.fill(ki.slice(0, t * d.heads * code_bytes), 0)?;
+            stream.fill(qs.slice(0, t * d.heads * 4), 0)?;
+            stream.fill(ks.slice(0, t * d.heads * 4), 0)?;
             Some(IntQk {
                 qi,
                 ki,
@@ -1392,7 +1392,7 @@ impl Stack {
             rows[i * 2 + 1] = (-*code).max(0);
         }
         let buffer = stream.allocate(rows.len() * 4)?;
-        crate::transfer::upload(stream, buffer.binding(), bytemuck::cast_slice(&rows))?;
+        stream.upload(buffer.binding(), bytemuck::cast_slice(&rows))?;
         self.world_attention = Some((kernel, buffer));
         Ok(())
     }

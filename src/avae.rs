@@ -447,7 +447,7 @@ impl AudioVae {
                 }
             }
             let d = self.dec.as_ref().expect("sized above");
-            crate::transfer::upload_at(stream, &d.input, 0, crate::vvae::as_bytes(&input))?;
+            stream.upload_at(&d.input, 0, crate::vvae::as_bytes(&input))?;
 
             let held_1 = self
                 .weights
@@ -546,18 +546,14 @@ impl AudioVae {
                 chan = cout;
                 let plane = chan * len;
                 let d = self.dec.as_ref().expect("sized above");
-                crate::transfer::copy(stream, d.h.slice(0, plane * 4), d.r.slice(0, plane * 4))?;
-                crate::transfer::fill(stream, d.acc.slice(0, plane * 4), 0)?;
+                stream.copy(d.h.slice(0, plane * 4), d.r.slice(0, plane * 4))?;
+                stream.fill(d.acc.slice(0, plane * 4), 0)?;
 
                 // three AMP blocks, averaged rather than summed
                 for (j, &kk) in RES_K.iter().enumerate() {
                     let r = i * 3 + j;
                     let d = self.dec.as_ref().expect("sized above");
-                    crate::transfer::copy(
-                        stream,
-                        d.hj.slice(0, plane * 4),
-                        d.h.slice(0, plane * 4),
-                    )?;
+                    stream.copy(d.hj.slice(0, plane * 4), d.h.slice(0, plane * 4))?;
                     for (dl, &dil) in RES_DIL.iter().enumerate() {
                         let act1 = format!("audio.res.{r}.act.{}.", 2 * dl);
                         let act2 = format!("audio.res.{r}.act.{}.", 2 * dl + 1);
@@ -787,7 +783,7 @@ impl AudioVae {
         for ch in 0..2 {
             host.fill(0.0);
             host[..n].copy_from_slice(&samples[ch * n..ch * n + n]);
-            crate::transfer::upload(stream, x0.binding(), crate::vvae::as_bytes(&host))?;
+            stream.upload(x0.binding(), crate::vvae::as_bytes(&host))?;
 
             let (mut len, mut dim) = (lp, 64usize);
             let hoisted_1 = w(stream, "aenc.conv_in.w", 64 * 7)?;

@@ -77,10 +77,9 @@ PM4 retains native graph batching. AQL and SDMA replay prepared commands in orde
 engine transitions wait for completion on the host. Device-clock graph profiling
 requires PM4 with compute copies; host profiling works with either engine.
 
-H3 splits fills, copies and staged uploads into at most 64 MiB per command.
-HRX 0.9's SDMA packets must fit the minimum 4 KiB ring together with wraparound
-padding; the compute path also has a 32-bit transfer byte count. These bounds
-apply to large activation buffers as well as weights and host inputs.
+H3 submits logical fills, copies and uploads directly to HRX. The pinned HRX
+revision splits native commands to fit SDMA rings and compute dispatch limits,
+including ranges larger than 4 GiB, and bounds host-upload staging internally.
 
 Addresses, constants and launch geometry are fixed at recording time; tensor
 contents can change in the same allocations. Dependencies order scratch reuse.

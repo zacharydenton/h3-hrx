@@ -74,9 +74,9 @@ fn matrices(
         rank_offset += spec.rank;
     }
     let a_buf = stream.allocate(a.len())?;
-    crate::transfer::upload(stream, a_buf.binding(), &a)?;
+    stream.upload(a_buf.binding(), &a)?;
     let b_buf = stream.allocate(b.len())?;
-    crate::transfer::upload(stream, b_buf.binding(), &b)?;
+    stream.upload(b_buf.binding(), &b)?;
     Ok((a_buf, b_buf))
 }
 

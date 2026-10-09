@@ -317,15 +317,14 @@ impl VideoVae {
         rotary_tables(grid.ft, grid.h, grid.w, &mut cos_h, &mut sin_h);
         let cos = stream.allocate(t * VAE_ROPE_HALF * 4)?;
         let sin = stream.allocate(t * VAE_ROPE_HALF * 4)?;
-        crate::transfer::upload(stream, cos.binding(), as_bytes(&cos_h))?;
-        crate::transfer::upload(stream, sin.binding(), as_bytes(&sin_h))?;
+        stream.upload(cos.binding(), as_bytes(&cos_h))?;
+        stream.upload(sin.binding(), as_bytes(&sin_h))?;
 
         // the output norm's (scale, shift) table: no scale, the checkpoint's bias as the shift
         let norm_table = stream.allocate(2 * VAE_HID * 4)?;
-        crate::transfer::fill(stream, norm_table.slice(0, VAE_HID * 4), 0)?;
+        stream.fill(norm_table.slice(0, VAE_HID * 4), 0)?;
         let bias = self.weights.at(stream, "vae.norm_out.b", VAE_HID * 4)?;
-        crate::transfer::copy(
-            stream,
+        stream.copy(
             norm_table.slice(VAE_HID * 4, VAE_HID * 4),
             bias.slice(0, VAE_HID * 4),
         )?;
@@ -409,8 +408,8 @@ impl VideoVae {
         let b = built.as_mut().expect("built above");
         grid.prepare_decoder_input(z, pq_w, pq_b, &mut b.stage_in);
 
-        crate::transfer::upload(stream, b.in16.binding(), as_bytes_f16(&b.stage_in))?;
-        crate::transfer::fill(stream, b.x.slice(0, nt * VAE_HID * 4), 0)?;
+        stream.upload(b.in16.binding(), as_bytes_f16(&b.stage_in))?;
+        stream.fill(b.x.slice(0, nt * VAE_HID * 4), 0)?;
 
         let w_in = weights.at(stream, "vae.proj_in.w", VAE_HID * VAE_KIN * 2)?;
         let b_in = weights.at(stream, "vae.proj_in.b", VAE_HID * 4)?;
@@ -428,8 +427,7 @@ impl VideoVae {
         )?;
         // the four register tokens follow the voxels, then a zero cls row
         let reg = weights.at(stream, "vae.register_tokens", VAE_REG * VAE_HID * 4)?;
-        crate::transfer::copy(
-            stream,
+        stream.copy(
             b.x.slice(n * VAE_HID * 4, VAE_REG * VAE_HID * 4),
             reg.slice(0, VAE_REG * VAE_HID * 4),
         )?;
@@ -896,7 +894,7 @@ impl VideoVae {
         .prepare_encoder_input(y0, x0, th, tw, inrows);
 
         let x = &scratch.x;
-        crate::transfer::upload(stream, x.binding(), as_bytes_f16(inrows))?;
+        stream.upload(x.binding(), as_bytes_f16(inrows))?;
         let mut h = &scratch.h;
         let y = &scratch.y;
         let mut tmp = &scratch.tmp;

@@ -77,7 +77,6 @@ pub mod session;
 mod tiles;
 pub mod tokenizer;
 mod trace;
-mod transfer;
 
 pub use cache::{CachePolicy, CacheThresholds};
 pub use dit::{

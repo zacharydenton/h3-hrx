@@ -201,12 +201,11 @@ impl Dit {
         // no rope: the identity rotation at every row
         let cos = stream.allocate(n * ROPE_HALF * 4)?;
         let sin = stream.allocate(n * ROPE_HALF * 4)?;
-        crate::transfer::upload(
-            stream,
+        stream.upload(
             cos.binding(),
             crate::vvae::as_bytes(&vec![1.0f32; n * ROPE_HALF]),
         )?;
-        crate::transfer::fill(stream, sin.slice(0, n * ROPE_HALF * 4), 0)?;
+        stream.fill(sin.slice(0, n * ROPE_HALF * 4), 0)?;
         self.refiner = Some(Refiner {
             stack,
             tokens: n,
@@ -958,8 +957,7 @@ impl Dit {
                 }
                 packed.extend_from_slice(&cache[tokens]);
             }
-            crate::transfer::upload_at(
-                stream,
+            stream.upload_at(
                 &self.seq.as_ref().expect("sized").x,
                 0,
                 crate::vvae::as_bytes(&packed),
@@ -981,8 +979,8 @@ impl Dit {
             // has no place for — 2 for a reference's video, 3 for its audio — so only the generated
             // span goes up, and the head binds it from row zero.
             seq.tcls.write(stream, &lay.tclass[lr..lr + na + nv], 2)?;
-            crate::transfer::upload_at(stream, &seq.cos, 0, crate::vvae::as_bytes(&cos))?;
-            crate::transfer::upload_at(stream, &seq.sin, 0, crate::vvae::as_bytes(&sin))?;
+            stream.upload_at(&seq.cos, 0, crate::vvae::as_bytes(&cos))?;
+            stream.upload_at(&seq.sin, 0, crate::vvae::as_bytes(&sin))?;
         }
         Ok(lay)
     }
@@ -1195,7 +1193,7 @@ impl Dit {
             }
             if res {
                 let seq = self.seq.as_ref().expect("sized above");
-                crate::transfer::upload_at(stream, &seq.in32, 0, crate::vvae::as_bytes(&arows))?;
+                stream.upload_at(&seq.in32, 0, crate::vvae::as_bytes(&arows))?;
             }
             let input = self
                 .euler
@@ -1205,7 +1203,7 @@ impl Dit {
             self.embed_f32(stream, prof, "audio in", lr, na, true, input)?;
             if res {
                 let seq = self.seq.as_ref().expect("sized above");
-                crate::transfer::upload_at(stream, &seq.in32, 0, crate::vvae::as_bytes(&vrows))?;
+                stream.upload_at(&seq.in32, 0, crate::vvae::as_bytes(&vrows))?;
             }
             let input = self
                 .euler
@@ -1218,8 +1216,7 @@ impl Dit {
                 self.inject_references(stream, prof, &lay, refs, kfs, p.seed, &mut in32)?;
                 let seq = self.seq.as_ref().expect("sized above");
                 let b = self.blocks.as_ref().expect("built above");
-                crate::transfer::copy(
-                    stream,
+                stream.copy(
                     b.text_copy.slice(0, lr * HID * 4),
                     seq.x.slice(0, lr * HID * 4),
                 )?;
@@ -1227,8 +1224,7 @@ impl Dit {
                 let seq = self.seq.as_ref().expect("sized above");
                 let b = self.blocks.as_ref().expect("built above");
                 // the blocks update x in place, so the text and reference rows are restored each step
-                crate::transfer::copy(
-                    stream,
+                stream.copy(
                     seq.x.slice(0, lr * HID * 4),
                     b.text_copy.slice(0, lr * HID * 4),
                 )?;
@@ -1515,8 +1511,7 @@ impl Dit {
                     }
                 }
                 let seq = self.seq.as_ref().expect("sized above");
-                crate::transfer::upload_at(
-                    stream,
+                stream.upload_at(
                     &seq.in32,
                     0,
                     crate::vvae::as_bytes(&in32[..sg.rows * AUDIO_CH]),
@@ -1535,8 +1530,7 @@ impl Dit {
                     seed,
                 );
                 let seq = self.seq.as_ref().expect("sized above");
-                crate::transfer::upload_at(
-                    stream,
+                stream.upload_at(
                     &seq.in32,
                     0,
                     crate::vvae::as_bytes(&in32[..sg.rows * VIDEO_PATCH]),
@@ -1684,7 +1678,7 @@ impl Dit {
                 if change.skip { "cached" } else { "full" }
             );
         }
-        crate::transfer::copy(stream, cb.prev.slice(0, n * 4), seq.x.slice(0, n * 4))?;
+        stream.copy(cb.prev.slice(0, n * 4), seq.x.slice(0, n * 4))?;
         if change.skip {
             axpy(
                 c,
@@ -1698,7 +1692,7 @@ impl Dit {
                 x,
             )?;
         } else {
-            crate::transfer::copy(stream, cb.xb0.slice(0, n * 4), seq.x.slice(0, n * 4))?;
+            stream.copy(cb.xb0.slice(0, n * 4), seq.x.slice(0, n * 4))?;
             // The host decision stays outside the recording. A miss replays
             // the same suffix; a hit only adds the cached residual.
             b.stack.forward_cached(
@@ -1714,7 +1708,7 @@ impl Dit {
                 None,
             )?;
             // the residual of blocks 1..49, which a skipped step adds instead of running them
-            crate::transfer::copy(stream, cb.resid.slice(0, n * 4), seq.x.slice(0, n * 4))?;
+            stream.copy(cb.resid.slice(0, n * 4), seq.x.slice(0, n * 4))?;
             axpy(
                 c,
                 stream,
