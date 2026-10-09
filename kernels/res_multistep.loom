@@ -1,0 +1,130 @@
+// Resident ResMultistep, retaining CPU rounding boundaries and FP64 solver arithmetic.
+amdgpu.target<gfx1151> @h3_sampler_update_target {subgroup_size = 32}
+config.decl @h3.res_multistep.count : %value: index where [range(%value, 1, 1073741824)]
+config.decl @h3.res_multistep.channels : %value: index where [range(%value, 1, 128)]
+config.decl @h3.res_multistep.row_offset : %value: index where [range(%value, 0, 1073741824)]
+config.decl @h3.res_multistep.col_offset : %value: index where [range(%value, 0, 128)]
+config.decl @h3.res_multistep.head_rows : %value: index where [range(%value, 1, 1073741824)]
+
+// RDNA exposes FP64 FMA. Each call below represents exactly one rounded
+// multiply or add; do not fuse calls. Negative zero preserves a product's sign.
+low.func.def target<amdgpu.rdna3_5.core>(@h3_sampler_update_target) @h3_mul64(%a: reg<amdgpu.sgpr x2>, %b: reg<amdgpu.vgpr x2>) -> (reg<amdgpu.vgpr x2>) asm {
+  %lo = v_mov_b32 0
+  %hi = v_mov_b32 2147483648
+  %zero = concat(%lo, %hi) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+  %result = v_fma_f64 %a, %b, %zero
+  return %result
+}
+low.func.def target<amdgpu.rdna3_5.core>(@h3_sampler_update_target) @h3_add64(%a: reg<amdgpu.vgpr x2>, %b: reg<amdgpu.vgpr x2>) -> (reg<amdgpu.vgpr x2>) asm {
+  %lo = v_mov_b32 0
+  %hi = v_mov_b32 1072693248
+  %one = concat(%lo, %hi) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+  %result = v_fma_f64 %a, %one, %b
+  return %result
+}
+low.func.def target<amdgpu.rdna3_5.core>(@h3_sampler_update_target) @h3_sub64(%a: reg<amdgpu.vgpr x2>, %b: reg<amdgpu.vgpr x2>) -> (reg<amdgpu.vgpr x2>) asm {
+  %lo = v_mov_b32 0
+  %hi = v_mov_b32 1072693248
+  %one = concat(%lo, %hi) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+  %blo = slice %b[0] : reg<amdgpu.vgpr x2> -> reg<amdgpu.vgpr>
+  %bhi = slice %b[1] : reg<amdgpu.vgpr x2> -> reg<amdgpu.vgpr>
+  %sign = v_mov_b32 2147483648
+  %negative = v_xor_b32 %bhi, %sign
+  %nb = concat(%blo, %negative) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x2>
+  %result = v_fma_f64 %a, %one, %nb
+  return %result
+}
+config.decl @h3.res_multistep.second_order : %value: index where [range(%value, 0, 1)]
+
+kernel.def target(@h3_sampler_update_target) export("h3_res_multistep") @h3_res_multistep() {
+  %count = config.get @h3.res_multistep.count : index
+  %one = index.constant 1 : index
+  %threads = index.constant 256 : index
+  %round = index.constant 255 : index
+  %rounded = index.add %count, %round : index
+  %groups = index.div %rounded, %threads : index
+  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%threads, %one, %one) : index
+} launch(%alpha: f64, %beta: f64, %sigma64: f64, %decay: f64, %h: f64, %b1: f64, %b2: f64, %sigma: f32, %ratio: f32, %carry: f32, %x: buffer, %head: buffer, %history: buffer, %audio_input: buffer) {
+  %count = config.get @h3.res_multistep.count : index
+  %channels = config.get @h3.res_multistep.channels : index
+  %row_offset = config.get @h3.res_multistep.row_offset : index
+  %col_offset = config.get @h3.res_multistep.col_offset : index
+  %head_rows = config.get @h3.res_multistep.head_rows : index
+  %threads = index.constant 256 : index
+  %offset = index.constant 0 : offset
+  %group = kernel.workgroup.id<x> : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %group, %threads : index
+  %i = index.add %base, %lane : index
+  %xg = buffer.assume.memory_space<global> %x : buffer
+  %hg = buffer.assume.memory_space<global> %head : buffer
+  %xv = buffer.view %xg[%offset] : buffer -> view<[%count]xf32>
+  %hv = buffer.view %hg[%offset] : buffer -> view<[%head_rows]x128xf32>
+  %history_g = buffer.assume.memory_space<global> %history : buffer
+  %history_v = buffer.view %history_g[%offset] : buffer -> view<[%count]xf32>
+  %input_g = buffer.assume.memory_space<global> %audio_input : buffer
+  %input_v = buffer.view %input_g[%offset] : buffer -> view<[%count]xf32>
+  %audio_channels = index.constant 32 : index
+  %is_audio = index.cmp eq, %channels, %audio_channels : index
+  %second_order = config.get @h3.res_multistep.second_order : index
+  %c1 = index.constant 1 : index
+  %second = index.cmp eq, %second_order, %c1 : index
+  %active = index.cmp ult, %i, %count : index
+  scf.if %active {
+    %ii = index.assume %i [lt(%i, %count)] : index
+    %row0 = index.div %ii, %channels : index
+    %col0 = index.rem %ii, %channels : index
+    %row1 = index.add %row0, %row_offset : index
+    %col1 = index.add %col0, %col_offset : index
+    %row = index.assume %row1 [lt(%row1, %head_rows)] : index
+    %cols = index.constant 128 : index
+    %col = index.assume %col1 [lt(%col1, %cols)] : index
+    %xi = view.load %xv[%ii] : view<[%count]xf32> -> f32
+    %vi = view.load %hv[%row, %col] : view<[%head_rows]x128xf32> -> f32
+    %d = scf.if %is_audio -> (f32) {
+      %input = view.load %input_v[%ii] : view<[%count]xf32> -> f32
+      %input64 = scalar.extf %input : f32 to f64
+      %vi64 = scalar.extf %vi : f32 to f64
+      %yi64 = scalar.extf %xi : f32 to f64
+      %p = low.invoke @h3_mul64(%alpha, %input64) : (f64, f64) -> (f64)
+      %q = low.invoke @h3_mul64(%beta, %vi64) : (f64, f64) -> (f64)
+      %out = low.invoke @h3_sub64(%p, %q) : (f64, f64) -> (f64)
+      %scaled = low.invoke @h3_mul64(%sigma64, %out) : (f64, f64) -> (f64)
+      %den64 = low.invoke @h3_sub64(%yi64, %scaled) : (f64, f64) -> (f64)
+      %den = scalar.fptrunc %den64 : f64 to f32
+      scf.yield %den : f32
+    } else {
+      %sv = scalar.mulf %sigma, %vi : f32
+      %den = scalar.addf %xi, %sv : f32
+      scf.yield %den : f32
+    }
+    %next = scf.if %second -> (f32) {
+      %old = view.load %history_v[%ii] : view<[%count]xf32> -> f32
+      %old64 = scalar.extf %old : f32 to f64
+      %d64 = scalar.extf %d : f32 to f64
+      %x64 = scalar.extf %xi : f32 to f64
+      %p1 = low.invoke @h3_mul64(%b1, %d64) : (f64, f64) -> (f64)
+      %p2 = low.invoke @h3_mul64(%b2, %old64) : (f64, f64) -> (f64)
+      %sum = low.invoke @h3_add64(%p1, %p2) : (f64, f64) -> (f64)
+      %increment = low.invoke @h3_mul64(%h, %sum) : (f64, f64) -> (f64)
+      %decayed = low.invoke @h3_mul64(%decay, %x64) : (f64, f64) -> (f64)
+      %next64 = low.invoke @h3_add64(%decayed, %increment) : (f64, f64) -> (f64)
+      %next32 = scalar.fptrunc %next64 : f64 to f32
+      scf.yield %next32 : f32
+    } else {
+      %one = scalar.constant 1.0 : f32
+      %complement = scalar.subf %one, %ratio : f32
+      %rx = scalar.mulf %ratio, %xi : f32
+      %rd = scalar.mulf %complement, %d : f32
+      %next32 = scalar.addf %rx, %rd : f32
+      scf.yield %next32 : f32
+    }
+    view.store %d, %history_v[%ii] : f32, view<[%count]xf32>
+    scf.if %is_audio {
+      %carried = scalar.mulf %next, %carry : f32
+      view.store %carried, %input_v[%ii] : f32, view<[%count]xf32>
+    }
+    view.store %next, %xv[%ii] : f32, view<[%count]xf32>
+  }
+  kernel.return
+}

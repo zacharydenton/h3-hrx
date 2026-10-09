@@ -1261,8 +1261,8 @@ mod tests {
             height: 256,
             width: 256,
             frames: 5,
-            steps: 2,
-            sampler: crate::Sampler::Euler,
+            steps: 4,
+            sampler: crate::Sampler::ResMultistep,
             seed: 7,
             ..DenoiseParams::default()
         };
@@ -1297,6 +1297,28 @@ mod tests {
         );
         let retained = residency.statistics().reserved_bytes;
         assert!(retained > 1 << 30);
+        // Cancellation leaves retained solver buffers in place; a new request
+        // must overwrite latents and restart without consuming stale history.
+        let cancelled = session.denoise(
+            &ids,
+            &p,
+            Noise::default(),
+            &[],
+            &[],
+            Some(&mut |_, _, _| Control::Cancel),
+        );
+        assert!(matches!(cancelled, Err(crate::Error::Cancelled)));
+        let restarted = session
+            .denoise(&ids, &p, Noise::default(), &[], &[], None)
+            .unwrap();
+        assert_eq!(
+            crate::vvae::as_bytes(&restarted.video),
+            crate::vvae::as_bytes(&expected.video)
+        );
+        assert_eq!(
+            crate::vvae::as_bytes(&restarted.audio),
+            crate::vvae::as_bytes(&expected.audio)
+        );
         session
             .scheduled(|state| {
                 state.options.residency = ResidencyPolicy::StageScoped;

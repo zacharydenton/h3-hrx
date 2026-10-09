@@ -286,6 +286,8 @@ fn denoise(c: &mut Criterion) {
                     .denoise(&ids, &params, h3_hrx::Noise::default(), &[], &[], None)
                     .unwrap();
                 let expected = (support::digest(&out.video), support::digest(&out.audio));
+                support::report_digest("denoise video", bytemuck::cast_slice(&out.video));
+                support::report_digest("denoise audio", bytemuck::cast_slice(&out.audio));
                 (runtime, session, ids, expected)
             });
             measure(

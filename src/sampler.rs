@@ -8,6 +8,7 @@ use crate::model::*;
 
 pub(crate) mod device;
 pub(crate) mod er_sde;
+pub(crate) mod resident;
 
 /// The reference the resident sampler is checked against; nothing dispatches it.
 #[cfg(test)]
@@ -49,6 +50,7 @@ pub fn denoised_audio(
     result
 }
 
+#[cfg(test)]
 pub(crate) fn denoised_audio_into(
     y: &[f32],
     x_a: &[f32],
@@ -70,6 +72,7 @@ pub(crate) fn denoised_audio_into(
 /// The first step, and any step landing on sigma zero, falls back to Euler because there is no previous
 /// denoised estimate to extrapolate from. Otherwise this is the second-order multistep of
 /// arXiv:2308.02157 in `t = -log sigma`, computed entirely in `f64`.
+#[cfg(test)]
 pub fn advance(x: &mut [f32], d: &[f32], old: Option<&[f32]>, sigmas: &[f32], step: usize) {
     let (sigma, sigma_next) = (sigmas[step], sigmas[step + 1]);
     let r = sigma_next / sigma;

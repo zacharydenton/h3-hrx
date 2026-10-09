@@ -88,6 +88,7 @@ pub struct Dit {
     suffix_graph: Option<hrx::GraphExec>,
     cache: Option<CacheBuffers>,
     euler: Option<crate::sampler::device::Euler>,
+    multistep: Option<crate::sampler::resident::Multistep>,
 }
 
 impl Dit {
@@ -127,6 +128,7 @@ impl Dit {
             suffix_graph: None,
             cache: None,
             euler: None,
+            multistep: None,
         })
     }
 
@@ -1048,6 +1050,8 @@ impl Dit {
             sh.audio_t as usize,
         );
         let res = refinement.is_some() || p.sampler == Sampler::ResMultistep;
+        let host_sampler = refinement.is_some();
+        let resident_multistep = res && !host_sampler;
         let (shift_v, shift_a) = (
             if p.video_shift > 0.0 {
                 p.video_shift
@@ -1121,13 +1125,23 @@ impl Dit {
             .map(|_| crate::sampler::er_sde::ErSde::new(vrows.len(), p.seed.wrapping_add(1)));
         // carry = sigma_a / sigma_v is one at sigma_v = 1, so the carried variable starts as the noise
         let mut yrows = if res { arows.clone() } else { Vec::new() };
-        // Multistep reuses all host workspaces; Euler keeps its evolving latents on GPU.
-        let host_v = if res { vrows.len() } else { 0 };
-        let host_a = if res { arows.len() } else { 0 };
-        let (mut old_v, mut old_a) = (vec![0.0; host_v], vec![0.0; host_a]);
-        let (mut den_v, mut den_a) = (vec![0.0; host_v], vec![0.0; host_a]);
-        let (mut vout, mut aout) = (vec![0.0; host_v], vec![0.0; host_a]);
-        if !res {
+        // ErSDE retains its CPU noise sequence. Ordinary samplers keep evolving
+        // latents and, for ResMultistep, denoised history on the device.
+        let host_v = if host_sampler { vrows.len() } else { 0 };
+        let mut den_v = vec![0.0; host_v];
+        let mut vout = vec![0.0; host_v];
+        if resident_multistep {
+            self.euler = None;
+            if !self.multistep.as_ref().is_some_and(|e| e.matches(na, nv)) {
+                self.multistep = None;
+                self.multistep = Some(crate::sampler::resident::Multistep::new(stream, c, na, nv)?);
+            }
+            self.multistep
+                .as_ref()
+                .expect("ResMultistep prepared")
+                .upload(stream, &arows, &vrows, sa.sigmas[0] / sv.sigmas[0])?;
+        } else if !res {
+            self.multistep = None;
             if !self.euler.as_ref().is_some_and(|e| e.matches(na, nv)) {
                 self.euler = None;
                 self.euler = Some(crate::sampler::device::Euler::new(stream, c, na, nv)?);
@@ -1136,6 +1150,9 @@ impl Dit {
                 .as_ref()
                 .expect("Euler prepared")
                 .upload(stream, &arows, &vrows)?;
+        } else {
+            self.euler = None;
+            self.multistep = None;
         }
 
         crate::trace::event("schedule", || {
@@ -1170,7 +1187,7 @@ impl Dit {
         }
         let started = std::time::Instant::now();
         let mut in32 = vec![0.0f32; in_rows * VIDEO_PATCH];
-        let mut out32 = vec![0.0f32; if res { generated * FINAL_N } else { 0 }];
+        let mut out32 = vec![0.0f32; if host_sampler { generated * FINAL_N } else { 0 }];
         // Retain the curve independently across the mutable block execution below.
         let curve = self.cond.as_ref().expect("ready").curve.clone();
 
@@ -1185,13 +1202,7 @@ impl Dit {
             self.build_mods(stream, (&tv, &ta, &tcv, &tca))?;
 
             // audio rows then video rows, each through its f32 patch projection
-            if res && refinement.is_none() {
-                let carry = sa.sigmas[step] / sv.sigmas[step];
-                for (x, y) in arows.iter_mut().zip(&yrows) {
-                    *x = y * carry;
-                }
-            }
-            if res {
+            if host_sampler {
                 let seq = self.seq.as_ref().expect("sized above");
                 stream.upload_at(&seq.in32, 0, crate::vvae::as_bytes(&arows))?;
             }
@@ -1199,9 +1210,15 @@ impl Dit {
                 .euler
                 .as_ref()
                 .filter(|_| !res)
-                .map(|e| e.audio.binding());
+                .map(|e| e.audio.binding())
+                .or_else(|| {
+                    self.multistep
+                        .as_ref()
+                        .filter(|_| resident_multistep)
+                        .map(|e| e.audio.binding())
+                });
             self.embed_f32(stream, prof, "audio in", lr, na, true, input)?;
-            if res {
+            if host_sampler {
                 let seq = self.seq.as_ref().expect("sized above");
                 stream.upload_at(&seq.in32, 0, crate::vvae::as_bytes(&vrows))?;
             }
@@ -1209,7 +1226,13 @@ impl Dit {
                 .euler
                 .as_ref()
                 .filter(|_| !res)
-                .map(|e| e.video.binding());
+                .map(|e| e.video.binding())
+                .or_else(|| {
+                    self.multistep
+                        .as_ref()
+                        .filter(|_| resident_multistep)
+                        .map(|e| e.video.binding())
+                });
             self.embed_f32(stream, prof, "video in", lr + na, nv, false, input)?;
 
             if step == 0 {
@@ -1268,11 +1291,23 @@ impl Dit {
                     seq.x.slice(lr * HID * 4, generated * HID * 4),
                     seq.out32.binding(),
                 )?;
-                if res {
+                if host_sampler {
                     stream.read_blocking(
                         seq.out32.slice(0, generated * FINAL_N * 4),
                         crate::vvae::as_bytes_mut(&mut out32),
                     )?;
+                } else if resident_multistep {
+                    self.multistep
+                        .as_ref()
+                        .expect("ResMultistep prepared")
+                        .step(
+                            stream,
+                            seq.out32.binding(),
+                            &sv.sigmas,
+                            &sa.sigmas,
+                            step,
+                            ascale,
+                        )?;
                 } else {
                     self.euler.as_ref().expect("Euler prepared").step(
                         stream,
@@ -1283,32 +1318,16 @@ impl Dit {
                 }
             }
 
-            if res {
+            if let Some(er) = &mut er {
                 for (i, value) in vout.iter_mut().enumerate() {
                     *value = out32[(na + i / VIDEO_PATCH) * FINAL_N + i % VIDEO_PATCH];
                 }
-                for (i, value) in aout.iter_mut().enumerate() {
-                    *value = out32[(i / AUDIO_CH) * FINAL_N + VIDEO_PATCH + i % AUDIO_CH];
-                }
-                let (sg_v, sg_a) = (sv.sigmas[step], sa.sigmas[step]);
-                crate::sampler::denoised_video_into(&vrows, &vout, sg_v, &mut den_v);
-                if let Some(er) = &mut er {
-                    er.advance(&mut vrows, &den_v, &sv.sigmas, step);
-                } else {
-                    crate::sampler::denoised_audio_into(
-                        &yrows, &arows, &aout, sg_v, sg_a, ascale, &mut den_a,
-                    );
-                    let previous_v = (step > 0).then_some(old_v.as_slice());
-                    let previous_a = (step > 0).then_some(old_a.as_slice());
-                    crate::sampler::advance(&mut vrows, &den_v, previous_v, &sv.sigmas, step);
-                    crate::sampler::advance(&mut yrows, &den_a, previous_a, &sv.sigmas, step);
-                    std::mem::swap(&mut old_v, &mut den_v);
-                    std::mem::swap(&mut old_a, &mut den_a);
-                }
+                crate::sampler::denoised_video_into(&vrows, &vout, sv.sigmas[step], &mut den_v);
+                er.advance(&mut vrows, &den_v, &sv.sigmas, step);
             }
             if let Some(cb) = progress.as_deref_mut() {
-                // Progress reports completed steps, even when Euler stays on the GPU.
-                if !res {
+                // Progress reports completed steps, including resident samplers.
+                if !host_sampler {
                     stream.synchronize()?;
                 }
                 match cb(
@@ -1337,7 +1356,12 @@ impl Dit {
             }
         }
 
-        if !res {
+        if resident_multistep {
+            self.multistep
+                .as_ref()
+                .expect("ResMultistep prepared")
+                .download(stream, &mut yrows, &mut vrows)?;
+        } else if !res {
             self.euler
                 .as_ref()
                 .expect("Euler prepared")
@@ -1773,6 +1797,7 @@ mod tests {
             suffix_graph: None,
             cache: None,
             euler: None,
+            multistep: None,
         };
         dit.ensure_seq(&mut stream, 1).unwrap();
         let capacity = dit.seq.as_ref().unwrap().capacity;

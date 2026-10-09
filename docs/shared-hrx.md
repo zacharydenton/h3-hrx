@@ -1,7 +1,7 @@
 # Shared HRX integration
 
 H3 uses `hrx-rs` for native loading, allocation, dispatch, graphs, compilation and
-artifact caching. H3 uses the published HRX 0.10.0 crate.
+artifact caching. H3 pins a post-0.10.0 revision for native large-transfer support.
 Model code owns tensor
 layouts, source selection and numerical behavior; `Session` is the public API.
 H3 does not enable HRX's optional NPU feature.
@@ -24,14 +24,14 @@ Caches live under `$XDG_CACHE_HOME/hrx`, or `~/.cache/hrx` when unset.
 `hrx gc [DAYS]` removes obsolete bundles and kernels unused for that many days
 (default 30). Cache hits refresh last-use timestamps.
 
-For local HRX development, override the registry dependency without changing the
+For local HRX development, override the pinned dependency without changing the
 manifest or committing a local lockfile:
 
 ```sh
-cargo check --config 'patch.crates-io.hrx-rs.path="../hrx-rs"'
+cargo check --config 'patch."https://github.com/zacharydenton/hrx-rs.git".hrx-rs.path="../hrx-rs"'
 ```
 
-CI and package verification use the published dependency recorded in `Cargo.lock`.
+CI uses the revision recorded in `Cargo.lock`.
 
 ## Compilation and dispatch
 
@@ -62,6 +62,12 @@ Packing arrays of at least 16 MiB uses two CPU workers writing disjoint row rang
 of the same host buffer; smaller arrays use one worker.
 `Stream::read_blocking` waits for readback completion. Normal inference does not
 synchronize around every kernel; `H3_PROFILE=1` does, changing timing.
+
+Euler and ResMultistep keep evolving latents on the device. ResMultistep also
+retains its denoised history, preserving FP32 first/final updates and separately
+rounded FP64 intermediate arithmetic. Schedule coefficients remain on the CPU.
+ErSDE retains its CPU solver and noise sequence. Progress callbacks wait for each
+reported evaluation to complete.
 
 ## Graph execution
 

@@ -16,7 +16,7 @@ cargo package --locked
 ```
 
 CPU CI runs these checks. Packaging verifies that the embedded kernels and
-tokenizer are included and the archive builds against published HRX 0.10.0.
+tokenizer are included and the archive builds against its published dependencies.
 
 On Strix Halo with the native bundle, checkpoints and reference dumps available:
 
@@ -40,7 +40,10 @@ h3 --width 864 --height 480 --frames 124 --steps 31 --seed 7 \
 
 ## Publication
 
-H3 depends on the published HRX 0.10.0 crate and its pinned native bundle.
+H3 currently pins an unreleased HRX revision for native large transfers.
+`cargo package` is blocked until that change is available in a published HRX
+release and H3 selects it. Adding a 0.10.0 version alongside the Git pin is
+insufficient: Cargo would strip the pin and package the older transfer behavior.
 Verify the package without local dependency overrides before publishing.
 
 Check the version, package contents, README links, Apache-2.0 code license,

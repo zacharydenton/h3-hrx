@@ -1,5 +1,4 @@
-//! Resident Euler latents. Multistep keeps its f64 CPU implementation until the
-//! packaged Loom compiler supports the required f64 operations on gfx1151.
+//! Resident Euler latents.
 
 use crate::compile::Compiler;
 use crate::error::{invalid, Result};
