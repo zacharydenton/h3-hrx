@@ -674,73 +674,89 @@ fn float_matmul_addresses_rows_past_32768() {
 )]
 fn vision_bf16_matmuls_match_rounded_operands_and_epilogues() {
     let mut h = Harness::new();
-    let (m, k, n) = (65usize, 128usize, 64usize);
-    let input = values(m * k, 0.5);
-    let w: Vec<_> = values(n * k, 0.1).into_iter().map(bf16::from_f32).collect();
-    let b = values(n, 0.1);
-    for kind in ["bias", "gelu", "gelu_erf", "resid"] {
-        eprintln!("vision epilogue: {kind}");
-        let a: Vec<_> = input
-            .iter()
-            .map(|&x| {
-                if kind == "resid" {
-                    bf16::from_f32(f16::from_f32(x).to_f32()).to_f64()
-                } else {
-                    bf16::from_f32(x).to_f64()
-                }
-            })
-            .collect();
-        let residual: Vec<_> = values(m * n, 0.5).into_iter().map(f16::from_f32).collect();
-        let lambda = values(n, 0.3);
-        let want: Vec<_> = (0..m * n)
-            .map(|i| {
-                let (r, c) = (i / n, i % n);
-                let v = b[c] as f64
-                    + (0..k)
-                        .map(|j| a[r * k + j] * w[c * k + j].to_f64())
-                        .sum::<f64>();
-                match kind {
-                    "gelu" => {
-                        0.5 * v * (1. + (0.7978845608028654 * (v + 0.044715 * v.powi(3))).tanh())
+    for (m, k, n) in [
+        (1usize, 32usize, 64usize),
+        (17, 64, 128),
+        (65, 96, 64),
+        (65, 128, 64),
+        (129, 192, 128),
+        (129, 256, 128),
+    ] {
+        let input = values(m * k, 0.5);
+        let w: Vec<_> = values(n * k, 0.1).into_iter().map(bf16::from_f32).collect();
+        let b = values(n, 0.1);
+        for kind in ["bias", "gelu", "gelu_erf", "resid"] {
+            eprintln!("vision epilogue: {kind} {m}x{k}x{n}");
+            let a: Vec<_> = input
+                .iter()
+                .map(|&x| {
+                    if kind == "resid" {
+                        bf16::from_f32(f16::from_f32(x).to_f32()).to_f64()
+                    } else {
+                        bf16::from_f32(x).to_f64()
                     }
-                    "gelu_erf" => 0.5 * v * (1. + libm::erf(v / std::f64::consts::SQRT_2)),
-                    "resid" => residual[i].to_f64() + lambda[c] as f64 * v,
-                    _ => v,
-                }
-            })
-            .collect();
-        let mut data = if kind == "resid" {
-            vec![
-                bytes(&input.iter().copied().map(f16::from_f32).collect::<Vec<_>>()),
-                bytes(&w),
-                bytes(&b),
-                bytes(&residual),
-                bytes(&lambda),
-            ]
-        } else {
-            vec![bytes(&input), bytes(&w), bytes(&b), vec![0; m * n * 4]]
-        };
-        let stem = format!("matmul_{kind}_bf16_wmma");
-        let out = h.run_module(
-            if kind == "resid" {
-                &stem
+                })
+                .collect();
+            let residual: Vec<_> = values(m * n, 0.5).into_iter().map(f16::from_f32).collect();
+            let lambda = values(n, 0.3);
+            let want: Vec<_> = (0..m * n)
+                .map(|i| {
+                    let (r, c) = (i / n, i % n);
+                    let v = b[c] as f64
+                        + (0..k)
+                            .map(|j| a[r * k + j] * w[c * k + j].to_f64())
+                            .sum::<f64>();
+                    match kind {
+                        "gelu" => {
+                            0.5 * v
+                                * (1. + (0.7978845608028654 * (v + 0.044715 * v.powi(3))).tanh())
+                        }
+                        "gelu_erf" => 0.5 * v * (1. + libm::erf(v / std::f64::consts::SQRT_2)),
+                        "resid" => residual[i].to_f64() + lambda[c] as f64 * v,
+                        _ => v,
+                    }
+                })
+                .collect();
+            let mut data = if kind == "resid" {
+                vec![
+                    bytes(&input.iter().copied().map(f16::from_f32).collect::<Vec<_>>()),
+                    bytes(&w),
+                    bytes(&b),
+                    bytes(&residual),
+                    bytes(&lambda),
+                ]
             } else {
-                "matmul_bf16_family"
-            },
-            &stem,
-            &cfg(&[("k_size", k), ("n_size", n)]),
-            [1, m.div_ceil(64) as u32, 1],
-            256,
-            &[m as u64],
-            &data,
-        );
-        let got = if kind == "resid" {
-            halves(&out[3], false)
-        } else {
-            floats(&out[3])
-        };
-        close(&got, &want, 2e-3, 4e-3);
-        data.clear();
+                vec![bytes(&input), bytes(&w), bytes(&b), vec![0; m * n * 4]]
+            };
+            let output_bytes = m * n * if kind == "resid" { 2 } else { 4 };
+            data[3].extend_from_slice(&[0xa5; 256]);
+            let stem = format!("matmul_{kind}_bf16_wmma");
+            let out = h.run_module(
+                if kind == "resid" {
+                    &stem
+                } else {
+                    "matmul_bf16_family"
+                },
+                &stem,
+                &cfg(&[("k_size", k), ("n_size", n)]),
+                [n.div_ceil(64) as u32, m.div_ceil(64) as u32, 1],
+                256,
+                &[m as u64],
+                &data,
+            );
+            let got = if kind == "resid" {
+                halves(&out[3][..output_bytes], false)
+            } else {
+                floats(&out[3][..output_bytes])
+            };
+            close(&got, &want, 2e-3, 4e-3);
+            assert!(out[3][output_bytes..].iter().all(|&v| v == 0xa5));
+            for i in 0..data.len() {
+                if i != 3 {
+                    assert_eq!(out[i], data[i], "{kind} changed input {i}");
+                }
+            }
+        }
     }
 }
 
@@ -755,7 +771,8 @@ fn vision_gelu_half_store_matches_separate_cast_and_preserves_guards() {
         (1usize, 32, 64),
         (63, 128, 128),
         (65, 128, 64),
-        (129, 1152, 4608),
+        (63, 96, 128),
+        (129, 1152, 4352),
     ] {
         let input = bytes(&values(m * k, 1.5));
         let weights = bytes(

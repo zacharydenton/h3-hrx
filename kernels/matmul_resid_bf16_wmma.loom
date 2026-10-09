@@ -1,27 +1,8 @@
-// vision tower rows as stored), A is narrowed to bf16 at LDS staging, bf16 x bf16 -> f32 WMMA; output and epilogue as the f16 twin.
-// The output projection / down projection with DINOv3's residual add and
-// LayerScale folded into the epilogue: x += lambda * (A@W + bias).
-//
-// This removes the branch tensor entirely -- it was written by the matmul
-// and read straight back by residual+norm, 20%% of that path's traffic --
-// and leaves a plain LayerNorm behind. The LayerNorm itself cannot move
-// here: it reduces over the whole 384-wide row and a workgroup owns only
-// 64 columns of it.
-// VARIANT: f16 in and f16 out.
-// C[m, n] = sum_k A[m, k] * W[n, k] + bias[n], through RDNA3 WMMA.
-//
-// A arrives as f32 and is narrowed to f16 while it is staged into LDS, so the
-// rest of the model keeps its f32 activations and only the weights change dtype.
-// W is f16 in memory, which also halves the weight bandwidth that dominates the
-// down and gate/up projections. Accumulation is f32 — the same arithmetic
-// hipBLASLt does for torch's fp16 path.
-//
-// One workgroup computes a 64x64 tile with 8 wave32s arranged 4x2; each wave
-// owns a 16x32 block, held as two 16x16 accumulator fragments.
-//
-// LDS rows are padded from 32 to 40 f16 for the usual bank reason.
-//
-// N must be a multiple of 64 and K of 32. M is a runtime value, bounds-checked.
+// Vision residual projection: FP16 activations narrow to BF16 in LDS,
+// BF16 weights, FP32 WMMA accumulation, bias and LayerScale, FP16 output.
+// C[m, n] += lambda[n] * (sum_k A[m, k] * W[n, k] + bias[n]).
+// Eight wave32s compute a 64x64 tile; each wave owns two 16x16 fragments.
+// N must be a multiple of 64 and K of 32. M is bounds-checked.
 
 amdgpu.target<gfx11-generic> @h3_matmul_resid_gfx11 {subgroup_size = 32}
 
@@ -52,13 +33,21 @@ kernel.def target(@h3_matmul_resid_gfx11) export("h3_matmul_resid_bf16_wmma") @h
   %c8 = index.constant 8 : index
   %c16 = index.constant 16 : index
   %c32 = index.constant 32 : index
-  %c40 = index.constant 40 : index
   %c64 = index.constant 64 : index
   %c256 = index.constant 256 : index
   %c0_offset = index.constant 0 : offset
-  %a_stage_bytes = index.constant 5120 : offset
-  %w_stage_bytes = index.constant 5120 : offset
-  %result_stage_bytes = index.constant 8192 : offset
+  // Use four WMMA steps per staging barrier when K is divisible by 64;
+  // retain the 32-wide tile for the remaining supported K dimensions.
+  %k_remainder = index.rem %k_size, %c64 : index
+  %k_aligned = index.cmp eq, %k_remainder, %c0 : index
+  %tile_k = scf.select %k_aligned, %c64, %c32 : index
+  %tile_pitch = index.add %tile_k, %c8 : index
+  %load_packets = index.div %tile_k, %c4 : index
+  %load_rows = index.div %c256, %load_packets : index
+  %row_passes = index.div %c64, %load_rows : index
+  %row_bytes = index.constant 128 : offset
+  %a_stage_bytes = index.scale %tile_pitch, %row_bytes : index, offset -> offset
+  %w_stage_bytes = index.scale %tile_pitch, %row_bytes : index, offset -> offset
   %wave_result_bytes = index.constant 1024 : offset
   %m = index.constant 16 : index
   %n = index.constant 16 : index
@@ -92,31 +81,31 @@ kernel.def target(@h3_matmul_resid_gfx11) export("h3_matmul_resid_bf16_wmma") @h
   %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_size]x[%n_size]xf16>
   %lambda_view = buffer.view %lambda_global[%c0_offset] : buffer -> view<[%n_size]xf32>
 
-  %a_stage = buffer.alloca<workgroup> align(16) %a_stage_bytes : buffer
-  %w_stage = buffer.alloca<workgroup> align(16) %w_stage_bytes : buffer
-  %result_stage = buffer.alloca<workgroup> align(16) %result_stage_bytes : buffer
-  %a_stage_view = buffer.view %a_stage[%c0_offset] : buffer -> view<64x40xbf16>
-  %w_stage_view = buffer.view %w_stage[%c0_offset] : buffer -> view<64x40xbf16>
+  // After the K loop's final workgroup barrier, the operand tiles become
+  // eight disjoint 1 KiB result tiles. Even the 32-wide fallback has 10 KiB.
+  %lds_bytes = index.add %a_stage_bytes, %w_stage_bytes : offset
+  %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
+  %a_stage_view = buffer.view %lds[%c0_offset] : buffer -> view<64x[%tile_pitch]xbf16>
+  %w_stage_view = buffer.view %lds[%a_stage_bytes] : buffer -> view<64x[%tile_pitch]xbf16>
   // The rhs fragment wants logical [k][n]; the staged weight tile is physically
-  // [n][k] with a 40-element row, so a strided layout reads it transposed.
-  %w_fragment_layout = encoding.layout.strided [1, %c40] : encoding<layout>
-  %w_fragment_view = buffer.view %w_stage[%c0_offset] : buffer -> view<32x64xbf16, %w_fragment_layout>
+  // [n][k] with eight padding elements per row, so a strided layout reads it transposed.
+  %w_fragment_layout = encoding.layout.strided [1, %tile_pitch] : encoding<layout>
+  %w_fragment_view = buffer.view %lds[%a_stage_bytes] : buffer -> view<[%tile_k]x64xbf16, %w_fragment_layout>
   %wave_result_offset = index.scale %subgroup, %wave_result_bytes : index, offset -> offset
-  %result_view = buffer.view %result_stage[%wave_result_offset] : buffer -> view<16x16xf32>
+  %result_view = buffer.view %lds[%wave_result_offset] : buffer -> view<16x16xf32>
 
-  %load_packet = index.rem %workitem, %c8 : index
+  %load_packet = index.rem %workitem, %load_packets : index
   %load_k = index.mul %load_packet, %c4 : index
-  %load_row0 = index.div %workitem, %c8 : index
+  %load_row0 = index.div %workitem, %load_packets : index
   %load_row = index.assume %load_row0 [range(%load_row0, 0, 31)] : index
-  %load_row_high = index.add %load_row, %c32 : index
 
   %acc_init0 = vector.fragment<init> %zero_f32x8 shape [%m, %n] : vector<8xf32>
   %acc_init1 = vector.fragment<init> %zero_f32x8 shape [%m, %n] : vector<8xf32>
 
-  %acc0, %acc1 = scf.for %k_base = [%c0 to %k_size step %c32](%run0 = %acc_init0 : vector<8xf32>, %run1 = %acc_init1 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>) {
+  %acc0, %acc1 = scf.for %k_base = [%c0 to %k_size step %tile_k](%run0 = %acc_init0 : vector<8xf32>, %run1 = %acc_init1 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>) {
     %source_k = index.add %k_base, %load_k : index
-    scf.for %half = [%c0 to %c2 step %c1] {
-      %row_offset = index.mul %half, %c32 : index
+    scf.for %half = [%c0 to %row_passes step %c1] unroll {
+      %row_offset = index.mul %half, %load_rows : index
       %row = index.add %load_row, %row_offset : index
       %source_m = index.add %base_m, %row : index
       %m_in_range = index.cmp ult, %source_m, %m_size : index
@@ -129,17 +118,17 @@ kernel.def target(@h3_matmul_resid_gfx11) export("h3_matmul_resid_bf16_wmma") @h
       } else {
         scf.yield %zero_f16x4 : vector<4xbf16>
       }
-      vector.store %a_values, %a_stage_view[%row, %load_k] : vector<4xbf16>, view<64x40xbf16>
+      vector.store %a_values, %a_stage_view[%row, %load_k] : vector<4xbf16>, view<64x[%tile_pitch]xbf16>
       %source_n = index.add %base_n, %row : index
       %w_values = vector.load %w_view[%source_n, %source_k] : view<[%n_size]x[%k_size]xbf16> -> vector<4xbf16>
-      vector.store %w_values, %w_stage_view[%row, %load_k] : vector<4xbf16>, view<64x40xbf16>
+      vector.store %w_values, %w_stage_view[%row, %load_k] : vector<4xbf16>, view<64x[%tile_pitch]xbf16>
     }
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
-    %next0, %next1 = scf.for %k_half = [%c0 to %c32 step %c16](%half0 = %run0 : vector<8xf32>, %half1 = %run1 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>) unroll {
-      %lhs = vector.fragment.load<lhs> %a_stage_view[%wave_row, %k_half] shape [%m, %k] : view<64x40xbf16> -> vector<16xbf16>
-      %rhs0 = vector.fragment.load<rhs> %w_fragment_view[%k_half, %wave_col] shape [%k, %n] : view<32x64xbf16, %w_fragment_layout> -> vector<16xbf16>
-      %rhs1 = vector.fragment.load<rhs> %w_fragment_view[%k_half, %wave_col1] shape [%k, %n] : view<32x64xbf16, %w_fragment_layout> -> vector<16xbf16>
+    %next0, %next1 = scf.for %k_half = [%c0 to %tile_k step %c16](%half0 = %run0 : vector<8xf32>, %half1 = %run1 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>) unroll {
+      %lhs = vector.fragment.load<lhs> %a_stage_view[%wave_row, %k_half] shape [%m, %k] : view<64x[%tile_pitch]xbf16> -> vector<16xbf16>
+      %rhs0 = vector.fragment.load<rhs> %w_fragment_view[%k_half, %wave_col] shape [%k, %n] : view<[%tile_k]x64xbf16, %w_fragment_layout> -> vector<16xbf16>
+      %rhs1 = vector.fragment.load<rhs> %w_fragment_view[%k_half, %wave_col1] shape [%k, %n] : view<[%tile_k]x64xbf16, %w_fragment_layout> -> vector<16xbf16>
       %out0 = vector.mma %lhs, %rhs0, %half0 : vector<16xbf16>, vector<16xbf16>, vector<8xf32>
       %out1 = vector.mma %lhs, %rhs1, %half1 : vector<16xbf16>, vector<16xbf16>, vector<8xf32>
       scf.yield %out0, %out1 : vector<8xf32>, vector<8xf32>
