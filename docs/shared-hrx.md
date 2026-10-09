@@ -1,7 +1,7 @@
 # Shared HRX integration
 
 H3 uses `hrx-rs` for native loading, allocation, dispatch, graphs, compilation and
-artifact caching. H3 pins a post-0.10.0 revision for native large-transfer support.
+artifact caching. H3 requires HRX 0.10.1 or newer for native large-transfer support.
 Model code owns tensor
 layouts, source selection and numerical behavior; `Session` is the public API.
 H3 does not enable HRX's optional NPU feature.

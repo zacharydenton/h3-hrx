@@ -40,11 +40,8 @@ h3 --width 864 --height 480 --frames 124 --steps 31 --seed 7 \
 
 ## Publication
 
-H3 currently pins an unreleased HRX revision for native large transfers.
-`cargo package` is blocked until that change is available in a published HRX
-release and H3 selects it. Adding a 0.10.0 version alongside the Git pin is
-insufficient: Cargo would strip the pin and package the older transfer behavior.
-Verify the package without local dependency overrides before publishing.
+HRX 0.10.1 includes the native large-transfer support required by H3. Verify the
+package against published dependencies without local overrides before publishing.
 
 Check the version, package contents, README links, Apache-2.0 code license,
 separate model terms and [asset attribution](../assets/README.md).
