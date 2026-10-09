@@ -2002,13 +2002,21 @@ template.def<@h3.packed_swiglu_256> @h3_packed_swiglu_256(%m_size: index, %a: bu
   %cf14 = index.constant 14 : index
   %cf15 = index.constant 15 : index
   %c0_offset = index.constant 0 : offset
-  %lds_bytes = index.constant 30720 : offset
-  %w_stage_offset = index.constant 20480 : offset
+  %stage_words = index.div %k_step, %packed_per_word : index
+  %stage_pitch = index.add %stage_words, %c4 : index
+  %deep = index.cmp eq, %stage_words, %c32 : index
+  %packet_columns = index.div %stage_words, %c4 : index
+  %stage_rows = index.div %c256, %packet_columns : index
+  %all_rows_bytes = index.constant 1536 : offset
+  %a_rows_bytes = index.constant 1024 : offset
+  %lds_bytes = index.scale %stage_pitch, %all_rows_bytes : index, offset -> offset
+  %w_stage_offset = index.scale %stage_pitch, %a_rows_bytes : index, offset -> offset
   %wave_result_bytes = index.constant 2048 : offset
   %m = index.constant 16 : index
   %n = index.constant 16 : index
   %k = index.constant 16 : index
   %zero_i32x8 = vector.constant 0 : vector<8xi32>
+  %zero_packet = vector.constant 0 : vector<4xi32>
   %zero_i32x4 = vector.constant 0 : vector<4xi32>
   %i4_schema = template.apply<@h3.packed_schema>(%registers) : (index) -> (encoding<schema>)
 
@@ -2058,42 +2066,82 @@ template.def<@h3.packed_swiglu_256> @h3_packed_swiglu_256(%m_size: index, %a: bu
     %c_view32 = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_bounded]x[%n_half]xf32>
 
     %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
-    %a_stage = buffer.view %lds[%c0_offset] : buffer -> view<256x20xi32>
-    %w_stage = buffer.view %lds[%w_stage_offset] : buffer -> view<128x20xi32>
+    %a_stage = buffer.view %lds[%c0_offset] : buffer -> view<256x[%stage_pitch]xi32>
+    %w_stage = buffer.view %lds[%w_stage_offset] : buffer -> view<128x[%stage_pitch]xi32>
     %wave_result_offset = index.scale %subgroup, %wave_result_bytes : index, offset -> offset
     %result_view = buffer.view %lds[%wave_result_offset] : buffer -> view<16x16xi32>
 
-    // Staging map: packet p = workitem + 256*i covers row p/4, quad column (p%4)*4; i = 0..3 are A rows 0..255, i = 4, 5 are W rows 0..127.
-    %st_sub = index.rem %workitem, %c4 : index
+    // Stage four or eight packets per row, depending on the packed K depth.
+    %st_sub = index.rem %workitem, %packet_columns : index
     %st_quad = index.mul %st_sub, %c4 : index
-    %st_row_base = index.div %workitem, %c4 : index
+    %st_row_base = index.div %workitem, %packet_columns : index
     %k_quad_limit = index.sub %k_quads, %c4 : index
-    %st_arow0 = index.add %st_row_base, %c0 : index
+    %st_aoff0 = index.mul %stage_rows, %cf0 : index
+    %st_arow0 = index.add %st_row_base, %st_aoff0 : index
     %a_m0 = index.add %base_m, %st_arow0 : index
     %a_ok0 = index.cmp ult, %a_m0, %m_bounded : index
     %a_safe0 = scf.select %a_ok0, %a_m0, %c0 : index
     %a_row0 = index.assume %a_safe0 [lt(%a_safe0, %m_bounded)] : index
-    %st_arow1 = index.add %st_row_base, %c64 : index
+    %st_aoff1 = index.mul %stage_rows, %cf1 : index
+    %st_arow1 = index.add %st_row_base, %st_aoff1 : index
     %a_m1 = index.add %base_m, %st_arow1 : index
     %a_ok1 = index.cmp ult, %a_m1, %m_bounded : index
     %a_safe1 = scf.select %a_ok1, %a_m1, %c0 : index
     %a_row1 = index.assume %a_safe1 [lt(%a_safe1, %m_bounded)] : index
-    %st_arow2 = index.add %st_row_base, %c128 : index
+    %st_aoff2 = index.mul %stage_rows, %cf2 : index
+    %st_arow2 = index.add %st_row_base, %st_aoff2 : index
     %a_m2 = index.add %base_m, %st_arow2 : index
     %a_ok2 = index.cmp ult, %a_m2, %m_bounded : index
     %a_safe2 = scf.select %a_ok2, %a_m2, %c0 : index
     %a_row2 = index.assume %a_safe2 [lt(%a_safe2, %m_bounded)] : index
-    %st_arow3 = index.add %st_row_base, %c192 : index
+    %st_aoff3 = index.mul %stage_rows, %cf3 : index
+    %st_arow3 = index.add %st_row_base, %st_aoff3 : index
     %a_m3 = index.add %base_m, %st_arow3 : index
     %a_ok3 = index.cmp ult, %a_m3, %m_bounded : index
     %a_safe3 = scf.select %a_ok3, %a_m3, %c0 : index
     %a_row3 = index.assume %a_safe3 [lt(%a_safe3, %m_bounded)] : index
-    %st_wrow0 = index.add %st_row_base, %c0 : index
+    %st_aoff4 = index.mul %stage_rows, %cf4 : index
+    %st_arow4 = index.add %st_row_base, %st_aoff4 : index
+    %a_m4 = index.add %base_m, %st_arow4 : index
+    %a_ok4 = index.cmp ult, %a_m4, %m_bounded : index
+    %a_safe4 = scf.select %a_ok4, %a_m4, %c0 : index
+    %a_row4 = index.assume %a_safe4 [lt(%a_safe4, %m_bounded)] : index
+    %st_aoff5 = index.mul %stage_rows, %cf5 : index
+    %st_arow5 = index.add %st_row_base, %st_aoff5 : index
+    %a_m5 = index.add %base_m, %st_arow5 : index
+    %a_ok5 = index.cmp ult, %a_m5, %m_bounded : index
+    %a_safe5 = scf.select %a_ok5, %a_m5, %c0 : index
+    %a_row5 = index.assume %a_safe5 [lt(%a_safe5, %m_bounded)] : index
+    %st_aoff6 = index.mul %stage_rows, %cf6 : index
+    %st_arow6 = index.add %st_row_base, %st_aoff6 : index
+    %a_m6 = index.add %base_m, %st_arow6 : index
+    %a_ok6 = index.cmp ult, %a_m6, %m_bounded : index
+    %a_safe6 = scf.select %a_ok6, %a_m6, %c0 : index
+    %a_row6 = index.assume %a_safe6 [lt(%a_safe6, %m_bounded)] : index
+    %st_aoff7 = index.mul %stage_rows, %cf7 : index
+    %st_arow7 = index.add %st_row_base, %st_aoff7 : index
+    %a_m7 = index.add %base_m, %st_arow7 : index
+    %a_ok7 = index.cmp ult, %a_m7, %m_bounded : index
+    %a_safe7 = scf.select %a_ok7, %a_m7, %c0 : index
+    %a_row7 = index.assume %a_safe7 [lt(%a_safe7, %m_bounded)] : index
+    %st_woff0 = index.mul %stage_rows, %cf0 : index
+    %st_wrow0 = index.add %st_row_base, %st_woff0 : index
     %w_n0 = index.add %base_n, %st_wrow0 : index
     %w_row0 = index.assume %w_n0 [lt(%w_n0, %n_size)] : index
-    %st_wrow1 = index.add %st_row_base, %c64 : index
+    %st_woff1 = index.mul %stage_rows, %cf1 : index
+    %st_wrow1 = index.add %st_row_base, %st_woff1 : index
     %w_n1 = index.add %base_n, %st_wrow1 : index
     %w_row1 = index.assume %w_n1 [lt(%w_n1, %n_size)] : index
+    %st_woff2 = index.mul %stage_rows, %cf2 : index
+    %st_wrow2 = index.add %st_row_base, %st_woff2 : index
+    %w_n2 = index.add %base_n, %st_wrow2 : index
+    %w_safe2 = scf.select %deep, %w_n2, %base_n : index
+    %w_row2 = index.assume %w_safe2 [lt(%w_safe2, %n_size)] : index
+    %st_woff3 = index.mul %stage_rows, %cf3 : index
+    %st_wrow3 = index.add %st_row_base, %st_woff3 : index
+    %w_n3 = index.add %base_n, %st_wrow3 : index
+    %w_safe3 = scf.select %deep, %w_n3, %base_n : index
+    %w_row3 = index.assume %w_safe3 [lt(%w_safe3, %n_size)] : index
 
     // Operand rows this lane reads: A rows wave_row + 16i + lane16, W rows wave_col + 16j + lane16.
     %fa0 = index.add %wave_row, %lane16 : index
@@ -2113,17 +2161,43 @@ template.def<@h3.packed_swiglu_256> @h3_packed_swiglu_256(%m_size: index, %a: bu
     %ga1 = vector.load %a_view[%a_row1, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga2 = vector.load %a_view[%a_row2, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga3 = vector.load %a_view[%a_row3, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+    %ga4, %ga5, %ga6, %ga7 = scf.if %deep -> (vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>) {
+      %ga4_loaded = vector.load %a_view[%a_row4, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+      %ga5_loaded = vector.load %a_view[%a_row5, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+      %ga6_loaded = vector.load %a_view[%a_row6, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+      %ga7_loaded = vector.load %a_view[%a_row7, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+      scf.yield %ga4_loaded, %ga5_loaded, %ga6_loaded, %ga7_loaded : vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>
+    } else {
+      scf.yield %zero_packet, %zero_packet, %zero_packet, %zero_packet : vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>
+    }
     %gw0 = vector.load %w_view[%w_row0, %kq_first] : view<[%n_size]x[%k_quads]xi32> -> vector<4xi32>
     %gw1 = vector.load %w_view[%w_row1, %kq_first] : view<[%n_size]x[%k_quads]xi32> -> vector<4xi32>
+    %gw2, %gw3 = scf.if %deep -> (vector<4xi32>, vector<4xi32>) {
+      %gw2_loaded = vector.load %w_view[%w_row2, %kq_first] : view<[%n_size]x[%k_quads]xi32> -> vector<4xi32>
+      %gw3_loaded = vector.load %w_view[%w_row3, %kq_first] : view<[%n_size]x[%k_quads]xi32> -> vector<4xi32>
+      scf.yield %gw2_loaded, %gw3_loaded : vector<4xi32>, vector<4xi32>
+    } else {
+      scf.yield %zero_packet, %zero_packet : vector<4xi32>, vector<4xi32>
+    }
 
-    %acc00, %acc01, %acc02, %acc03, %acc10, %acc11, %acc12, %acc13, %acc20, %acc21, %acc22, %acc23, %acc30, %acc31, %acc32, %acc33, %a_last0, %a_last1, %a_last2, %a_last3, %w_last0, %w_last1 = scf.for %k_base = [%c0 to %k_size step %k_step](%r00 = %acc_init : vector<8xi32>, %r01 = %acc_init : vector<8xi32>, %r02 = %acc_init : vector<8xi32>, %r03 = %acc_init : vector<8xi32>, %r10 = %acc_init : vector<8xi32>, %r11 = %acc_init : vector<8xi32>, %r12 = %acc_init : vector<8xi32>, %r13 = %acc_init : vector<8xi32>, %r20 = %acc_init : vector<8xi32>, %r21 = %acc_init : vector<8xi32>, %r22 = %acc_init : vector<8xi32>, %r23 = %acc_init : vector<8xi32>, %r30 = %acc_init : vector<8xi32>, %r31 = %acc_init : vector<8xi32>, %r32 = %acc_init : vector<8xi32>, %r33 = %acc_init : vector<8xi32>, %ca0 = %ga0 : vector<4xi32>, %ca1 = %ga1 : vector<4xi32>, %ca2 = %ga2 : vector<4xi32>, %ca3 = %ga3 : vector<4xi32>, %cw0 = %gw0 : vector<4xi32>, %cw1 = %gw1 : vector<4xi32>) -> (vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>) {
+    %acc00, %acc01, %acc02, %acc03, %acc10, %acc11, %acc12, %acc13, %acc20, %acc21, %acc22, %acc23, %acc30, %acc31, %acc32, %acc33, %a_last0, %a_last1, %a_last2, %a_last3, %a_last4, %a_last5, %a_last6, %a_last7, %w_last0, %w_last1, %w_last2, %w_last3 = scf.for %k_base = [%c0 to %k_size step %k_step](%r00 = %acc_init : vector<8xi32>, %r01 = %acc_init : vector<8xi32>, %r02 = %acc_init : vector<8xi32>, %r03 = %acc_init : vector<8xi32>, %r10 = %acc_init : vector<8xi32>, %r11 = %acc_init : vector<8xi32>, %r12 = %acc_init : vector<8xi32>, %r13 = %acc_init : vector<8xi32>, %r20 = %acc_init : vector<8xi32>, %r21 = %acc_init : vector<8xi32>, %r22 = %acc_init : vector<8xi32>, %r23 = %acc_init : vector<8xi32>, %r30 = %acc_init : vector<8xi32>, %r31 = %acc_init : vector<8xi32>, %r32 = %acc_init : vector<8xi32>, %r33 = %acc_init : vector<8xi32>, %ca0 = %ga0 : vector<4xi32>, %ca1 = %ga1 : vector<4xi32>, %ca2 = %ga2 : vector<4xi32>, %ca3 = %ga3 : vector<4xi32>, %ca4 = %ga4 : vector<4xi32>, %ca5 = %ga5 : vector<4xi32>, %ca6 = %ga6 : vector<4xi32>, %ca7 = %ga7 : vector<4xi32>, %cw0 = %gw0 : vector<4xi32>, %cw1 = %gw1 : vector<4xi32>, %cw2 = %gw2 : vector<4xi32>, %cw3 = %gw3 : vector<4xi32>) -> (vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>) {
       // Stage what we were handed.
-      vector.store %ca0, %a_stage[%st_arow0, %st_quad] : vector<4xi32>, view<256x20xi32>
-      vector.store %ca1, %a_stage[%st_arow1, %st_quad] : vector<4xi32>, view<256x20xi32>
-      vector.store %ca2, %a_stage[%st_arow2, %st_quad] : vector<4xi32>, view<256x20xi32>
-      vector.store %ca3, %a_stage[%st_arow3, %st_quad] : vector<4xi32>, view<256x20xi32>
-      vector.store %cw0, %w_stage[%st_wrow0, %st_quad] : vector<4xi32>, view<128x20xi32>
-      vector.store %cw1, %w_stage[%st_wrow1, %st_quad] : vector<4xi32>, view<128x20xi32>
+      vector.store %ca0, %a_stage[%st_arow0, %st_quad] : vector<4xi32>, view<256x[%stage_pitch]xi32>
+      vector.store %ca1, %a_stage[%st_arow1, %st_quad] : vector<4xi32>, view<256x[%stage_pitch]xi32>
+      vector.store %ca2, %a_stage[%st_arow2, %st_quad] : vector<4xi32>, view<256x[%stage_pitch]xi32>
+      vector.store %ca3, %a_stage[%st_arow3, %st_quad] : vector<4xi32>, view<256x[%stage_pitch]xi32>
+      scf.if %deep {
+        vector.store %ca4, %a_stage[%st_arow4, %st_quad] : vector<4xi32>, view<256x[%stage_pitch]xi32>
+        vector.store %ca5, %a_stage[%st_arow5, %st_quad] : vector<4xi32>, view<256x[%stage_pitch]xi32>
+        vector.store %ca6, %a_stage[%st_arow6, %st_quad] : vector<4xi32>, view<256x[%stage_pitch]xi32>
+        vector.store %ca7, %a_stage[%st_arow7, %st_quad] : vector<4xi32>, view<256x[%stage_pitch]xi32>
+      }
+      vector.store %cw0, %w_stage[%st_wrow0, %st_quad] : vector<4xi32>, view<128x[%stage_pitch]xi32>
+      vector.store %cw1, %w_stage[%st_wrow1, %st_quad] : vector<4xi32>, view<128x[%stage_pitch]xi32>
+      scf.if %deep {
+        vector.store %cw2, %w_stage[%st_wrow2, %st_quad] : vector<4xi32>, view<128x[%stage_pitch]xi32>
+        vector.store %cw3, %w_stage[%st_wrow3, %st_quad] : vector<4xi32>, view<128x[%stage_pitch]xi32>
+      }
       kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
 
       // Prefetch the next step (zero past K) while the WMMAs run on this one.
@@ -2137,21 +2211,37 @@ template.def<@h3.packed_swiglu_256> @h3_packed_swiglu_256(%m_size: index, %a: bu
       %na1 = vector.load %a_view[%a_row1, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
       %na2 = vector.load %a_view[%a_row2, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
       %na3 = vector.load %a_view[%a_row3, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+      %na4, %na5, %na6, %na7 = scf.if %deep -> (vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>) {
+        %na4_loaded = vector.load %a_view[%a_row4, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+        %na5_loaded = vector.load %a_view[%a_row5, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+        %na6_loaded = vector.load %a_view[%a_row6, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+        %na7_loaded = vector.load %a_view[%a_row7, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
+        scf.yield %na4_loaded, %na5_loaded, %na6_loaded, %na7_loaded : vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>
+      } else {
+        scf.yield %zero_packet, %zero_packet, %zero_packet, %zero_packet : vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>
+      }
       %nw0 = vector.load %w_view[%w_row0, %kq_next] : view<[%n_size]x[%k_quads]xi32> -> vector<4xi32>
       %nw1 = vector.load %w_view[%w_row1, %kq_next] : view<[%n_size]x[%k_quads]xi32> -> vector<4xi32>
+      %nw2, %nw3 = scf.if %deep -> (vector<4xi32>, vector<4xi32>) {
+        %nw2_loaded = vector.load %w_view[%w_row2, %kq_next] : view<[%n_size]x[%k_quads]xi32> -> vector<4xi32>
+        %nw3_loaded = vector.load %w_view[%w_row3, %kq_next] : view<[%n_size]x[%k_quads]xi32> -> vector<4xi32>
+        scf.yield %nw2_loaded, %nw3_loaded : vector<4xi32>, vector<4xi32>
+      } else {
+        scf.yield %zero_packet, %zero_packet : vector<4xi32>, vector<4xi32>
+      }
 
       // Full unrolling preserves the source order of each staged substep.
-      %substeps = index.div %c16, %registers : index
+      %substeps = index.div %stage_words, %registers : index
       %o00_end, %o01_end, %o02_end, %o03_end, %o10_end, %o11_end, %o12_end, %o13_end, %o20_end, %o21_end, %o22_end, %o23_end, %o30_end, %o31_end, %o32_end, %o33_end = scf.for %sub = [%c0 to %substeps step %c1](%carry00 = %r00 : vector<8xi32>, %carry01 = %r01 : vector<8xi32>, %carry02 = %r02 : vector<8xi32>, %carry03 = %r03 : vector<8xi32>, %carry10 = %r10 : vector<8xi32>, %carry11 = %r11 : vector<8xi32>, %carry12 = %r12 : vector<8xi32>, %carry13 = %r13 : vector<8xi32>, %carry20 = %r20 : vector<8xi32>, %carry21 = %r21 : vector<8xi32>, %carry22 = %r22 : vector<8xi32>, %carry23 = %r23 : vector<8xi32>, %carry30 = %r30 : vector<8xi32>, %carry31 = %r31 : vector<8xi32>, %carry32 = %r32 : vector<8xi32>, %carry33 = %r33 : vector<8xi32>) -> (vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>) unroll {
         %sub_column = index.mul %sub, %registers : index
-        %u_da0 = vector.load %a_stage[%fa0, %sub_column] : view<256x20xi32> -> vector<[%registers]xi32>
-        %u_da1 = vector.load %a_stage[%fa1, %sub_column] : view<256x20xi32> -> vector<[%registers]xi32>
-        %u_da2 = vector.load %a_stage[%fa2, %sub_column] : view<256x20xi32> -> vector<[%registers]xi32>
-        %u_da3 = vector.load %a_stage[%fa3, %sub_column] : view<256x20xi32> -> vector<[%registers]xi32>
-        %u_db0 = vector.load %w_stage[%fb0, %sub_column] : view<128x20xi32> -> vector<[%registers]xi32>
-        %u_db1 = vector.load %w_stage[%fb1, %sub_column] : view<128x20xi32> -> vector<[%registers]xi32>
-        %u_db2 = vector.load %w_stage[%fb2, %sub_column] : view<128x20xi32> -> vector<[%registers]xi32>
-        %u_db3 = vector.load %w_stage[%fb3, %sub_column] : view<128x20xi32> -> vector<[%registers]xi32>
+        %u_da0 = vector.load %a_stage[%fa0, %sub_column] : view<256x[%stage_pitch]xi32> -> vector<[%registers]xi32>
+        %u_da1 = vector.load %a_stage[%fa1, %sub_column] : view<256x[%stage_pitch]xi32> -> vector<[%registers]xi32>
+        %u_da2 = vector.load %a_stage[%fa2, %sub_column] : view<256x[%stage_pitch]xi32> -> vector<[%registers]xi32>
+        %u_da3 = vector.load %a_stage[%fa3, %sub_column] : view<256x[%stage_pitch]xi32> -> vector<[%registers]xi32>
+        %u_db0 = vector.load %w_stage[%fb0, %sub_column] : view<128x[%stage_pitch]xi32> -> vector<[%registers]xi32>
+        %u_db1 = vector.load %w_stage[%fb1, %sub_column] : view<128x[%stage_pitch]xi32> -> vector<[%registers]xi32>
+        %u_db2 = vector.load %w_stage[%fb2, %sub_column] : view<128x[%stage_pitch]xi32> -> vector<[%registers]xi32>
+        %u_db3 = vector.load %w_stage[%fb3, %sub_column] : view<128x[%stage_pitch]xi32> -> vector<[%registers]xi32>
         %u_la0 = vector.fragment<lhs> %u_da0 shape [%m, %k] using {schema = %i4_schema : encoding<schema>} : vector<[%registers]xi32>
         %u_la1 = vector.fragment<lhs> %u_da1 shape [%m, %k] using {schema = %i4_schema : encoding<schema>} : vector<[%registers]xi32>
         %u_la2 = vector.fragment<lhs> %u_da2 shape [%m, %k] using {schema = %i4_schema : encoding<schema>} : vector<[%registers]xi32>
@@ -2179,7 +2269,7 @@ template.def<@h3.packed_swiglu_256> @h3_packed_swiglu_256(%m_size: index, %a: bu
         scf.yield %u_o00, %u_o01, %u_o02, %u_o03, %u_o10, %u_o11, %u_o12, %u_o13, %u_o20, %u_o21, %u_o22, %u_o23, %u_o30, %u_o31, %u_o32, %u_o33 : vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>
       }
       kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-      scf.yield %o00_end, %o01_end, %o02_end, %o03_end, %o10_end, %o11_end, %o12_end, %o13_end, %o20_end, %o21_end, %o22_end, %o23_end, %o30_end, %o31_end, %o32_end, %o33_end, %na0, %na1, %na2, %na3, %nw0, %nw1 : vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>
+      scf.yield %o00_end, %o01_end, %o02_end, %o03_end, %o10_end, %o11_end, %o12_end, %o13_end, %o20_end, %o21_end, %o22_end, %o23_end, %o30_end, %o31_end, %o32_end, %o33_end, %na0, %na1, %na2, %na3, %na4, %na5, %na6, %na7, %nw0, %nw1, %nw2, %nw3 : vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<8xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>
     }
 
     // Publish through LDS. Each lane takes two vector4 slices of each staged 16x16 tile.
@@ -2868,7 +2958,14 @@ kernel.def target(@h3_gemm_i8_swiglu_f32_256_gfx11) export("h3_gemm_i8_swiglu_f3
   %cfg_k_stride = config.get @h3.gemm_i8_swiglu_f32_256.k_stride : index
   %cfg_m_group = config.get @h3.gemm_i8_swiglu_f32_256.m_group : index
   %registers = index.constant 4 : index
-  %k_step = index.constant 64 : index
+  %default_step = index.constant 64 : index
+  %deep_step = index.constant 128 : index
+  %dit_k = index.constant 5376 : index
+  %dit_n = index.constant 28672 : index
+  %dit_k_match = index.cmp eq, %cfg_k_size, %dit_k : index
+  %dit_n_match = index.cmp eq, %cfg_n_size, %dit_n : index
+  %dit = scalar.andi %dit_k_match, %dit_n_match : i1
+  %k_step = scf.select %dit, %deep_step, %default_step : index
   %packed_per_word = index.constant 4 : index
   %output_f32 = scalar.constant true : i1
   template.apply<@h3.packed_swiglu_256>(%m_size, %a, %w, %scale, %a_scale, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %registers, %k_step, %packed_per_word, %output_f32) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, i1)

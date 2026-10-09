@@ -5186,3 +5186,65 @@ fn upscale_fused_residual_preserves_convolution_rounding_and_guards() {
         }
     }
 }
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
+fn dit_swiglu_matches_integer_dots_above_f16_range() {
+    use h3_hrx::model::{gemm_pitch, FFN, HID};
+    let mut h = Harness::new();
+    let (rows, k, n) = (257usize, HID, 2 * FFN);
+    let stride = gemm_pitch(k, 8);
+    let a: Vec<i8> = (0..rows * stride)
+        .map(|i| (i * 37 % 15) as i8 - 7)
+        .collect();
+    let w: Vec<i8> = (0..n * stride).map(|i| (i * 13 % 17) as i8 - 8).collect();
+    let output_bytes = rows * FFN * 4;
+    let mut output = vec![0; output_bytes];
+    output.extend([0xa5; 64]);
+    let out = h.run_geometry(
+        "gemm_packed_256",
+        "gemm_i8_swiglu_f32_256",
+        &cfg(&[
+            ("k_size", k),
+            ("n_size", n),
+            ("k_stride", stride),
+            ("m_group", 3),
+        ]),
+        None,
+        &[rows as u64],
+        &[
+            bytes(&a),
+            bytes(&w),
+            bytes(&vec![512.0f32; n]),
+            bytes(&vec![1.0f32; rows]),
+            output,
+        ],
+    );
+    assert_eq!(&out[4][output_bytes..], &[0xa5; 64]);
+    let actual = floats(&out[4][..output_bytes]);
+    assert!(actual.iter().all(|v| v.is_finite()));
+    assert!(actual.iter().any(|v| v.abs() > 65504.0));
+    for row in [0, 1, 127, 128, 255, 256] {
+        for col in [0, 1, 15, 16, 31, 32, 63, 64, FFN - 1] {
+            let gate_col = col / 16 * 32 + col % 16;
+            let dot = |w_col: usize| -> f32 {
+                let sum: i32 = (0..k)
+                    .map(|i| i32::from(a[row * stride + i]) * i32::from(w[w_col * stride + i]))
+                    .sum();
+                sum as f32 * 512.0
+            };
+            let gate = dot(gate_col);
+            let up = dot(gate_col + 16);
+            // Every nonzero gate is at least 512 in magnitude: in f32,
+            // sigmoid is exactly one or zero, making this an exact CPU oracle.
+            let expected = if gate > 0.0 { gate * up } else { 0.0 };
+            assert_eq!(
+                actual[row * FFN + col],
+                f64::from(expected),
+                "row={row} col={col}"
+            );
+        }
+    }
+}
