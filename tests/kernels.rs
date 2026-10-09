@@ -815,6 +815,81 @@ fn vision_bf16_matmuls_match_rounded_operands_and_epilogues() {
     not(feature = "gpu-tests"),
     ignore = "requires gfx1151 and provisioned HRX"
 )]
+fn vision_padded_projection_matches_generic_and_preserves_guards() {
+    let mut h = Harness::new();
+    for (m, k, n) in [
+        (1usize, 512, 64),
+        (17, 1024, 128),
+        (63, 1536, 64),
+        (64, 2048, 64),
+        (65, 2048, 128),
+        (129, 8192, 64),
+        (4032, 2048, 1152),
+    ] {
+        // Exercise both the production 72-channel heads and all 80 supported
+        // channels. Nonzero padded weights ensure the input contract is tested.
+        let input: Vec<_> = values(m * k, 0.5)
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let active = if (i / 128).is_multiple_of(2) { 72 } else { 80 };
+                f16::from_f32(if i % 128 < active { v } else { 0. })
+            })
+            .collect();
+        let weights: Vec<_> = values(n * k, 0.1).into_iter().map(bf16::from_f32).collect();
+        let bias = values(n, 0.1);
+        let residual: Vec<_> = values(m * n, 0.5).into_iter().map(f16::from_f32).collect();
+        let lambda = values(n, 0.3);
+        let mut data = vec![
+            bytes(&input),
+            bytes(&weights),
+            bytes(&bias),
+            bytes(&residual),
+            bytes(&lambda),
+        ];
+        data[3].extend_from_slice(&[0xa5; 256]);
+        let config = cfg(&[("k_size", k), ("n_size", n)]);
+        let baseline = h.run_auto("matmul_resid_bf16_wmma", &config, &[m as u64], &data);
+        let out = h.run_geometry(
+            "matmul_resid_bf16_wmma",
+            "matmul_resid80_bf16_wmma",
+            &config,
+            None,
+            &[m as u64],
+            &data,
+        );
+        assert_eq!(out, baseline, "padded projection {m}x{k}x{n}");
+        for row in [0, 15.min(m - 1), 63.min(m - 1), m - 1] {
+            for col in [0, 15, 63, n - 1] {
+                let dot: f64 = (0..k)
+                    .map(|j| {
+                        bf16::from_f32(input[row * k + j].to_f32()).to_f64()
+                            * weights[col * k + j].to_f64()
+                    })
+                    .sum();
+                let want = residual[row * n + col].to_f64()
+                    + f64::from(lambda[col]) * (dot + f64::from(bias[col]));
+                let offset = (row * n + col) * 2;
+                close(
+                    &halves(&out[3][offset..offset + 2], false),
+                    &[want],
+                    2e-3,
+                    4e-3,
+                );
+            }
+        }
+        assert!(out[3][m * n * 2..].iter().all(|&v| v == 0xa5));
+        for i in [0, 1, 2, 4] {
+            assert_eq!(out[i], data[i], "projection input {i}");
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn vision_gelu_half_store_matches_separate_cast_and_preserves_guards() {
     let mut h = Harness::new();
     for (m, k, n) in [

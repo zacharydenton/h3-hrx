@@ -1,7 +1,7 @@
 use super::{check_f16, check_f32, compiler, support, upload};
 use criterion::{Criterion, Throughput};
 use h3_hrx::dispatch::{Matmul16, Profile};
-use h3_hrx::model::{VHDP, VHEADS, VHID, VISION_PATCH, VMERGE, VMLP, VOUT};
+use h3_hrx::model::{VHD, VHDP, VHEADS, VHID, VISION_PATCH, VMERGE, VMLP, VOUT};
 use half::{bf16, f16};
 use hrx::{Buffer, Stream};
 use std::time::{Duration, Instant};
@@ -30,10 +30,16 @@ impl Fixture {
         let compiler = compiler();
         let gemm = Matmul16::build(&compiler, &mut stream, kind, k, n).unwrap();
         compiler.flush(&mut stream).unwrap();
-        let residual = kind == "resid";
+        let residual = matches!(kind, "resid" | "resid80");
         let half_output = residual || kind == "gelu_f16";
         let input: Vec<f32> = (0..m * k)
-            .map(|i| ((i * 17 % 251) as f32 - 125.) / 97.)
+            .map(|i| {
+                if kind == "resid80" && i % VHDP >= VHD {
+                    0.
+                } else {
+                    ((i * 17 % 251) as f32 - 125.) / 97.
+                }
+            })
             .collect();
         let input_bytes = if residual {
             bytemuck::cast_slice::<_, u8>(
@@ -112,7 +118,7 @@ impl Fixture {
                         0.5 * v * (1. + (0.7978845608028654 * (v + 0.044715 * v.powi(3))).tanh())
                     }
                     "gelu_erf" => 0.5 * v * (1. + libm::erf(v / std::f64::consts::SQRT_2)),
-                    "resid" => 0.25 + f64::from(lambdas[col]) * v,
+                    "resid" | "resid80" => 0.25 + f64::from(lambdas[col]) * v,
                     _ => v,
                 };
                 let offset = (row * n + col) * if half_output { 2 } else { 4 };
@@ -177,7 +183,7 @@ pub fn bench(c: &mut Criterion) {
         for (stage, kind, m, k, n) in [
             ("patch", "bias", tokens, VISION_PATCH, VHID),
             ("qkv", "bias", tokens, VHID, 3 * VHID),
-            ("proj", "resid", tokens, VHEADS * VHDP, VHID),
+            ("proj", "resid80", tokens, VHEADS * VHDP, VHID),
             ("fc1", "gelu_f16", tokens, VHID, VMLP),
             ("fc2", "resid", tokens, VMLP, VHID),
             ("merge1", "gelu_erf", tokens / 4, VMERGE, VMERGE),
@@ -185,7 +191,8 @@ pub fn bench(c: &mut Criterion) {
         ] {
             for rotating in [false, true] {
                 let storage = if rotating { "rotating" } else { "cached" };
-                group.throughput(Throughput::Elements((2 * m * k * n) as u64));
+                let active_k = if kind == "resid80" { k / 128 * 80 } else { k };
+                group.throughput(Throughput::Elements((2 * m * active_k * n) as u64));
                 // Criterion calls this closure again for each sample. Keep both
                 // allocations and the ring position across warmup and samples,
                 // even when a sample contains only one measured iteration.

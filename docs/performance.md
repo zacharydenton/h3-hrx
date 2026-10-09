@@ -34,6 +34,9 @@ cached weights and a rotating weight set exceeding 64 MiB are measured within
 a 512 MiB residency budget. Allocations and the ring position persist across
 Criterion samples, including single-iteration samples. Compilation, allocation,
 correctness readback and residual restoration are outside timing.
+The attention projection uses the production zero-padded heads and skips their
+inactive fragments; throughput counts only the active K extent. Native tests
+compare this specialization bit for bit with the general residual GEMM.
 Use the complete `stages` vision cases
 to verify whether an isolated kernel improvement helps the tower.
 

@@ -1389,6 +1389,8 @@ pub fn axpy(
 /// their activation, and `resid` adds into an existing f16 stream. The two GELUs are not the same
 /// function and are not interchangeable: the tower's MLP uses the tanh approximation and its mergers
 /// the error function. `gelu_f16` narrows the GELU result to f16 at the final store.
+/// `resid80` skips zero channels [80, 128) in every padded input head; callers
+/// must supply those zeros and a K dimension divisible by 512.
 pub struct Matmul16 {
     kernel: crate::compile::Kernel,
     k: usize,
@@ -1406,6 +1408,7 @@ impl Matmul16 {
         n: usize,
     ) -> Result<Self> {
         let stem = format!("matmul_{kind}_bf16_wmma");
+        let resid = matches!(kind, "resid" | "resid80");
         let ns = format!("h3.{stem}.");
         let cfg: Cfg = vec![
             (format!("{ns}k_size"), k.to_string()),
@@ -1414,8 +1417,8 @@ impl Matmul16 {
         Ok(Self {
             kernel: c.get(
                 stream,
-                if kind == "resid" {
-                    &stem
+                if resid {
+                    "matmul_resid_bf16_wmma"
                 } else {
                     "matmul_bf16_family"
                 },
@@ -1424,8 +1427,8 @@ impl Matmul16 {
             )?,
             k,
             n,
-            resid: kind == "resid",
-            output_half: matches!(kind, "resid" | "gelu_f16"),
+            resid,
+            output_half: resid || kind == "gelu_f16",
         })
     }
 
@@ -1449,7 +1452,7 @@ impl Matmul16 {
             "only the resid form takes a lambda"
         );
         // the weight rows are bf16 as stored, and the bias and the residual form's lambda are one
-        // f32 per output column. Only `resid` reads f16; `resid` and `gelu_f16`
+        // f32 per output column. Residual forms read f16; they and `gelu_f16`
         // write f16. Accumulation and activation remain f32 in every form.
         let input_elem = if self.resid { 2 } else { 4 };
         let output_elem = if self.output_half { 2 } else { 4 };

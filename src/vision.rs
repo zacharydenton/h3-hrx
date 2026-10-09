@@ -283,7 +283,8 @@ fn embed_frames(
     let norm = LayerNorm16::build(c, stream, VHID, 1e-6)?;
     let norm4 = LayerNorm16::build(c, stream, VMERGE, 1e-6)?;
     let g_qkv = Matmul16::build(c, stream, "bias", VHID, qkv_width)?;
-    let g_proj = Matmul16::build(c, stream, "resid", VHEADS * VHDP, VHID)?;
+    // Attention zeros channels [80, 128) of every head; skip their GEMM fragments.
+    let g_proj = Matmul16::build(c, stream, "resid80", VHEADS * VHDP, VHID)?;
     let g_fc1 = Matmul16::build(c, stream, "gelu_f16", VHID, VMLP)?;
     let g_fc2 = Matmul16::build(c, stream, "resid", VMLP, VHID)?;
     let g_merge1 = Matmul16::build(c, stream, "gelu_erf", VMERGE, VMERGE)?;
