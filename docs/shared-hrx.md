@@ -24,14 +24,14 @@ Caches live under `$XDG_CACHE_HOME/hrx`, or `~/.cache/hrx` when unset.
 `hrx gc [DAYS]` removes obsolete bundles and kernels unused for that many days
 (default 30). Cache hits refresh last-use timestamps.
 
-For local HRX development, override the pinned dependency without changing the
+For local HRX development, override the registry dependency without changing the
 manifest or committing a local lockfile:
 
 ```sh
-cargo check --config 'patch."https://github.com/zacharydenton/hrx-rs.git".hrx-rs.path="../hrx-rs"'
+cargo check --config 'patch.crates-io.hrx-rs.path="../hrx-rs"'
 ```
 
-CI uses the revision recorded in `Cargo.lock`.
+CI uses the version and checksum recorded in `Cargo.lock`.
 
 ## Compilation and dispatch
 
@@ -83,8 +83,8 @@ PM4 retains native graph batching. AQL and SDMA replay prepared commands in orde
 engine transitions wait for completion on the host. Device-clock graph profiling
 requires PM4 with compute copies; host profiling works with either engine.
 
-H3 submits logical fills, copies and uploads directly to HRX. The pinned HRX
-revision splits native commands to fit SDMA rings and compute dispatch limits,
+H3 submits logical fills, copies and uploads directly to HRX. HRX 0.10.1
+splits native commands to fit SDMA rings and compute dispatch limits,
 including ranges larger than 4 GiB, and bounds host-upload staging internally.
 
 Addresses, constants and launch geometry are fixed at recording time; tensor
