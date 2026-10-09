@@ -1,5 +1,7 @@
 //! Resident GPU workloads. Compilation, allocation and readback are outside timing.
 mod support;
+#[path = "kernels/vision.rs"]
+mod vision;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use h3_hrx::dispatch::{ActivationType, Gemm, MatmulF32, Prepare, Sink, Tile};
 use half::{bf16, f16};
@@ -1695,6 +1697,6 @@ fn video_convolution(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = support::criterion();
-    targets = vision_rotary, decoder_feed_forward, video_convolution, groupnorm_apply, groupnorm_statistics, preparation, rotary_preparation, attention_preparation, fused_qk_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, audio_qkv, audio_convolution, dispatch
+    targets = vision_rotary, decoder_feed_forward, video_convolution, groupnorm_apply, groupnorm_statistics, preparation, rotary_preparation, attention_preparation, fused_qk_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, vision::bench, audio_qkv, audio_convolution, dispatch
 }
 criterion_main!(benches);

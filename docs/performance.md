@@ -13,7 +13,7 @@ Each native engine/compiler configuration has its own subdirectory there.
 | --- | --- |
 | `host` | Short/long tokenization, mixed-media presentation, image resizing, RefMod loading/strength/copies, packed sequence layout |
 | `attention` | Head-128 FP16 four/eight-wave tiles and 16-head vision attention with 72 populated channels, including 480p/768p token counts and ragged lengths, checked against sampled FP64 attention |
-| `kernels` | FP32 Hadamard preparation, INT8 attention preparation in both layouts, V transpose, INT8/BF16 GEMMs including all four DiT projections through 37,977 rows, cached/rotating weights, eager/graph dispatch |
+| `kernels` | FP32 Hadamard preparation, INT8 attention preparation in both layouts, V transpose, INT8/BF16 GEMMs including all four DiT projections through 37,977 rows and all vision projections at 64px/480p/768p, cached/rotating weights, eager/graph dispatch |
 | `models` | Resident INT8 DiT eager/graph comparison through 37,977 tokens including partial tiles, a complete 50-block 768p sequence in both modes, and short audio roundtrip |
 | `stages` | Complete text encoder plus token refiner, vision tower, video encode/decode, audio encode/decode, complete 50-block denoising trajectories with Euler and ResMultistep |
 | `lifecycle` | Mapping/planning, tensor packing and completed uploads, block loading throughput, cold-file loading, forced audio eviction/reload |
@@ -26,6 +26,16 @@ and a large downscale. They exercise the reference/keyframe bilinear path:
 ```sh
 cargo bench --bench host -- resize/
 ```
+
+`cargo bench --bench kernels -- vision_gemm/` isolates the vision patch, QKV,
+attention projection, MLP and merger/DeepStack GEMMs. It uses model dimensions,
+sampled FP64 checks with BF16 operand rounding, and exact replay checks. Both
+cached weights and a rotating weight set exceeding 64 MiB are measured within
+a 512 MiB residency budget. Allocations and the ring position persist across
+Criterion samples, including single-iteration samples. Compilation, allocation,
+correctness readback and residual restoration are outside timing.
+Use the complete `stages` vision cases
+to verify whether an isolated kernel improvement helps the tower.
 
 Video stage cases cross spatial tile overlaps horizontally and vertically and
 use 5/22/39/56 frames across temporal chunks. Audio cases cover the 800-sample
