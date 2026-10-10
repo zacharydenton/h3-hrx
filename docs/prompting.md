@@ -1,134 +1,11 @@
-# Writing prompts for H3
+# H3 prompts and references
 
-H3 expects structured prompts. MiniMax's
-[prompt-writing guide](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills/h3-prompt-writing)
-covers text/keyframe modes in `references/base-en.txt` and reference mode in
-`references/ref-en.txt`. Supply text on stdin or with `-p`; h3 passes it verbatim
-unless `--generate-prompt` is enabled.
+Describe the picture, action and sound in H3's structured format. Pass the prompt
+on stdin or with `-p`; generation uses it verbatim.
 
-## Optional prompt generation
-
-The optional processor analyzes reference media, then writes an H3 prompt through
-a configured endpoint. It follows MiniMax's format guides; it is not the
-proprietary Context-IR service.
-
-Configure an OpenAI-compatible Chat Completions endpoint. The URL includes its
-API prefix; the client appends `/chat/completions`:
-
-```sh
-export H3_PROMPT_BASE_URL=http://localhost:8000/v1
-export H3_PROMPT_MODEL=your-multimodal-model
-# For an authenticated endpoint, also set H3_PROMPT_API_KEY.
-h3 prompt -p 'A red fox crosses a snowy clearing; no music' > fox.txt
-h3 --generate-prompt -p 'A red fox crosses a snowy clearing; no music' \
-  --save-prompt fox.txt --out fox.mp4
-```
-
-`h3 prompt` shares generation's input and shape arguments, writes only prompt
-text to stdout, and does not run video generation. `--prompt-base-url` and
-`--prompt-model` override the environment. `--save-prompt FILE` writes the final
-text plus `FILE.json` with model, template version, effective duration, reference
-mapping, and validation status. Reuse the text without `--generate-prompt` to
-avoid another rewrite. Keep the same reference ordering and presentation options.
-
-For media, explicitly declare the endpoint's supported input types:
-
-```sh
-h3 prompt --prompt-images --first-frame frame.png \
-  -p 'The subject slowly turns toward the camera' > turn.txt
-h3 prompt --prompt-images --prompt-audio person.png voice.wav \
-  -p 'Use Picture 1 for appearance and Audio 1 for the voice' > character.txt
-h3 prompt --prompt-images --prompt-audio movement.mp4 --video-audio 1 \
-  -p 'Continue this scene with its original atmosphere' > continuation.txt
-h3 prompt --prompt-images --prompt-audio --refmod character.safetensors \
-  -p 'The referenced character greets the viewer' > greeting.txt
-h3 prompt --prompt-images --refmod portrait.safetensors \
-  --refmod-source '1:1=original portrait.png' \
-  -p 'The referenced character greets the viewer' > greeting.txt
-```
-
-Images use `image_url` PNG data URLs. Video uses timestamped images sampled at
-2 fps, preserving its timeline instead of relying on a provider-specific video
-field. Audio uses `input_audio` with WAV data. A video soundtrack is included only
-when selected with `--video-audio INDEX` (one-based among positional videos).
-The endpoint must support these payloads; generic chat compatibility alone does
-not imply image or audio support. Unsupported media fails explicitly.
-
-Enabling rewriting sends your instruction and supplied/reconstructed media to
-the configured endpoint. Ordinary generation makes no LLM request. `--offline`
-continues to mean **no checkpoint downloads**; it does not disable the explicitly
-selected endpoint. Prompt-only raw-media requests need no H3 checkpoints or GPU.
-RefMod members without `--refmod-source SLOT:MEMBER=PATH` require the corresponding
-local VAE and GPU for reconstruction. Supplying originals for every active member
-also makes endpoint RefMod prompting independent of H3 checkpoints and GPU; see
-[RefMod presentation](refmods.md#upstream-presentation).
-
-The processor uses the actual rounded frame count at 24 fps, not an integer API
-duration. Validation checks section order, available media labels, cut timing,
-quoted literal text and the complete H3 token budget, including visual spans.
-One corrective rewrite is allowed. Endpoint failures or an invalid final prompt
-stop before denoising, without silently truncating references or reverting to the
-original instruction. Long video presentations can exhaust the 4096-token budget:
-use shorter/smaller references or a smaller canvas, then rerun.
-
-Requests have a 300-second timeout and no automatic HTTP retries. Prompt generation
-uses two endpoint calls, or three if format repair is needed. Evaluate instruction
-preservation and output quality with your chosen model.
-
-### Native Rust RefMod prompting
-
-Prompt generation uses the configured endpoint. With originals, call
-`PromptGenerator::generate_refmods_with_sources(None, request, &sources)`.
-This returns the prompt and its matching H3 presentation without opening a
-session, loading model weights, or initializing a GPU. The application decodes
-its source files into `Media`; each `RefModSource` selects a one-based RefMod slot
-and original member number. For example, for a single image member:
-
-```rust,no_run
-use h3_hrx::{media_context::{Frame, Media}, Shape};
-use h3_hrx::prompt::{PromptGenerator, RefModPromptRequest, RefModPromptResult, PromptError};
-use h3_hrx::refmod::{ApplyOptions, RefMod, RefModSource};
-
-fn prompt_from_original(
-    generator: &PromptGenerator, // Configure EndpointConfig.images = true.
-    refmod: &RefMod,
-    original: Frame, // Decoded RGB floats, dimensions aligned to 32 pixels.
-    shape: &Shape,
-) -> Result<RefModPromptResult, PromptError> {
-    let mods = [refmod.prepare(ApplyOptions::default())?];
-    let sources = [RefModSource {
-        slot: 1,
-        member: 1,
-        media: Media::Picture(original),
-        provenance: serde_json::json!({"path":"original.png"}),
-        synthetic_timing: false,
-    }];
-    generator.generate_refmods_with_sources(None, RefModPromptRequest {
-        instruction: "The referenced character greets the viewer",
-        entries: &[],
-        refmods: &mods,
-        shape,
-        presentation: Default::default(),
-    }, &sources)
-}
-```
-
-Every active member needs a source when the session is `None`; missing sources
-fail before contacting the endpoint. Pass `Some(&mut session)` to reconstruct
-unmapped members through the VAEs. Original media changes presentation only;
-use the same RefMods, ordering and preparation options for latent conditioning.
-
-`PromptGenerator::generate_refmods(&mut session, request)` reconstructs every
-active member through the local VAEs before calling the endpoint. Both methods
-return the prompt and matching `PreparedPresentation`; pass that presentation and
-the same prepared references to `Session::denoise_presented`.
-
-`RefModPresentationOptions::{max_media_bytes, fps}` controls the host float-media
-budget (default 1 GiB) and reconstructed playback rate (default 24 fps). Copies
-share decoded buffers; disabled members are skipped. The host budget excludes
-GPU allocations and serialized endpoint payloads. See
-[RefMod presentation](refmods.md#upstream-presentation) and
-[session memory budgets](runtime-options.md#shared-allocation-budgets).
+Start with a [showcase prompt](showcase.md), or write the fields below.
+[Endpoint prompt generation](prompt-generation.md) can turn a short instruction
+and reference media into this format.
 
 ## The three fields
 
@@ -156,11 +33,24 @@ a radio, a busker, singing — is diegetic and goes in the description instead.
 
 The keyframe modes prepend one instruction line, then a blank line, then the same three fields. `--first-frame`
 is I2VA; a first and last image is FL2VA (the `fl2va` checkpoint); reference images and audio are Ref2VA (the
-`ref2va` checkpoint, a different set of six sections — see `ref-en.txt`).
+`ref2va` checkpoint, a different set of six sections — see the [format reference](#format-reference)).
 
 ```text
 For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
 ```
+
+## Keyframes and references
+
+```sh
+h3 --first-frame opening.png --out animated.mp4 < keyframe-prompt.txt
+h3 person.jpg voice.wav --out referenced.mp4 < reference-prompt.txt
+h3 --refmod character.safetensors --out character.mp4 < reference-prompt.txt
+```
+
+`--first-frame` anchors the opening composition. `--last-frame` adds a final
+keyframe and requires a first frame. Positional media supplies image, audio or
+video references; `--video-audio INDEX` includes a positional video's soundtrack.
+Use [RefMods](refmods.md) to encode references once and reuse them across renders.
 
 ## Details that matter
 
@@ -191,3 +81,15 @@ h3 --width 1344 --height 768 --frames 124 --steps 31 --seed 7 \
 ```
 
 ![cliff rider](media/cliff_rider_768p_strip.jpg)
+
+## Optional prompt generation
+
+Use `h3 prompt` to write a prompt before rendering, or `--generate-prompt` to
+combine both steps. See [endpoint configuration and media inputs](prompt-generation.md)
+and the [Rust RefMod example](prompt-generation.md#native-rust-refmod-prompting).
+
+## Format reference
+
+MiniMax's [prompt-writing guide](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills/h3-prompt-writing)
+defines text/keyframe modes in `references/base-en.txt` and reference mode in
+`references/ref-en.txt`.

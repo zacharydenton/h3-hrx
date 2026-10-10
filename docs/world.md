@@ -1,15 +1,11 @@
-# H3-World action-controlled generation
+# Action-controlled video with H3-World
 
-`h3 world` runs the [H3-World method](https://arxiv.org/html/2609.01560v1) in
-Rust/Loom using the released rank-32 adapter and the existing FL2VA base model.
-It generates a complete fixed-length clip from an initial image, a static scene
-description, and a recorded action schedule. `h3 world-session` adds continued
-interaction: generate a segment, observe its result, choose the next controls,
-and resume from the last decoded frame.
+Generate from an opening image, a scene description and recorded movement/camera
+controls. `h3 world` renders one clip; `h3 world-session` lets you inspect each
+segment, choose new controls, save and branch.
 
-Continuation is an application extension: each segment starts from the last RGB
-observation and requires full diffusion inference. It carries no recurrent world
-state or off-screen memory, so continuity can drift across segments.
+The [H3-World method](https://arxiv.org/html/2609.01560v1) runs through H3's
+Rust/Loom pipeline with the released rank-32 adapter and FL2VA base model.
 
 ```sh
 h3 world --first-frame garage.png \
@@ -29,7 +25,7 @@ The pinned adapter downloads through the standard Hugging Face cache. Use
 Use FL2VA weights for any explicit `--dit` override. Exactly one complete
 104-pair rank-32 world adapter is required. Additional references, last-frame
 conditioning, Turbo, custom adapter composition, and step caching are rejected.
-The adapter remains subject to the MiniMax H3 Community License.
+The adapter is subject to the MiniMax H3 Community License.
 
 ## Controls
 
@@ -52,10 +48,14 @@ OR-pooling each native latent interval (repeating widths 1,4,4,4,4 frames).
 
 The learned clauses use “the man”, exactly as upstream. Control generalization
 to other subjects and scenes is empirical. `--generate-prompt` can prepare the
-static scene description through the existing optional endpoint using a dedicated
+static scene description through the optional endpoint using a dedicated
 scene-only template; it never receives or rewrites the action clauses.
 
 ## Continued world sessions
+
+Each segment starts from the previous decoded frame and runs full diffusion
+inference. There is no recurrent world state or off-screen memory; continuity
+can drift across segments.
 
 Start a smaller interactive session on a shared machine:
 

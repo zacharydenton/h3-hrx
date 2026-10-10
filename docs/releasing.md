@@ -1,6 +1,10 @@
 # Releasing h3-hrx
 
-## Validation
+Ship a build that installs from published dependencies, passes numerical checks
+and completes a render on the supported hardware. Record the commit, toolchain,
+HRX bundle, Loom compiler and checks actually run.
+
+## Build and package
 
 Run from a clean checkout with a current stable Rust toolchain:
 
@@ -18,7 +22,9 @@ cargo package --locked
 CPU CI runs these checks. Packaging verifies that the embedded kernels and
 tokenizer are included and the archive builds against its published dependencies.
 
-On Strix Halo with the native bundle, checkpoints and reference dumps available:
+## Validate on Strix Halo
+
+With the native bundle, checkpoints and reference dumps available:
 
 ```sh
 cargo test
@@ -27,16 +33,21 @@ python3 scripts/parity.py gate --require
 
 The parity gate needs ComfyUI dumps from `scripts/comfy_dump.py`; missing fixtures
 fail the gate. See [test coverage](testing.md) for dependencies and limits.
-Record the commit, toolchain, native bundle, GPU and results.
 
-Install and run a complete clip before publishing:
+Install and run the documented 768p workload before publishing:
 
 ```sh
 cargo install --locked --path . --bin h3
 h3 --version
-h3 --width 864 --height 480 --frames 124 --steps 31 --seed 7 \
-  --out clip.mp4 < docs/prompts/cliff_rider_768p.txt
+/usr/bin/time -f 'Elapsed: %e seconds' \
+  h3 --width 1344 --height 768 --frames 124 --steps 21 --seed 0 \
+  --weight-io native-direct --memory-budget-mib 49152 \
+  --out clip.mp4 < docs/prompts/wyvern_cinematic.txt
 ```
+
+Inspect the completed video and audio. Compare speed using the
+[performance guide](performance.md); update advertised timings only from
+completed, reproducible measurements with their workload and timing boundaries.
 
 ## Publication
 

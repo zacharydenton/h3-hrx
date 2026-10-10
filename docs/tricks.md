@@ -1,6 +1,7 @@
-# Audio, stills, and reference modes
+# Generate audio or still images
 
-See [setup](setup.md) and [prompt format](prompting.md) first.
+H3 jointly generates video and audio. Save just the soundtrack or a selected
+frame when that is the output you need. Start with a [structured prompt](prompting.md).
 
 ## Audio only
 
@@ -31,12 +32,5 @@ h3 scene.jpg --width 864 --height 480 --frames 22 --steps 21 --still night.png \
 
 [Fox still](media/fox_still_1344x768.jpg) · [Night edit](media/edit_night_neon.jpg)
 
-## Conditioning
-
-- `--first-frame image.png` anchors frame zero using FL2VA.
-- `--last-frame image.png` adds a final keyframe and requires a first frame.
-  See the [Orbit example](loras.md#360-orbit-example).
-- Positional images, audio and videos select Ref2VA. `--video-audio INDEX`
-  explicitly includes a positional video's soundtrack.
-- `--refmod FILE` reuses encoded references. See [RefMods](refmods.md) for strengths,
-  original-media presentation and combining references with keyframes.
+Use [keyframes and references](prompting.md#keyframes-and-references) for input
+conditioning, or [RefMods](refmods.md) to reuse encoded subjects and voices.

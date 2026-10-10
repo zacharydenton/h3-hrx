@@ -1,4 +1,7 @@
-# H3 LoRAs
+# Control style and motion with LoRAs
+
+Apply camera or style adapters during generation, including first/last-frame
+loops. H3 evaluates the low-rank updates in Loom alongside the base projections.
 
 Pass a safetensors checkpoint with `--lora`. Repeat the flag to combine adapters;
 each defaults to strength 1. `--lora-strength INDEX=VALUE` selects a one-based
@@ -9,31 +12,6 @@ h3 --lora camera.safetensors --lora style.safetensors \
   --lora-strength 1=0.8 --lora-strength 2=-0.25 \
   --first-frame input.png --out clip.mp4 < prompt.txt
 ```
-
-The loader accepts the native H3 keys:
-
-```text
-diffusion_model.blocks.{0..49}.{projection}.lora_A.weight
-diffusion_model.blocks.{0..49}.{projection}.lora_B.weight
-diffusion_model.token_refiner.blocks.{0..1}.{projection}.lora_A.weight
-diffusion_model.token_refiner.blocks.{0..1}.{projection}.lora_B.weight
-```
-
-`projection` is `attn.qkv_proj`, `attn.out_proj`, `mlp.fc1`, or `mlp.fc2`.
-Any subset is supported, with independent positive ranks and FP16, BF16, or FP32
-weights. A is `[rank, input]`, B is `[output, rank]`. An optional floating scalar
-`{prefix}.alpha` supplies `alpha / rank`; without it, the multiplier is 1.
-The effective multiplier also includes the chosen strength. Unknown tensors,
-unpaired factors, invalid dimensions, and nonfinite values are errors. Other
-model architectures and naming conventions are not translated.
-
-The original quantized base weights remain intact. Native BF16 branches evaluate
-the weighted low-rank updates in the original weight basis before the projection's
-activation or residual gate. Multiple adapters concatenate their ranks, giving
-the sum of their updates. Rank projections, deltas and SwiGLU products retain
-FP32 range; matrix operands narrow to BF16. Ranks are padded for the kernels; the combined rank per projection is limited to 32,768.
-Missing projections use their original base path. Files must remain unchanged
-for the lifetime of a session. Custom LoRAs cannot be combined with a Turbo preset.
 
 ## 360 Orbit example
 
@@ -62,6 +40,33 @@ and more than one output frame; its index follows the rounded output length.
 Different first/last images are also supported. h3 jointly samples video and
 audio; the final command removes audio from the MP4 to make a silent preview.
 It does not change audio conditioning during sampling.
+
+## Checkpoint format and precision
+
+The loader accepts the native H3 keys:
+
+```text
+diffusion_model.blocks.{0..49}.{projection}.lora_A.weight
+diffusion_model.blocks.{0..49}.{projection}.lora_B.weight
+diffusion_model.token_refiner.blocks.{0..1}.{projection}.lora_A.weight
+diffusion_model.token_refiner.blocks.{0..1}.{projection}.lora_B.weight
+```
+
+`projection` is `attn.qkv_proj`, `attn.out_proj`, `mlp.fc1`, or `mlp.fc2`.
+Any subset is supported, with independent positive ranks and FP16, BF16, or FP32
+weights. A is `[rank, input]`, B is `[output, rank]`. An optional floating scalar
+`{prefix}.alpha` supplies `alpha / rank`; without it, the multiplier is 1.
+The effective multiplier also includes the chosen strength. Unknown tensors,
+unpaired factors, invalid dimensions, and nonfinite values are errors. Other
+model architectures and naming conventions are not translated.
+
+The original quantized base weights remain intact. Native BF16 branches evaluate
+the weighted low-rank updates in the original weight basis before the projection's
+activation or residual gate. Multiple adapters concatenate their ranks, giving
+the sum of their updates. Rank projections, deltas and SwiGLU products retain
+FP32 range; matrix operands narrow to BF16. Ranks are padded for the kernels; the combined rank per projection is limited to 32,768.
+Missing projections use their original base path. Files must remain unchanged
+for the lifetime of a session. Custom LoRAs cannot be combined with a Turbo preset.
 
 ## Rust API
 

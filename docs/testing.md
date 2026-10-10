@@ -1,16 +1,24 @@
-# Native test coverage
+# Validate numerical and rendered output
 
-Run `cargo test` from the repository root. It includes host, compiler, GPU,
+Loom kernel changes need an independent numerical reference; performance changes
+also need a completed workload comparison. Start with the native suite:
+
+```sh
+cargo test
+```
+
+It includes host, compiler, GPU,
 full-model, adapter, RefMod and World tests, plus the Rust cache-calibration tests.
 It requires gfx1151, the HRX bundle and enough memory for the full models.
 Checkpoints and pinned adapters resolve through the standard Hugging Face cache;
 missing files are downloaded. The test profile is optimized and repository Cargo
 configuration runs tests serially so model allocations do not overlap.
 
-Only subprocess fixtures and the externally driven parity dump remain ignored;
-their parent tests/tools invoke them explicitly. Native validation needs no Python.
-Independent Torch/ComfyUI references remain separate because they require another
-implementation and its fixtures.
+Subprocess fixtures and the externally driven parity dump are invoked by their
+parent tests/tools. Independent Torch/ComfyUI checks are separate from the native
+suite because they need the reference implementation and its fixtures.
+
+## CPU checks
 
 For a CPU-only machine or CI, explicitly disable the default `gpu-tests` feature:
 
@@ -18,7 +26,7 @@ For a CPU-only machine or CI, explicitly disable the default `gpu-tests` feature
 cargo test --workspace --no-default-features --features cli,prompt-generation
 ```
 
-Formatting and linting remain ordinary Cargo commands:
+Check formatting and linting with:
 
 ```sh
 cargo fmt --all -- --check
@@ -149,9 +157,11 @@ branching, last-frame handoff, seed/frame accounting, rollback and writer locks.
 session. These tests run by default and require the pinned world adapter.
 See [world validation](world.md#validation) for visual qualification guidance.
 
+## Latent upscaling
+
 The upscaler tests cover the complete upstream node at two spatial sizes,
 including its per-channel input/output transforms and FP16 rounding boundaries,
 temporal chunk blending, scalar convolution/normalization
 oracles, ER-SDE with explicit noise, and two-pass generation with RefMods,
 fixed audio, target-grid keyframes and cancellation recovery. They run through
-`cargo test`; CPU-only builds skip hardware tests. Fixtures need no Python.
+`cargo test`; CPU-only builds skip hardware tests.

@@ -1,57 +1,8 @@
-# RefMods
+# Reuse subjects and voices with RefMods
 
-RefMods store encoded image and audio references for reuse during generation.
-Creation uses the H3 VAEs. Loading reuses the stored latents; output decoding
-still needs the video/audio VAEs.
-
-Only current embedded-metadata standalone v4 and bundle v5 safetensors files are
-supported. Legacy sidecars, older format versions, and LoRA hybrid containers
-are unsupported. Compatibility follows ComfyUI-MiniMaxH3Mod commit
-[`f9462081`](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod/tree/f9462081e28794389b5a6c5067eb327412ad8ee7).
-
-## Create
-
-```sh
-h3 refmod create ./character-images --out character.safetensors
-h3 refmod create ./character-images --audio voice.wav \
-  --name character --description 'A character with a low, soft voice' \
-  --out character-with-voice.safetensors
-h3 refmod create --audio voice.wav --out voice.safetensors
-h3 refmod inspect character-with-voice.safetensors
-```
-
-Directories are scanned nonrecursively in lexical order; explicit image files
-retain argument order. Images use the existing CLI's supported image formats.
-The first image determines the canvas. Its short edge is capped at 1024 pixels,
-with dimensions rounded to multiples of 32. A single image is resized without
-cropping; a stack is center-cropped to the shared canvas aspect ratio.
-Native bilinear resampling differs from the upstream
-extractor's Lanczos resampling, so independently encoded files need not be
-byte-identical. Preprocessing settings are recorded in metadata.
-
-Each image is encoded separately and stacked along the latent time axis. The
-visual budget defaults to 8192 tokens. When necessary, near-duplicate latent
-frames are removed, then remaining frames are uniformly sampled. Spatial grids
-are preserved. The report includes retained image indices (zero-based into the
-printed source list); omitted indices identify dropped images. If one image
-alone exceeds the budget, reduce `--resolution` or increase `--max-tokens`.
-
-Audio is resampled to 32 kHz stereo and limited to the first 30 seconds by default.
-It is encoded in 10-second chunks, with a default 5120-token audio budget.
-Use `--audio-max-seconds`, `--audio-max-tokens`, and `--truncate-audio` to control
-this. Exceeding the audio budget fails unless truncation is explicitly enabled.
-The optional audio member's concept type is `voice`; the visual concept type
-defaults to `identity` and can be set with `--concept-type`.
-
-Images alone produce a standalone file, as does audio alone. Images plus audio
-produce a single bundle containing a visual member followed by an audio member.
-Bundling does not assign a voice to a character or encode synchronization.
-
-`--dry-run` decodes and validates media and reports estimated costs, without
-opening models, initializing a GPU, or writing output. It cannot predict latent
-deduplication. `--force` allows atomic replacement of an existing output.
-`--video-vae`, `--audio-vae`, `--offline`, and `--root` apply after `create`.
-Creation resolves only the requested encoders and retains their weights for reuse.
+Encode image and audio references once, then reuse them across renders. RefMods
+store those latents in safetensors files; loading them skips reference VAE
+encoding. Output decoding still uses the video/audio VAEs.
 
 ## Generate
 
@@ -72,8 +23,8 @@ storage. The optional total token limit counts selected members and copies.
 
 RefMods follow raw references in file/member order and select Ref2VA by default.
 `--dit` and `--base-weights` override model selection; Turbo cannot use active RefMods.
-Pre-encoded visual
-members have no original pixels to send through the vision tower, so no picture
+In the default latent-only mode, visual members have no original pixels to send
+through the vision tower, so no picture
 placeholders or prompt text are inserted. Describe the desired subjects and
 sounds explicitly in the prompt; member descriptions are printed as hints.
 
@@ -110,13 +61,56 @@ The combined path has CPU regression coverage; reference fidelity with stock
 FL2VA still needs visual qualification. RefMod tokens add attention work with
 either checkpoint.
 
+## Create
+
+```sh
+h3 refmod create ./character-images --out character.safetensors
+h3 refmod create ./character-images --audio voice.wav \
+  --name character --description 'A character with a low, soft voice' \
+  --out character-with-voice.safetensors
+h3 refmod create --audio voice.wav --out voice.safetensors
+h3 refmod inspect character-with-voice.safetensors
+```
+
+Directories are scanned nonrecursively in lexical order; explicit image files
+retain argument order. Images use the formats supported by the CLI.
+The first image determines the canvas. Its short edge is capped at 1024 pixels,
+with dimensions rounded to multiples of 32. A single image is resized without
+cropping; a stack is center-cropped to the shared canvas aspect ratio.
+Native bilinear resampling differs from the upstream
+extractor's Lanczos resampling, so independently encoded files need not be
+byte-identical. Preprocessing settings are recorded in metadata.
+
+Each image is encoded separately and stacked along the latent time axis. The
+visual budget defaults to 8192 tokens. When necessary, near-duplicate latent
+frames are removed, then remaining frames are uniformly sampled. Spatial grids
+are preserved. The report includes retained image indices (zero-based into the
+printed source list); omitted indices identify dropped images. If one image
+alone exceeds the budget, reduce `--resolution` or increase `--max-tokens`.
+
+Audio is resampled to 32 kHz stereo and limited to the first 30 seconds by default.
+It is encoded in 10-second chunks, with a default 5120-token audio budget.
+Use `--audio-max-seconds`, `--audio-max-tokens`, and `--truncate-audio` to control
+this. Exceeding the audio budget fails unless truncation is explicitly enabled.
+The optional audio member's concept type is `voice`; the visual concept type
+defaults to `identity` and can be set with `--concept-type`.
+
+Images alone produce a standalone file, as does audio alone. Images plus audio
+produce a single bundle containing a visual member followed by an audio member.
+Bundling does not assign a voice to a character or encode synchronization.
+
+`--dry-run` decodes and validates media and reports estimated costs, without
+opening models, initializing a GPU, or writing output. It cannot predict latent
+deduplication. `--force` allows atomic replacement of an existing output.
+`--video-vae`, `--audio-vae`, `--offline`, and `--root` apply after `create`.
+Creation resolves only the requested encoders and retains their weights for reuse.
+
 ## Upstream presentation
 
 `--refmod-presentation upstream` reconstructs active references through the H3
 VAEs and presents numbered media to H3's text/vision encoder. `--generate-prompt`
 and `h3 prompt` select this path automatically; combining them with
-`--refmod-presentation latent-only` is an error. Ordinary generation keeps the
-existing latent-only default for compatibility.
+`--refmod-presentation latent-only` is an error. Ordinary generation defaults to latent-only conditioning.
 
 ```sh
 h3 --refmod character.safetensors --refmod-presentation upstream \
@@ -138,8 +132,7 @@ the prompt processor treats these timestamps as synthetic. A bundle does not
 implicitly synchronize audio or bind a voice to a subject.
 
 The prepared-presentation path uses upstream Qwen3-VL image/video resizing and
-0.5 normalization. The older direct-generation image path retains its existing
-preprocessing for compatibility.
+0.5 normalization. The direct-generation image path uses different preprocessing for compatibility.
 
 Visual reconstruction retains float pixels for H3 conditioning. Audio is decoded
 for the optional LLM's analysis; H3's text encoder receives its label, while its
@@ -194,6 +187,13 @@ verified automatically, especially for pooled or optimized RefMods. Provenance
 records supplied paths as `original_file`, separately from reconstructed latent
 evidence. Originals do not reflect latent strength adjustments.
 
+## File compatibility
+
+Only current embedded-metadata standalone v4 and bundle v5 safetensors files are
+supported. Legacy sidecars, older format versions, and LoRA hybrid containers
+are unsupported. Compatibility follows ComfyUI-MiniMaxH3Mod commit
+[`f9462081`](https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod/tree/f9462081e28794389b5a6c5067eb327412ad8ee7).
+
 ## Rust
 
 Use `refmod::{RefMod, RefModMember, ApplyOptions, CreateOptions, ImageInput,
@@ -206,7 +206,7 @@ reconstructs the active members as ordered `MediaEntry` values for upstream
 presentation, including copy labels and synthetic timing. With the optional
 `prompt-generation` feature, `PromptGenerator::generate_refmods` performs this
 preparation and endpoint rewriting together, returning the prompt and matching
-H3 presentation. See the [native Rust example](prompting.md#native-rust-refmod-prompting).
+H3 presentation. See the [native Rust example](prompt-generation.md#native-rust-refmod-prompting).
 
 For originals, pass decoded `RefModSource` values to
 `Session::refmod_entries_with_sources`; only unmapped members are reconstructed.
@@ -217,7 +217,7 @@ numbers, including copies.
 For endpoint prompting in one call, use
 `PromptGenerator::generate_refmods_with_sources(None, request, &sources)` when
 all active members have originals, or pass `Some(&mut session)` for partial
-coverage. See the [Rust original-media example](prompting.md#native-rust-refmod-prompting).
+coverage. See the [Rust original-media example](prompt-generation.md#native-rust-refmod-prompting).
 
 With `Config::dit = None` and the default `base_weights: false`, `Session::denoise`
 selects Ref2VA whenever its reference list is nonempty. Set `base_weights: true`

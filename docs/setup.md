@@ -1,67 +1,79 @@
-# Setup
+# Install and run
 
-Run commands from the repository root.
+h3-hrx runs MiniMax H3 on Linux with AMD Strix Halo (`gfx1151`). Development and
+[measured renders](showcase.md#wyvern-chase--anime-and-cinematic) use a 128 GB
+unified-memory system. Other GPUs are unvalidated.
 
 ## Dependencies
 
-- Linux with a working AMD Strix Halo (`gfx1151`) driver and GPU access.
-  Development uses a 128 GB unified-memory system.
+- A working AMD driver and GPU access.
 - A current stable Rust toolchain and ffmpeg.
-- System libraries compatible with the pinned HRX bundle. It targets
-  Ubuntu 26.04 with glibc 2.43+; see
+- System libraries compatible with HRX's pinned native bundle: Ubuntu 26.04,
+  glibc 2.43+, or a compatible environment. See
   [HRX native setup](https://github.com/zacharydenton/hrx-rs/blob/main/docs/GPU-NPU.md#native-setup).
+- About 54 GB of disk space for base checkpoints, plus runtime caches and outputs.
 
-HRX supplies Loom and the native runtime. Building h3 requires no ROCm headers,
-`hipcc`, or local LLVM build. Python is used only by optional validation tools.
-Allow memory for activations and staging as well as model weights.
+HRX supplies the Loom compiler and GPU runtime. Building h3 requires no ROCm
+headers, `hipcc` or local LLVM build.
 
 ## Toolchain and build
 
-HRX 0.9.0 resolves from crates.io; a sibling source checkout is unnecessary.
+From the repository root:
 
 ```sh
-cargo build --locked --release --bin h3
-# Or install onto Cargo's binary path:
 cargo install --locked --path . --bin h3
+h3 --width 1344 --height 768 --frames 124 --steps 21 --seed 0 \
+  --weight-io native-direct --memory-budget-mib 49152 \
+  --out clip.mp4 < docs/prompts/wyvern_cinematic.txt
 ```
 
-The first GPU operation downloads and verifies HRX's pinned native bundle.
-To provision it ahead of time using the version in `Cargo.lock`:
+This writes `clip.mp4` and `clip.wav`. First use fetches missing checkpoints and
+HRX's verified native bundle, then compiles the Loom kernels. `--steps 21` gives
+20 model evaluations. For development, use `cargo build --locked --release --bin h3`.
+
+The default CLI canvas is 864×480 with 124 frames and 30 evaluations. The command
+above selects the featured 768p workload. Dimensions must be multiples of 32;
+frame counts round up to `17n + 5`. See [prompts](prompting.md) and
+[runtime options](runtime-options.md) for inputs, memory limits and loading modes.
+
+## Offline runtime
+
+Provision the HRX version used by this checkout before going offline:
 
 ```sh
-cargo install --locked hrx-rs --version 0.9.0
+cargo install --locked hrx-rs --version 0.10.1
 hrx prepare
 hrx doctor
 ```
 
-For offline installation, supply that version's matching native archive to
-`HRX_OFFLINE=1 hrx prepare native.tar.gz`. After provisioning, set `HRX_OFFLINE=1`
-to prevent native downloads. This is separate from checkpoint offline mode.
-
-An installed binary embeds the Loom sources and tokenizer. `h3 --root DIR`
-selects `DIR/kernels/` for development. HRX stores runtime bundles and compiled
-kernels under `$XDG_CACHE_HOME/hrx`, falling back to `~/.cache/hrx`.
-See [runtime overrides and caching](shared-hrx.md).
+Alternatively, supply that version's matching native archive to
+`HRX_OFFLINE=1 hrx prepare native.tar.gz`. Set `HRX_OFFLINE=1` to prevent native
+bundle downloads. Checkpoint downloads have a separate offline switch below.
+[Runtime overrides and cache locations](shared-hrx.md#provisioning-and-overrides).
 
 ## Checkpoints
 
-Missing checkpoints download into the standard Hugging Face Hub cache.
+Missing checkpoints download from
+[Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3).
 No conversion step is needed.
 
-| Checkpoint | Contents | Approximate disk size |
+| Checkpoint | Contents | Disk size |
 | --- | --- | ---: |
-| `minimax_h3_fl2va_pruned_int8_convrot.safetensors` | Base DiT | 21 GB |
-| `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` | Text encoder and vision tower | 27 GB |
-| `minimax_h3_video_vae_fp16.safetensors` | Video encoder and decoder | 5.2 GB |
-| `minimax_h3_audio_vae_fp32.safetensors` | Audio encoder and decoder | 0.6 GB |
-| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | Reference-conditioned DiT | 21 GB |
+| `minimax_h3_fl2va_pruned_int8_convrot.safetensors` | Base DiT | ~21 GB |
+| `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` | Text encoder and vision tower | ~27 GB |
+| `minimax_h3_video_vae_fp16.safetensors` | Video encoder and decoder | ~5.2 GB |
+| `minimax_h3_audio_vae_fp32.safetensors` | Audio encoder and decoder | ~0.6 GB |
+| `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | Reference-conditioned DiT | ~21 GB additional |
 
 The default cache is `~/.cache/huggingface/hub`. Precedence is `HF_HUB_CACHE`,
 then `$HF_HOME/hub`, then `$XDG_CACHE_HOME/huggingface/hub`.
-`--offline` or `HF_HUB_OFFLINE=1` restricts checkpoint resolution to local files.
-Use `--dit`, `--te`, `--video-vae`, or `--audio-vae` to select individual files.
+`--offline` or `HF_HUB_OFFLINE=1` requires cached checkpoints.
+Use `--dit`, `--te`, `--video-vae` or `--audio-vae` for explicit file paths.
+Model weights have separate license terms.
 
-To prefetch the base files with the optional Hugging Face CLI:
+Reference requests select Ref2VA; text and keyframe-only requests select FL2VA.
+`--base-weights` forces FL2VA with references. To prefetch files with the optional
+Hugging Face CLI:
 
 ```sh
 hf download Comfy-Org/MiniMax-H3 \
@@ -69,12 +81,7 @@ hf download Comfy-Org/MiniMax-H3 \
             '*qwen3vl_32b_minimax_h3_int8_convrot.safetensors' \
             '*minimax_h3_video_vae_fp16.safetensors' \
             '*minimax_h3_audio_vae_fp32.safetensors'
-```
-
-Reference requests select Ref2VA; keyframe-only requests select FL2VA.
-`--base-weights` forces FL2VA with references. To prefetch Ref2VA:
-
-```sh
+# Additional model for references:
 hf download Comfy-Org/MiniMax-H3 \
   --include '*minimax_h3_ref2va_pruned_int8_convrot.safetensors'
 ```

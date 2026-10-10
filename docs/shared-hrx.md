@@ -1,16 +1,24 @@
-# Shared HRX integration
+# Loom kernels and HRX execution
 
-H3 uses `hrx-rs` for native loading, allocation, dispatch, graphs, compilation and
-artifact caching. H3 requires HRX 0.10.1 or newer for native large-transfer support.
-Model code owns tensor
-layouts, source selection and numerical behavior; `Session` is the public API.
-H3 does not enable HRX's optional NPU feature.
-Consumers sharing HRX contexts must resolve the same HRX crate instance.
+H3 expresses its GPU operations as custom Loom kernels and executes them through
+HRX from Rust. This keeps kernel arithmetic, scheduling and memory ownership
+available for [measurement and optimization](performance.md).
+
+| Layer | Responsibility |
+| --- | --- |
+| H3 | Model shapes, checkpoint layouts, conditioning and sampler semantics |
+| Loom kernels | Attention, projections, normalization, convolutions and other GPU operations |
+| HRX | Compilation, artifact caches, native buffers, transfers, dispatch, graphs and execution admission |
+| `Session` | The application-facing encoding, denoising and decoding API |
+
+H3 requires HRX 0.10.1 or newer for native large transfers. Applications sharing
+a `ModelContext` must resolve the same HRX crate instance. The current kernels
+target Strix Halo; H3 does not use HRX's NPU feature.
 
 ## Provisioning and overrides
 
 HRX downloads and verifies its native bundle on first GPU use.
-See [offline provisioning](setup.md#toolchain-and-build).
+See [offline provisioning](setup.md#offline-runtime).
 
 | Setting | Purpose |
 | --- | --- |
@@ -92,7 +100,7 @@ contents can change in the same allocations. Dependencies order scratch reuse.
 Q preparation, K preparation and V transpose branch from their producer and
 feed attention directly.
 
-Graphs remain opt-in. [Criterion benchmarks](performance.md) compare eager and
+Graphs are opt-in. [Criterion benchmarks](performance.md) compare eager and
 recorded dispatch and DiT execution, including submission and completion waits.
 
 ## Session ownership
@@ -102,14 +110,5 @@ quarantine after uncertain completion. H3's lazy model units share a memory
 budget and residency manager. See [session lifecycle](runtime-options.md) for
 cancellation, eviction and callback constraints.
 
-[Rustler](../clients/README.md) workers own their sessions and accept jobs through
-a bounded queue. The Python parity tools invoke an ignored Rust fixture test; neither
-integration adds a Python or Rustler dependency to the inference library.
-
-## Model-specific engine boundaries
-
-H3 keeps immutable checkpoint mappings and directly initializes repacked weights
-through HRX. GPU-authored storage rings do not replace these model-aware packing
-recipes or provide automatic weight paging. Likewise, resident XDNA sessions
-require NPU kernels and tensor layouts that H3 does not currently provide. H3 does
-not expose storage-ring or NPU switches that would leave inference unchanged.
+[Rustler](../clients/rustler/README.md) workers own their sessions and accept jobs
+through a bounded queue. See [client integration](../clients/README.md) for examples.

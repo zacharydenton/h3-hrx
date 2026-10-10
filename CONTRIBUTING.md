@@ -1,35 +1,37 @@
-# Contributing to h3-hrx
+# Contributing
 
-Edit checked-in `.loom` kernels directly and validate numerical changes against
-an independent reference. Retired generators and experiments remain in Git history.
+Improve the completed render: its quality, speed, memory use or reliability.
+H3 owns model layouts and numerical behavior; custom Loom kernels perform GPU
+work, and HRX handles native resources and execution.
 
-Use HRX for native loading, allocation, dispatch, compilation and caching. H3 owns
-model shapes, weight layouts and numerical semantics. `Session` is the inference
-API; language adapters belong in consuming applications.
+## Make a change
 
-## Tests
-
-From the repository root:
+Edit the checked-in `.loom` sources directly. Validate numerical changes against
+an independent reference and inspect rendered output when arithmetic changes.
+Keep the public inference API in `Session`; language adapters belong in clients.
+See [Loom and HRX integration](docs/shared-hrx.md) for execution and ownership.
 
 ```sh
 cargo test
 cargo bench
 ```
 
-Both commands include GPU workloads and require `gfx1151` and a provisioned HRX
-bundle. Checkpoints resolve through the standard Hub cache. Tests run serially
-by default. CPU-only CI and independent reference checks are described in
-[test coverage](docs/testing.md).
+Both commands include GPU workloads and require Strix Halo, the HRX bundle and
+model checkpoints. Tests run serially by default. Use the [test guide](docs/testing.md)
+for CPU-only checks and independent references.
 
-Use [Criterion benchmarks](docs/performance.md) for performance work. Keep generated
-reports and baselines under `target/`; commit benchmark code, not results.
+For optimization, follow the [performance guide](docs/performance.md): profile a
+real workload, validate the candidate, then compare completed timings. Keep
+reports, scratch renders and Criterion baselines under `target/`; commit the
+benchmark code, not generated results.
 
-## Changes and bug reports
+## Send a change or report a bug
 
-Explain the behavior changed and how it was checked. For numerical bugs, include
-shape, seed, sampler, attention mode and a minimal prompt. For performance claims,
-include hardware, precision, timing boundaries and an output correctness check.
+Explain the problem, resulting behavior and checks performed. Include:
 
-Bug reports should include the commit, OS, GPU, memory, Rust/HRX versions,
-command and error output. See the [release checks](docs/releasing.md) before
-publishing a build.
+- For numerical issues: shape, seed, sampler, attention mode and a minimal prompt.
+- For performance claims: hardware, workload, precision, timing boundaries,
+  variation and output validation.
+- For failures: commit, OS, GPU, memory, Rust/HRX versions, command and error output.
+
+See [release checks](docs/releasing.md) before publishing a build.
