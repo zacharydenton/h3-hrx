@@ -4416,6 +4416,7 @@ fn compact_qkv_matches_scalar_projection_and_zeroes_v_padding() {
                 ("n_size", n),
                 ("k_stride", k),
                 ("m_group", 3),
+                ("rows_bound", 65536),
             ]),
             [
                 (n / 128) as u32,
@@ -5311,6 +5312,7 @@ fn dit_swiglu_matches_integer_dots_above_f16_range() {
                 ("n_size", n),
                 ("k_stride", stride),
                 ("m_group", 3),
+                ("rows_bound", 65536),
             ]),
             None,
             &[rows as u64],
@@ -5346,6 +5348,83 @@ fn dit_swiglu_matches_integer_dots_above_f16_range() {
                     actual[row * FFN + col],
                     f64::from(expected),
                     "{stem}: row={row} col={col}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
+fn compact_qkv_dispatch_crosses_specialized_row_bound() {
+    use h3_hrx::dispatch::Gemm;
+    let manager = hrx::residency::ResidencyManager::new(256 << 20).unwrap();
+    let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+    let compiler =
+        h3_hrx::compile::Compiler::new(None, Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels"));
+    let (k, n) = (64usize, 384usize);
+    let small = Gemm::build_compact_qkv(&compiler, &mut stream, k, n, 1, k).unwrap();
+    let large = Gemm::build_compact_qkv(&compiler, &mut stream, k, n, 65537, k).unwrap();
+    compiler.flush(&mut stream).unwrap();
+    let w: Vec<i8> = (0..n * k).map(|i| (i / k % 5) as i8 - 2).collect();
+    let wq = stream.allocate_from(&bytes(&w)).unwrap();
+    let ws = stream
+        .allocate_from(&bytes(&vec![1. / k as f32; n]))
+        .unwrap();
+    // Reuse one small-row operator across its specialization boundary, then
+    // exercise a general-only operator at a smaller row count.
+    for (op, rows) in [
+        (&small, 65535usize),
+        (&small, 65536),
+        (&small, 65537),
+        (&large, 17),
+    ] {
+        let cap = rows.div_ceil(256) * 256;
+        let qk_elements = rows * (2 * n / 3);
+        let elements = qk_elements + cap * (n / 3);
+        let a: Vec<i8> = (0..rows * k).map(|i| (i / k % 7) as i8 - 3).collect();
+        let aq = stream.allocate_from(&bytes(&a)).unwrap();
+        let as_ = stream.allocate_from(&bytes(&vec![1f32; rows])).unwrap();
+        let mut actual = vec![0x7f; elements * 2];
+        actual.extend([0xa5; 64]);
+        let out = stream.allocate_from(&actual).unwrap();
+        op.run(
+            &mut stream,
+            None,
+            "bounded QKV",
+            rows as u32,
+            aq.binding(),
+            wq.binding(),
+            Some((ws.binding(), as_.binding())),
+            out.binding(),
+            None,
+            None,
+        )
+        .unwrap();
+        stream.read_blocking(out.binding(), &mut actual).unwrap();
+        assert_eq!(&actual[elements * 2..], &[0xa5; 64]);
+        for col in 0..n {
+            let extent = if col < 2 * n / 3 { rows } else { cap };
+            for row in 0..extent {
+                let offset = if col < 2 * n / 3 {
+                    row * (2 * n / 3) + col
+                } else {
+                    qk_elements + (col - 2 * n / 3) * cap + row
+                };
+                let expected = if row < rows {
+                    ((row % 7) as i32 - 3) * ((col % 5) as i32 - 2)
+                } else {
+                    0
+                };
+                let actual =
+                    f16::from_le_bytes(actual[offset * 2..offset * 2 + 2].try_into().unwrap());
+                assert_eq!(
+                    actual.to_f32(),
+                    expected as f32,
+                    "rows={rows}, row={row}, col={col}"
                 );
             }
         }

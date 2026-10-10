@@ -12,9 +12,9 @@ template.def<@h3.packed_schema> @h3_packed_i8(%registers: index) -> (encoding<sc
   template.return %schema : encoding<schema>
 }
 
-template.decl @h3.packed_256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %registers: index, %k_step: index, %packed_per_word: index, %output_f32: i1, %compact_qkv: i1)
+template.decl @h3.packed_256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %registers: index, %k_step: index, %packed_per_word: index, %output_f32: i1, %compact_qkv: i1, %rows_bound: index)
 
-template.def<@h3.packed_256> @h3_packed_256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %registers: index, %k_step: index, %packed_per_word: index, %output_f32: i1, %compact_qkv: i1) {
+template.def<@h3.packed_256> @h3_packed_256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %registers: index, %k_step: index, %packed_per_word: index, %output_f32: i1, %compact_qkv: i1, %rows_bound: index) {
   %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), mul(%cfg_k_size, 64)] : index
   // the operand rows' pitch (k elements); K itself when it is not a multiple of 1024, else K + 64,
   // so that the 384 rows a step touches do not alias in the cache (K = 7168: 36.7 -> 41.2 TOPS, K = 21504: 33.4 -> 41.4)
@@ -70,7 +70,7 @@ template.def<@h3.packed_256> @h3_packed_256(%m_size: index, %a: buffer, %w: buff
   %subgroup = index.assume %subgroup0 [range(%subgroup0, 0, 7)] : index
   %lane = kernel.subgroup.lane.id : index
   %lane16 = index.rem %lane, %c16 : index
-  %m_bounded = index.assume %m_size [range(%m_size, 1, 16777216)] : index
+  %m_bounded = index.assume %m_size [range(%m_size, 1, 16777216), le(%m_size, %rows_bound)] : index
   %v_width = index.div %n_size, %c3 : index
   %v_start = index.mul %v_width, %c2 : index
   %out_stride = scf.select %compact_qkv, %v_start, %n_size : index
@@ -443,7 +443,8 @@ kernel.def target(@h3_gemm_i4_256_gfx11) export("h3_gemm_i4_256") @h3_gemm_i4_25
   %packed_per_word = index.constant 8 : index
   %output_f32 = scalar.constant false : i1
   %compact_qkv = scalar.constant false : i1
-  template.apply<@h3.packed_256>(%m_size, %a, %w, %scale, %a_scale, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %registers, %k_step, %packed_per_word, %output_f32, %compact_qkv) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, i1, i1)
+  %rows_bound = index.constant 16777216 : index
+  template.apply<@h3.packed_256>(%m_size, %a, %w, %scale, %a_scale, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %registers, %k_step, %packed_per_word, %output_f32, %compact_qkv, %rows_bound) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, i1, i1, index)
   kernel.return
 }
 
@@ -484,7 +485,8 @@ kernel.def target(@h3_gemm_i8_256_gfx11) export("h3_gemm_i8_256") @h3_gemm_i8_25
   %packed_per_word = index.constant 4 : index
   %output_f32 = scalar.constant false : i1
   %compact_qkv = scalar.constant false : i1
-  template.apply<@h3.packed_256>(%m_size, %a, %w, %scale, %a_scale, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %registers, %k_step, %packed_per_word, %output_f32, %compact_qkv) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, i1, i1)
+  %rows_bound = index.constant 16777216 : index
+  template.apply<@h3.packed_256>(%m_size, %a, %w, %scale, %a_scale, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %registers, %k_step, %packed_per_word, %output_f32, %compact_qkv, %rows_bound) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, i1, i1, index)
   kernel.return
 }
 
@@ -525,7 +527,8 @@ kernel.def target(@h3_gemm_i8_f32_256_gfx11) export("h3_gemm_i8_f32_256") @h3_ge
   %packed_per_word = index.constant 4 : index
   %output_f32 = scalar.constant true : i1
   %compact_qkv = scalar.constant false : i1
-  template.apply<@h3.packed_256>(%m_size, %a, %w, %scale, %a_scale, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %registers, %k_step, %packed_per_word, %output_f32, %compact_qkv) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, i1, i1)
+  %rows_bound = index.constant 16777216 : index
+  template.apply<@h3.packed_256>(%m_size, %a, %w, %scale, %a_scale, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %registers, %k_step, %packed_per_word, %output_f32, %compact_qkv, %rows_bound) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, i1, i1, index)
   kernel.return
 }
 
@@ -3430,6 +3433,8 @@ config.decl @h3.gemm_i8_qkv_256.k_stride : %value: index where [range(%value, 64
 
 config.decl @h3.gemm_i8_qkv_256.m_group : %value: index where [range(%value, 1, 4)]
 
+config.decl @h3.gemm_i8_qkv_256.rows_bound : %value: index where [range(%value, 1, 16777216)]
+
 kernel.def target(@h3_gemm_i8_qkv_256_gfx11) export("h3_gemm_i8_qkv_256") @h3_gemm_i8_qkv_256(%m_size: index) {
   %c1 = index.constant 1 : index
   %c3 = index.constant 3 : index
@@ -3457,6 +3462,7 @@ kernel.def target(@h3_gemm_i8_qkv_256_gfx11) export("h3_gemm_i8_qkv_256") @h3_ge
   %packed_per_word = index.constant 4 : index
   %output_f32 = scalar.constant false : i1
   %compact_qkv = scalar.constant true : i1
-  template.apply<@h3.packed_256>(%m_size, %a, %w, %scale, %a_scale, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %registers, %k_step, %packed_per_word, %output_f32, %compact_qkv) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, i1, i1)
+  %rows_bound = config.get @h3.gemm_i8_qkv_256.rows_bound : index
+  template.apply<@h3.packed_256>(%m_size, %a, %w, %scale, %a_scale, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %registers, %k_step, %packed_per_word, %output_f32, %compact_qkv, %rows_bound) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, i1, i1, index)
   kernel.return
 }

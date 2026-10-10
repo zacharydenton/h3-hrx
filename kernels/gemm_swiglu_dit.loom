@@ -6,6 +6,7 @@ config.decl @h3.gemm_i8_swiglu_f32_192x256.k_size : %value: index where [eq(%val
 config.decl @h3.gemm_i8_swiglu_f32_192x256.n_size : %value: index where [eq(%value, 28672)]
 config.decl @h3.gemm_i8_swiglu_f32_192x256.k_stride : %value: index where [range(%value, 5376, 65536), mul(%value, 64)]
 config.decl @h3.gemm_i8_swiglu_f32_192x256.m_group : %value: index where [range(%value, 1, 4)]
+config.decl @h3.gemm_i8_swiglu_f32_192x256.rows_bound : %value: index where [range(%value, 1, 16777216)]
 
 low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@h3_gemm_i8_swiglu_f32_192x256_gfx11) @h3_swiglu_mma_row(%a0: reg<amdgpu.vgpr x4>, %b0: reg<amdgpu.vgpr x4>, %b1: reg<amdgpu.vgpr x4>, %b2: reg<amdgpu.vgpr x4>, %b3: reg<amdgpu.vgpr x4>, %c00: reg<amdgpu.vgpr x8>, %c01: reg<amdgpu.vgpr x8>, %c02: reg<amdgpu.vgpr x8>, %c03: reg<amdgpu.vgpr x8>) -> (reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>) asm {
   %owned00 = copy %c00 : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr x8>
@@ -88,7 +89,8 @@ kernel.def target(@h3_gemm_i8_swiglu_f32_192x256_gfx11) export("h3_gemm_i8_swigl
   %subgroup = index.assume %subgroup0 [range(%subgroup0, 0, 15)] : index
   %lane = kernel.subgroup.lane.id : index
   %lane16 = index.rem %lane, %c16 : index
-  %m_bounded = index.assume %m_size [range(%m_size, 1, 16777216)] : index
+  %rows_bound = config.get @h3.gemm_i8_swiglu_f32_192x256.rows_bound : index
+  %m_bounded = index.assume %m_size [range(%m_size, 1, 16777216), le(%m_size, %rows_bound)] : index
   %wg_x = kernel.workgroup.id<x> : index
   %wg_y = kernel.workgroup.id<y> : index
   %c_n_tiles = index.div %n_size, %c256 : index

@@ -700,6 +700,7 @@ impl Prepare {
 /// A GEMM of the int8, f16 or bf16 family for one (K, N, row group).
 pub struct Gemm {
     kernel: crate::compile::Kernel,
+    bounded_kernel: Option<crate::compile::Kernel>,
     n: usize,
     resid: bool,
     bias: bool,
@@ -725,6 +726,32 @@ pub enum Tile {
 }
 
 impl Gemm {
+    const ROW_BOUND: usize = 65536;
+
+    // Keep the general kernel: callers may run more rows than they built for.
+    // Smaller row bounds let the compiler narrow intermediate address arithmetic.
+    fn build_bounded(
+        c: &Compiler,
+        stream: &mut hrx::Stream,
+        module: &str,
+        stem: &str,
+        mut cfg: Cfg,
+        tokens: usize,
+    ) -> Result<(crate::compile::Kernel, Option<crate::compile::Kernel>)> {
+        let bound_key = format!("h3.{stem}.rows_bound");
+        cfg.push((bound_key.clone(), "16777216".into()));
+        let symbol = format!("h3_{stem}");
+        let general = c.get(stream, module, &symbol, &cfg)?;
+        let bounded = if tokens <= Self::ROW_BOUND {
+            cfg.pop();
+            cfg.push((bound_key, Self::ROW_BOUND.to_string()));
+            Some(c.get(stream, module, &symbol, &cfg)?)
+        } else {
+            None
+        };
+        Ok((general, bounded))
+    }
+
     /// INT8 MHA projection with Q/K rows followed by transposed V. The output
     /// needs `(tokens * 2 + tokens.div_ceil(256) * 256) * n / 3` FP16 elements.
     pub fn build_compact_qkv(
@@ -743,8 +770,11 @@ impl Gemm {
             (format!("{ns}k_stride"), k_stride.to_string()),
             (format!("{ns}m_group"), m_group.to_string()),
         ];
+        let (kernel, bounded_kernel) =
+            Self::build_bounded(c, stream, "gemm_packed_256", "gemm_i8_qkv_256", cfg, tokens)?;
         Ok(Self {
-            kernel: c.get(stream, "gemm_packed_256", "h3_gemm_i8_qkv_256", &cfg)?,
+            kernel,
+            bounded_kernel,
             n,
             resid: false,
             bias: false,
@@ -926,9 +956,14 @@ impl Gemm {
         } else {
             stem.clone()
         };
-        let kernel = c.get(stream, &module, &format!("h3_{stem}"), &cfg)?;
+        let (kernel, bounded_kernel) = if long_dit_swiglu {
+            Self::build_bounded(c, stream, &module, &stem, cfg, tokens)?
+        } else {
+            (c.get(stream, &module, &format!("h3_{stem}"), &cfg)?, None)
+        };
         Ok(Self {
             kernel,
+            bounded_kernel,
             n: n_size,
             resid,
             bias,
@@ -1012,9 +1047,14 @@ impl Gemm {
         if self.bias {
             args.push(bias.expect("a biased GEMM needs its bias"), self.n * 4);
         }
+        let kernel = if (1..=Self::ROW_BOUND).contains(&t) {
+            self.bounded_kernel.as_ref().unwrap_or(&self.kernel)
+        } else {
+            &self.kernel
+        };
         emit(
             sink,
-            &self.kernel,
+            kernel,
             profile,
             stage,
             &[tokens],
