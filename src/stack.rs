@@ -176,6 +176,7 @@ pub struct Stack {
     prep_attn: Option<Prepare>,
     prep_down: Option<Prepare>,
     gemm_qkv: Option<Gemm>,
+    compact_qkv: Option<CompactQkv>,
     gemm_gu: Gemm,
     gemm_out: Gemm,
     gemm_down: Gemm,
@@ -199,6 +200,12 @@ pub struct Stack {
     gu: Option<hrx::Buffer>,
     /// The integer QK^T operands, when the attention runs on them.
     int_qk: Option<IntQk>,
+}
+
+struct CompactQkv {
+    projection: Gemm,
+    q: crate::compile::Kernel,
+    k: crate::compile::Kernel,
 }
 
 struct IntQk {
@@ -538,6 +545,7 @@ impl Stack {
             "prepare_qk_i8"
         };
         let (mut colmean, mut prep_q, mut prep_k, mut transpose) = (None, None, None, None);
+        let mut compact_qkv = None;
         if qk_int {
             if d.causal || d.head_dim != 128 {
                 return err("integer QK^T attention: MHA with head 128 only");
@@ -575,6 +583,34 @@ impl Stack {
                 cfg[1].1 = d.inner().to_string();
             }
             prep_k = Some(c.get(stream, pqk, &format!("h3_{pqk}"), &cfg)?);
+            // This layout uses the existing fused allocation. Its V tail must
+            // have exactly the capacity written by the 256-row projection.
+            // Adapter projections retain the original layout at execution.
+            if fused_operands
+                && elem == "i8"
+                && !d.bias
+                && capacity == tokens.div_ceil(256) * 256
+                && env_once("H3_COMPACT_QKV") != Some("0")
+            {
+                let mut compact_cfg = cfg.clone();
+                compact_cfg[0].1 = (2 * d.inner()).to_string();
+                let k = c.get(stream, pqk, &format!("h3_{pqk}"), &compact_cfg)?;
+                compact_cfg[1].1 = "0".into();
+                compact_cfg[last].1 = num(1.0 / (d.head_dim as f64).sqrt() / 128.0);
+                let q = c.get(stream, pqk, &format!("h3_{pqk}"), &compact_cfg)?;
+                compact_qkv = Some(CompactQkv {
+                    projection: Gemm::build_compact_qkv(
+                        c,
+                        stream,
+                        d.hidden,
+                        d.qkv(),
+                        tokens,
+                        pitch(d.hidden),
+                    )?,
+                    q,
+                    k,
+                });
+            }
             let transpose_stem = if fused_operands || direct_v {
                 "transpose_qkv_v_f16"
             } else {
@@ -779,6 +815,7 @@ impl Stack {
             prep_attn,
             prep_down,
             gemm_qkv,
+            compact_qkv,
             gemm_gu,
             gemm_out,
             gemm_down,
@@ -846,10 +883,20 @@ impl Stack {
     }
 
     fn vt_view<'a>(&'a self, iq: &'a IntQk) -> View<'a> {
+        if self.compact_projection().is_some() {
+            return self.fused.slice(
+                self.tokens * 2 * self.d.inner() * 2,
+                self.d.inner() * self.capacity * 2,
+            );
+        }
         iq.vt.as_ref().map_or_else(
             || self.a_q.slice(0, self.d.inner() * self.capacity * 2),
             hrx::Buffer::binding,
         )
+    }
+
+    fn compact_projection(&self) -> Option<&CompactQkv> {
+        self.compact_qkv.as_ref().filter(|_| self.adapter.is_none())
     }
 
     /// Q, K and V, whether they are their own allocations or views into the fused one.
@@ -1078,7 +1125,11 @@ impl Stack {
                         None,
                     )?;
                 } else {
-                    self.gemm_qkv.as_ref().expect("built when not fused").emit(
+                    let projection = self.compact_projection().map_or_else(
+                        || self.gemm_qkv.as_ref().expect("built when not fused"),
+                        |qkv| &qkv.projection,
+                    );
+                    projection.emit(
                         sink,
                         Some(prof),
                         "gemm qkv",
@@ -1294,17 +1345,18 @@ impl Stack {
         let rows = t as usize;
         let before = sink.head();
         let mut ends = [Default::default(); 3];
+        let compact = self.compact_projection();
         for (i, kernel, weight, codes, scales) in [
             (
                 0,
-                self.prep_q.as_ref().unwrap(),
+                compact.map_or_else(|| self.prep_q.as_ref().unwrap(), |qkv| &qkv.q),
                 qnorm,
                 iq.qi.binding(),
                 iq.qs.binding(),
             ),
             (
                 1,
-                self.prep_k.as_ref().unwrap(),
+                compact.map_or_else(|| self.prep_k.as_ref().unwrap(), |qkv| &qkv.k),
                 knorm,
                 iq.ki.binding(),
                 iq.ks.binding(),
@@ -1331,17 +1383,21 @@ impl Stack {
             ends[i] = sink.head();
         }
         sink.resume(before);
-        emit(
-            sink,
-            self.transpose.as_ref().unwrap(),
-            Some(prof),
-            "fused V transpose",
-            &[t],
-            &[t],
-            &[self.fused.binding(), self.vt_view(iq)],
-            &[rows * self.d.qkv() * 2, self.d.inner() * self.capacity * 2],
-        )?;
-        ends[2] = sink.head();
+        if compact.is_some() {
+            ends[2] = before;
+        } else {
+            emit(
+                sink,
+                self.transpose.as_ref().unwrap(),
+                Some(prof),
+                "fused V transpose",
+                &[t],
+                &[t],
+                &[self.fused.binding(), self.vt_view(iq)],
+                &[rows * self.d.qkv() * 2, self.d.inner() * self.capacity * 2],
+            )?;
+            ends[2] = sink.head();
+        }
         sink.after_branches(ends)?;
         Ok(())
     }

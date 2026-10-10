@@ -934,6 +934,7 @@ fn gemm(c: &mut Criterion) {
             // Actual FP16 QKV outputs, including raster groups with empty row tiles.
             for m in [1024, 1025, 4096, 4097] {
                 shapes.push(("plain", m, HID, QKV));
+                shapes.push(("qkv", m, HID, QKV));
             }
             for m in [1025, 4097] {
                 shapes.extend([("swiglu", m, HID, 2 * FFN), ("resid", m, FFN, HID)]);
@@ -942,6 +943,7 @@ fn gemm(c: &mut Criterion) {
             for m in [15666, 37977] {
                 shapes.extend([
                     ("plain", m, HID, QKV),
+                    ("qkv", m, HID, QKV),
                     ("resid", m, INNER, HID),
                     ("swiglu", m, HID, 2 * FFN),
                     ("resid", m, FFN, HID),
@@ -965,27 +967,31 @@ fn gemm(c: &mut Criterion) {
                     let mut stream = support::stream(Some(manager.budget()));
                     let compiler = compiler();
                     let stride = h3_hrx::model::gemm_pitch(k, h3_hrx::model::elem_bits(elem));
-                    let output_type = if mode == "plain" {
+                    let output_type = if matches!(mode, "plain" | "qkv") {
                         ActivationType::F16
                     } else {
                         ActivationType::F32
                     };
-                    let gemm = Gemm::build_with_output(
-                        &compiler,
-                        &mut stream,
-                        mode,
-                        elem,
-                        false,
-                        true,
-                        k,
-                        n,
-                        m,
-                        1,
-                        stride,
-                        Tile::Plain,
-                        0,
-                        output_type,
-                    )
+                    let gemm = if mode == "qkv" {
+                        Gemm::build_compact_qkv(&compiler, &mut stream, k, n, m, stride)
+                    } else {
+                        Gemm::build_with_output(
+                            &compiler,
+                            &mut stream,
+                            mode,
+                            elem,
+                            false,
+                            true,
+                            k,
+                            n,
+                            m,
+                            1,
+                            stride,
+                            Tile::Plain,
+                            0,
+                            output_type,
+                        )
+                    }
                     .unwrap();
                     compiler.flush(&mut stream).unwrap();
                     let a = upload(&mut stream, &operand(m * stride, elem, 3));
@@ -1000,10 +1006,22 @@ fn gemm(c: &mut Criterion) {
                     let ws = upload(&mut stream, bytemuck::cast_slice(&vec![0.01f32; n]));
                     let as_ = upload(&mut stream, bytemuck::cast_slice(&vec![0.01f32; m]));
                     let width = if mode == "swiglu" { n / 2 } else { n };
+                    let padding = if mode == "qkv" {
+                        (m.div_ceil(256) * 256 - m) * (n / 3)
+                    } else {
+                        0
+                    };
                     let out = stream
-                        .allocate_zeroed(m * width * if mode == "plain" { 2 } else { 4 })
+                        .allocate_zeroed(
+                            (m * width + padding)
+                                * if matches!(mode, "plain" | "qkv") {
+                                    2
+                                } else {
+                                    4
+                                },
+                        )
                         .unwrap();
-                    let check = if mode == "plain" {
+                    let check = if matches!(mode, "plain" | "qkv") {
                         check_f16
                     } else {
                         check_f32

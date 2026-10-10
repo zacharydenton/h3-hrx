@@ -12,9 +12,9 @@ template.def<@h3.packed_schema> @h3_packed_i8(%registers: index) -> (encoding<sc
   template.return %schema : encoding<schema>
 }
 
-template.decl @h3.packed_256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %registers: index, %k_step: index, %packed_per_word: index, %output_f32: i1)
+template.decl @h3.packed_256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %registers: index, %k_step: index, %packed_per_word: index, %output_f32: i1, %compact_qkv: i1)
 
-template.def<@h3.packed_256> @h3_packed_256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %registers: index, %k_step: index, %packed_per_word: index, %output_f32: i1) {
+template.def<@h3.packed_256> @h3_packed_256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %registers: index, %k_step: index, %packed_per_word: index, %output_f32: i1, %compact_qkv: i1) {
   %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), mul(%cfg_k_size, 64)] : index
   // the operand rows' pitch (k elements); K itself when it is not a multiple of 1024, else K + 64,
   // so that the 384 rows a step touches do not alias in the cache (K = 7168: 36.7 -> 41.2 TOPS, K = 21504: 33.4 -> 41.4)
@@ -71,6 +71,16 @@ template.def<@h3.packed_256> @h3_packed_256(%m_size: index, %a: buffer, %w: buff
   %lane = kernel.subgroup.lane.id : index
   %lane16 = index.rem %lane, %c16 : index
   %m_bounded = index.assume %m_size [range(%m_size, 1, 16777216)] : index
+  %v_width = index.div %n_size, %c3 : index
+  %v_start = index.mul %v_width, %c2 : index
+  %out_stride = scf.select %compact_qkv, %v_start, %n_size : index
+  %v_c255 = index.constant 255 : index
+  %v_rounded = index.add %m_bounded, %v_c255 : index
+  %v_tiles = index.div %v_rounded, %c256 : index
+  %v_cap = index.mul %v_tiles, %c256 : index
+  %v_elements = index.mul %m_bounded, %v_start : index
+  %v_elem_bytes = index.constant 2 : offset
+  %v_offset = index.scale %v_elements, %v_elem_bytes : index, offset -> offset
   %wg_x = kernel.workgroup.id<x> : index
   %wg_y = kernel.workgroup.id<y> : index
   %c_n_tiles = index.div %n_size, %c128 : index
@@ -92,6 +102,8 @@ template.def<@h3.packed_256> @h3_packed_256(%m_size: index, %a: buffer, %w: buff
   %wave_col = index.mul %wave_n, %c64 : index
   %base_m = index.mul %tile_m_id, %c256 : index
   %base_n = index.mul %tile_n_id, %c128 : index
+  %v_column = index.cmp uge, %base_n, %v_start : index
+  %is_v = scalar.andi %compact_qkv, %v_column : i1
   // Raster groups can include entirely padded row tiles. This branch is workgroup-uniform.
   %has_rows = index.cmp ult, %base_m, %m_bounded : index
   scf.if %has_rows {
@@ -106,7 +118,8 @@ template.def<@h3.packed_256> @h3_packed_256(%m_size: index, %a: buffer, %w: buff
     %scale_view = buffer.view %scale_global[%c0_offset] : buffer -> view<[%n_size]xf32>
     %a_scale_global = buffer.assume.memory_space<global> %a_scale : buffer
     %a_scale_view = buffer.view %a_scale_global[%c0_offset] : buffer -> view<[%m_bounded]xf32>
-    %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_bounded]x[%n_size]xf16>
+    %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_bounded]x[%out_stride]xf16>
+    %vt_view = buffer.view %c_global[%v_offset] : buffer -> view<[%v_width]x[%v_cap]xf16>
     %c_view32 = buffer.view %c_global[%c0_offset] : buffer -> view<[%m_bounded]x[%n_size]xf32>
 
     %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
@@ -288,8 +301,72 @@ template.def<@h3.packed_256> @h3_packed_256(%m_size: index, %a: buffer, %w: buff
       %frag_row_offset = index.mul %fi, %c16 : index
       %frag_col_offset = index.mul %fj, %c16 : index
       %tile_col = index.add %wave_col, %frag_col_offset : index
+      scf.if %is_v {
+        %vt_row_group = index.rem %lane, %c4 : index
+        %vt_r0 = index.mul %vt_row_group, %c4 : index
+        %vt_r1 = index.add %vt_r0, %c1 : index
+        %vt_r2 = index.add %vt_r0, %c2 : index
+        %vt_r3 = index.add %vt_r0, %c3 : index
+        %vt_col0 = index.div %lane, %c4 : index
+        %vt_wave_row = index.add %wave_row, %frag_row_offset : index
+        %vt_block_row = index.add %base_m, %vt_wave_row : index
+        %vt_row = index.add %vt_block_row, %vt_r0 : index
+        %vt_row_limit = index.sub %v_cap, %c4 : index
+        %vt_row_b = index.assume %vt_row [le(%vt_row, %vt_row_limit), mul(%vt_row, 4)] : index
+        %vt_last_row = index.sub %m_bounded, %c1 : index
+        %vt_g0 = index.add %vt_block_row, %vt_r0 : index
+        %vt_ok0 = index.cmp ult, %vt_g0, %m_bounded : index
+        %vt_safe0 = index.min %vt_g0, %vt_last_row : index
+        %vt_bounded0 = index.assume %vt_safe0 [lt(%vt_safe0, %m_bounded)] : index
+        %vt_as0 = view.load %a_scale_view[%vt_bounded0] : view<[%m_bounded]xf32> -> f32
+        %vt_g1 = index.add %vt_block_row, %vt_r1 : index
+        %vt_ok1 = index.cmp ult, %vt_g1, %m_bounded : index
+        %vt_safe1 = index.min %vt_g1, %vt_last_row : index
+        %vt_bounded1 = index.assume %vt_safe1 [lt(%vt_safe1, %m_bounded)] : index
+        %vt_as1 = view.load %a_scale_view[%vt_bounded1] : view<[%m_bounded]xf32> -> f32
+        %vt_g2 = index.add %vt_block_row, %vt_r2 : index
+        %vt_ok2 = index.cmp ult, %vt_g2, %m_bounded : index
+        %vt_safe2 = index.min %vt_g2, %vt_last_row : index
+        %vt_bounded2 = index.assume %vt_safe2 [lt(%vt_safe2, %m_bounded)] : index
+        %vt_as2 = view.load %a_scale_view[%vt_bounded2] : view<[%m_bounded]xf32> -> f32
+        %vt_g3 = index.add %vt_block_row, %vt_r3 : index
+        %vt_ok3 = index.cmp ult, %vt_g3, %m_bounded : index
+        %vt_safe3 = index.min %vt_g3, %vt_last_row : index
+        %vt_bounded3 = index.assume %vt_safe3 [lt(%vt_safe3, %m_bounded)] : index
+        %vt_as3 = view.load %a_scale_view[%vt_bounded3] : view<[%m_bounded]xf32> -> f32
+        %vt_as = vector.from_elements %vt_as0, %vt_as1, %vt_as2, %vt_as3 : vector<4xf32>
+        %vt_valid = vector.from_elements %vt_ok0, %vt_ok1, %vt_ok2, %vt_ok3 : vector<4xi1>
+        scf.for %vt_half = [%c0 to %c2 step %c1] {
+          %vt_col_offset = index.mul %vt_half, %c8 : index
+          %vt_col = index.add %vt_col0, %vt_col_offset : index
+          %vt_block_col = index.add %base_n, %tile_col : index
+          %vt_global_col = index.add %vt_block_col, %vt_col : index
+          %vt_channel = index.sub %vt_global_col, %v_start : index
+          %vt_scale = view.load %scale_view[%vt_global_col] : view<[%n_size]xf32> -> f32
+          %vt_scales = vector.splat %vt_scale : vector<4xf32>
+          %vt_i0 = view.load %result_view[%vt_r0, %vt_col] : view<16x16xi32> -> i32
+          %vt_i1 = view.load %result_view[%vt_r1, %vt_col] : view<16x16xi32> -> i32
+          %vt_i2 = view.load %result_view[%vt_r2, %vt_col] : view<16x16xi32> -> i32
+          %vt_i3 = view.load %result_view[%vt_r3, %vt_col] : view<16x16xi32> -> i32
+          %vt_ints = vector.from_elements %vt_i0, %vt_i1, %vt_i2, %vt_i3 : vector<4xi32>
+          %vt_values = vector.sitofp %vt_ints : vector<4xi32> to vector<4xf32>
+          %vt_scaled0 = vector.mulf %vt_values, %vt_scales : vector<4xf32>
+          %vt_scaled1 = vector.mulf %vt_scaled0, %vt_as : vector<4xf32>
+          %vt_scaled = vector.addf %vt_scaled1, %zero4 : vector<4xf32>
+          %vt_sat0 = vector.minnumf %vt_scaled, %f16_max4 : vector<4xf32>
+          %vt_sat = vector.maxnumf %vt_sat0, %f16_min4 : vector<4xf32>
+          %vt_inf = vector.constant inf : vector<4xf32>
+          %vt_abs = vector.absf %vt_scaled : vector<4xf32>
+          %vt_finite = vector.cmpf olt, %vt_abs, %vt_inf : vector<4xf32> -> vector<4xi1>
+          %vt_checked = vector.select %vt_finite, %vt_sat, %vt_scaled : vector<4xf32>
+          %vt_masked = vector.select %vt_valid, %vt_checked, %zero4 : vector<4xf32>
+          %vt_half_values = vector.fptrunc %vt_masked : vector<4xf32> to vector<4xf16>
+          vector.store %vt_half_values, %vt_view[%vt_channel, %vt_row_b] : vector<4xf16>, view<[%v_width]x[%v_cap]xf16>
+        }
+      } else {
       %out_col_local = index.add %tile_col, %publish_col : index
       %out_col = index.add %base_n, %out_col_local : index
+      %qk_col = index.assume %out_col [lt(%out_col, %out_stride), mul(%out_col, 4)] : index
       %scale_values = vector.load %scale_view[%out_col] : view<[%n_size]xf32> -> vector<4xf32>
       scf.for %half = [%c0 to %c2 step %c1] {
         %row_offset = index.mul %half, %c8 : index
@@ -318,9 +395,10 @@ template.def<@h3.packed_256> @h3_packed_256(%m_size: index, %a: buffer, %w: buff
           %range_finite = vector.cmpf olt, %range_abs, %range_inf : vector<4xf32> -> vector<4xi1>
           %range_checked = vector.select %range_finite, %sat, %scaled : vector<4xf32>
           %narrow = vector.fptrunc %range_checked : vector<4xf32> to vector<4xf16>
-          vector.store %narrow, %c_view[%bounded, %out_col] : vector<4xf16>, view<[%m_bounded]x[%n_size]xf16>
+          vector.store %narrow, %c_view[%bounded, %qk_col] : vector<4xf16>, view<[%m_bounded]x[%out_stride]xf16>
           }
         }
+      }
       }
       kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
     }
@@ -364,7 +442,8 @@ kernel.def target(@h3_gemm_i4_256_gfx11) export("h3_gemm_i4_256") @h3_gemm_i4_25
   %k_step = index.constant 128 : index
   %packed_per_word = index.constant 8 : index
   %output_f32 = scalar.constant false : i1
-  template.apply<@h3.packed_256>(%m_size, %a, %w, %scale, %a_scale, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %registers, %k_step, %packed_per_word, %output_f32) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, i1)
+  %compact_qkv = scalar.constant false : i1
+  template.apply<@h3.packed_256>(%m_size, %a, %w, %scale, %a_scale, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %registers, %k_step, %packed_per_word, %output_f32, %compact_qkv) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, i1, i1)
   kernel.return
 }
 
@@ -404,7 +483,8 @@ kernel.def target(@h3_gemm_i8_256_gfx11) export("h3_gemm_i8_256") @h3_gemm_i8_25
   %k_step = index.constant 64 : index
   %packed_per_word = index.constant 4 : index
   %output_f32 = scalar.constant false : i1
-  template.apply<@h3.packed_256>(%m_size, %a, %w, %scale, %a_scale, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %registers, %k_step, %packed_per_word, %output_f32) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, i1)
+  %compact_qkv = scalar.constant false : i1
+  template.apply<@h3.packed_256>(%m_size, %a, %w, %scale, %a_scale, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %registers, %k_step, %packed_per_word, %output_f32, %compact_qkv) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, i1, i1)
   kernel.return
 }
 
@@ -444,7 +524,8 @@ kernel.def target(@h3_gemm_i8_f32_256_gfx11) export("h3_gemm_i8_f32_256") @h3_ge
   %k_step = index.constant 64 : index
   %packed_per_word = index.constant 4 : index
   %output_f32 = scalar.constant true : i1
-  template.apply<@h3.packed_256>(%m_size, %a, %w, %scale, %a_scale, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %registers, %k_step, %packed_per_word, %output_f32) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, i1)
+  %compact_qkv = scalar.constant false : i1
+  template.apply<@h3.packed_256>(%m_size, %a, %w, %scale, %a_scale, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %registers, %k_step, %packed_per_word, %output_f32, %compact_qkv) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, i1, i1)
   kernel.return
 }
 
@@ -3335,5 +3416,47 @@ kernel.def target(@h3_gemm_i8_swiglu_f32_256b_gs_gfx11) export("h3_gemm_i8_swigl
   %packed_per_word = index.constant 4 : index
   %output_f32 = scalar.constant true : i1
   template.apply<@h3.packed_swiglu_256b_gs>(%m_size, %a, %w, %scale, %a_scale, %c, %bias, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %registers, %k_step, %packed_per_word, %output_f32) : (index, buffer, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, i1)
+  kernel.return
+}
+
+// Q/K rows are compact; V follows as [N/3][ceil(M/256)*256].
+amdgpu.target<gfx11-generic> @h3_gemm_i8_qkv_256_gfx11 {subgroup_size = 32}
+
+config.decl @h3.gemm_i8_qkv_256.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+
+config.decl @h3.gemm_i8_qkv_256.n_size : %value: index where [range(%value, 384, 65536), mul(%value, 384)]
+
+config.decl @h3.gemm_i8_qkv_256.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+
+config.decl @h3.gemm_i8_qkv_256.m_group : %value: index where [range(%value, 1, 4)]
+
+kernel.def target(@h3_gemm_i8_qkv_256_gfx11) export("h3_gemm_i8_qkv_256") @h3_gemm_i8_qkv_256(%m_size: index) {
+  %c1 = index.constant 1 : index
+  %c3 = index.constant 3 : index
+  %c4 = index.constant 4 : index
+  %c128 = index.constant 128 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %n_size0 = config.get @h3.gemm_i8_qkv_256.n_size : index
+  %m_rounded = index.add %m_size, %c255 : index
+  %m_tiles = index.div %m_rounded, %c256 : index
+  %m_group = config.get @h3.gemm_i8_qkv_256.m_group : index
+  %m_group_less = index.sub %m_group, %c1 : index
+  %m_tiles3 = index.add %m_tiles, %m_group_less : index
+  %m_groups = index.div %m_tiles3, %m_group : index
+  %m_tiles_padded = index.mul %m_groups, %m_group : index
+  %n_tiles = index.div %n_size0, %c128 : index
+  kernel.launch.config workgroups(%n_tiles, %m_tiles_padded, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer) {
+  %cfg_k_size = config.get @h3.gemm_i8_qkv_256.k_size : index
+  %cfg_n_size = config.get @h3.gemm_i8_qkv_256.n_size : index
+  %cfg_k_stride = config.get @h3.gemm_i8_qkv_256.k_stride : index
+  %cfg_m_group = config.get @h3.gemm_i8_qkv_256.m_group : index
+  %registers = index.constant 4 : index
+  %k_step = index.constant 64 : index
+  %packed_per_word = index.constant 4 : index
+  %output_f32 = scalar.constant false : i1
+  %compact_qkv = scalar.constant true : i1
+  template.apply<@h3.packed_256>(%m_size, %a, %w, %scale, %a_scale, %c, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %registers, %k_step, %packed_per_word, %output_f32, %compact_qkv) : (index, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, i1, i1)
   kernel.return
 }

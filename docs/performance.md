@@ -240,6 +240,10 @@ H3_BENCH_BUDGET_GIB=32 H3_PROFILE=device cargo bench --locked --bench models -- 
 DiT fuses Q/K normalization, rotary embedding and INT8 preparation from 4,096
 tokens unless K smoothing is enabled. `H3_FUSED_OPERANDS=0` selects the separate
 path for comparisons; the fused path preserves the intermediate FP16 rounding.
+Eligible INT8 DiT projections also write V directly in attention order, keeping
+compact Q/K rows and V in the existing allocation. `H3_COMPACT_QKV=0` selects
+the separate V transpose for comparisons. Adapter-enabled stacks retain the
+original projection layout.
 
 `H3_BENCH_RESIDENCY` selects `budgeted` (default), `retain`, or `stage-scoped` for
 stage and API render benchmarks. A reused stage-scoped session reloads weights

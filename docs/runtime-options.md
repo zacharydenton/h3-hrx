@@ -118,9 +118,9 @@ Use [Criterion benchmarks](performance.md) for repeatable timing comparisons.
 `cargo run --example cache_calibrate -- TRACE` reads a captured stage trace from `--cache-observe`
 and proposes cache thresholds to evaluate on the same inputs.
 
-Developer switches `H3_FUSED_OPERANDS=1` and `H3_REUSE_SCRATCH=1` enable pending
-operand-fusion and scratch-lifetime experiments; neither changes the default
-until its parity and timing gates pass.
+`H3_FUSED_OPERANDS=0` disables fused attention preparation for comparisons.
+`H3_COMPACT_QKV=0` disables direct V publication from eligible INT8 projections.
+`H3_REUSE_SCRATCH=1` enables the optional QKV/feed-forward scratch reuse experiment.
 
 ## Native engines and compiler controls
 

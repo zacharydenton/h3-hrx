@@ -712,6 +712,7 @@ pub struct Gemm {
     classes: usize,
     out_width: usize,
     out_bytes: usize,
+    compact_qkv: bool,
 }
 
 /// Which workgroup tile the decoder uses. `Plain` is the general 256x128; the other two are the
@@ -724,6 +725,39 @@ pub enum Tile {
 }
 
 impl Gemm {
+    /// INT8 MHA projection with Q/K rows followed by transposed V. The output
+    /// needs `(tokens * 2 + tokens.div_ceil(256) * 256) * n / 3` FP16 elements.
+    pub fn build_compact_qkv(
+        c: &Compiler,
+        stream: &mut hrx::Stream,
+        k: usize,
+        n: usize,
+        tokens: usize,
+        k_stride: usize,
+    ) -> Result<Self> {
+        let m_group = gemm_m_group_for(tokens, k, n, 8);
+        let ns = "h3.gemm_i8_qkv_256.";
+        let cfg = vec![
+            (format!("{ns}k_size"), k.to_string()),
+            (format!("{ns}n_size"), n.to_string()),
+            (format!("{ns}k_stride"), k_stride.to_string()),
+            (format!("{ns}m_group"), m_group.to_string()),
+        ];
+        Ok(Self {
+            kernel: c.get(stream, "gemm_packed_256", "h3_gemm_i8_qkv_256", &cfg)?,
+            n,
+            resid: false,
+            bias: false,
+            elem: "i8".into(),
+            m_group,
+            k_stride,
+            classes: 1,
+            out_width: n,
+            out_bytes: 2,
+            compact_qkv: true,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         c: &Compiler,
@@ -890,6 +924,7 @@ impl Gemm {
             classes,
             out_width,
             out_bytes: output_type.bytes(),
+            compact_qkv: false,
         })
     }
 
@@ -949,7 +984,12 @@ impl Gemm {
             args.push(w_s, self.n * 4);
             args.push(a_s, t * 4);
         }
-        args.push(out, t * self.out_width * self.out_bytes);
+        let padding = if self.compact_qkv {
+            (t.div_ceil(256) * 256 - t) * (self.n / 3)
+        } else {
+            0
+        };
+        args.push(out, (t * self.out_width + padding) * self.out_bytes);
         if self.resid {
             let (gate, cls) = residual.expect("a residual GEMM needs its gate and class rows");
             args.push(gate, self.classes * self.n * 4);

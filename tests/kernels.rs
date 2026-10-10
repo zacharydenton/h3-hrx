@@ -4386,6 +4386,91 @@ fn swiglu_preserves_f32_range() {
     not(feature = "gpu-tests"),
     ignore = "requires gfx1151 and provisioned HRX"
 )]
+fn compact_qkv_matches_scalar_projection_and_zeroes_v_padding() {
+    let mut h = Harness::new();
+    let (k, n) = (64usize, 384usize);
+    let w: Vec<u8> = (0..n * k)
+        .map(|i| ((i * 17 % 255) as i16 - 127) as i8 as u8)
+        .collect();
+    let mut ws: Vec<f32> = (0..n).map(|i| (i % 13 + 1) as f32 * 0.01).collect();
+    ws[0] = 100.;
+    ws[2 * n / 3] = 100.;
+    ws[2 * n / 3 + 1] = f32::INFINITY;
+    ws[2 * n / 3 + 2] = f32::NAN;
+    for rows in [1usize, 17, 255, 256, 257, 513] {
+        let cap = rows.div_ceil(256) * 256;
+        let a: Vec<u8> = (0..rows * k)
+            .map(|i| ((i * 31 % 255) as i16 - 127) as i8 as u8)
+            .collect();
+        let mut scales: Vec<f32> = (0..rows).map(|i| (i % 7 + 1) as f32 * 0.02).collect();
+        scales[0] = 50.;
+        let qk_bytes = rows * (2 * n / 3) * 2;
+        let output_bytes = qk_bytes + cap * (n / 3) * 2;
+        let mut output = vec![0x7f; output_bytes];
+        output.extend([0xa5; 64]);
+        let out = h.run_module(
+            "gemm_packed_256",
+            "gemm_i8_qkv_256",
+            &cfg(&[
+                ("k_size", k),
+                ("n_size", n),
+                ("k_stride", k),
+                ("m_group", 3),
+            ]),
+            [
+                (n / 128) as u32,
+                (rows.div_ceil(256).div_ceil(3) * 3) as u32,
+                1,
+            ],
+            256,
+            &[rows as u64],
+            &[a.clone(), w.clone(), bytes(&ws), bytes(&scales), output],
+        );
+        let out = &out[4];
+        assert_eq!(&out[output_bytes..], &[0xa5; 64]);
+        for r in 0..rows {
+            for col in 0..n {
+                let dot: i32 = (0..k)
+                    .map(|i| i32::from(a[r * k + i] as i8) * i32::from(w[col * k + i] as i8))
+                    .sum();
+                let raw = (dot as f32 * ws[col]) * scales[r] + 0.;
+                let expected = f16::from_f32(if raw.is_finite() {
+                    raw.clamp(-65472., 65472.)
+                } else {
+                    raw
+                });
+                let offset = if col < 2 * n / 3 {
+                    (r * (2 * n / 3) + col) * 2
+                } else {
+                    qk_bytes + ((col - 2 * n / 3) * cap + r) * 2
+                };
+                let got = f16::from_le_bytes(out[offset..offset + 2].try_into().unwrap());
+                if expected.is_nan() {
+                    assert!(got.is_nan());
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        expected.to_bits(),
+                        "rows={rows} row={r} col={col}"
+                    );
+                }
+            }
+        }
+        for col in 0..n / 3 {
+            assert!(
+                out[qk_bytes + (col * cap + rows) * 2..qk_bytes + (col + 1) * cap * 2]
+                    .iter()
+                    .all(|&b| b == 0)
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
 fn gemm_preserves_nonfinite_results() {
     let mut h = Harness::new();
     let (k, n) = (128usize, 128usize);
