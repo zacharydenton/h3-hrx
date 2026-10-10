@@ -86,7 +86,9 @@ low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_m
   return %out
 }
 
-low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_pv_update_0_scaled(%v: reg<amdgpu.vgpr x8>, %p: reg<amdgpu.vgpr x8>, %acc: reg<amdgpu.vgpr x16>, %scale: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr x16>) asm {
+// Allow independent FP32 rescales to pair; keep plain PV helpers locked
+// to bound register pressure.
+low.func.def target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_pv_update_0_scaled(%v: reg<amdgpu.vgpr x8>, %p: reg<amdgpu.vgpr x8>, %acc: reg<amdgpu.vgpr x16>, %scale: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr x16>) asm {
   %owned = copy %acc : reg<amdgpu.vgpr x16> -> reg<amdgpu.vgpr x16>
   %a0 = slice %owned[0] : reg<amdgpu.vgpr x16> -> reg<amdgpu.vgpr x8>
   %a1 = slice %owned[8] : reg<amdgpu.vgpr x16> -> reg<amdgpu.vgpr x8>
@@ -122,7 +124,7 @@ low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_m
   return %out
 }
 
-low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_pv_update_1_scaled(%v: reg<amdgpu.vgpr x8>, %p: reg<amdgpu.vgpr x8>, %acc: reg<amdgpu.vgpr x16>, %scale: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr x16>) asm {
+low.func.def target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_pv_update_1_scaled(%v: reg<amdgpu.vgpr x8>, %p: reg<amdgpu.vgpr x8>, %acc: reg<amdgpu.vgpr x16>, %scale: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr x16>) asm {
   %owned = copy %acc : reg<amdgpu.vgpr x16> -> reg<amdgpu.vgpr x16>
   %a0 = slice %owned[0] : reg<amdgpu.vgpr x16> -> reg<amdgpu.vgpr x8>
   %a1 = slice %owned[8] : reg<amdgpu.vgpr x16> -> reg<amdgpu.vgpr x8>
