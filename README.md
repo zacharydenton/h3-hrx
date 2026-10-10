@@ -11,15 +11,12 @@ the binary embeds its kernel sources and tokenizer.
 Tested on Linux with AMD Strix Halo (`gfx1151`) and 128 GB unified memory.
 Other GPUs are unvalidated. See [setup](docs/setup.md) for requirements.
 
-
-
 https://github.com/user-attachments/assets/7a3e95c2-0174-4da4-b2f7-8b7219c650a3
 
-
-
-*Glass Leviathan · 768p, generated locally in 39m58s from an OpenAI-generated
-first frame. [Video](docs/media/showcase/glass-leviathan.mp4) ·
-[Settings and prompt](docs/showcase.md#glass-leviathan--768p) ·
+*Wyvern chase · anime → cinematic. Two text-to-video renders with generated
+audio at 1344×768 and 20 model evaluations each: 31m57s and 31m49s end to end
+on Strix Halo. Each clip is trimmed to five seconds for this comparison.
+[Settings and prompts](docs/showcase.md#wyvern-chase--anime-and-cinematic) ·
 [More examples](docs/showcase.md)*
 
 ## Quick start
