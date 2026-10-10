@@ -7,7 +7,8 @@
 use crate::checkpoint::Checkpoint;
 use crate::model::*;
 use crate::weights::{
-    interleave16, rows_of, scales_interleave16, scales_rows, widen_f32, Recipe, Result,
+    interleave16, packed_f32_rows, rows_of, scales_interleave16, scales_rows, widen_f32, Recipe,
+    Result,
 };
 use hrx::artifacts::safetensors::DType as Dtype;
 use std::collections::BTreeMap;
@@ -171,13 +172,12 @@ pub fn plan(ck: &Checkpoint, out: &mut Table) -> Result<()> {
     // the two heads stacked to N = 128 (video 96 | audio 32) for one f32 matmul
     out.insert(
         "h3.final.out.w".into(),
-        rows_of(
+        packed_f32_rows(
             ck,
             &[
                 &mat("final_layer.video_out.weight", Dtype::F32, VIDEO_PATCH, HID)?,
                 &mat("final_layer.audio_out.weight", Dtype::F32, AUDIO_CH, HID)?,
             ],
-            0,
         )?,
     );
     out.insert(
@@ -205,7 +205,7 @@ pub fn plan(ck: &Checkpoint, out: &mut Table) -> Result<()> {
     );
     out.insert(
         "h3.video_in.w".into(),
-        rows_of(
+        packed_f32_rows(
             ck,
             &[&mat(
                 "video_patch_proj.weight",
@@ -213,7 +213,6 @@ pub fn plan(ck: &Checkpoint, out: &mut Table) -> Result<()> {
                 HID,
                 VIDEO_PATCH,
             )?],
-            0,
         )?,
     );
     out.insert(
@@ -222,10 +221,9 @@ pub fn plan(ck: &Checkpoint, out: &mut Table) -> Result<()> {
     );
     out.insert(
         "h3.audio_in.w".into(),
-        rows_of(
+        packed_f32_rows(
             ck,
             &[&mat("audio_patch_proj.weight", Dtype::F32, HID, AUDIO_CH)?],
-            0,
         )?,
     );
     out.insert(

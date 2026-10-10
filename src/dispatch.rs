@@ -1269,8 +1269,7 @@ impl Matmul {
 
 /// `out[m][n] = x[m][k] . w[n][k] + b`, one lane per output element.
 ///
-/// The plain f32 matmul the heads and the patch projections use: no tiling, no quantisation, just the
-/// arithmetic in the order the checkpoint stores it.
+/// FP32 projection with the bias followed by ascending-K fused multiply-adds.
 pub struct MatmulF32 {
     kernel: crate::compile::Kernel,
     k: usize,
@@ -1279,7 +1278,7 @@ pub struct MatmulF32 {
 
 impl MatmulF32 {
     pub fn build(c: &Compiler, stream: &mut hrx::Stream, k: usize, n: usize) -> Result<Self> {
-        Self::build_layout(c, stream, k, n, false)
+        Self::build_kernel(c, stream, k, n, "matmul_f32")
     }
 
     /// Weights are `[N / 32][K][32]`, preserving the original ordered FP32 dot.
@@ -1289,26 +1288,41 @@ impl MatmulF32 {
         k: usize,
         n: usize,
     ) -> Result<Self> {
+        Self::build_packed_layout(c, stream, k, n, "matmul_packed_f32")
+    }
+
+    /// Packed weights with eight rows sharing each load; arithmetic order is unchanged.
+    pub fn build_packed_tiled(
+        c: &Compiler,
+        stream: &mut hrx::Stream,
+        k: usize,
+        n: usize,
+    ) -> Result<Self> {
+        Self::build_packed_layout(c, stream, k, n, "matmul_packed_tiled_f32")
+    }
+
+    fn build_packed_layout(
+        c: &Compiler,
+        stream: &mut hrx::Stream,
+        k: usize,
+        n: usize,
+        stem: &str,
+    ) -> Result<Self> {
         if !n.is_multiple_of(32) {
             return Err(crate::compile::Error::Io(
                 "packed matmul needs 32-column groups".into(),
             ));
         }
-        Self::build_layout(c, stream, k, n, true)
+        Self::build_kernel(c, stream, k, n, stem)
     }
 
-    fn build_layout(
+    fn build_kernel(
         c: &Compiler,
         stream: &mut hrx::Stream,
         k: usize,
         n: usize,
-        packed: bool,
+        stem: &str,
     ) -> Result<Self> {
-        let stem = if packed {
-            "matmul_packed_f32"
-        } else {
-            "matmul_f32"
-        };
         let ns = format!("h3.{stem}.");
         let cfg: Cfg = vec![
             (format!("{ns}k"), k.to_string()),

@@ -6,7 +6,7 @@
 //! (`comfy/ldm/minimax/audio_vae.py`). The encoder's Snake takes its alpha as stored.
 use crate::checkpoint::Checkpoint;
 use crate::model::*;
-use crate::weights::{rows_of, widen_f32, Recipe, Result};
+use crate::weights::{pack_output_channels, rows_of, widen_f32, Recipe, Result};
 use hrx::artifacts::safetensors::DType as Dtype;
 use std::collections::BTreeMap;
 
@@ -131,20 +131,6 @@ pub fn plan(ck: &Checkpoint, out: &mut Table) -> Result<()> {
 /// Shared by the audio weight plan and dispatch: the layout must agree.
 pub(crate) fn packed_conv(cin: usize, cout: usize) -> bool {
     cin >= 32 && cout >= 32 && cout.is_multiple_of(8)
-}
-
-fn pack_output_channels(bytes: &[u8], outputs: usize, reduction: usize, tile: usize) -> Vec<u8> {
-    let mut packed = vec![0; bytes.len()];
-    for group in 0..outputs / tile {
-        for tap in 0..reduction {
-            for channel in 0..tile {
-                let src = ((group * tile + channel) * reduction + tap) * 4;
-                let dst = ((group * reduction + tap) * tile + channel) * 4;
-                packed[dst..dst + 4].copy_from_slice(&bytes[src..src + 4]);
-            }
-        }
-    }
-    packed
 }
 
 /// Replace the flat recipe, retaining one device copy and every FP32 bit.

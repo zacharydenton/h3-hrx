@@ -454,7 +454,14 @@ fn attention_preserves_the_upper_tile_softmax_maximum() {
 )]
 fn packed_fp32_projection_preserves_ordered_dots_and_guards() {
     let mut h = Harness::new();
-    for (m, k, n) in [(1usize, 1usize, 32usize), (3, 129, 288), (5, 2048, 64)] {
+    for (m, k, n) in [
+        (1usize, 1usize, 32usize),
+        (3, 129, 288),
+        (5, 2048, 64),
+        (8, 96, 5376),
+        (9, 5376, 128),
+        (17, 32, 5376),
+    ] {
         let x = values(m * k, 0.25);
         let w = values(n * k, 0.125);
         let bias = values(n, 0.01);
@@ -476,11 +483,15 @@ fn packed_fp32_projection_preserves_ordered_dots_and_guards() {
                 expected[row * n + col] = acc;
             }
         }
-        for (stem, weights) in [("matmul_f32", &w), ("matmul_packed_f32", &packed)] {
+        for (stem, weights, rows_per_group) in [
+            ("matmul_f32", &w, 1),
+            ("matmul_packed_f32", &packed, 1),
+            ("matmul_packed_tiled_f32", &packed, 8),
+        ] {
             let out = h.run(
                 stem,
                 &cfg(&[("k", k), ("n", n)]),
-                [n.div_ceil(256) as u32, m as u32, 1],
+                [n.div_ceil(256) as u32, m.div_ceil(rows_per_group) as u32, 1],
                 256,
                 &[m as u64],
                 &[

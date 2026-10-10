@@ -1144,77 +1144,92 @@ fn attention_transpose(c: &mut Criterion) {
     group.finish();
 }
 
-fn audio_qkv(c: &mut Criterion) {
-    let mut group = c.benchmark_group("audio_qkv_f32");
-    let (k, n) = (2048, 6144);
-    for m in [1usize, 207] {
-        for packed in [false, true] {
-            let layout = if packed { "packed" } else { "row_major" };
-            group.bench_function(format!("{layout}/{m}x{k}x{n}"), |b| {
-                let mut stream = support::stream(None);
-                let compiler = compiler();
-                let plain = MatmulF32::build(&compiler, &mut stream, k, n).unwrap();
-                let op = if packed {
-                    MatmulF32::build_packed(&compiler, &mut stream, k, n).unwrap()
-                } else {
-                    MatmulF32::build(&compiler, &mut stream, k, n).unwrap()
-                };
-                compiler.flush(&mut stream).unwrap();
-                let values = |len| {
-                    (0..len)
-                        .map(|i| ((i * 37 % 101) as f32 - 50.) / 200.)
-                        .collect::<Vec<_>>()
-                };
-                let x = upload(&mut stream, bytemuck::cast_slice(&values(m * k)));
-                let w = values(n * k);
-                let reference = upload(&mut stream, bytemuck::cast_slice(&w));
-                let bias = upload(&mut stream, bytemuck::cast_slice(&values(n)));
-                let out = stream.allocate(m * n * 4).unwrap();
-                plain
-                    .run(
-                        &mut stream,
-                        None,
-                        "qkv",
-                        m,
-                        x.binding(),
-                        reference.binding(),
-                        bias.binding(),
-                        out.binding(),
-                    )
-                    .unwrap();
-                let expected = check_f32(&mut stream, &out);
-                let weights = if packed {
-                    let mut permuted = Vec::with_capacity(w.len());
-                    for tile in w.chunks(32 * k) {
-                        for i in 0..k {
-                            for col in 0..32 {
-                                permuted.push(tile[col * k + i]);
+fn fp32_projections(c: &mut Criterion) {
+    for (name, shapes, tiled) in [
+        (
+            "audio_qkv_f32",
+            vec![(1usize, 2048, 6144), (207, 2048, 6144)],
+            false,
+        ),
+        (
+            "dit_projection_f32",
+            vec![(414, 32, 5376), (37296, 96, 5376), (37710, 5376, 128)],
+            true,
+        ),
+    ] {
+        let mut group = c.benchmark_group(name);
+        for (m, k, n) in shapes {
+            for packed in [false, true] {
+                let layout = if packed { "packed" } else { "row_major" };
+                group.bench_function(format!("{layout}/{m}x{k}x{n}"), |b| {
+                    let budget = hrx::residency::ResidencyManager::new(3usize << 30).unwrap();
+                    let mut stream = support::stream(Some(budget.budget()));
+                    let compiler = compiler();
+                    let plain = MatmulF32::build(&compiler, &mut stream, k, n).unwrap();
+                    let op = if packed && tiled {
+                        MatmulF32::build_packed_tiled(&compiler, &mut stream, k, n).unwrap()
+                    } else if packed {
+                        MatmulF32::build_packed(&compiler, &mut stream, k, n).unwrap()
+                    } else {
+                        MatmulF32::build(&compiler, &mut stream, k, n).unwrap()
+                    };
+                    compiler.flush(&mut stream).unwrap();
+                    let values = |len| {
+                        (0..len)
+                            .map(|i| ((i * 37 % 101) as f32 - 50.) / 200.)
+                            .collect::<Vec<_>>()
+                    };
+                    let x = upload(&mut stream, bytemuck::cast_slice(&values(m * k)));
+                    let w = values(n * k);
+                    let reference = upload(&mut stream, bytemuck::cast_slice(&w));
+                    let bias = upload(&mut stream, bytemuck::cast_slice(&values(n)));
+                    let out = stream.allocate(m * n * 4).unwrap();
+                    plain
+                        .run(
+                            &mut stream,
+                            None,
+                            "projection",
+                            m,
+                            x.binding(),
+                            reference.binding(),
+                            bias.binding(),
+                            out.binding(),
+                        )
+                        .unwrap();
+                    let expected = check_f32(&mut stream, &out);
+                    let weights = if packed {
+                        let mut permuted = Vec::with_capacity(w.len());
+                        for tile in w.chunks(32 * k) {
+                            for i in 0..k {
+                                for col in 0..32 {
+                                    permuted.push(tile[col * k + i]);
+                                }
                             }
                         }
-                    }
-                    upload(&mut stream, bytemuck::cast_slice(&permuted))
-                } else {
-                    reference
-                };
-                b.iter(|| {
-                    op.run(
-                        &mut stream,
-                        None,
-                        "qkv",
-                        m,
-                        x.binding(),
-                        weights.binding(),
-                        bias.binding(),
-                        out.binding(),
-                    )
-                    .unwrap();
-                    stream.synchronize().unwrap();
+                        upload(&mut stream, bytemuck::cast_slice(&permuted))
+                    } else {
+                        reference
+                    };
+                    b.iter(|| {
+                        op.run(
+                            &mut stream,
+                            None,
+                            "projection",
+                            m,
+                            x.binding(),
+                            weights.binding(),
+                            bias.binding(),
+                            out.binding(),
+                        )
+                        .unwrap();
+                        stream.synchronize().unwrap();
+                    });
+                    assert_eq!(check_f32(&mut stream, &out), expected);
                 });
-                assert_eq!(check_f32(&mut stream, &out), expected);
-            });
+            }
         }
+        group.finish();
     }
-    group.finish();
 }
 
 fn audio_convolution(c: &mut Criterion) {
@@ -1697,6 +1712,6 @@ fn video_convolution(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = support::criterion();
-    targets = vision_rotary, decoder_feed_forward, video_convolution, groupnorm_apply, groupnorm_statistics, preparation, rotary_preparation, attention_preparation, fused_qk_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, vision::bench, vision::normalization, audio_qkv, audio_convolution, dispatch
+    targets = vision_rotary, decoder_feed_forward, video_convolution, groupnorm_apply, groupnorm_statistics, preparation, rotary_preparation, attention_preparation, fused_qk_preparation, quantized_attention, attention_output_preparation, normalization_preparation, attention_transpose, gemm, vision::bench, vision::normalization, fp32_projections, audio_convolution, dispatch
 }
 criterion_main!(benches);

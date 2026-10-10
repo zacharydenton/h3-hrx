@@ -444,7 +444,7 @@ impl Projection {
         n: usize,
     ) -> Result<Self> {
         Ok(Self {
-            op: crate::dispatch::MatmulF32::build(c, stream, k, n)?,
+            op: crate::dispatch::MatmulF32::build_packed_tiled(c, stream, k, n)?,
             weight: weights.at(stream, &format!("{name}.w"), n * k * 4)?,
             bias: weights.at(stream, &format!("{name}.b"), n * 4)?,
         })

@@ -511,7 +511,58 @@ fn widenable(entry: &Entry, what: &str) -> Result<usize> {
     Ok(eb)
 }
 
+pub(crate) fn pack_output_channels(
+    bytes: &[u8],
+    outputs: usize,
+    reduction: usize,
+    tile: usize,
+) -> Vec<u8> {
+    let mut packed = vec![0; bytes.len()];
+    for group in 0..outputs / tile {
+        for tap in 0..reduction {
+            for channel in 0..tile {
+                let src = ((group * tile + channel) * reduction + tap) * 4;
+                let dst = ((group * reduction + tap) * tile + channel) * 4;
+                packed[dst..dst + 4].copy_from_slice(&bytes[src..src + 4]);
+            }
+        }
+    }
+    packed
+}
+
 // --- recipe primitives: layout only, bit for bit ----------------------------------------------
+
+/// Concatenate FP32 matrices and pack their rows as `[N / 32][K][32]`.
+pub fn packed_f32_rows(ck: &Checkpoint, parts: &[&str]) -> Result<Recipe> {
+    if parts.is_empty() {
+        return layout("packed f32 rows need at least one matrix");
+    }
+    let mut outputs = 0;
+    for name in parts {
+        let entry = ck.at(name)?;
+        if entry.dtype != Dtype::F32 || entry.shape.len() != 2 {
+            return layout("packed f32 rows need FP32 matrices");
+        }
+        outputs += entry.rows();
+    }
+    if outputs == 0 || !outputs.is_multiple_of(32) {
+        return layout("packed f32 rows need 32-row groups");
+    }
+    let recipe = rows_of(ck, parts, 0)?;
+    let bytes = recipe.device_bytes();
+    let reduction = bytes / outputs / 4;
+    Ok(Recipe::Built {
+        bytes,
+        build: Box::new(move |ck| {
+            Ok(pack_output_channels(
+                &recipe.assemble(ck)?,
+                outputs,
+                reduction,
+                32,
+            ))
+        }),
+    })
+}
 
 /// The rows of one or more tensors of the same row width, in order, at `pitch_bytes` (0: the row width).
 pub fn rows_of(ck: &Checkpoint, parts: &[&str], pitch_bytes: usize) -> Result<Recipe> {
@@ -936,6 +987,38 @@ mod tests {
             .iter()
             .map(|c| f32::from_le_bytes(*c))
             .collect()
+    }
+
+    #[test]
+    fn packed_projection_rows_preserve_bits_and_concatenation() {
+        let dir = tempfile::tempdir().unwrap();
+        let bits: Vec<u8> = (0..64 * 3u32)
+            .flat_map(|i| (0x7fc0_0000 + i).to_le_bytes())
+            .collect();
+        // The source boundary falls inside a packed group.
+        let ck = checkpoint(
+            dir.path(),
+            &[
+                ("a", "F32", vec![17, 3], bits[..17 * 3 * 4].to_vec()),
+                ("b", "F32", vec![47, 3], bits[17 * 3 * 4..].to_vec()),
+                ("half", "F16", vec![32, 3], vec![0; 32 * 3 * 2]),
+                ("wide", "F32", vec![32, 4], vec![0; 32 * 4 * 4]),
+            ],
+        );
+        let recipe = packed_f32_rows(&ck, &["a", "b"]).unwrap();
+        assert_eq!(recipe.device_bytes(), bits.len());
+        let packed = recipe.assemble(&ck).unwrap();
+        for output in 0..64 {
+            for k in 0..3 {
+                let src = (output * 3 + k) * 4;
+                let dst = ((output / 32 * 3 + k) * 32 + output % 32) * 4;
+                assert_eq!(&packed[dst..dst + 4], &bits[src..src + 4]);
+            }
+        }
+        assert!(packed_f32_rows(&ck, &[]).is_err());
+        assert!(packed_f32_rows(&ck, &["a"]).is_err());
+        assert!(packed_f32_rows(&ck, &["half"]).is_err());
+        assert!(packed_f32_rows(&ck, &["a", "b", "wide"]).is_err());
     }
 
     #[test]

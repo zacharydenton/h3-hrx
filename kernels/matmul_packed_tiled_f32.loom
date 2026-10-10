@@ -1,0 +1,141 @@
+// Coalesced FP32 projection: weights [N/32][K][32], eight rows per lane.
+// Packing changes only addresses; bias and ascending-K FMAs match matmul_f32.
+amdgpu.target<gfx11-generic> @h3_matmul_packed_tiled_f32_gfx11 {subgroup_size = 32}
+
+config.decl @h3.matmul_packed_tiled_f32.k : %value: index where [range(%value, 1, 8192)]
+
+config.decl @h3.matmul_packed_tiled_f32.n : %value: index where [range(%value, 32, 8192), mul(%value, 32)]
+
+kernel.def target(@h3_matmul_packed_tiled_f32_gfx11) export("h3_matmul_packed_tiled_f32") @h3_matmul_packed_tiled_f32(%m: index) {
+  %c1 = index.constant 1 : index
+  %c255 = index.constant 255 : index
+  %c256 = index.constant 256 : index
+  %m_tile = index.constant 8 : index
+  %m_round_by = index.constant 7 : index
+  %m_rounded = index.add %m, %m_round_by : index
+  %m_groups = index.div %m_rounded, %m_tile : index
+  %n = config.get @h3.matmul_packed_tiled_f32.n : index
+  %rounded = index.add %n, %c255 : index
+  %groups = index.div %rounded, %c256 : index
+  kernel.launch.config workgroups(%groups, %m_groups, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%m: index, %x: buffer, %w: buffer, %b: buffer, %out: buffer) {
+  %k = config.get @h3.matmul_packed_tiled_f32.k : index
+  %n = config.get @h3.matmul_packed_tiled_f32.n : index
+  %c0 = index.constant 0 : index
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  %c0_offset = index.constant 0 : offset
+  %tile = index.constant 32 : index
+  %groups = index.div %n, %tile : index
+  %m_b = index.assume %m [range(%m, 1, 1048576)] : index
+  %wg = kernel.workgroup.id<x> : index
+  %row_group = kernel.workgroup.id<y> : index
+  %m_tile_rows = index.constant 8 : index
+  %row_base = index.mul %row_group, %m_tile_rows : index
+  %row_offset0 = index.constant 0 : index
+  %row_raw0 = index.add %row_base, %row_offset0 : index
+  %row_valid0 = index.cmp ult, %row_raw0, %m_b : index
+  %row_safe0 = scf.select %row_valid0, %row_raw0, %c0 : index
+  %row0 = index.assume %row_safe0 [lt(%row_safe0, %m_b)] : index
+  %row_offset1 = index.constant 1 : index
+  %row_raw1 = index.add %row_base, %row_offset1 : index
+  %row_valid1 = index.cmp ult, %row_raw1, %m_b : index
+  %row_safe1 = scf.select %row_valid1, %row_raw1, %c0 : index
+  %row1 = index.assume %row_safe1 [lt(%row_safe1, %m_b)] : index
+  %row_offset2 = index.constant 2 : index
+  %row_raw2 = index.add %row_base, %row_offset2 : index
+  %row_valid2 = index.cmp ult, %row_raw2, %m_b : index
+  %row_safe2 = scf.select %row_valid2, %row_raw2, %c0 : index
+  %row2 = index.assume %row_safe2 [lt(%row_safe2, %m_b)] : index
+  %row_offset3 = index.constant 3 : index
+  %row_raw3 = index.add %row_base, %row_offset3 : index
+  %row_valid3 = index.cmp ult, %row_raw3, %m_b : index
+  %row_safe3 = scf.select %row_valid3, %row_raw3, %c0 : index
+  %row3 = index.assume %row_safe3 [lt(%row_safe3, %m_b)] : index
+  %row_offset4 = index.constant 4 : index
+  %row_raw4 = index.add %row_base, %row_offset4 : index
+  %row_valid4 = index.cmp ult, %row_raw4, %m_b : index
+  %row_safe4 = scf.select %row_valid4, %row_raw4, %c0 : index
+  %row4 = index.assume %row_safe4 [lt(%row_safe4, %m_b)] : index
+  %row_offset5 = index.constant 5 : index
+  %row_raw5 = index.add %row_base, %row_offset5 : index
+  %row_valid5 = index.cmp ult, %row_raw5, %m_b : index
+  %row_safe5 = scf.select %row_valid5, %row_raw5, %c0 : index
+  %row5 = index.assume %row_safe5 [lt(%row_safe5, %m_b)] : index
+  %row_offset6 = index.constant 6 : index
+  %row_raw6 = index.add %row_base, %row_offset6 : index
+  %row_valid6 = index.cmp ult, %row_raw6, %m_b : index
+  %row_safe6 = scf.select %row_valid6, %row_raw6, %c0 : index
+  %row6 = index.assume %row_safe6 [lt(%row_safe6, %m_b)] : index
+  %row_offset7 = index.constant 7 : index
+  %row_raw7 = index.add %row_base, %row_offset7 : index
+  %row_valid7 = index.cmp ult, %row_raw7, %m_b : index
+  %row_safe7 = scf.select %row_valid7, %row_raw7, %c0 : index
+  %row7 = index.assume %row_safe7 [lt(%row_safe7, %m_b)] : index
+  %lane = kernel.workitem.id<x> : index
+  %base = index.mul %wg, %c256 : index
+  %col = index.add %base, %lane : index
+  %x_global = buffer.assume.memory_space<global> %x : buffer
+  %w_global = buffer.assume.memory_space<global> %w : buffer
+  %b_global = buffer.assume.memory_space<global> %b : buffer
+  %out_global = buffer.assume.memory_space<global> %out : buffer
+  %x_view = buffer.view %x_global[%c0_offset] : buffer -> view<[%m_b]x[%k]xf32>
+  %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%groups]x[%k]x32xf32>
+  %b_view = buffer.view %b_global[%c0_offset] : buffer -> view<[%n]xf32>
+  %out_view = buffer.view %out_global[%c0_offset] : buffer -> view<[%m_b]x[%n]xf32>
+  %active = index.cmp ult, %col, %n : index
+  scf.if %active {
+    %cc = index.assume %col [lt(%col, %n)] : index
+    %group0 = index.div %cc, %tile : index
+    %group = index.assume %group0 [lt(%group0, %groups)] : index
+    %within0 = index.rem %cc, %tile : index
+    %within = index.assume %within0 [range(%within0, 0, 32)] : index
+    %bias = view.load %b_view[%cc] : view<[%n]xf32> -> f32
+    %acc0, %acc1, %acc2, %acc3, %acc4, %acc5, %acc6, %acc7 = scf.for %i = [%c0 to %k step %c1](%a0 = %bias : f32, %a1 = %bias : f32, %a2 = %bias : f32, %a3 = %bias : f32, %a4 = %bias : f32, %a5 = %bias : f32, %a6 = %bias : f32, %a7 = %bias : f32) -> (f32, f32, f32, f32, f32, f32, f32, f32) {
+      %ii = index.assume %i [lt(%i, %k)] : index
+      %wv = view.load %w_view[%group, %ii, %within] : view<[%groups]x[%k]x32xf32> -> f32
+      %xv0 = view.load %x_view[%row0, %ii] : view<[%m_b]x[%k]xf32> -> f32
+      %f0 = scalar.fmaf %xv0, %wv, %a0 : f32
+      %xv1 = view.load %x_view[%row1, %ii] : view<[%m_b]x[%k]xf32> -> f32
+      %f1 = scalar.fmaf %xv1, %wv, %a1 : f32
+      %xv2 = view.load %x_view[%row2, %ii] : view<[%m_b]x[%k]xf32> -> f32
+      %f2 = scalar.fmaf %xv2, %wv, %a2 : f32
+      %xv3 = view.load %x_view[%row3, %ii] : view<[%m_b]x[%k]xf32> -> f32
+      %f3 = scalar.fmaf %xv3, %wv, %a3 : f32
+      %xv4 = view.load %x_view[%row4, %ii] : view<[%m_b]x[%k]xf32> -> f32
+      %f4 = scalar.fmaf %xv4, %wv, %a4 : f32
+      %xv5 = view.load %x_view[%row5, %ii] : view<[%m_b]x[%k]xf32> -> f32
+      %f5 = scalar.fmaf %xv5, %wv, %a5 : f32
+      %xv6 = view.load %x_view[%row6, %ii] : view<[%m_b]x[%k]xf32> -> f32
+      %f6 = scalar.fmaf %xv6, %wv, %a6 : f32
+      %xv7 = view.load %x_view[%row7, %ii] : view<[%m_b]x[%k]xf32> -> f32
+      %f7 = scalar.fmaf %xv7, %wv, %a7 : f32
+      scf.yield %f0, %f1, %f2, %f3, %f4, %f5, %f6, %f7 : f32, f32, f32, f32, f32, f32, f32, f32
+    }
+    scf.if %row_valid0 {
+      view.store %acc0, %out_view[%row0, %cc] : f32, view<[%m_b]x[%n]xf32>
+    }
+    scf.if %row_valid1 {
+      view.store %acc1, %out_view[%row1, %cc] : f32, view<[%m_b]x[%n]xf32>
+    }
+    scf.if %row_valid2 {
+      view.store %acc2, %out_view[%row2, %cc] : f32, view<[%m_b]x[%n]xf32>
+    }
+    scf.if %row_valid3 {
+      view.store %acc3, %out_view[%row3, %cc] : f32, view<[%m_b]x[%n]xf32>
+    }
+    scf.if %row_valid4 {
+      view.store %acc4, %out_view[%row4, %cc] : f32, view<[%m_b]x[%n]xf32>
+    }
+    scf.if %row_valid5 {
+      view.store %acc5, %out_view[%row5, %cc] : f32, view<[%m_b]x[%n]xf32>
+    }
+    scf.if %row_valid6 {
+      view.store %acc6, %out_view[%row6, %cc] : f32, view<[%m_b]x[%n]xf32>
+    }
+    scf.if %row_valid7 {
+      view.store %acc7, %out_view[%row7, %cc] : f32, view<[%m_b]x[%n]xf32>
+    }
+  }
+  kernel.return
+}
