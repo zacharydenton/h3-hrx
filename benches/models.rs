@@ -165,6 +165,7 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
         0,
         None,
     )?;
+    wait_for_stack(&mut stream)?;
     let mut expected = vec![0u8; input.len() * 4];
     stream.read_blocking(x.binding(), &mut expected)?;
     support::report_digest(&format!("dit_stack/{tokens}/{layers}_layers"), &expected);
@@ -217,7 +218,7 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
             stream
                 .upload_blocking(x.binding(), bytemuck::cast_slice(&input))
                 .unwrap();
-            stream.synchronize().unwrap();
+            wait_for_stack(&mut stream).unwrap();
             let start = Instant::now();
             let device = if let Some(recorded) = &mut graph {
                 if profile_graph {
@@ -242,7 +243,7 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
                     .unwrap();
                 None
             };
-            stream.synchronize().unwrap();
+            wait_for_stack(&mut stream).unwrap();
             let replay_time = start.elapsed();
             elapsed += replay_time;
             if let Some(device) = device {
@@ -270,6 +271,21 @@ fn stack(b: &mut Bencher, tokens: usize, layers: usize, graph_mode: bool) -> Res
         }
         elapsed
     });
+    Ok(())
+}
+
+// Match the resident sampler's host wait. Busy polling a complete stack can
+// compete with the GPU for package power on an integrated device.
+fn wait_for_stack(stream: &mut hrx::Stream) -> hrx::Result<()> {
+    let started = Instant::now();
+    let mut completion = stream.submit()?;
+    while !completion.is_complete()? {
+        if started.elapsed() < Duration::from_micros(100) {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
     Ok(())
 }
 

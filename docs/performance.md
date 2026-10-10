@@ -145,6 +145,9 @@ measurements can take tens of minutes. This case streams all 50 checkpoint
 blocks through one activation workspace. It measures the resident backbone
 with synthetic inputs and modulation tables; conditioning, sampler updates,
 decoding and model loading remain covered by the stage and render targets.
+Stack warmup and timed forwards use the resident sampler's cooperative host
+wait, including completion in the measurement. This avoids keeping a CPU core
+busy throughout a long GPU forward on devices with shared package power.
 
 ```sh
 H3_BENCH_PROFILE=480p cargo bench --locked --bench pipeline -- text/res_multistep/warm_session
@@ -371,10 +374,13 @@ H3_PROFILE=device H3_COMPILE_REPORT_DIR=target/h3-reports cargo bench --bench ke
 
 GEMM cases include DiT QKV, FFN and down-projection dimensions at 256 and 2,048
 rows. FP32 SwiGLU also covers 4,096 and 8,192 rows with cached and rotating
-weights, using a 1 GiB GPU allocation budget. Residual down projections cover
-4,096 rows; their residual is reset outside timing before each iteration. Other
-GEMM cases use a 512 MiB budget. All use the runtime's operand pitches and direct
-buffer initialization. Setup and output readback stay outside timing.
+weights, using a 1 GiB GPU allocation budget. All four DiT projections also cover
+15,666 and 37,977 rows with a 4 GiB budget. Long INT8 FP32 SwiGLU uses the
+192×256 tile from 32,768 rows; smaller sequences retain the existing kernel.
+Residual down projections cover 4,096 rows; their residual is reset outside
+timing before each iteration. Other GEMM cases use a 512 MiB budget. All use
+the runtime's dispatch choices, operand pitches and direct buffer initialization.
+Setup and output readback stay outside timing.
 `prepare_f32_i8` covers tiny rows, the tiled FFN dispatch boundary, and batches
 through 4,096 tokens, plus wider 25,600-value rows. It supports the same HRX
 profiling and allocation cap, with direct readback outside timing.

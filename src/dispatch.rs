@@ -859,23 +859,35 @@ impl Gemm {
         } else {
             gemm_m_group_for(tokens, k_size, n_size, elem_bits(elem))
         };
-        let stem = format!(
-            "gemm_{elem}{}{}_256{}{}",
-            if wide {
-                "_wide"
-            } else if fast {
-                "_fast"
-            } else {
-                ""
-            },
-            if mode == "plain" {
-                String::new()
-            } else {
-                format!("_{mode}")
-            },
-            if bias { "b" } else { "" },
-            if swiglu && !gate_first { "_gs" } else { "" },
-        );
+        let long_dit_swiglu = elem == "i8"
+            && mode == "swiglu_f32"
+            && !bias
+            && gate_first
+            && tile == Tile::Plain
+            && k_size == HID
+            && n_size == 2 * FFN
+            && tokens >= 32768;
+        let stem = if long_dit_swiglu {
+            "gemm_i8_swiglu_f32_192x256".into()
+        } else {
+            format!(
+                "gemm_{elem}{}{}_256{}{}",
+                if wide {
+                    "_wide"
+                } else if fast {
+                    "_fast"
+                } else {
+                    ""
+                },
+                if mode == "plain" {
+                    String::new()
+                } else {
+                    format!("_{mode}")
+                },
+                if bias { "b" } else { "" },
+                if swiglu && !gate_first { "_gs" } else { "" },
+            )
+        };
         let ns = format!("h3.{stem}.");
         let mut cfg: Cfg = vec![
             (format!("{ns}k_size"), k_size.to_string()),
@@ -905,7 +917,9 @@ impl Gemm {
             cfg.push((format!("{ns}out_stride"), stride.to_string()));
             out_width = stride;
         }
-        let module = if tile == Tile::Plain && quantised(elem) {
+        let module = if long_dit_swiglu {
+            "gemm_swiglu_dit".into()
+        } else if tile == Tile::Plain && quantised(elem) {
             "gemm_packed_256".into()
         } else if tile == Tile::Plain {
             format!("gemm_{elem}_family")
