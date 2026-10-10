@@ -74,10 +74,167 @@ template.def<@h3.pack_attention_probability> @h3_pack_probability_long(%tokens: 
   template.return %packed : vector<16xf16>
 }
 
-low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_pv32(%v: reg<amdgpu.vgpr x8>, %p: reg<amdgpu.vgpr x8>, %acc: reg<amdgpu.vgpr x8>) -> (reg<amdgpu.vgpr x8>) asm {
-  %owned = copy %acc : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr x8>
-  %result = v_wmma_f32_16x16x16_f16 %v, %p, %owned
-  return %result
+// Carry each complete 32-float accumulator group through its four fragments.
+// The scaled helpers apply FP32 rescaling before the first ordered PV update;
+// later updates preserve the other three fragments and use the same dot order.
+low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_pv_update_0(%v: reg<amdgpu.vgpr x8>, %p: reg<amdgpu.vgpr x8>, %acc: reg<amdgpu.vgpr x32>, %scale: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr x32>) asm {
+  %owned = copy %acc : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x32>
+  %a0 = slice %owned[0] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a1 = slice %owned[8] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a2 = slice %owned[16] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a3 = slice %owned[24] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %r = v_wmma_f32_16x16x16_f16 %v, %p, %a0
+  %out = concat(%r, %a1, %a2, %a3) : (reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>) -> reg<amdgpu.vgpr x32>
+  return %out
+}
+
+low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_pv_update_0_scaled(%v: reg<amdgpu.vgpr x8>, %p: reg<amdgpu.vgpr x8>, %acc: reg<amdgpu.vgpr x32>, %scale: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr x32>) asm {
+  %owned = copy %acc : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x32>
+  %a0 = slice %owned[0] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a1 = slice %owned[8] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a2 = slice %owned[16] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a3 = slice %owned[24] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %x0 = slice %a0[0] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y0 = v_mul_f32 %x0, %scale
+  %x1 = slice %a0[1] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y1 = v_mul_f32 %x1, %scale
+  %x2 = slice %a0[2] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y2 = v_mul_f32 %x2, %scale
+  %x3 = slice %a0[3] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y3 = v_mul_f32 %x3, %scale
+  %x4 = slice %a0[4] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y4 = v_mul_f32 %x4, %scale
+  %x5 = slice %a0[5] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y5 = v_mul_f32 %x5, %scale
+  %x6 = slice %a0[6] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y6 = v_mul_f32 %x6, %scale
+  %x7 = slice %a0[7] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y7 = v_mul_f32 %x7, %scale
+  %scaled = concat(%y0, %y1, %y2, %y3, %y4, %y5, %y6, %y7) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x8>
+  %c = copy %scaled : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr x8>
+  %r = v_wmma_f32_16x16x16_f16 %v, %p, %c
+  %out = concat(%r, %a1, %a2, %a3) : (reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>) -> reg<amdgpu.vgpr x32>
+  return %out
+}
+
+low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_pv_update_1(%v: reg<amdgpu.vgpr x8>, %p: reg<amdgpu.vgpr x8>, %acc: reg<amdgpu.vgpr x32>, %scale: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr x32>) asm {
+  %owned = copy %acc : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x32>
+  %a0 = slice %owned[0] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a1 = slice %owned[8] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a2 = slice %owned[16] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a3 = slice %owned[24] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %r = v_wmma_f32_16x16x16_f16 %v, %p, %a1
+  %out = concat(%a0, %r, %a2, %a3) : (reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>) -> reg<amdgpu.vgpr x32>
+  return %out
+}
+
+low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_pv_update_1_scaled(%v: reg<amdgpu.vgpr x8>, %p: reg<amdgpu.vgpr x8>, %acc: reg<amdgpu.vgpr x32>, %scale: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr x32>) asm {
+  %owned = copy %acc : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x32>
+  %a0 = slice %owned[0] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a1 = slice %owned[8] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a2 = slice %owned[16] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a3 = slice %owned[24] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %x0 = slice %a1[0] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y0 = v_mul_f32 %x0, %scale
+  %x1 = slice %a1[1] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y1 = v_mul_f32 %x1, %scale
+  %x2 = slice %a1[2] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y2 = v_mul_f32 %x2, %scale
+  %x3 = slice %a1[3] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y3 = v_mul_f32 %x3, %scale
+  %x4 = slice %a1[4] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y4 = v_mul_f32 %x4, %scale
+  %x5 = slice %a1[5] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y5 = v_mul_f32 %x5, %scale
+  %x6 = slice %a1[6] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y6 = v_mul_f32 %x6, %scale
+  %x7 = slice %a1[7] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y7 = v_mul_f32 %x7, %scale
+  %scaled = concat(%y0, %y1, %y2, %y3, %y4, %y5, %y6, %y7) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x8>
+  %c = copy %scaled : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr x8>
+  %r = v_wmma_f32_16x16x16_f16 %v, %p, %c
+  %out = concat(%a0, %r, %a2, %a3) : (reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>) -> reg<amdgpu.vgpr x32>
+  return %out
+}
+
+low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_pv_update_2(%v: reg<amdgpu.vgpr x8>, %p: reg<amdgpu.vgpr x8>, %acc: reg<amdgpu.vgpr x32>, %scale: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr x32>) asm {
+  %owned = copy %acc : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x32>
+  %a0 = slice %owned[0] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a1 = slice %owned[8] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a2 = slice %owned[16] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a3 = slice %owned[24] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %r = v_wmma_f32_16x16x16_f16 %v, %p, %a2
+  %out = concat(%a0, %a1, %r, %a3) : (reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>) -> reg<amdgpu.vgpr x32>
+  return %out
+}
+
+low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_pv_update_2_scaled(%v: reg<amdgpu.vgpr x8>, %p: reg<amdgpu.vgpr x8>, %acc: reg<amdgpu.vgpr x32>, %scale: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr x32>) asm {
+  %owned = copy %acc : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x32>
+  %a0 = slice %owned[0] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a1 = slice %owned[8] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a2 = slice %owned[16] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a3 = slice %owned[24] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %x0 = slice %a2[0] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y0 = v_mul_f32 %x0, %scale
+  %x1 = slice %a2[1] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y1 = v_mul_f32 %x1, %scale
+  %x2 = slice %a2[2] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y2 = v_mul_f32 %x2, %scale
+  %x3 = slice %a2[3] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y3 = v_mul_f32 %x3, %scale
+  %x4 = slice %a2[4] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y4 = v_mul_f32 %x4, %scale
+  %x5 = slice %a2[5] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y5 = v_mul_f32 %x5, %scale
+  %x6 = slice %a2[6] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y6 = v_mul_f32 %x6, %scale
+  %x7 = slice %a2[7] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y7 = v_mul_f32 %x7, %scale
+  %scaled = concat(%y0, %y1, %y2, %y3, %y4, %y5, %y6, %y7) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x8>
+  %c = copy %scaled : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr x8>
+  %r = v_wmma_f32_16x16x16_f16 %v, %p, %c
+  %out = concat(%a0, %a1, %r, %a3) : (reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>) -> reg<amdgpu.vgpr x32>
+  return %out
+}
+
+low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_pv_update_3(%v: reg<amdgpu.vgpr x8>, %p: reg<amdgpu.vgpr x8>, %acc: reg<amdgpu.vgpr x32>, %scale: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr x32>) asm {
+  %owned = copy %acc : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x32>
+  %a0 = slice %owned[0] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a1 = slice %owned[8] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a2 = slice %owned[16] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a3 = slice %owned[24] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %r = v_wmma_f32_16x16x16_f16 %v, %p, %a3
+  %out = concat(%a0, %a1, %a2, %r) : (reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>) -> reg<amdgpu.vgpr x32>
+  return %out
+}
+
+low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_pv_update_3_scaled(%v: reg<amdgpu.vgpr x8>, %p: reg<amdgpu.vgpr x8>, %acc: reg<amdgpu.vgpr x32>, %scale: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr x32>) asm {
+  %owned = copy %acc : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x32>
+  %a0 = slice %owned[0] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a1 = slice %owned[8] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a2 = slice %owned[16] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %a3 = slice %owned[24] : reg<amdgpu.vgpr x32> -> reg<amdgpu.vgpr x8>
+  %x0 = slice %a3[0] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y0 = v_mul_f32 %x0, %scale
+  %x1 = slice %a3[1] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y1 = v_mul_f32 %x1, %scale
+  %x2 = slice %a3[2] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y2 = v_mul_f32 %x2, %scale
+  %x3 = slice %a3[3] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y3 = v_mul_f32 %x3, %scale
+  %x4 = slice %a3[4] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y4 = v_mul_f32 %x4, %scale
+  %x5 = slice %a3[5] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y5 = v_mul_f32 %x5, %scale
+  %x6 = slice %a3[6] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y6 = v_mul_f32 %x6, %scale
+  %x7 = slice %a3[7] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
+  %y7 = v_mul_f32 %x7, %scale
+  %scaled = concat(%y0, %y1, %y2, %y3, %y4, %y5, %y6, %y7) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr x8>
+  %c = copy %scaled : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr x8>
+  %r = v_wmma_f32_16x16x16_f16 %v, %p, %c
+  %out = concat(%a0, %a1, %a2, %r) : (reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>) -> reg<amdgpu.vgpr x32>
+  return %out
 }
 
 low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) @h3_qk_pair(%ka: reg<amdgpu.vgpr x4>, %kb: reg<amdgpu.vgpr x4>, %q: reg<amdgpu.vgpr x4>, %aa: reg<amdgpu.vgpr x8>, %ab: reg<amdgpu.vgpr x8>) -> (reg<amdgpu.vgpr x8>, reg<amdgpu.vgpr x8>) asm {
@@ -388,8 +545,6 @@ kernel.def target(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) export("h3_a
     %part_start = scf.select %full_keys, %c0, %full_tile_count : index
     %part_end = scf.select %full_keys, %full_tile_count, %key_tile_count : index
     %part_max, %part_sum, %part_all0, %part_all1 = scf.for %key_tile = [%part_start to %part_end step %c1](%row_max = %phase_max : f32, %row_sum = %phase_sum : f32, %acc_all0 = %phase_all0 : vector<32xf32>, %acc_all1 = %phase_all1 : vector<32xf32>) -> (f32, f32, vector<32xf32>, vector<32xf32>) {
-      %acc0, %acc1, %acc2, %acc3 = low.invoke @h3_accsplit(%acc_all0) : (vector<32xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>)
-      %acc4, %acc5, %acc6, %acc7 = low.invoke @h3_accsplit(%acc_all1) : (vector<32xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>)
 
       %key_origin1 = index.mul %key_tile, %c64 : index
       %key_origin0 = index.assume %key_origin1 [le(%key_origin1, %tile_origin_limit), mul(%key_origin1, 16)] : index
@@ -849,7 +1004,6 @@ kernel.def target(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) export("h3_a
       %weight_d = vector.exp2f<afn> %delta_d : vector<8xf32>
       %old_delta = scalar.subf %row_max, %next_max : f32
       %old_scale = scalar.exp2f<afn> %old_delta : f32
-      %selected_old_scale = vector.splat %old_scale : vector<8xf32>
       %local_sum_a = vector.reduce<addf> %weight, %zero_f32 : vector<8xf32>, f32
       %local_sum_b = vector.reduce<addf> %weight_b, %zero_f32 : vector<8xf32>, f32
       %local_sum_c = vector.reduce<addf> %weight_c, %zero_f32 : vector<8xf32>, f32
@@ -882,78 +1036,68 @@ kernel.def target(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) export("h3_a
       %v_data0 = vector.load %v_tile_b[%vrow0, %c0] : view<128x72xf16> -> vector<16xf16>
       %v_data0_b = vector.load %v_tile_b[%vrow0, %c16] : view<128x72xf16> -> vector<16xf16>
       %v_data0_c = vector.load %v_tile_b[%vrow0, %c32] : view<128x72xf16> -> vector<16xf16>
-      %rescaled0 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %acc0, %selected_old_scale : vector<8xf32>
-      %partial0 = low.invoke @h3_pv32(%v_data0, %probability, %rescaled0) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update0_0 = low.invoke @h3_pv_update_0_scaled(%v_data0, %probability, %acc_all0, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data0_d = vector.load %v_tile_b[%vrow0, %c48] : view<128x72xf16> -> vector<16xf16>
-      %partial0_b = low.invoke @h3_pv32(%v_data0_b, %probability_b, %partial0) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update0_1 = low.invoke @h3_pv_update_0(%v_data0_b, %probability_b, %update0_0, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data1 = vector.load %v_tile_b[%vrow1, %c0] : view<128x72xf16> -> vector<16xf16>
-      %partial0_c = low.invoke @h3_pv32(%v_data0_c, %probability_c, %partial0_b) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update0_2 = low.invoke @h3_pv_update_0(%v_data0_c, %probability_c, %update0_1, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data1_b = vector.load %v_tile_b[%vrow1, %c16] : view<128x72xf16> -> vector<16xf16>
-      %next0 = low.invoke @h3_pv32(%v_data0_d, %probability_d, %partial0_c) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update0_3 = low.invoke @h3_pv_update_0(%v_data0_d, %probability_d, %update0_2, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data1_c = vector.load %v_tile_b[%vrow1, %c32] : view<128x72xf16> -> vector<16xf16>
-      %rescaled1 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %acc1, %selected_old_scale : vector<8xf32>
-      %partial1 = low.invoke @h3_pv32(%v_data1, %probability, %rescaled1) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update0_4 = low.invoke @h3_pv_update_1_scaled(%v_data1, %probability, %update0_3, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data1_d = vector.load %v_tile_b[%vrow1, %c48] : view<128x72xf16> -> vector<16xf16>
-      %partial1_b = low.invoke @h3_pv32(%v_data1_b, %probability_b, %partial1) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update0_5 = low.invoke @h3_pv_update_1(%v_data1_b, %probability_b, %update0_4, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data2 = vector.load %v_tile_b[%vrow2, %c0] : view<128x72xf16> -> vector<16xf16>
-      %partial1_c = low.invoke @h3_pv32(%v_data1_c, %probability_c, %partial1_b) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update0_6 = low.invoke @h3_pv_update_1(%v_data1_c, %probability_c, %update0_5, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data2_b = vector.load %v_tile_b[%vrow2, %c16] : view<128x72xf16> -> vector<16xf16>
-      %next1 = low.invoke @h3_pv32(%v_data1_d, %probability_d, %partial1_c) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update0_7 = low.invoke @h3_pv_update_1(%v_data1_d, %probability_d, %update0_6, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data2_c = vector.load %v_tile_b[%vrow2, %c32] : view<128x72xf16> -> vector<16xf16>
-      %rescaled2 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %acc2, %selected_old_scale : vector<8xf32>
-      %partial2 = low.invoke @h3_pv32(%v_data2, %probability, %rescaled2) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update0_8 = low.invoke @h3_pv_update_2_scaled(%v_data2, %probability, %update0_7, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data2_d = vector.load %v_tile_b[%vrow2, %c48] : view<128x72xf16> -> vector<16xf16>
-      %partial2_b = low.invoke @h3_pv32(%v_data2_b, %probability_b, %partial2) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update0_9 = low.invoke @h3_pv_update_2(%v_data2_b, %probability_b, %update0_8, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data3 = vector.load %v_tile_b[%vrow3, %c0] : view<128x72xf16> -> vector<16xf16>
-      %partial2_c = low.invoke @h3_pv32(%v_data2_c, %probability_c, %partial2_b) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update0_10 = low.invoke @h3_pv_update_2(%v_data2_c, %probability_c, %update0_9, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data3_b = vector.load %v_tile_b[%vrow3, %c16] : view<128x72xf16> -> vector<16xf16>
-      %next2 = low.invoke @h3_pv32(%v_data2_d, %probability_d, %partial2_c) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update0_11 = low.invoke @h3_pv_update_2(%v_data2_d, %probability_d, %update0_10, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data3_c = vector.load %v_tile_b[%vrow3, %c32] : view<128x72xf16> -> vector<16xf16>
-      %rescaled3 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %acc3, %selected_old_scale : vector<8xf32>
-      %partial3 = low.invoke @h3_pv32(%v_data3, %probability, %rescaled3) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update0_12 = low.invoke @h3_pv_update_3_scaled(%v_data3, %probability, %update0_11, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data3_d = vector.load %v_tile_b[%vrow3, %c48] : view<128x72xf16> -> vector<16xf16>
-      %partial3_b = low.invoke @h3_pv32(%v_data3_b, %probability_b, %partial3) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update0_13 = low.invoke @h3_pv_update_3(%v_data3_b, %probability_b, %update0_12, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data4 = vector.load %v_tile_b[%vrow4, %c0] : view<128x72xf16> -> vector<16xf16>
-      %partial3_c = low.invoke @h3_pv32(%v_data3_c, %probability_c, %partial3_b) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update0_14 = low.invoke @h3_pv_update_3(%v_data3_c, %probability_c, %update0_13, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data4_b = vector.load %v_tile_b[%vrow4, %c16] : view<128x72xf16> -> vector<16xf16>
-      %next3 = low.invoke @h3_pv32(%v_data3_d, %probability_d, %partial3_c) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %next_all0 = low.invoke @h3_pv_update_3(%v_data3_d, %probability_d, %update0_14, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data4_c = vector.load %v_tile_b[%vrow4, %c32] : view<128x72xf16> -> vector<16xf16>
-      %rescaled4 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %acc4, %selected_old_scale : vector<8xf32>
-      %partial4 = low.invoke @h3_pv32(%v_data4, %probability, %rescaled4) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update1_0 = low.invoke @h3_pv_update_0_scaled(%v_data4, %probability, %acc_all1, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data4_d = vector.load %v_tile_b[%vrow4, %c48] : view<128x72xf16> -> vector<16xf16>
-      %partial4_b = low.invoke @h3_pv32(%v_data4_b, %probability_b, %partial4) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update1_1 = low.invoke @h3_pv_update_0(%v_data4_b, %probability_b, %update1_0, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data5 = vector.load %v_tile_b[%vrow5, %c0] : view<128x72xf16> -> vector<16xf16>
-      %partial4_c = low.invoke @h3_pv32(%v_data4_c, %probability_c, %partial4_b) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update1_2 = low.invoke @h3_pv_update_0(%v_data4_c, %probability_c, %update1_1, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data5_b = vector.load %v_tile_b[%vrow5, %c16] : view<128x72xf16> -> vector<16xf16>
-      %next4 = low.invoke @h3_pv32(%v_data4_d, %probability_d, %partial4_c) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update1_3 = low.invoke @h3_pv_update_0(%v_data4_d, %probability_d, %update1_2, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data5_c = vector.load %v_tile_b[%vrow5, %c32] : view<128x72xf16> -> vector<16xf16>
-      %rescaled5 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %acc5, %selected_old_scale : vector<8xf32>
-      %partial5 = low.invoke @h3_pv32(%v_data5, %probability, %rescaled5) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update1_4 = low.invoke @h3_pv_update_1_scaled(%v_data5, %probability, %update1_3, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data5_d = vector.load %v_tile_b[%vrow5, %c48] : view<128x72xf16> -> vector<16xf16>
-      %partial5_b = low.invoke @h3_pv32(%v_data5_b, %probability_b, %partial5) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update1_5 = low.invoke @h3_pv_update_1(%v_data5_b, %probability_b, %update1_4, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data6 = vector.load %v_tile_b[%vrow6, %c0] : view<128x72xf16> -> vector<16xf16>
-      %partial5_c = low.invoke @h3_pv32(%v_data5_c, %probability_c, %partial5_b) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update1_6 = low.invoke @h3_pv_update_1(%v_data5_c, %probability_c, %update1_5, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data6_b = vector.load %v_tile_b[%vrow6, %c16] : view<128x72xf16> -> vector<16xf16>
-      %next5 = low.invoke @h3_pv32(%v_data5_d, %probability_d, %partial5_c) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update1_7 = low.invoke @h3_pv_update_1(%v_data5_d, %probability_d, %update1_6, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data6_c = vector.load %v_tile_b[%vrow6, %c32] : view<128x72xf16> -> vector<16xf16>
-      %rescaled6 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %acc6, %selected_old_scale : vector<8xf32>
-      %partial6 = low.invoke @h3_pv32(%v_data6, %probability, %rescaled6) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update1_8 = low.invoke @h3_pv_update_2_scaled(%v_data6, %probability, %update1_7, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data6_d = vector.load %v_tile_b[%vrow6, %c48] : view<128x72xf16> -> vector<16xf16>
-      %partial6_b = low.invoke @h3_pv32(%v_data6_b, %probability_b, %partial6) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update1_9 = low.invoke @h3_pv_update_2(%v_data6_b, %probability_b, %update1_8, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data7 = vector.load %v_tile_b[%vrow7, %c0] : view<128x72xf16> -> vector<16xf16>
-      %partial6_c = low.invoke @h3_pv32(%v_data6_c, %probability_c, %partial6_b) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update1_10 = low.invoke @h3_pv_update_2(%v_data6_c, %probability_c, %update1_9, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data7_b = vector.load %v_tile_b[%vrow7, %c16] : view<128x72xf16> -> vector<16xf16>
-      %next6 = low.invoke @h3_pv32(%v_data6_d, %probability_d, %partial6_c) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update1_11 = low.invoke @h3_pv_update_2(%v_data6_d, %probability_d, %update1_10, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data7_c = vector.load %v_tile_b[%vrow7, %c32] : view<128x72xf16> -> vector<16xf16>
-      %rescaled7 = vector.mulf<reassoc|nnan|ninf|nsz|contract> %acc7, %selected_old_scale : vector<8xf32>
-      %partial7 = low.invoke @h3_pv32(%v_data7, %probability, %rescaled7) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update1_12 = low.invoke @h3_pv_update_3_scaled(%v_data7, %probability, %update1_11, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       %v_data7_d = vector.load %v_tile_b[%vrow7, %c48] : view<128x72xf16> -> vector<16xf16>
-      %partial7_b = low.invoke @h3_pv32(%v_data7_b, %probability_b, %partial7) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
-      %partial7_c = low.invoke @h3_pv32(%v_data7_c, %probability_c, %partial7_b) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
-      %next7 = low.invoke @h3_pv32(%v_data7_d, %probability_d, %partial7_c) : (vector<16xf16>, vector<16xf16>, vector<8xf32>) -> (vector<8xf32>)
+      %update1_13 = low.invoke @h3_pv_update_3(%v_data7_b, %probability_b, %update1_12, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
+      %update1_14 = low.invoke @h3_pv_update_3(%v_data7_c, %probability_c, %update1_13, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
+      %next_all1 = low.invoke @h3_pv_update_3(%v_data7_d, %probability_d, %update1_14, %old_scale) : (vector<16xf16>, vector<16xf16>, vector<32xf32>, f32) -> (vector<32xf32>)
       kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-      %next_all0 = low.invoke @h3_accjoin(%next0, %next1, %next2, %next3) : (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) -> (vector<32xf32>)
-      %next_all1 = low.invoke @h3_accjoin(%next4, %next5, %next6, %next7) : (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) -> (vector<32xf32>)
       scf.yield %next_max, %next_sum, %next_all0, %next_all1 : f32, f32, vector<32xf32>, vector<32xf32>
     }
     scf.yield %part_max, %part_sum, %part_all0, %part_all1 : f32, f32, vector<32xf32>, vector<32xf32>
