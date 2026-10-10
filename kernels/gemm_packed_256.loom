@@ -924,9 +924,9 @@ kernel.def target(@h3_gemm_i8_256b_gfx11) export("h3_gemm_i8_256b") @h3_gemm_i8_
   kernel.return
 }
 
-template.decl @h3.packed_resid_256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index)
+template.decl @h3.packed_resid_256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index, %rows_bound: index)
 
-template.def<@h3.packed_resid_256> @h3_packed_resid_256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index) {
+template.def<@h3.packed_resid_256> @h3_packed_resid_256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index, %rows_bound: index) {
   %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), mul(%cfg_k_size, 64)] : index
   // the operand rows' pitch (k elements); K itself when it is not a multiple of 1024, else K + 64,
   // so that the 384 rows a step touches do not alias in the cache (K = 7168: 36.7 -> 41.2 TOPS, K = 21504: 33.4 -> 41.4)
@@ -990,7 +990,7 @@ template.def<@h3.packed_resid_256> @h3_packed_resid_256(%m_size: index, %a: buff
   %subgroup = index.assume %subgroup0 [range(%subgroup0, 0, 7)] : index
   %lane = kernel.subgroup.lane.id : index
   %lane16 = index.rem %lane, %c16 : index
-  %m_bounded = index.assume %m_size [range(%m_size, 1, 16777216)] : index
+  %m_bounded = index.assume %m_size [range(%m_size, 1, 16777216), le(%m_size, %rows_bound)] : index
   %wg_x = kernel.workgroup.id<x> : index
   %wg_y = kernel.workgroup.id<y> : index
   %c_n_tiles = index.div %n_size, %c128 : index
@@ -1265,9 +1265,9 @@ template.def<@h3.packed_resid_256> @h3_packed_resid_256(%m_size: index, %a: buff
 
 // The DiT residual projections use M128 N128 K128: fewer accumulator
 // registers and eight K16 updates per staged tile.
-template.decl @h3.packed_resid_k128(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index)
+template.decl @h3.packed_resid_k128(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index, %rows_bound: index)
 
-template.def<@h3.packed_resid_k128> @h3_packed_resid_k128(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index) {
+template.def<@h3.packed_resid_k128> @h3_packed_resid_k128(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index, %rows_bound: index) {
   %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), mul(%cfg_k_size, 64)] : index
   // Pad 1024-aligned operand rows to avoid cache-set conflicts.
   %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), mul(%cfg_k_stride, 64)] : index
@@ -1306,7 +1306,7 @@ template.def<@h3.packed_resid_k128> @h3_packed_resid_k128(%m_size: index, %a: bu
   %subgroup = index.assume %subgroup0 [range(%subgroup0, 0, 7)] : index
   %lane = kernel.subgroup.lane.id : index
   %lane16 = index.rem %lane, %c16 : index
-  %m_bounded = index.assume %m_size [range(%m_size, 1, 16777216)] : index
+  %m_bounded = index.assume %m_size [range(%m_size, 1, 16777216), le(%m_size, %rows_bound)] : index
   %wg_x = kernel.workgroup.id<x> : index
   %wg_y = kernel.workgroup.id<y> : index
   %c_n_tiles = index.div %n_size, %c128 : index
@@ -1535,9 +1535,9 @@ template.def<@h3.packed_resid_k128> @h3_packed_resid_k128(%m_size: index, %a: bu
 }
 
 // The long DiT down projection uses M128 N64 K256 to reduce staging barriers.
-template.decl @h3.packed_resid_n64_k256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index)
+template.decl @h3.packed_resid_n64_k256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index, %rows_bound: index)
 
-template.def<@h3.packed_resid_n64_k256> @h3_packed_resid_n64_k256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index) {
+template.def<@h3.packed_resid_n64_k256> @h3_packed_resid_n64_k256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index, %rows_bound: index) {
   %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), mul(%cfg_k_size, 64)] : index
   // Pad 1024-aligned operand rows to avoid cache-set conflicts.
   %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), mul(%cfg_k_stride, 64)] : index
@@ -1574,7 +1574,7 @@ template.def<@h3.packed_resid_n64_k256> @h3_packed_resid_n64_k256(%m_size: index
   %subgroup = index.assume %subgroup0 [range(%subgroup0, 0, 7)] : index
   %lane = kernel.subgroup.lane.id : index
   %lane16 = index.rem %lane, %c16 : index
-  %m_bounded = index.assume %m_size [range(%m_size, 1, 16777216)] : index
+  %m_bounded = index.assume %m_size [range(%m_size, 1, 16777216), le(%m_size, %rows_bound)] : index
   %wg_x = kernel.workgroup.id<x> : index
   %wg_y = kernel.workgroup.id<y> : index
   %c_n_tiles = index.div %n_size, %c64 : index
@@ -1846,10 +1846,11 @@ kernel.def target(@h3_gemm_i4_resid_256_gfx11) export("h3_gemm_i4_resid_256") @h
   %cfg_k_stride = config.get @h3.gemm_i4_resid_256.k_stride : index
   %cfg_m_group = config.get @h3.gemm_i4_resid_256.m_group : index
   %cfg_classes = config.get @h3.gemm_i4_resid_256.classes : index
+  %rows_bound = index.constant 16777216 : index
   %registers = index.constant 2 : index
   %k_step = index.constant 128 : index
   %packed_per_word = index.constant 8 : index
-  template.apply<@h3.packed_resid_256>(%m_size, %a, %w, %scale, %a_scale, %c, %gate, %cls, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %cfg_classes, %registers, %k_step, %packed_per_word) : (index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, index)
+  template.apply<@h3.packed_resid_256>(%m_size, %a, %w, %scale, %a_scale, %c, %gate, %cls, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %cfg_classes, %registers, %k_step, %packed_per_word, %rows_bound) : (index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, index, index)
   kernel.return
 }
 
@@ -1864,6 +1865,8 @@ config.decl @h3.gemm_i8_resid_256.k_stride : %value: index where [range(%value, 
 config.decl @h3.gemm_i8_resid_256.m_group : %value: index where [range(%value, 1, 4)]
 
 config.decl @h3.gemm_i8_resid_256.classes : %value: index where [range(%value, 1, 64)]
+
+config.decl @h3.gemm_i8_resid_256.rows_bound : %value: index where [range(%value, 1, 16777216)]
 
 kernel.def target(@h3_gemm_i8_resid_256_gfx11) export("h3_gemm_i8_resid_256") @h3_gemm_i8_resid_256(%m_size: index) {
   %c1 = index.constant 1 : index
@@ -1902,6 +1905,7 @@ kernel.def target(@h3_gemm_i8_resid_256_gfx11) export("h3_gemm_i8_resid_256") @h
   %cfg_k_stride = config.get @h3.gemm_i8_resid_256.k_stride : index
   %cfg_m_group = config.get @h3.gemm_i8_resid_256.m_group : index
   %cfg_classes = config.get @h3.gemm_i8_resid_256.classes : index
+  %rows_bound = config.get @h3.gemm_i8_resid_256.rows_bound : index
   %registers = index.constant 4 : index
   %k_step = index.constant 64 : index
   %packed_per_word = index.constant 4 : index
@@ -1917,12 +1921,12 @@ kernel.def target(@h3_gemm_i8_resid_256_gfx11) export("h3_gemm_i8_resid_256") @h
   %narrow_step = index.constant 256 : index
   %narrow_ok = scalar.andi %device_down, %device_width : i1
   scf.if %narrow_ok {
-    template.apply<@h3.packed_resid_n64_k256>(%m_size, %a, %w, %scale, %a_scale, %c, %gate, %cls, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %cfg_classes, %registers, %narrow_step, %packed_per_word) : (index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, index)
+    template.apply<@h3.packed_resid_n64_k256>(%m_size, %a, %w, %scale, %a_scale, %c, %gate, %cls, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %cfg_classes, %registers, %narrow_step, %packed_per_word, %rows_bound) : (index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, index, index)
   } else {
     scf.if %deep_ok {
-      template.apply<@h3.packed_resid_k128>(%m_size, %a, %w, %scale, %a_scale, %c, %gate, %cls, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %cfg_classes, %registers, %deep_step, %packed_per_word) : (index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, index)
+      template.apply<@h3.packed_resid_k128>(%m_size, %a, %w, %scale, %a_scale, %c, %gate, %cls, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %cfg_classes, %registers, %deep_step, %packed_per_word, %rows_bound) : (index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, index, index)
     } else {
-      template.apply<@h3.packed_resid_256>(%m_size, %a, %w, %scale, %a_scale, %c, %gate, %cls, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %cfg_classes, %registers, %k_step, %packed_per_word) : (index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, index)
+      template.apply<@h3.packed_resid_256>(%m_size, %a, %w, %scale, %a_scale, %c, %gate, %cls, %cfg_k_size, %cfg_n_size, %cfg_k_stride, %cfg_m_group, %cfg_classes, %registers, %k_step, %packed_per_word, %rows_bound) : (index, buffer, buffer, buffer, buffer, buffer, buffer, buffer, index, index, index, index, index, index, index, index, index)
     }
   }
   kernel.return

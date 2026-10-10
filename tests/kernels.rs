@@ -1314,6 +1314,9 @@ fn quantized_gemms_match_integer_dot_products_bias_and_residual_classes() {
                     let mut data = vec![pack(&a), pack(&w), bytes(&ws), bytes(&scales)];
                     let want = if mode == "resid" {
                         config.push(("classes", "2".into()));
+                        if bits == 8 && !biased {
+                            config.push(("rows_bound", "65536".into()));
+                        }
                         data.extend([bytes(&residual), bytes(&gates), bytes(&classes)]);
                         full.iter()
                             .enumerate()
@@ -5427,6 +5430,97 @@ fn compact_qkv_dispatch_crosses_specialized_row_bound() {
                     "rows={rows}, row={row}, col={col}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires gfx1151 and provisioned HRX"
+)]
+fn residual_dispatch_crosses_specialized_row_bound() {
+    use h3_hrx::dispatch::{Classes, Gemm, Tile};
+    let manager = hrx::residency::ResidencyManager::new(256 << 20).unwrap();
+    let mut stream = Stream::open().unwrap().with_memory_budget(manager.budget());
+    let compiler =
+        h3_hrx::compile::Compiler::new(None, Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels"));
+    let (k, n) = (64usize, 128usize);
+    let mut build = |tokens| {
+        Gemm::build(
+            &compiler,
+            &mut stream,
+            "resid",
+            "i8",
+            false,
+            true,
+            k,
+            n,
+            tokens,
+            2,
+            k,
+            Tile::Plain,
+            0,
+        )
+        .unwrap()
+    };
+    let small = build(1);
+    let large = build(65537);
+    compiler.flush(&mut stream).unwrap();
+    let w: Vec<i8> = (0..n * k).map(|i| (i / k % 5) as i8 - 2).collect();
+    let wq = stream.allocate_from(&bytes(&w)).unwrap();
+    let ws = stream
+        .allocate_from(&bytes(&vec![1. / k as f32; n]))
+        .unwrap();
+    let gates: Vec<f32> = (0..2 * n).map(|i| if i < n { 0.5 } else { -0.5 }).collect();
+    let gate = stream.allocate_from(&bytes(&gates)).unwrap();
+    for (op, rows) in [
+        (&small, 65535usize),
+        (&small, 65536),
+        (&small, 65537),
+        (&large, 17),
+    ] {
+        let a: Vec<i8> = (0..rows * k).map(|i| (i / k % 7) as i8 - 3).collect();
+        let aq = stream.allocate_from(&bytes(&a)).unwrap();
+        let as_ = stream.allocate_from(&bytes(&vec![1f32; rows])).unwrap();
+        let mut classes = Classes::zeroed(&mut stream, rows).unwrap();
+        classes
+            .write(
+                &mut stream,
+                &(0..rows).map(|i| (i % 2) as i32).collect::<Vec<_>>(),
+                2,
+            )
+            .unwrap();
+        let prior: Vec<f32> = (0..rows * n)
+            .map(|i| (i % 17) as f32 * 0.125 - 1.0)
+            .collect();
+        let mut actual = bytes(&prior);
+        actual.extend([0xa5; 64]);
+        let out = stream.allocate_from(&actual).unwrap();
+        op.run(
+            &mut stream,
+            None,
+            "bounded residual",
+            rows as u32,
+            aq.binding(),
+            wq.binding(),
+            Some((ws.binding(), as_.binding())),
+            out.binding(),
+            Some((gate.binding(), classes.all())),
+            None,
+        )
+        .unwrap();
+        stream.read_blocking(out.binding(), &mut actual).unwrap();
+        assert_eq!(&actual[rows * n * 4..], &[0xa5; 64]);
+        for (i, word) in actual[..rows * n * 4].as_chunks::<4>().0.iter().enumerate() {
+            let (row, col) = (i / n, i % n);
+            let product = ((row % 7) as i32 - 3) * ((col % 5) as i32 - 2);
+            let expected = prior[i] + product as f32 * gates[(row % 2) * n + col];
+            assert_eq!(
+                f32::from_le_bytes(*word),
+                expected,
+                "rows={rows},row={row},col={col}"
+            );
         }
     }
 }

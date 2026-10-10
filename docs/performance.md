@@ -377,9 +377,10 @@ rows. FP32 SwiGLU also covers 4,096 and 8,192 rows with cached and rotating
 weights, using a 1 GiB GPU allocation budget. All four DiT projections also cover
 15,666 and 37,977 rows with a 4 GiB budget. Long INT8 FP32 SwiGLU uses the
 192×256 tile from 32,768 rows; smaller sequences retain the existing kernel.
-Compact QKV and long-sequence SwiGLU specialize address arithmetic for at most
-65,536 rows. Dispatch checks the actual row count and retains a general kernel
-for larger calls, including when an operator is reused with more rows.
+Compact QKV, INT8 residual projections, and long-sequence SwiGLU specialize
+address arithmetic for at most 65,536 rows. Dispatch checks the actual row count
+and retains a general kernel for larger calls, including when an operator is
+reused with more rows.
 Residual down projections cover 4,096 rows; their residual is reset outside
 timing before each iteration. Other GEMM cases use a 512 MiB budget. All use
 the runtime's dispatch choices, operand pitches and direct buffer initialization.

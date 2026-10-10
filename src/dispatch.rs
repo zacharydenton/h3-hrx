@@ -956,7 +956,8 @@ impl Gemm {
         } else {
             stem.clone()
         };
-        let (kernel, bounded_kernel) = if long_dit_swiglu {
+        let bounded_residual = elem == "i8" && resid && !bias && tile == Tile::Plain;
+        let (kernel, bounded_kernel) = if long_dit_swiglu || bounded_residual {
             Self::build_bounded(c, stream, &module, &stem, cfg, tokens)?
         } else {
             (c.get(stream, &module, &format!("h3_{stem}"), &cfg)?, None)
