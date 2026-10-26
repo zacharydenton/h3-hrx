@@ -156,18 +156,22 @@ StageScoped leaves the native stream's bounded staging cache resident between
 calls; dropping the session releases it too. Ordinary compiler/code-object memory, native
 allocator rounding and checkpoint mappings are not part of this byte ceiling.
 Each public inference stage uses HRX's `NativeSession` to reserve the context's
-compute lane and replay its original stream-bound graphs. Earlier submissions
-drain first; later compute cannot overtake the stage. Other transfer/NPU lanes
-remain available. Native transfers inside the stage remain on its private stream
+compute lane and replay its private stream-bound graphs. Earlier submissions
+drain first. Eager and recorded transformer blocks end with a fenced checkpoint:
+queued work runs before H3 reacquires compute, retaining its capacity slot.
+Eager dispatch and lazy weight loading also check for waiting submissions.
+Other transfer/NPU lanes remain available. Native transfers remain on the private stream
 and are not included in coordinated Runtime transfer statistics. Runtime traces
-include host-observed stage latency, including loading and compilation.
+include host-observed stage latency, including loading, compilation and time yielded
+to other components. Kernels are not preempted; the longest fenced chunk determines
+handoff latency.
 
 Inputs and output buffers are borrowed directly, and progress callbacks run on
 the calling thread. A callback may enqueue other compute but must not wait for
 it while holding the lane. Nested sessions in the same context return `Busy`.
 Admission also returns `Busy` when the context's submission capacity is full.
 Cancellation, ordinary errors and panics all fence before releasing the lane;
-an uncertain fence quarantines the entire owner and prevents session reuse.
+an uncertain final or checkpoint fence quarantines the entire owner and prevents session reuse.
 `profile_report()` returns `Result<Option<String>>` and propagates admission
 or device failures.
 

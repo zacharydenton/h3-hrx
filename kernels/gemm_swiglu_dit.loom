@@ -4,7 +4,7 @@ amdgpu.target<gfx1151> @h3_gemm_i8_swiglu_f32_192x256_gfx11 {subgroup_size = 32}
 
 config.decl @h3.gemm_i8_swiglu_f32_192x256.k_size : %value: index where [eq(%value, 5376)]
 config.decl @h3.gemm_i8_swiglu_f32_192x256.n_size : %value: index where [eq(%value, 28672)]
-config.decl @h3.gemm_i8_swiglu_f32_192x256.k_stride : %value: index where [range(%value, 5376, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_swiglu_f32_192x256.k_stride : %value: index where [range(%value, 5376, 65536), multiple_of(%value, 64)]
 config.decl @h3.gemm_i8_swiglu_f32_192x256.m_group : %value: index where [range(%value, 1, 4)]
 config.decl @h3.gemm_i8_swiglu_f32_192x256.rows_bound : %value: index where [range(%value, 1, 16777216)]
 
@@ -44,10 +44,10 @@ kernel.def target(@h3_gemm_i8_swiglu_f32_192x256_gfx11) export("h3_gemm_i8_swigl
   %registers = index.constant 4 : index
   %k_step = index.constant 128 : index
   %packed_per_word = index.constant 4 : index
-  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), mul(%cfg_k_size, 64)] : index
+  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), multiple_of(%cfg_k_size, 64)] : index
   // Respect the pitch used by activation preparation and weight packing.
-  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), mul(%cfg_k_stride, 64)] : index
-  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 256, 65536), mul(%cfg_n_size, 256)] : index
+  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), multiple_of(%cfg_k_stride, 64)] : index
+  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 256, 65536), multiple_of(%cfg_n_size, 256)] : index
 
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -190,7 +190,7 @@ kernel.def target(@h3_gemm_i8_swiglu_f32_192x256_gfx11) export("h3_gemm_i8_swigl
     %acc_init = vector.fragment<init> %zero_i32x8 shape [%m, %n] : vector<8xi32>
 
     // Gather of the first k step into registers.
-    %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), mul(%st_quad, 4)] : index
+    %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), multiple_of(%st_quad, 4)] : index
     %ga0 = vector.load %a_view[%a_row0, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga1 = vector.load %a_view[%a_row1, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga2 = vector.load %a_view[%a_row2, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
@@ -216,7 +216,7 @@ kernel.def target(@h3_gemm_i8_swiglu_f32_192x256_gfx11) export("h3_gemm_i8_swigl
       %kq_next0 = index.div %k_next, %packed_per_word : index
       %kq_slot = index.add %kq_next0, %st_quad : index
       %kq_safe = scf.select %in_k, %kq_slot, %st_quad : index
-      %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), mul(%kq_safe, 4)] : index
+      %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), multiple_of(%kq_safe, 4)] : index
       %na0 = vector.load %a_view[%a_row0, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
       %na1 = vector.load %a_view[%a_row1, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
       %na2 = vector.load %a_view[%a_row2, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>

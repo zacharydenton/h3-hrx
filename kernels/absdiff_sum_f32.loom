@@ -19,7 +19,7 @@ kernel.def target(@h3_absdiff_sum_f32_gfx11) export("h3_absdiff_sum_f32") @h3_ab
   %c0_offset = index.constant 0 : offset
   %zero = scalar.constant 0.0 : f32
   %zero8 = vector.splat %zero : vector<8xf32>
-  %count_b = index.assume %count [range(%count, 8, 1073741824), mul(%count, 8)] : index
+  %count_b = index.assume %count [range(%count, 8, 1073741824), multiple_of(%count, 8)] : index
   %wg = kernel.workgroup.id<x> : index
   %lane = kernel.workitem.id<x> : index
   %base0 = index.mul %wg, %c2048 : index
@@ -38,7 +38,7 @@ kernel.def target(@h3_absdiff_sum_f32_gfx11) export("h3_absdiff_sum_f32") @h3_ab
   %o_view = buffer.view %o_global[%c0_offset] : buffer -> view<[%ocount]xf32>
   %inside = index.cmp ule, %i0, %last : index
   %d, %m = scf.if %inside -> (f32, f32) {
-    %i = index.assume %i0 [le(%i0, %last), mul(%i0, 8)] : index
+    %i = index.assume %i0 [le(%i0, %last), multiple_of(%i0, 8)] : index
     %av = vector.load %a_view[%i] : view<[%count_b]xf32> -> vector<8xf32>
     %bv = vector.load %b_view[%i] : view<[%count_b]xf32> -> vector<8xf32>
     %diff = vector.subf %av, %bv : vector<8xf32>

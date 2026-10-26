@@ -318,6 +318,7 @@ impl Weights {
     }
 
     fn load(&self, stream: &mut hrx::Stream, recipe: &Recipe) -> Result<hrx::Buffer> {
+        crate::scheduling::yield_if_waiting(stream)?;
         if self.io.mode != WeightIoMode::Mapped && matches!(recipe, Recipe::Rows { .. }) {
             let mut loader = self.native.lock().expect("not poisoned");
             if loader.is_none() {

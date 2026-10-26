@@ -3,13 +3,13 @@
 // Share statistics across four adjacent channels when each packet stays inside its group.
 amdgpu.target<gfx11-generic> @h3_gn_silu_f16_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gn_silu_f16.channels : %value: index where [range(%value, 32, 4096), mul(%value, 32)]
+config.decl @h3.gn_silu_f16.channels : %value: index where [range(%value, 32, 4096), multiple_of(%value, 32)]
 
 config.decl @h3.gn_silu_f16.groups : %value: index where [range(%value, 1, 64)]
 
 config.decl @h3.gn_silu_f16.plane : %value: index where [range(%value, 1, 1048576)]
 
-config.decl @h3.gn_silu_f16.rows_bound : %value: index where [range(%value, 64, 2097152), mul(%value, 64)]
+config.decl @h3.gn_silu_f16.rows_bound : %value: index where [range(%value, 64, 2097152), multiple_of(%value, 64)]
 
 config.decl @h3.gn_silu_f16.eps : f32
 

@@ -4,9 +4,9 @@
 // final norm (zero table) and any f32 norm that feeds the host rather than a GEMM.
 amdgpu.target<gfx11-generic> @h3_norm_mod_f32_gfx11 {subgroup_size = 32}
 
-config.decl @h3.norm_mod_f32.width : %value: index where [range(%value, 256, 32768), mul(%value, 256)]
+config.decl @h3.norm_mod_f32.width : %value: index where [range(%value, 256, 32768), multiple_of(%value, 256)]
 
-config.decl @h3.norm_mod_f32.lanes : %value: index where [range(%value, 32, 1024), mul(%value, 32)]
+config.decl @h3.norm_mod_f32.lanes : %value: index where [range(%value, 32, 1024), multiple_of(%value, 32)]
 
 config.decl @h3.norm_mod_f32.eps : f32
 
@@ -57,7 +57,7 @@ kernel.def target(@h3_norm_mod_f32_gfx11) export("h3_norm_mod_f32") @h3_norm_mod
     %ss_lane_step = index.mul %ss_j, %lanes : index
     %ss_chunk = index.add %ss_lane_step, %lane : index
     %ss_i0 = index.mul %ss_chunk, %c8 : index
-    %ss_i = index.assume %ss_i0 [le(%ss_i0, %width_last), mul(%ss_i0, 8)] : index
+    %ss_i = index.assume %ss_i0 [le(%ss_i0, %width_last), multiple_of(%ss_i0, 8)] : index
     %ss_x = vector.load %h_view[%row, %ss_i] : view<[%tokens_b]x[%width]xf32> -> vector<8xf32>
     %ss_sq = vector.mulf %ss_x, %ss_x : vector<8xf32>
     %ss_next = vector.addf %ss_acc, %ss_sq : vector<8xf32>
@@ -75,7 +75,7 @@ kernel.def target(@h3_norm_mod_f32_gfx11) export("h3_norm_mod_f32") @h3_norm_mod
     %m_lane_step = index.mul %m_j, %lanes : index
     %m_chunk = index.add %m_lane_step, %lane : index
     %m_i0 = index.mul %m_chunk, %c8 : index
-    %m_i = index.assume %m_i0 [le(%m_i0, %width_last), mul(%m_i0, 8)] : index
+    %m_i = index.assume %m_i0 [le(%m_i0, %width_last), multiple_of(%m_i0, 8)] : index
     %m_x = vector.load %h_view[%row, %m_i] : view<[%tokens_b]x[%width]xf32> -> vector<8xf32>
     %m_n = vector.mulf %m_x, %rms_inv8 : vector<8xf32>
     %m_nw = vector.load %nw_view[%m_i] : view<[%width]xf32> -> vector<8xf32>

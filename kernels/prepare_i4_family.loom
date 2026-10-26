@@ -152,7 +152,7 @@ template.def<@h3.prepare_finish_i4> @h3_prepare_finish_i4(%c0: index, %quads_per
     %a_lane_step = index.mul %a_j, %lanes : index
     %a_chunk = index.add %a_lane_step, %lane : index
     %a_i0 = index.mul %a_chunk, %c8 : index
-    %a_i = index.assume %a_i0 [le(%a_i0, %width_last), mul(%a_i0, 8)] : index
+    %a_i = index.assume %a_i0 [le(%a_i0, %width_last), multiple_of(%a_i0, 8)] : index
     %a_x = vector.load %x_view[%a_i] : view<[%width]xf32> -> vector<8xf32>
     %a_abs = vector.absf %a_x : vector<8xf32>
     %check_inf = vector.constant inf : vector<8xf32>
@@ -174,7 +174,7 @@ template.def<@h3.prepare_finish_i4> @h3_prepare_finish_i4(%c0: index, %quads_per
     %q_lane_step = index.mul %q_j, %lanes : index
     %q_chunk = index.add %q_lane_step, %lane : index
     %q_i0 = index.mul %q_chunk, %c8 : index
-    %q_i = index.assume %q_i0 [le(%q_i0, %width_last), mul(%q_i0, 8)] : index
+    %q_i = index.assume %q_i0 [le(%q_i0, %width_last), multiple_of(%q_i0, 8)] : index
     %q_w = index.assume %q_chunk [lt(%q_chunk, %word_width)] : index
     %q_x = vector.load %x_view[%q_i] : view<[%width]xf32> -> vector<8xf32>
     %q_r = vector.mulf %q_x, %inv_s8 : vector<8xf32>
@@ -225,11 +225,11 @@ template.def<@h3.prepare_finish_i4> @h3_prepare_finish_i4(%c0: index, %quads_per
 //
 amdgpu.target<gfx11-generic> @h3_prepare_plain_i4_gfx11 {subgroup_size = 32}
 
-config.decl @h3.prepare_plain_i4.width : %value: index where [range(%value, 256, 32768), mul(%value, 256)]
+config.decl @h3.prepare_plain_i4.width : %value: index where [range(%value, 256, 32768), multiple_of(%value, 256)]
 
-config.decl @h3.prepare_plain_i4.lanes : %value: index where [range(%value, 32, 1024), mul(%value, 32)]
+config.decl @h3.prepare_plain_i4.lanes : %value: index where [range(%value, 32, 1024), multiple_of(%value, 32)]
 
-config.decl @h3.prepare_plain_i4.out_stride : %value: index where [range(%value, 256, 65536), mul(%value, 64)]
+config.decl @h3.prepare_plain_i4.out_stride : %value: index where [range(%value, 256, 65536), multiple_of(%value, 64)]
 
 kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_prepare_plain_i4(%tokens: index) {
   %c1 = index.constant 1 : index
@@ -307,7 +307,7 @@ kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_
     %m_lane_step = index.mul %m_j, %lanes : index
     %m_chunk = index.add %m_lane_step, %lane : index
     %m_i0 = index.mul %m_chunk, %c8 : index
-    %m_i = index.assume %m_i0 [le(%m_i0, %width_last), mul(%m_i0, 8)] : index
+    %m_i = index.assume %m_i0 [le(%m_i0, %width_last), multiple_of(%m_i0, 8)] : index
     %m_v16 = vector.load %h_view[%row, %m_i] : view<[%tokens_b]x[%width]xf16> -> vector<8xf16>
     %m_out0 = vector.extf %m_v16 : vector<8xf16> to vector<8xf32>
     %m_out = vector.mulf %m_out0, %prescale8 : vector<8xf32>
@@ -324,11 +324,11 @@ kernel.def target(@h3_prepare_plain_i4_gfx11) export("h3_prepare_plain_i4") @h3_
 //
 amdgpu.target<gfx11-generic> @h3_prepare_norm_i4_gfx11 {subgroup_size = 32}
 
-config.decl @h3.prepare_norm_i4.width : %value: index where [range(%value, 256, 32768), mul(%value, 256)]
+config.decl @h3.prepare_norm_i4.width : %value: index where [range(%value, 256, 32768), multiple_of(%value, 256)]
 
-config.decl @h3.prepare_norm_i4.lanes : %value: index where [range(%value, 32, 1024), mul(%value, 32)]
+config.decl @h3.prepare_norm_i4.lanes : %value: index where [range(%value, 32, 1024), multiple_of(%value, 32)]
 
-config.decl @h3.prepare_norm_i4.out_stride : %value: index where [range(%value, 256, 65536), mul(%value, 64)]
+config.decl @h3.prepare_norm_i4.out_stride : %value: index where [range(%value, 256, 65536), multiple_of(%value, 64)]
 
 config.decl @h3.prepare_norm_i4.eps : f32
 
@@ -428,7 +428,7 @@ kernel.def target(@h3_prepare_norm_i4_gfx11) export("h3_prepare_norm_i4") @h3_pr
     %ss_lane_step = index.mul %ss_j, %lanes : index
     %ss_chunk = index.add %ss_lane_step, %lane : index
     %ss_i0 = index.mul %ss_chunk, %c8 : index
-    %ss_i = index.assume %ss_i0 [le(%ss_i0, %width_last), mul(%ss_i0, 8)] : index
+    %ss_i = index.assume %ss_i0 [le(%ss_i0, %width_last), multiple_of(%ss_i0, 8)] : index
     %ss_x = vector.load %h_view[%row, %ss_i] : view<[%tokens_b]x[%width]xf32> -> vector<8xf32>
     %ss_sq = vector.mulf %ss_x, %ss_x : vector<8xf32>
     %ss_next = vector.addf %ss_acc, %ss_sq : vector<8xf32>
@@ -446,7 +446,7 @@ kernel.def target(@h3_prepare_norm_i4_gfx11) export("h3_prepare_norm_i4") @h3_pr
     %m_lane_step = index.mul %m_j, %lanes : index
     %m_chunk = index.add %m_lane_step, %lane : index
     %m_i0 = index.mul %m_chunk, %c8 : index
-    %m_i = index.assume %m_i0 [le(%m_i0, %width_last), mul(%m_i0, 8)] : index
+    %m_i = index.assume %m_i0 [le(%m_i0, %width_last), multiple_of(%m_i0, 8)] : index
     %m_x = vector.load %h_view[%row, %m_i] : view<[%tokens_b]x[%width]xf32> -> vector<8xf32>
     %m_n = vector.mulf %m_x, %rms_inv8 : vector<8xf32>
     %m_nw = vector.load %nw_view[%m_i] : view<[%width]xf32> -> vector<8xf32>
@@ -464,11 +464,11 @@ kernel.def target(@h3_prepare_norm_i4_gfx11) export("h3_prepare_norm_i4") @h3_pr
 
 amdgpu.target<gfx11-generic> @h3_prepare_plain_f32_i4_gfx11 {subgroup_size = 32}
 
-config.decl @h3.prepare_plain_f32_i4.width : %value: index where [range(%value, 256, 32768), mul(%value, 256)]
+config.decl @h3.prepare_plain_f32_i4.width : %value: index where [range(%value, 256, 32768), multiple_of(%value, 256)]
 
-config.decl @h3.prepare_plain_f32_i4.lanes : %value: index where [range(%value, 32, 1024), mul(%value, 32)]
+config.decl @h3.prepare_plain_f32_i4.lanes : %value: index where [range(%value, 32, 1024), multiple_of(%value, 32)]
 
-config.decl @h3.prepare_plain_f32_i4.out_stride : %value: index where [range(%value, 256, 65536), mul(%value, 64)]
+config.decl @h3.prepare_plain_f32_i4.out_stride : %value: index where [range(%value, 256, 65536), multiple_of(%value, 64)]
 
 kernel.def target(@h3_prepare_plain_f32_i4_gfx11) export("h3_prepare_plain_f32_i4") @h3_prepare_plain_f32_i4(%tokens: index) {
   %c1 = index.constant 1 : index
@@ -546,7 +546,7 @@ kernel.def target(@h3_prepare_plain_f32_i4_gfx11) export("h3_prepare_plain_f32_i
     %m_lane_step = index.mul %m_j, %lanes : index
     %m_chunk = index.add %m_lane_step, %lane : index
     %m_i0 = index.mul %m_chunk, %c8 : index
-    %m_i = index.assume %m_i0 [le(%m_i0, %width_last), mul(%m_i0, 8)] : index
+    %m_i = index.assume %m_i0 [le(%m_i0, %width_last), multiple_of(%m_i0, 8)] : index
     %m_v16 = vector.load %h_view[%row, %m_i] : view<[%tokens_b]x[%width]xf32> -> vector<8xf32>
     %m_out0 = vector.addf %m_v16, %zero8 : vector<8xf32>
     %m_out = vector.mulf %m_out0, %prescale8 : vector<8xf32>

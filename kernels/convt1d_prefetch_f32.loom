@@ -3,9 +3,9 @@
 // Visit only the output phase's contributing taps, retaining ascending channel/tap FP32 FMAs.
 amdgpu.target<gfx11-generic> @h3_convt1d_prefetch_f32_gfx11 {subgroup_size = 32}
 
-config.decl @h3.convt1d_prefetch_f32.cin : %value: index where [range(%value, 4, 4096), mul(%value, 4)]
+config.decl @h3.convt1d_prefetch_f32.cin : %value: index where [range(%value, 4, 4096), multiple_of(%value, 4)]
 
-config.decl @h3.convt1d_prefetch_f32.cout : %value: index where [range(%value, 16, 4096), mul(%value, 16)]
+config.decl @h3.convt1d_prefetch_f32.cout : %value: index where [range(%value, 16, 4096), multiple_of(%value, 16)]
 
 config.decl @h3.convt1d_prefetch_f32.ksize : %value: index where [range(%value, 1, 64)]
 
@@ -13,7 +13,7 @@ config.decl @h3.convt1d_prefetch_f32.stride : %value: index where [range(%value,
 
 config.decl @h3.convt1d_prefetch_f32.pad : %value: index where [range(%value, 0, 1024)]
 
-config.decl @h3.convt1d_prefetch_f32.len_bound : %value: index where [range(%value, 256, 4194304), mul(%value, 256)]
+config.decl @h3.convt1d_prefetch_f32.len_bound : %value: index where [range(%value, 256, 4194304), multiple_of(%value, 256)]
 
 kernel.def target(@h3_convt1d_prefetch_f32_gfx11) export("h3_convt1d_prefetch_f32") @h3_convt1d_prefetch_f32(%len: index, %olen: index) {
   %one = index.constant 1 : index

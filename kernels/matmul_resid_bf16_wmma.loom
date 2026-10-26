@@ -7,8 +7,8 @@
 template.decl @h3.shared_matmul_resid(%m_size: index, %a: buffer, %w: buffer, %bias: buffer, %c: buffer, %lambda: buffer, %k_size0: index, %n_size0: index, %padded80: i1)
 
 template.def<@h3.shared_matmul_resid> @h3_body_matmul_resid(%m_size: index, %a: buffer, %w: buffer, %bias: buffer, %c: buffer, %lambda: buffer, %k_size0: index, %n_size0: index, %padded80: i1) {
-  %k_size = index.assume %k_size0 [range(%k_size0, 32, 8192), mul(%k_size0, 32)] : index
-  %n_size = index.assume %n_size0 [range(%n_size0, 64, 8192), mul(%n_size0, 64)] : index
+  %k_size = index.assume %k_size0 [range(%k_size0, 32, 8192), multiple_of(%k_size0, 32)] : index
+  %n_size = index.assume %n_size0 [range(%n_size0, 64, 8192), multiple_of(%n_size0, 64)] : index
 
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -183,9 +183,9 @@ template.def<@h3.shared_matmul_resid> @h3_body_matmul_resid(%m_size: index, %a: 
 
 amdgpu.target<gfx11-generic> @h3_matmul_resid_gfx11 {subgroup_size = 32}
 
-config.decl @h3.matmul_resid_bf16_wmma.k_size : %value: index where [range(%value, 32, 8192), mul(%value, 32)]
+config.decl @h3.matmul_resid_bf16_wmma.k_size : %value: index where [range(%value, 32, 8192), multiple_of(%value, 32)]
 
-config.decl @h3.matmul_resid_bf16_wmma.n_size : %value: index where [range(%value, 64, 8192), mul(%value, 64)]
+config.decl @h3.matmul_resid_bf16_wmma.n_size : %value: index where [range(%value, 64, 8192), multiple_of(%value, 64)]
 
 kernel.def target(@h3_matmul_resid_gfx11) export("h3_matmul_resid_bf16_wmma") @h3_matmul_resid_bf16_wmma(%m_size: index) {
   %c1 = index.constant 1 : index
@@ -209,9 +209,9 @@ kernel.def target(@h3_matmul_resid_gfx11) export("h3_matmul_resid_bf16_wmma") @h
 // Four-head groups keep the compact K extent divisible by the 64-wide stage.
 amdgpu.target<gfx11-generic> @h3_matmul_resid80_gfx11 {subgroup_size = 32}
 
-config.decl @h3.matmul_resid80_bf16_wmma.k_size : %value: index where [range(%value, 512, 8192), mul(%value, 512)]
+config.decl @h3.matmul_resid80_bf16_wmma.k_size : %value: index where [range(%value, 512, 8192), multiple_of(%value, 512)]
 
-config.decl @h3.matmul_resid80_bf16_wmma.n_size : %value: index where [range(%value, 64, 8192), mul(%value, 64)]
+config.decl @h3.matmul_resid80_bf16_wmma.n_size : %value: index where [range(%value, 64, 8192), multiple_of(%value, 64)]
 
 kernel.def target(@h3_matmul_resid80_gfx11) export("h3_matmul_resid80_bf16_wmma") @h3_matmul_resid80_bf16_wmma(%m_size: index) {
   %c1 = index.constant 1 : index

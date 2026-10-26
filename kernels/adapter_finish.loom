@@ -1,7 +1,7 @@
 // Experimental low-rank side branch. Add before SwiGLU or residual gating.
 // Base, low-rank projections, SwiGLU products and residuals retain f32 range.
 amdgpu.target<gfx11-generic> @h3_adapter_finish_gfx11 {subgroup_size = 32}
-config.decl @h3.adapter_finish.width : %v: index where [range(%v, 128, 32768), mul(%v, 128)]
+config.decl @h3.adapter_finish.width : %v: index where [range(%v, 128, 32768), multiple_of(%v, 128)]
 config.decl @h3.adapter_finish.mode : %v: index where [range(%v, 0, 2)]
 config.decl @h3.adapter_finish.classes : %v: index where [range(%v, 1, 64)]
 
@@ -23,7 +23,7 @@ kernel.def target(@h3_adapter_finish_gfx11) export("h3_adapter_finish") @h3_adap
   %c256 = index.constant 256 : index
   %off0 = index.constant 0 : offset
   %width0 = config.get @h3.adapter_finish.width : index
-  %width = index.assume %width0 [range(%width0, 128, 32768), mul(%width0, 128)] : index
+  %width = index.assume %width0 [range(%width0, 128, 32768), multiple_of(%width0, 128)] : index
   %mode = config.get @h3.adapter_finish.mode : index
   %classes0 = config.get @h3.adapter_finish.classes : index
   %classes = index.assume %classes0 [range(%classes0, 1, 64)] : index

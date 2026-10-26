@@ -1,6 +1,6 @@
 // Four adjacent channels per thread; each keeps the original ordered FP32 tap sum.
 amdgpu.target<gfx11-generic> @target {subgroup_size = 32}
-config.decl @h3.upscale_temporal.channels : %value: index where [range(%value, 64, 1024), mul(%value, 64)]
+config.decl @h3.upscale_temporal.channels : %value: index where [range(%value, 64, 1024), multiple_of(%value, 64)]
 config.decl @h3.upscale_temporal.plane : %value: index where [range(%value, 1, 1048576)]
 config.decl @h3.upscale_temporal.frames : %value: index where [range(%value, 1, 64)]
 config.decl @h3.upscale_temporal.taps : %value: index where [range(%value, 1, 31)]
@@ -44,7 +44,7 @@ kernel.def target(@target) export("h3_upscale_temporal") @h3_upscale_temporal(%c
     // Channel counts are multiples of 64, so no packet crosses a row boundary.
     %c0 = index.rem %i, %channels : index
     %last = index.sub %channels, %four : index
-    %c = index.assume %c0 [le(%c0, %last), mul(%c0, 4)] : index
+    %c = index.assume %c0 [le(%c0, %last), multiple_of(%c0, 4)] : index
     %row0 = index.div %i, %channels : index
     %row = index.assume %row0 [lt(%row0, %rows)] : index
     %t = index.div %row, %plane : index

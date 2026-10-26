@@ -6,9 +6,9 @@
 //   -> codes [tokens][heads * 32] i32, scales [tokens][heads] f32 (= absmax/127 * extra_scale)
 amdgpu.target<gfx11-generic> @h3_prepare_qk_i8_gfx11 {subgroup_size = 32}
 
-config.decl @h3.prepare_qk_i8.row_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.prepare_qk_i8.row_stride : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.prepare_qk_i8.head_offset : %value: index where [range(%value, 0, 65536), mul(%value, 128)]
+config.decl @h3.prepare_qk_i8.head_offset : %value: index where [range(%value, 0, 65536), multiple_of(%value, 128)]
 
 config.decl @h3.prepare_qk_i8.heads : %value: index where [range(%value, 1, 256)]
 
@@ -75,7 +75,7 @@ kernel.def target(@h3_prepare_qk_i8_gfx11) export("h3_prepare_qk_i8") @h3_prepar
       %lane4 = index.mul %lane, %c4 : index
       %col0 = index.add %hcol1, %lane4 : index
       %col_limit = index.sub %row_stride, %c4 : index
-      %col = index.assume %col0 [le(%col0, %col_limit), mul(%col0, 4)] : index
+      %col = index.assume %col0 [le(%col0, %col_limit), multiple_of(%col0, 4)] : index
       %x4h = vector.load %x_view[%token, %col] : view<[%tokens_b]x[%row_stride]xf16> -> vector<4xf16>
       %x4 = vector.extf %x4h : vector<4xf16> to vector<4xf32>
       %m4 = vector.load %m_view[%col] : view<[%row_stride]xf32> -> vector<4xf32>

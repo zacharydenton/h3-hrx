@@ -2,7 +2,7 @@
 // int4 QK^T attention. One lane per column, a workgroup per 256 columns, a loop over the rows.
 amdgpu.target<gfx11-generic> @h3_vsa_kmean_gfx11 {subgroup_size = 32}
 
-config.decl @h3.vsa_kmean.width : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.vsa_kmean.width : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
 kernel.def target(@h3_vsa_kmean_gfx11) export("h3_vsa_kmean") @h3_vsa_kmean(%tokens: index) {
   %c1 = index.constant 1 : index

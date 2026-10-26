@@ -1,5 +1,5 @@
 amdgpu.target<gfx11-generic> @target {subgroup_size = 32}
-config.decl @h3.upscale_resize.channels : %value: index where [range(%value, 64, 1024), mul(%value, 64)]
+config.decl @h3.upscale_resize.channels : %value: index where [range(%value, 64, 1024), multiple_of(%value, 64)]
 config.decl @h3.upscale_resize.in_plane : %value: index where [range(%value, 1, 1048576)]
 config.decl @h3.upscale_resize.out_plane : %value: index where [range(%value, 1, 1048576)]
 config.decl @h3.upscale_resize.frames : %value: index where [range(%value, 1, 64)]

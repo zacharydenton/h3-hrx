@@ -99,11 +99,11 @@ pub struct Dit {
     cond: Option<Conditioning>,
     blocks: Option<Blocks>,
     /// The recording binds both `seq` and `blocks`; replacing either invalidates it.
-    block_graph: Option<hrx::GraphExec>,
+    block_graph: Option<Vec<hrx::GraphExec>>,
     /// Blocks 1..49, replayed only when the host step cache misses.
-    suffix_graph: Option<hrx::GraphExec>,
-    sparse_graph: Option<hrx::GraphExec>,
-    sparse_suffix_graph: Option<hrx::GraphExec>,
+    suffix_graph: Option<Vec<hrx::GraphExec>>,
+    sparse_graph: Option<Vec<hrx::GraphExec>>,
+    sparse_suffix_graph: Option<Vec<hrx::GraphExec>>,
     attention_pattern: crate::AttentionPattern,
     vsa: Option<std::sync::Arc<crate::vsa::device::Runtime>>,
     vsa_active: bool,
@@ -1918,14 +1918,18 @@ mod tests {
         graph
             .fill(&[], dit.seq.as_ref().unwrap().x.binding(), 1)
             .unwrap();
-        dit.block_graph = Some(graph.finish().unwrap());
-        stream.launch(dit.block_graph.as_mut().unwrap()).unwrap();
+        dit.block_graph = Some(vec![graph.finish().unwrap()]);
+        stream
+            .launch(&mut dit.block_graph.as_mut().unwrap()[0])
+            .unwrap();
         let mut graph = stream.graph().unwrap();
         graph
             .fill(&[], dit.seq.as_ref().unwrap().x.binding(), 2)
             .unwrap();
-        dit.suffix_graph = Some(graph.finish().unwrap());
-        stream.launch(dit.suffix_graph.as_mut().unwrap()).unwrap();
+        dit.suffix_graph = Some(vec![graph.finish().unwrap()]);
+        stream
+            .launch(&mut dit.suffix_graph.as_mut().unwrap()[0])
+            .unwrap();
 
         let mut other = device.stream().unwrap();
         assert!(dit.ensure_seq(&mut other, capacity + 1).is_err());
@@ -1959,8 +1963,10 @@ mod tests {
         graph
             .fill(&[], dit.seq.as_ref().unwrap().x.binding(), 7)
             .unwrap();
-        dit.block_graph = Some(graph.finish().unwrap());
-        stream.launch(dit.block_graph.as_mut().unwrap()).unwrap();
+        dit.block_graph = Some(vec![graph.finish().unwrap()]);
+        stream
+            .launch(&mut dit.block_graph.as_mut().unwrap()[0])
+            .unwrap();
         let mut actual = [0u8; 16];
         stream
             .read_blocking(dit.seq.as_ref().unwrap().x.slice(0, 16), &mut actual)

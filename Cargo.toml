@@ -82,7 +82,9 @@ name = "render_latents"
 required-features = ["cli"]
 
 [dependencies]
-hrx = { package = "hrx-rs", version = "0.10.1" }
+# Requires the cooperative NativeSession API in the matching HRX development
+# checkout; use the local Cargo patch in docs/shared-hrx.md until it is released.
+hrx = { package = "hrx-rs", version = "0.12.0" }
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"
 thiserror = "2"

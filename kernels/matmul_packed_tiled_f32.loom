@@ -4,7 +4,7 @@ amdgpu.target<gfx11-generic> @h3_matmul_packed_tiled_f32_gfx11 {subgroup_size = 
 
 config.decl @h3.matmul_packed_tiled_f32.k : %value: index where [range(%value, 1, 8192)]
 
-config.decl @h3.matmul_packed_tiled_f32.n : %value: index where [range(%value, 32, 8192), mul(%value, 32)]
+config.decl @h3.matmul_packed_tiled_f32.n : %value: index where [range(%value, 32, 8192), multiple_of(%value, 32)]
 
 kernel.def target(@h3_matmul_packed_tiled_f32_gfx11) export("h3_matmul_packed_tiled_f32") @h3_matmul_packed_tiled_f32(%m: index) {
   %c1 = index.constant 1 : index

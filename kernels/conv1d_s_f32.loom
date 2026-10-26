@@ -16,9 +16,9 @@ config.decl @h3.conv1d_s_f32.pad : %value: index where [range(%value, 0, 1024)]
 
 config.decl @h3.conv1d_s_f32.stride : %value: index where [range(%value, 1, 64)]
 
-config.decl @h3.conv1d_s_f32.in_bound : %value: index where [range(%value, 256, 4194304), mul(%value, 256)]
+config.decl @h3.conv1d_s_f32.in_bound : %value: index where [range(%value, 256, 4194304), multiple_of(%value, 256)]
 
-config.decl @h3.conv1d_s_f32.out_bound : %value: index where [range(%value, 256, 4194304), mul(%value, 256)]
+config.decl @h3.conv1d_s_f32.out_bound : %value: index where [range(%value, 256, 4194304), multiple_of(%value, 256)]
 
 kernel.def target(@h3_conv1d_s_f32_gfx11) export("h3_conv1d_s_f32") @h3_conv1d_s_f32(%out_len: index, %in_len: index) {
   %c1 = index.constant 1 : index

@@ -5,7 +5,7 @@ amdgpu.target<gfx11-generic> @h3_conv1d_block_f32_gfx11 {subgroup_size = 32}
 
 config.decl @h3.conv1d_block_f32.cin : %value: index where [range(%value, 1, 4096)]
 
-config.decl @h3.conv1d_block_f32.cout : %value: index where [range(%value, 8, 4096), mul(%value, 8)]
+config.decl @h3.conv1d_block_f32.cout : %value: index where [range(%value, 8, 4096), multiple_of(%value, 8)]
 
 config.decl @h3.conv1d_block_f32.ksize : %value: index where [range(%value, 1, 64)]
 
@@ -15,7 +15,7 @@ config.decl @h3.conv1d_block_f32.pad : %value: index where [range(%value, 0, 102
 
 config.decl @h3.conv1d_block_f32.accumulate : %value: index where [range(%value, 0, 1)]
 
-config.decl @h3.conv1d_block_f32.len_bound : %value: index where [range(%value, 256, 4194304), mul(%value, 256)]
+config.decl @h3.conv1d_block_f32.len_bound : %value: index where [range(%value, 256, 4194304), multiple_of(%value, 256)]
 
 kernel.def target(@h3_conv1d_block_f32_gfx11) export("h3_conv1d_block_f32") @h3_conv1d_block_f32(%len: index) {
   %one = index.constant 1 : index

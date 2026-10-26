@@ -1,15 +1,15 @@
 // Whole-volume GroupNorm mean and centered variance, accumulated in FP32.
 amdgpu.target<gfx11-generic> @h3_upscale_gn_stats_gfx11 {subgroup_size = 32}
 
-config.decl @h3.upscale_gn_stats.channels : %value: index where [range(%value, 32, 4096), mul(%value, 32)]
+config.decl @h3.upscale_gn_stats.channels : %value: index where [range(%value, 32, 4096), multiple_of(%value, 32)]
 
-config.decl @h3.upscale_gn_stats.lanes : %value: index where [range(%value, 32, 1024), mul(%value, 32)]
+config.decl @h3.upscale_gn_stats.lanes : %value: index where [range(%value, 32, 1024), multiple_of(%value, 32)]
 
 config.decl @h3.upscale_gn_stats.groups : %value: index where [range(%value, 1, 64)]
 
 config.decl @h3.upscale_gn_stats.plane : %value: index where [range(%value, 1, 1048576)]
 
-config.decl @h3.upscale_gn_stats.rows_bound : %value: index where [range(%value, 64, 2097152), mul(%value, 64)]
+config.decl @h3.upscale_gn_stats.rows_bound : %value: index where [range(%value, 64, 2097152), multiple_of(%value, 64)]
 
 kernel.def target(@h3_upscale_gn_stats_gfx11) export("h3_upscale_gn_stats") @h3_upscale_gn_stats(%frames: index) {
   %c1 = index.constant 1 : index

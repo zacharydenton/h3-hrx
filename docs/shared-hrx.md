@@ -11,7 +11,9 @@ available for [measurement and optimization](performance.md).
 | HRX | Compilation, artifact caches, native buffers, transfers, dispatch, graphs and execution admission |
 | `Session` | The application-facing encoding, denoising and decoding API |
 
-H3 requires HRX 0.10.1 or newer for native large transfers. Applications sharing
+These changes require the matching HRX development checkout with
+`NativeSession::run_cooperative` (based on 0.12.0). Until that API is released,
+use the local Cargo override below. Applications sharing
 a `ModelContext` must resolve the same HRX crate instance. The current kernels
 target Strix Halo; H3 does not use HRX's NPU feature.
 
@@ -79,9 +81,11 @@ reported evaluation to complete.
 
 ## Graph execution
 
-`H3_GRAPH=1` records the video decoder stack and DiT block loop. With step caching,
-block 0 and its metric run eagerly; the host chooses between replaying blocks
-1–49 and adding the cached residual.
+`H3_GRAPH=1` records the video decoder stack and DiT block loop as one replay per
+transformer block. With step caching, block 0 and its metric run eagerly; the host
+chooses between replaying blocks 1–49 and adding the cached residual. Each replay
+preserves its internal dependencies; stream order preserves dependencies between
+blocks, including shared scratch and mixed-precision boundaries.
 
 `H3_PROFILE` and `H3_DUMP_BLOCKS` select eager execution even after a graph is
 cached. Replacing sequence/block storage or a VAE grid invalidates the associated
@@ -109,6 +113,34 @@ HRX's `NativeSession` handles compute-lane admission, completion fencing and
 quarantine after uncertain completion. H3's lazy model units share a memory
 budget and residency manager. See [session lifecycle](runtime-options.md) for
 cancellation, eviction and callback constraints.
+
+`Session` opts into cooperative admission on its single private stream. It fences
+after every eager or recorded transformer block, allowing other queued components
+to run before H3 resumes. Eager kernel dispatch and lazy weight loading also check
+for waiters. This keeps a denoising loop from reserving compute for the entire
+render while preserving exclusive admission between checkpoints. Kernels are not
+preempted; a large block, tensor load or compilation can still delay a handoff.
+Standalone low-level model calls outside `Session` do not install checkpoints.
+
+Run the warm-render correctness and latency probe with the same local override:
+
+```sh
+H3_GRAPH=1 cargo run --release --example scheduler_probe \
+  --config 'patch.crates-io.hrx-rs.path="../hrx-rs"'
+```
+
+It compares baseline and contended latent bytes and reports short-graph latency
+and completed render times. It uses the cached default DiT/text checkpoints.
+Pass `-- --decode` for a smaller video-decoder workload. Run separately with
+`H3_GRAPH=0` and `H3_GRAPH=1` to compare eager and block-recorded output hashes.
+
+On the local gfx1151 GPU (2026-10-26), the 256×256, five-frame decode probe
+completed 34 short jobs in eager mode and 32 with block replay, with maximum
+latencies of 25.8 ms and 23.3 ms respectively. Baseline and contended output bytes
+matched in each mode, and both modes produced the same SHA-256
+`031da6ef1ee919d32debcce1198db36112e2cb6d7dd9177dbb4cd83eff27151e`.
+These are decoder measurements under the host's existing load, not denoising
+latency guarantees or a render throughput comparison.
 
 [Rustler](../clients/rustler/README.md) workers own their sessions and accept jobs
 through a bounded queue. See [client integration](../clients/README.md) for examples.

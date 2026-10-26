@@ -5,7 +5,7 @@ amdgpu.target<gfx11-generic> @h3_down2_f32_gfx11 {subgroup_size = 32}
 
 config.decl @h3.down2_f32.channels : %value: index where [range(%value, 1, 4096)]
 
-config.decl @h3.down2_f32.len_bound : %value: index where [range(%value, 256, 4194304), mul(%value, 256)]
+config.decl @h3.down2_f32.len_bound : %value: index where [range(%value, 256, 4194304), multiple_of(%value, 256)]
 
 kernel.def target(@h3_down2_f32_gfx11) export("h3_down2_f32") @h3_down2_f32(%len2: index) {
   %c1 = index.constant 1 : index
@@ -27,7 +27,7 @@ kernel.def target(@h3_down2_f32_gfx11) export("h3_down2_f32") @h3_down2_f32(%len
   %c256 = index.constant 256 : index
   %c0_offset = index.constant 0 : offset
   %zero = scalar.constant 0.0 : f32
-  %len2_b = index.assume %len2 [range(%len2, 2, 8388608), mul(%len2, 2), le(%len2, %len_bound)] : index
+  %len2_b = index.assume %len2 [range(%len2, 2, 8388608), multiple_of(%len2, 2), le(%len2, %len_bound)] : index
   %olen = index.div %len2_b, %c2 : index
   %len_last = index.sub %len2_b, %c1 : index
   %wg = kernel.workgroup.id<x> : index

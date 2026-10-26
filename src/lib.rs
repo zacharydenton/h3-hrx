@@ -77,6 +77,7 @@ pub mod sampling;
 pub mod vsa;
 pub use sampling::{SamplingOptions, SamplingPreset, Scheduler};
 pub use vsa::{AttentionPattern, VsaOptions};
+mod scheduling;
 pub mod session;
 mod tiles;
 pub mod tokenizer;

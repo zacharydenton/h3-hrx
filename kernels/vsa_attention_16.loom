@@ -142,7 +142,7 @@ template.def<@h3.shared_vsa_attention_16> @h3_body_vsa_attention_16(%token_count
   %st_col0 = index.add %kv_base0, %st_chunk : index
   %kv_col_limit = index.sub %cfg_kv_stride, %c16 : index
   %q_col_limit = index.sub %cfg_q_stride, %c16 : index
-  %st_col = index.assume %st_col0 [le(%st_col0, %kv_col_limit), mul(%st_col0, 16)] : index
+  %st_col = index.assume %st_col0 [le(%st_col0, %kv_col_limit), multiple_of(%st_col0, 16)] : index
   // V staging: lane -> (key = workitem mod 16, channel chunk = workitem / 16), transposed into LDS
   %st_key_v = index.rem %st_lane, %c16 : index
   %st_chunk_v0 = index.div %st_lane, %c16 : index
@@ -150,7 +150,7 @@ template.def<@h3.shared_vsa_attention_16> @h3_body_vsa_attention_16(%token_count
   %st_is_v = index.cmp ult, %workitem, %c_kvlanes : index
   %st_chunk_v = index.mul %st_chunk_v0, %c16 : index
   %st_col_v0 = index.add %kv_base0, %st_chunk_v : index
-  %st_col_v = index.assume %st_col_v0 [le(%st_col_v0, %kv_col_limit), mul(%st_col_v0, 16)] : index
+  %st_col_v = index.assume %st_col_v0 [le(%st_col_v0, %kv_col_limit), multiple_of(%st_col_v0, 16)] : index
   %init = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
   %key_tile_count = index.add %tiles_per_image, %c0 : index
 
@@ -177,7 +177,7 @@ template.def<@h3.shared_vsa_attention_16> @h3_body_vsa_attention_16(%token_count
       %qrow_global = index.assume %qrow_global0 [lt(%qrow_global0, %cfg_token_capacity)] : index
       %qcol0 = index.add %head_base0, %qchunk : index
       %qcol1 = index.add %qcol0, %c64 : index
-      %qcol = index.assume %qcol1 [le(%qcol1, %q_col_limit), mul(%qcol1, 16)] : index
+      %qcol = index.assume %qcol1 [le(%qcol1, %q_col_limit), multiple_of(%qcol1, 16)] : index
       %q_chunk = vector.load %q_view[%qrow_global, %qcol] : view<[%cfg_token_capacity]x[%cfg_q_stride]xf16> -> vector<16xf16>
       vector.store %q_chunk, %q_tile[%qrow, %qchunk] : vector<16xf16>, view<16x[%q_pitch]xf16>
     }
@@ -199,7 +199,7 @@ template.def<@h3.shared_vsa_attention_16> @h3_body_vsa_attention_16(%token_count
     %take = index.cmp ne, %route_index, %c0 : index
     %sparse0, %sparse1, %sparse2, %sparse3, %sparse4, %sparse5, %sparse6, %sparse7, %sparse8, %sparse9 = scf.if %take -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) {
     %key_origin1 = index.mul %key_tile, %c16 : index
-    %key_origin0 = index.assume %key_origin1 [le(%key_origin1, %tile_origin_limit), mul(%key_origin1, 16)] : index
+    %key_origin0 = index.assume %key_origin1 [le(%key_origin1, %tile_origin_limit), multiple_of(%key_origin1, 16)] : index
     %stage_k_narrow = index.cmp ult, %st_chunk, %v_depth : index
     %stage_k = scf.select %padded80, %stage_k_narrow, %true : i1
     %stage_v_narrow = index.cmp ult, %st_chunk_v, %v_depth : index
@@ -558,15 +558,15 @@ template.def<@h3.shared_vsa_attention_16> @h3_body_vsa_attention_16(%token_count
 
 amdgpu.target<gfx11-generic> @h3_vsa_attention_16_gfx11 {subgroup_size = 32}
 
-config.decl @h3.vsa_attention_16.q_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
+config.decl @h3.vsa_attention_16.q_stride : %value: index where [range(%value, 128, 32768), multiple_of(%value, 128)]
 
-config.decl @h3.vsa_attention_16.kv_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
+config.decl @h3.vsa_attention_16.kv_stride : %value: index where [range(%value, 128, 32768), multiple_of(%value, 128)]
 
-config.decl @h3.vsa_attention_16.out_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
+config.decl @h3.vsa_attention_16.out_stride : %value: index where [range(%value, 128, 32768), multiple_of(%value, 128)]
 
 config.decl @h3.vsa_attention_16.tokens : %value: index where [range(%value, 1, 1048576)]
 
-config.decl @h3.vsa_attention_16.token_capacity : %value: index where [range(%value, 32, 1048576), mul(%value, 16)]
+config.decl @h3.vsa_attention_16.token_capacity : %value: index where [range(%value, 32, 1048576), multiple_of(%value, 16)]
 
 config.decl @h3.vsa_attention_16.scale : f32
 

@@ -4,15 +4,15 @@
 // the amdgpu.rdna3_5.core descriptor set, and only a bare architecture selects that profile.
 amdgpu.target<gfx1151> @h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11 {subgroup_size = 32}
 
-config.decl @h3.attention_i8qkhm_mha8_k64_lds_f16_wmma.q_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
+config.decl @h3.attention_i8qkhm_mha8_k64_lds_f16_wmma.q_stride : %value: index where [range(%value, 128, 32768), multiple_of(%value, 128)]
 
-config.decl @h3.attention_i8qkhm_mha8_k64_lds_f16_wmma.kv_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
+config.decl @h3.attention_i8qkhm_mha8_k64_lds_f16_wmma.kv_stride : %value: index where [range(%value, 128, 32768), multiple_of(%value, 128)]
 
-config.decl @h3.attention_i8qkhm_mha8_k64_lds_f16_wmma.out_stride : %value: index where [range(%value, 128, 32768), mul(%value, 128)]
+config.decl @h3.attention_i8qkhm_mha8_k64_lds_f16_wmma.out_stride : %value: index where [range(%value, 128, 32768), multiple_of(%value, 128)]
 
 config.decl @h3.attention_i8qkhm_mha8_k64_lds_f16_wmma.tokens : %value: index where [range(%value, 1, 1048576)]
 
-config.decl @h3.attention_i8qkhm_mha8_k64_lds_f16_wmma.token_capacity : %value: index where [range(%value, 32, 1048576), mul(%value, 16)]
+config.decl @h3.attention_i8qkhm_mha8_k64_lds_f16_wmma.token_capacity : %value: index where [range(%value, 32, 1048576), multiple_of(%value, 16)]
 
 config.decl @h3.attention_i8qkhm_mha8_k64_lds_f16_wmma.scale : f32
 
@@ -384,7 +384,7 @@ kernel.def target(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) export("h3_a
   %st_col0 = index.add %kv_word0, %st_chunk : index
   %kv_col_limit = index.sub %kv_stride0, %c16 : index
   %ki_col_limit = index.sub %ki_words, %c4 : index
-  %st_col = index.assume %st_col0 [le(%st_col0, %ki_col_limit), mul(%st_col0, 4)] : index
+  %st_col = index.assume %st_col0 [le(%st_col0, %ki_col_limit), multiple_of(%st_col0, 4)] : index
   // V staging: lane -> (key = workitem mod 16, channel chunk = workitem / 16), transposed into LDS
   %st_key_v = index.rem %st_lane, %c16 : index
   %st_chan_v = index.add %kv_base0, %st_lane : index
@@ -395,7 +395,7 @@ kernel.def target(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) export("h3_a
   %st_is_v = index.cmp ult, %workitem, %c_kvlanes : index
   %st_chunk_v = index.mul %st_chunk_v0, %c16 : index
   %st_col_v0 = index.add %kv_base0, %st_chunk_v : index
-  %st_col_v = index.assume %st_col_v0 [le(%st_col_v0, %kv_col_limit), mul(%st_col_v0, 16)] : index
+  %st_col_v = index.assume %st_col_v0 [le(%st_col_v0, %kv_col_limit), multiple_of(%st_col_v0, 16)] : index
   %init = vector.fragment<init> %zero_acc shape [%m, %n] : vector<8xf32>
   %c31 = index.constant 63 : index
   %key_round = index.add %tokens0, %c31 : index
@@ -408,35 +408,35 @@ kernel.def target(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) export("h3_a
   %q_wbase = index.mul %head, %c32 : index
   %q_word_limit = index.sub %qi_words, %c4 : index
   %q_word0a = index.add %q_wbase, %c0 : index
-  %q_word0 = index.assume %q_word0a [le(%q_word0a, %q_word_limit), mul(%q_word0a, 4)] : index
+  %q_word0 = index.assume %q_word0a [le(%q_word0a, %q_word_limit), multiple_of(%q_word0a, 4)] : index
   %qd0 = vector.load %qi_view[%q_flat, %c0] : view<[%q_rows]x32xi32> -> vector<4xi32>
   %lhs0 = vector.fragment<rhs> %qd0 shape [%k_frag, %n] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
   %q_word1a = index.add %q_wbase, %c4 : index
-  %q_word1 = index.assume %q_word1a [le(%q_word1a, %q_word_limit), mul(%q_word1a, 4)] : index
+  %q_word1 = index.assume %q_word1a [le(%q_word1a, %q_word_limit), multiple_of(%q_word1a, 4)] : index
   %qd1 = vector.load %qi_view[%q_flat, %c4] : view<[%q_rows]x32xi32> -> vector<4xi32>
   %lhs1 = vector.fragment<rhs> %qd1 shape [%k_frag, %n] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
   %q_word2a = index.add %q_wbase, %c8 : index
-  %q_word2 = index.assume %q_word2a [le(%q_word2a, %q_word_limit), mul(%q_word2a, 4)] : index
+  %q_word2 = index.assume %q_word2a [le(%q_word2a, %q_word_limit), multiple_of(%q_word2a, 4)] : index
   %qd2 = vector.load %qi_view[%q_flat, %c8] : view<[%q_rows]x32xi32> -> vector<4xi32>
   %lhs2 = vector.fragment<rhs> %qd2 shape [%k_frag, %n] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
   %q_word3a = index.add %q_wbase, %c12 : index
-  %q_word3 = index.assume %q_word3a [le(%q_word3a, %q_word_limit), mul(%q_word3a, 4)] : index
+  %q_word3 = index.assume %q_word3a [le(%q_word3a, %q_word_limit), multiple_of(%q_word3a, 4)] : index
   %qd3 = vector.load %qi_view[%q_flat, %c12] : view<[%q_rows]x32xi32> -> vector<4xi32>
   %lhs3 = vector.fragment<rhs> %qd3 shape [%k_frag, %n] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
   %q_word4a = index.add %q_wbase, %c16 : index
-  %q_word4 = index.assume %q_word4a [le(%q_word4a, %q_word_limit), mul(%q_word4a, 4)] : index
+  %q_word4 = index.assume %q_word4a [le(%q_word4a, %q_word_limit), multiple_of(%q_word4a, 4)] : index
   %qd4 = vector.load %qi_view[%q_flat, %c16] : view<[%q_rows]x32xi32> -> vector<4xi32>
   %lhs4 = vector.fragment<rhs> %qd4 shape [%k_frag, %n] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
   %q_word5a = index.add %q_wbase, %c20 : index
-  %q_word5 = index.assume %q_word5a [le(%q_word5a, %q_word_limit), mul(%q_word5a, 4)] : index
+  %q_word5 = index.assume %q_word5a [le(%q_word5a, %q_word_limit), multiple_of(%q_word5a, 4)] : index
   %qd5 = vector.load %qi_view[%q_flat, %c20] : view<[%q_rows]x32xi32> -> vector<4xi32>
   %lhs5 = vector.fragment<rhs> %qd5 shape [%k_frag, %n] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
   %q_word6a = index.add %q_wbase, %c24 : index
-  %q_word6 = index.assume %q_word6a [le(%q_word6a, %q_word_limit), mul(%q_word6a, 4)] : index
+  %q_word6 = index.assume %q_word6a [le(%q_word6a, %q_word_limit), multiple_of(%q_word6a, 4)] : index
   %qd6 = vector.load %qi_view[%q_flat, %c24] : view<[%q_rows]x32xi32> -> vector<4xi32>
   %lhs6 = vector.fragment<rhs> %qd6 shape [%k_frag, %n] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
   %q_word7a = index.add %q_wbase, %c28 : index
-  %q_word7 = index.assume %q_word7a [le(%q_word7a, %q_word_limit), mul(%q_word7a, 4)] : index
+  %q_word7 = index.assume %q_word7a [le(%q_word7a, %q_word_limit), multiple_of(%q_word7a, 4)] : index
   %qd7 = vector.load %qi_view[%q_flat, %c28] : view<[%q_rows]x32xi32> -> vector<4xi32>
   %lhs7 = vector.fragment<rhs> %qd7 shape [%k_frag, %n] using {schema = %i8_schema : encoding<schema>} : vector<4xi32>
   %qs_unscaled = view.load %qs_view[%head, %q_row] : view<[%head_limit]x[%padded_tokens]xf32> -> f32
@@ -454,7 +454,7 @@ kernel.def target(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) export("h3_a
     %part_max, %part_sum, %part_all0, %part_all1, %part_all2, %part_all3 = scf.for %key_tile = [%part_start to %part_end step %c1](%row_max = %phase_max : f32, %row_sum = %phase_sum : f32, %acc_all0 = %phase_all0 : vector<16xf32>, %acc_all1 = %phase_all1 : vector<16xf32>, %acc_all2 = %phase_all2 : vector<16xf32>, %acc_all3 = %phase_all3 : vector<16xf32>) -> (f32, f32, vector<16xf32>, vector<16xf32>, vector<16xf32>, vector<16xf32>) {
 
       %key_origin1 = index.mul %key_tile, %c64 : index
-      %key_origin0 = index.assume %key_origin1 [le(%key_origin1, %tile_origin_limit), mul(%key_origin1, 16)] : index
+      %key_origin0 = index.assume %key_origin1 [le(%key_origin1, %tile_origin_limit), multiple_of(%key_origin1, 16)] : index
       %key_origin_b = index.add %key_origin0, %c16 : index
       %key_lane_b = index.add %lane_column, %c16 : index
       %key_lane_c = index.add %lane_column, %c32 : index
@@ -499,13 +499,13 @@ kernel.def target(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) export("h3_a
       } else {
         %v_chunk = vector.load %v_view[%st_chan, %key_origin0] : view<[%kv_stride0]x[%padded_tokens]xf16> -> vector<16xf16>
         vector.store %v_chunk, %v_tile_b[%st_lane, %c0] : vector<16xf16>, view<128x72xf16>
-        %v_key_b = index.assume %key_origin_b [le(%key_origin_b, %tile_origin_limit), mul(%key_origin_b, 16)] : index
+        %v_key_b = index.assume %key_origin_b [le(%key_origin_b, %tile_origin_limit), multiple_of(%key_origin_b, 16)] : index
         %v_chunk_b = vector.load %v_view[%st_chan, %v_key_b] : view<[%kv_stride0]x[%padded_tokens]xf16> -> vector<16xf16>
         vector.store %v_chunk_b, %v_tile_b[%st_lane, %c16] : vector<16xf16>, view<128x72xf16>
-        %v_key_c = index.assume %key_origin_c [le(%key_origin_c, %tile_origin_limit), mul(%key_origin_c, 16)] : index
+        %v_key_c = index.assume %key_origin_c [le(%key_origin_c, %tile_origin_limit), multiple_of(%key_origin_c, 16)] : index
         %v_chunk_c = vector.load %v_view[%st_chan, %v_key_c] : view<[%kv_stride0]x[%padded_tokens]xf16> -> vector<16xf16>
         vector.store %v_chunk_c, %v_tile_b[%st_lane, %c32] : vector<16xf16>, view<128x72xf16>
-        %v_key_d = index.assume %key_origin_d [le(%key_origin_d, %tile_origin_limit), mul(%key_origin_d, 16)] : index
+        %v_key_d = index.assume %key_origin_d [le(%key_origin_d, %tile_origin_limit), multiple_of(%key_origin_d, 16)] : index
         %v_chunk_d = vector.load %v_view[%st_chan, %v_key_d] : view<[%kv_stride0]x[%padded_tokens]xf16> -> vector<16xf16>
         vector.store %v_chunk_d, %v_tile_b[%st_lane, %c48] : vector<16xf16>, view<128x72xf16>
       }
@@ -1069,35 +1069,35 @@ kernel.def target(@h3_attention_i8qkhm_mha8_k64_lds_f16_wmma_gfx11) export("h3_a
     %out_limit = index.sub %out_stride0, %c16 : index
     %oc0 = index.constant 0 : index
     %col0_0 = index.add %head_base0, %oc0 : index
-    %col0 = index.assume %col0_0 [le(%col0_0, %out_limit), mul(%col0_0, 16)] : index
+    %col0 = index.assume %col0_0 [le(%col0_0, %out_limit), multiple_of(%col0_0, 16)] : index
     vector.store %packed0, %out_view[%global_row, %col0] : vector<16xf16>, view<[%token_count]x[%out_stride0]xf16>
     %oc16 = index.constant 16 : index
     %col16_0 = index.add %head_base0, %oc16 : index
-    %col16 = index.assume %col16_0 [le(%col16_0, %out_limit), mul(%col16_0, 16)] : index
+    %col16 = index.assume %col16_0 [le(%col16_0, %out_limit), multiple_of(%col16_0, 16)] : index
     vector.store %packed1, %out_view[%global_row, %col16] : vector<16xf16>, view<[%token_count]x[%out_stride0]xf16>
     %oc32 = index.constant 32 : index
     %col32_0 = index.add %head_base0, %oc32 : index
-    %col32 = index.assume %col32_0 [le(%col32_0, %out_limit), mul(%col32_0, 16)] : index
+    %col32 = index.assume %col32_0 [le(%col32_0, %out_limit), multiple_of(%col32_0, 16)] : index
     vector.store %packed2, %out_view[%global_row, %col32] : vector<16xf16>, view<[%token_count]x[%out_stride0]xf16>
     %oc48 = index.constant 48 : index
     %col48_0 = index.add %head_base0, %oc48 : index
-    %col48 = index.assume %col48_0 [le(%col48_0, %out_limit), mul(%col48_0, 16)] : index
+    %col48 = index.assume %col48_0 [le(%col48_0, %out_limit), multiple_of(%col48_0, 16)] : index
     vector.store %packed3, %out_view[%global_row, %col48] : vector<16xf16>, view<[%token_count]x[%out_stride0]xf16>
     %oc64 = index.constant 64 : index
     %col64_0 = index.add %head_base0, %oc64 : index
-    %col64 = index.assume %col64_0 [le(%col64_0, %out_limit), mul(%col64_0, 16)] : index
+    %col64 = index.assume %col64_0 [le(%col64_0, %out_limit), multiple_of(%col64_0, 16)] : index
     vector.store %packed4, %out_view[%global_row, %col64] : vector<16xf16>, view<[%token_count]x[%out_stride0]xf16>
     %oc80 = index.constant 80 : index
     %col80_0 = index.add %head_base0, %oc80 : index
-    %col80 = index.assume %col80_0 [le(%col80_0, %out_limit), mul(%col80_0, 16)] : index
+    %col80 = index.assume %col80_0 [le(%col80_0, %out_limit), multiple_of(%col80_0, 16)] : index
     vector.store %packed5, %out_view[%global_row, %col80] : vector<16xf16>, view<[%token_count]x[%out_stride0]xf16>
     %oc96 = index.constant 96 : index
     %col96_0 = index.add %head_base0, %oc96 : index
-    %col96 = index.assume %col96_0 [le(%col96_0, %out_limit), mul(%col96_0, 16)] : index
+    %col96 = index.assume %col96_0 [le(%col96_0, %out_limit), multiple_of(%col96_0, 16)] : index
     vector.store %packed6, %out_view[%global_row, %col96] : vector<16xf16>, view<[%token_count]x[%out_stride0]xf16>
     %oc112 = index.constant 112 : index
     %col112_0 = index.add %head_base0, %oc112 : index
-    %col112 = index.assume %col112_0 [le(%col112_0, %out_limit), mul(%col112_0, 16)] : index
+    %col112 = index.assume %col112_0 [le(%col112_0, %out_limit), multiple_of(%col112_0, 16)] : index
     vector.store %packed7, %out_view[%global_row, %col112] : vector<16xf16>, view<[%token_count]x[%out_stride0]xf16>
   }
   kernel.return

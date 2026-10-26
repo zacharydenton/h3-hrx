@@ -157,7 +157,7 @@ impl MixedStack {
         &mut self,
         stream: &mut hrx::Stream,
         prof: &mut Profile,
-        recorded: &mut Option<hrx::GraphExec>,
+        recorded: &mut Option<Vec<hrx::GraphExec>>,
         x: View<'a>,
         cls: ClassRows<'a>,
         cos: View<'a>,
@@ -170,25 +170,37 @@ impl MixedStack {
             return self.forward(stream, prof, x, cls, cos, sin, cond, first, last);
         }
         if recorded.is_none() {
-            let mut graph = stream.graph()?;
-            self.emit(
-                &mut Sink::Graph {
-                    graph: &mut graph,
-                    after: Default::default(),
-                },
-                prof,
-                x,
-                cls,
-                cos,
-                sin,
-                cond,
-                first,
-                last,
-                false,
-            )?;
-            *recorded = Some(graph.finish()?);
+            let last = last.unwrap_or(self.layers);
+            if first > last || last > self.layers {
+                return err("block range exceeds mixed stack");
+            }
+            let mut blocks = Vec::with_capacity(last - first);
+            for block in first..last {
+                let mut graph = stream.graph()?;
+                self.emit(
+                    &mut Sink::Graph {
+                        graph: &mut graph,
+                        after: Default::default(),
+                    },
+                    prof,
+                    x,
+                    cls,
+                    cos,
+                    sin,
+                    cond,
+                    block,
+                    Some(block + 1),
+                    false,
+                )?;
+                blocks.push(graph.finish()?);
+            }
+            *recorded = Some(blocks);
         }
-        stream.launch(recorded.as_mut().expect("recorded above"))?;
+        for block in recorded.as_mut().expect("recorded above") {
+            crate::scheduling::yield_if_waiting(stream)?;
+            stream.launch(block)?;
+            crate::scheduling::boundary(stream)?;
+        }
         Ok(())
     }
 

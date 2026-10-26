@@ -15,11 +15,11 @@ template.def<@h3.packed_schema> @h3_packed_i8(%registers: index) -> (encoding<sc
 template.decl @h3.packed_256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %registers: index, %k_step: index, %packed_per_word: index, %output_f32: i1, %compact_qkv: i1, %rows_bound: index)
 
 template.def<@h3.packed_256> @h3_packed_256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %registers: index, %k_step: index, %packed_per_word: index, %output_f32: i1, %compact_qkv: i1, %rows_bound: index) {
-  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), mul(%cfg_k_size, 64)] : index
+  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), multiple_of(%cfg_k_size, 64)] : index
   // the operand rows' pitch (k elements); K itself when it is not a multiple of 1024, else K + 64,
   // so that the 384 rows a step touches do not alias in the cache (K = 7168: 36.7 -> 41.2 TOPS, K = 21504: 33.4 -> 41.4)
-  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), mul(%cfg_k_stride, 64)] : index
-  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 128, 65536), mul(%cfg_n_size, 128)] : index
+  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), multiple_of(%cfg_k_stride, 64)] : index
+  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 128, 65536), multiple_of(%cfg_n_size, 128)] : index
 
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -173,7 +173,7 @@ template.def<@h3.packed_256> @h3_packed_256(%m_size: index, %a: buffer, %w: buff
     %acc_init = vector.fragment<init> %zero_i32x8 shape [%m, %n] : vector<8xi32>
 
     // Gather of the first k step into registers.
-    %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), mul(%st_quad, 4)] : index
+    %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), multiple_of(%st_quad, 4)] : index
     %ga0 = vector.load %a_view[%a_row0, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga1 = vector.load %a_view[%a_row1, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga2 = vector.load %a_view[%a_row2, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
@@ -197,7 +197,7 @@ template.def<@h3.packed_256> @h3_packed_256(%m_size: index, %a: buffer, %w: buff
       %kq_next0 = index.div %k_next, %packed_per_word : index
       %kq_slot = index.add %kq_next0, %st_quad : index
       %kq_safe = scf.select %in_k, %kq_slot, %st_quad : index
-      %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), mul(%kq_safe, 4)] : index
+      %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), multiple_of(%kq_safe, 4)] : index
       %na0 = vector.load %a_view[%a_row0, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
       %na1 = vector.load %a_view[%a_row1, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
       %na2 = vector.load %a_view[%a_row2, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
@@ -312,7 +312,7 @@ template.def<@h3.packed_256> @h3_packed_256(%m_size: index, %a: buffer, %w: buff
         %vt_block_row = index.add %base_m, %vt_wave_row : index
         %vt_row = index.add %vt_block_row, %vt_r0 : index
         %vt_row_limit = index.sub %v_cap, %c4 : index
-        %vt_row_b = index.assume %vt_row [le(%vt_row, %vt_row_limit), mul(%vt_row, 4)] : index
+        %vt_row_b = index.assume %vt_row [le(%vt_row, %vt_row_limit), multiple_of(%vt_row, 4)] : index
         %vt_last_row = index.sub %m_bounded, %c1 : index
         %vt_g0 = index.add %vt_block_row, %vt_r0 : index
         %vt_ok0 = index.cmp ult, %vt_g0, %m_bounded : index
@@ -366,7 +366,7 @@ template.def<@h3.packed_256> @h3_packed_256(%m_size: index, %a: buffer, %w: buff
       } else {
       %out_col_local = index.add %tile_col, %publish_col : index
       %out_col = index.add %base_n, %out_col_local : index
-      %qk_col = index.assume %out_col [lt(%out_col, %out_stride), mul(%out_col, 4)] : index
+      %qk_col = index.assume %out_col [lt(%out_col, %out_stride), multiple_of(%out_col, 4)] : index
       %scale_values = vector.load %scale_view[%out_col] : view<[%n_size]xf32> -> vector<4xf32>
       scf.for %half = [%c0 to %c2 step %c1] {
         %row_offset = index.mul %half, %c8 : index
@@ -408,11 +408,11 @@ template.def<@h3.packed_256> @h3_packed_256(%m_size: index, %a: buffer, %w: buff
 
 amdgpu.target<gfx11-generic> @h3_gemm_i4_256_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_i4_256.k_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_256.k_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i4_256.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_256.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i4_256.k_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_256.k_stride : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
 config.decl @h3.gemm_i4_256.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -450,11 +450,11 @@ kernel.def target(@h3_gemm_i4_256_gfx11) export("h3_gemm_i4_256") @h3_gemm_i4_25
 
 amdgpu.target<gfx11-generic> @h3_gemm_i8_256_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_i8_256.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_256.k_size : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
-config.decl @h3.gemm_i8_256.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i8_256.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i8_256.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_256.k_stride : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
 config.decl @h3.gemm_i8_256.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -492,11 +492,11 @@ kernel.def target(@h3_gemm_i8_256_gfx11) export("h3_gemm_i8_256") @h3_gemm_i8_25
 
 amdgpu.target<gfx11-generic> @h3_gemm_i8_f32_256_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_i8_f32_256.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_f32_256.k_size : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
-config.decl @h3.gemm_i8_f32_256.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i8_f32_256.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i8_f32_256.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_f32_256.k_stride : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
 config.decl @h3.gemm_i8_f32_256.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -535,11 +535,11 @@ kernel.def target(@h3_gemm_i8_f32_256_gfx11) export("h3_gemm_i8_f32_256") @h3_ge
 template.decl @h3.packed_256b(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %bias: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %registers: index, %k_step: index, %packed_per_word: index)
 
 template.def<@h3.packed_256b> @h3_packed_256b(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %bias: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %registers: index, %k_step: index, %packed_per_word: index) {
-  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), mul(%cfg_k_size, 64)] : index
+  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), multiple_of(%cfg_k_size, 64)] : index
   // the operand rows' pitch (k elements); K itself when it is not a multiple of 1024, else K + 64,
   // so that the 384 rows a step touches do not alias in the cache (K = 7168: 36.7 -> 41.2 TOPS, K = 21504: 33.4 -> 41.4)
-  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), mul(%cfg_k_stride, 64)] : index
-  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 128, 65536), mul(%cfg_n_size, 128)] : index
+  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), multiple_of(%cfg_k_stride, 64)] : index
+  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 128, 65536), multiple_of(%cfg_n_size, 128)] : index
 
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -681,7 +681,7 @@ template.def<@h3.packed_256b> @h3_packed_256b(%m_size: index, %a: buffer, %w: bu
     %acc_init = vector.fragment<init> %zero_i32x8 shape [%m, %n] : vector<8xi32>
 
     // Gather of the first k step into registers.
-    %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), mul(%st_quad, 4)] : index
+    %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), multiple_of(%st_quad, 4)] : index
     %ga0 = vector.load %a_view[%a_row0, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga1 = vector.load %a_view[%a_row1, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga2 = vector.load %a_view[%a_row2, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
@@ -705,7 +705,7 @@ template.def<@h3.packed_256b> @h3_packed_256b(%m_size: index, %a: buffer, %w: bu
       %kq_next0 = index.div %k_next, %packed_per_word : index
       %kq_slot = index.add %kq_next0, %st_quad : index
       %kq_safe = scf.select %in_k, %kq_slot, %st_quad : index
-      %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), mul(%kq_safe, 4)] : index
+      %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), multiple_of(%kq_safe, 4)] : index
       %na0 = vector.load %a_view[%a_row0, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
       %na1 = vector.load %a_view[%a_row1, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
       %na2 = vector.load %a_view[%a_row2, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
@@ -848,11 +848,11 @@ template.def<@h3.packed_256b> @h3_packed_256b(%m_size: index, %a: buffer, %w: bu
 
 amdgpu.target<gfx11-generic> @h3_gemm_i4_256b_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_i4_256b.k_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_256b.k_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i4_256b.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_256b.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i4_256b.k_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_256b.k_stride : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
 config.decl @h3.gemm_i4_256b.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -887,11 +887,11 @@ kernel.def target(@h3_gemm_i4_256b_gfx11) export("h3_gemm_i4_256b") @h3_gemm_i4_
 
 amdgpu.target<gfx11-generic> @h3_gemm_i8_256b_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_i8_256b.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_256b.k_size : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
-config.decl @h3.gemm_i8_256b.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i8_256b.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i8_256b.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_256b.k_stride : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
 config.decl @h3.gemm_i8_256b.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -927,11 +927,11 @@ kernel.def target(@h3_gemm_i8_256b_gfx11) export("h3_gemm_i8_256b") @h3_gemm_i8_
 template.decl @h3.packed_resid_256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index, %rows_bound: index)
 
 template.def<@h3.packed_resid_256> @h3_packed_resid_256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index, %rows_bound: index) {
-  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), mul(%cfg_k_size, 64)] : index
+  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), multiple_of(%cfg_k_size, 64)] : index
   // the operand rows' pitch (k elements); K itself when it is not a multiple of 1024, else K + 64,
   // so that the 384 rows a step touches do not alias in the cache (K = 7168: 36.7 -> 41.2 TOPS, K = 21504: 33.4 -> 41.4)
-  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), mul(%cfg_k_stride, 64)] : index
-  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 128, 65536), mul(%cfg_n_size, 128)] : index
+  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), multiple_of(%cfg_k_stride, 64)] : index
+  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 128, 65536), multiple_of(%cfg_n_size, 128)] : index
 
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -1083,7 +1083,7 @@ template.def<@h3.packed_resid_256> @h3_packed_resid_256(%m_size: index, %a: buff
     %acc_init = vector.fragment<init> %zero_i32x8 shape [%m, %n] : vector<8xi32>
 
     // Gather of the first k step into registers.
-    %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), mul(%st_quad, 4)] : index
+    %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), multiple_of(%st_quad, 4)] : index
     %ga0 = vector.load %a_view[%a_row0, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga1 = vector.load %a_view[%a_row1, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga2 = vector.load %a_view[%a_row2, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
@@ -1107,7 +1107,7 @@ template.def<@h3.packed_resid_256> @h3_packed_resid_256(%m_size: index, %a: buff
       %kq_next0 = index.div %k_next, %packed_per_word : index
       %kq_slot = index.add %kq_next0, %st_quad : index
       %kq_safe = scf.select %in_k, %kq_slot, %st_quad : index
-      %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), mul(%kq_safe, 4)] : index
+      %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), multiple_of(%kq_safe, 4)] : index
       %pending_na0, %pending_na1, %pending_na2, %pending_na3, %pending_nw0, %pending_nw1 = scf.if %late_prefetch -> (vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>) {
         scf.yield %zero_i32x4, %zero_i32x4, %zero_i32x4, %zero_i32x4, %zero_i32x4, %zero_i32x4 : vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>, vector<4xi32>
       } else {
@@ -1268,10 +1268,10 @@ template.def<@h3.packed_resid_256> @h3_packed_resid_256(%m_size: index, %a: buff
 template.decl @h3.packed_resid_k128(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index, %rows_bound: index)
 
 template.def<@h3.packed_resid_k128> @h3_packed_resid_k128(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index, %rows_bound: index) {
-  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), mul(%cfg_k_size, 64)] : index
+  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), multiple_of(%cfg_k_size, 64)] : index
   // Pad 1024-aligned operand rows to avoid cache-set conflicts.
-  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), mul(%cfg_k_stride, 64)] : index
-  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 128, 65536), mul(%cfg_n_size, 128)] : index
+  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), multiple_of(%cfg_k_stride, 64)] : index
+  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 128, 65536), multiple_of(%cfg_n_size, 128)] : index
 
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -1403,7 +1403,7 @@ template.def<@h3.packed_resid_k128> @h3_packed_resid_k128(%m_size: index, %a: bu
     %acc_init = vector.fragment<init> %zero_i32x8 shape [%m, %n] : vector<8xi32>
 
     // Gather of the first k step into registers.
-    %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), mul(%st_quad, 4)] : index
+    %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), multiple_of(%st_quad, 4)] : index
     %ga0 = vector.load %a_view[%a_row0, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga1 = vector.load %a_view[%a_row1, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga2 = vector.load %a_view[%a_row2, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
@@ -1431,7 +1431,7 @@ template.def<@h3.packed_resid_k128> @h3_packed_resid_k128(%m_size: index, %a: bu
       %kq_next0 = index.div %k_next, %packed_per_word : index
       %kq_slot = index.add %kq_next0, %st_quad : index
       %kq_safe = scf.select %in_k, %kq_slot, %st_quad : index
-      %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), mul(%kq_safe, 4)] : index
+      %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), multiple_of(%kq_safe, 4)] : index
       %na0 = vector.load %a_view[%a_row0, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
       %na1 = vector.load %a_view[%a_row1, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
       %na2 = vector.load %a_view[%a_row2, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
@@ -1538,10 +1538,10 @@ template.def<@h3.packed_resid_k128> @h3_packed_resid_k128(%m_size: index, %a: bu
 template.decl @h3.packed_resid_n64_k256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index, %rows_bound: index)
 
 template.def<@h3.packed_resid_n64_k256> @h3_packed_resid_n64_k256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index, %rows_bound: index) {
-  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), mul(%cfg_k_size, 64)] : index
+  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), multiple_of(%cfg_k_size, 64)] : index
   // Pad 1024-aligned operand rows to avoid cache-set conflicts.
-  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), mul(%cfg_k_stride, 64)] : index
-  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 128, 65536), mul(%cfg_n_size, 128)] : index
+  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), multiple_of(%cfg_k_stride, 64)] : index
+  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 128, 65536), multiple_of(%cfg_n_size, 128)] : index
 
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -1688,7 +1688,7 @@ template.def<@h3.packed_resid_n64_k256> @h3_packed_resid_n64_k256(%m_size: index
 
     %acc_init = vector.fragment<init> %zero_i32x8 shape [%m, %n] : vector<8xi32>
 
-    %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), mul(%st_quad, 4)] : index
+    %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), multiple_of(%st_quad, 4)] : index
     %ga0 = vector.load %a_view[%a_row0, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga1 = vector.load %a_view[%a_row1, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga2 = vector.load %a_view[%a_row2, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
@@ -1720,7 +1720,7 @@ template.def<@h3.packed_resid_n64_k256> @h3_packed_resid_n64_k256(%m_size: index
       %kq_next0 = index.div %k_next, %packed_per_word : index
       %kq_slot = index.add %kq_next0, %st_quad : index
       %kq_safe = scf.select %in_k, %kq_slot, %st_quad : index
-      %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), mul(%kq_safe, 4)] : index
+      %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), multiple_of(%kq_safe, 4)] : index
       %na0 = vector.load %a_view[%a_row0, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
       %na1 = vector.load %a_view[%a_row1, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
       %na2 = vector.load %a_view[%a_row2, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
@@ -1813,11 +1813,11 @@ template.def<@h3.packed_resid_n64_k256> @h3_packed_resid_n64_k256(%m_size: index
 
 amdgpu.target<gfx11-generic> @h3_gemm_i4_resid_256_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_i4_resid_256.k_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_resid_256.k_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i4_resid_256.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_resid_256.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i4_resid_256.k_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_resid_256.k_stride : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
 config.decl @h3.gemm_i4_resid_256.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -1856,11 +1856,11 @@ kernel.def target(@h3_gemm_i4_resid_256_gfx11) export("h3_gemm_i4_resid_256") @h
 
 amdgpu.target<gfx11-generic> @h3_gemm_i8_resid_256_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_i8_resid_256.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_resid_256.k_size : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
-config.decl @h3.gemm_i8_resid_256.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i8_resid_256.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i8_resid_256.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_resid_256.k_stride : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
 config.decl @h3.gemm_i8_resid_256.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -1935,11 +1935,11 @@ kernel.def target(@h3_gemm_i8_resid_256_gfx11) export("h3_gemm_i8_resid_256") @h
 template.decl @h3.packed_resid_256b(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %bias: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index)
 
 template.def<@h3.packed_resid_256b> @h3_packed_resid_256b(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %gate: buffer, %cls: buffer, %bias: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %registers: index, %k_step: index, %packed_per_word: index) {
-  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), mul(%cfg_k_size, 64)] : index
+  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), multiple_of(%cfg_k_size, 64)] : index
   // the operand rows' pitch (k elements); K itself when it is not a multiple of 1024, else K + 64,
   // so that the 384 rows a step touches do not alias in the cache (K = 7168: 36.7 -> 41.2 TOPS, K = 21504: 33.4 -> 41.4)
-  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), mul(%cfg_k_stride, 64)] : index
-  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 128, 65536), mul(%cfg_n_size, 128)] : index
+  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), multiple_of(%cfg_k_stride, 64)] : index
+  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 128, 65536), multiple_of(%cfg_n_size, 128)] : index
 
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -2085,7 +2085,7 @@ template.def<@h3.packed_resid_256b> @h3_packed_resid_256b(%m_size: index, %a: bu
     %acc_init = vector.fragment<init> %zero_i32x8 shape [%m, %n] : vector<8xi32>
 
     // Gather of the first k step into registers.
-    %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), mul(%st_quad, 4)] : index
+    %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), multiple_of(%st_quad, 4)] : index
     %ga0 = vector.load %a_view[%a_row0, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga1 = vector.load %a_view[%a_row1, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga2 = vector.load %a_view[%a_row2, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
@@ -2109,7 +2109,7 @@ template.def<@h3.packed_resid_256b> @h3_packed_resid_256b(%m_size: index, %a: bu
       %kq_next0 = index.div %k_next, %packed_per_word : index
       %kq_slot = index.add %kq_next0, %st_quad : index
       %kq_safe = scf.select %in_k, %kq_slot, %st_quad : index
-      %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), mul(%kq_safe, 4)] : index
+      %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), multiple_of(%kq_safe, 4)] : index
       %na0 = vector.load %a_view[%a_row0, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
       %na1 = vector.load %a_view[%a_row1, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
       %na2 = vector.load %a_view[%a_row2, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
@@ -2251,11 +2251,11 @@ template.def<@h3.packed_resid_256b> @h3_packed_resid_256b(%m_size: index, %a: bu
 
 amdgpu.target<gfx11-generic> @h3_gemm_i4_resid_256b_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_i4_resid_256b.k_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_resid_256b.k_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i4_resid_256b.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_resid_256b.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i4_resid_256b.k_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_resid_256b.k_stride : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
 config.decl @h3.gemm_i4_resid_256b.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -2293,11 +2293,11 @@ kernel.def target(@h3_gemm_i4_resid_256b_gfx11) export("h3_gemm_i4_resid_256b") 
 
 amdgpu.target<gfx11-generic> @h3_gemm_i8_resid_256b_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_i8_resid_256b.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_resid_256b.k_size : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
-config.decl @h3.gemm_i8_resid_256b.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i8_resid_256b.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i8_resid_256b.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_resid_256b.k_stride : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
 config.decl @h3.gemm_i8_resid_256b.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -2336,11 +2336,11 @@ kernel.def target(@h3_gemm_i8_resid_256b_gfx11) export("h3_gemm_i8_resid_256b") 
 template.decl @h3.packed_swiglu_256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %registers: index, %k_step: index, %packed_per_word: index, %output_f32: i1)
 
 template.def<@h3.packed_swiglu_256> @h3_packed_swiglu_256(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %registers: index, %k_step: index, %packed_per_word: index, %output_f32: i1) {
-  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), mul(%cfg_k_size, 64)] : index
+  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), multiple_of(%cfg_k_size, 64)] : index
   // the operand rows' pitch (k elements); K itself when it is not a multiple of 1024, else K + 64,
   // so that the 384 rows a step touches do not alias in the cache (K = 7168: 36.7 -> 41.2 TOPS, K = 21504: 33.4 -> 41.4)
-  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), mul(%cfg_k_stride, 64)] : index
-  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 128, 65536), mul(%cfg_n_size, 128)] : index
+  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), multiple_of(%cfg_k_stride, 64)] : index
+  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 128, 65536), multiple_of(%cfg_n_size, 128)] : index
 
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -2530,7 +2530,7 @@ template.def<@h3.packed_swiglu_256> @h3_packed_swiglu_256(%m_size: index, %a: bu
     %acc_init = vector.fragment<init> %zero_i32x8 shape [%m, %n] : vector<8xi32>
 
     // Gather of the first k step into registers.
-    %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), mul(%st_quad, 4)] : index
+    %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), multiple_of(%st_quad, 4)] : index
     %ga0 = vector.load %a_view[%a_row0, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga1 = vector.load %a_view[%a_row1, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga2 = vector.load %a_view[%a_row2, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
@@ -2580,7 +2580,7 @@ template.def<@h3.packed_swiglu_256> @h3_packed_swiglu_256(%m_size: index, %a: bu
       %kq_next0 = index.div %k_next, %packed_per_word : index
       %kq_slot = index.add %kq_next0, %st_quad : index
       %kq_safe = scf.select %in_k, %kq_slot, %st_quad : index
-      %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), mul(%kq_safe, 4)] : index
+      %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), multiple_of(%kq_safe, 4)] : index
       %na0 = vector.load %a_view[%a_row0, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
       %na1 = vector.load %a_view[%a_row1, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
       %na2 = vector.load %a_view[%a_row2, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
@@ -2761,11 +2761,11 @@ template.def<@h3.packed_swiglu_256> @h3_packed_swiglu_256(%m_size: index, %a: bu
 
 amdgpu.target<gfx11-generic> @h3_gemm_i4_swiglu_256_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_i4_swiglu_256.k_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_swiglu_256.k_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i4_swiglu_256.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_swiglu_256.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i4_swiglu_256.k_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_swiglu_256.k_stride : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
 config.decl @h3.gemm_i4_swiglu_256.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -2801,11 +2801,11 @@ kernel.def target(@h3_gemm_i4_swiglu_256_gfx11) export("h3_gemm_i4_swiglu_256") 
 
 amdgpu.target<gfx11-generic> @h3_gemm_i8_swiglu_256_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_i8_swiglu_256.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_swiglu_256.k_size : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
-config.decl @h3.gemm_i8_swiglu_256.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i8_swiglu_256.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i8_swiglu_256.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_swiglu_256.k_stride : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
 config.decl @h3.gemm_i8_swiglu_256.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -2842,11 +2842,11 @@ kernel.def target(@h3_gemm_i8_swiglu_256_gfx11) export("h3_gemm_i8_swiglu_256") 
 template.decl @h3.packed_swiglu_256b_gs(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %bias: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %registers: index, %k_step: index, %packed_per_word: index, %output_f32: i1)
 
 template.def<@h3.packed_swiglu_256b_gs> @h3_packed_swiglu_256b_gs(%m_size: index, %a: buffer, %w: buffer, %scale: buffer, %a_scale: buffer, %c: buffer, %bias: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %registers: index, %k_step: index, %packed_per_word: index, %output_f32: i1) {
-  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), mul(%cfg_k_size, 64)] : index
+  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), multiple_of(%cfg_k_size, 64)] : index
   // the operand rows' pitch (k elements); K itself when it is not a multiple of 1024, else K + 64,
   // so that the 384 rows a step touches do not alias in the cache (K = 7168: 36.7 -> 41.2 TOPS, K = 21504: 33.4 -> 41.4)
-  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), mul(%cfg_k_stride, 64)] : index
-  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 128, 65536), mul(%cfg_n_size, 128)] : index
+  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), multiple_of(%cfg_k_stride, 64)] : index
+  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 128, 65536), multiple_of(%cfg_n_size, 128)] : index
 
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -2990,7 +2990,7 @@ template.def<@h3.packed_swiglu_256b_gs> @h3_packed_swiglu_256b_gs(%m_size: index
     %acc_init = vector.fragment<init> %zero_i32x8 shape [%m, %n] : vector<8xi32>
 
     // Gather of the first k step into registers.
-    %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), mul(%st_quad, 4)] : index
+    %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), multiple_of(%st_quad, 4)] : index
     %ga0 = vector.load %a_view[%a_row0, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga1 = vector.load %a_view[%a_row1, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
     %ga2 = vector.load %a_view[%a_row2, %kq_first] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
@@ -3014,7 +3014,7 @@ template.def<@h3.packed_swiglu_256b_gs> @h3_packed_swiglu_256b_gs(%m_size: index
       %kq_next0 = index.div %k_next, %packed_per_word : index
       %kq_slot = index.add %kq_next0, %st_quad : index
       %kq_safe = scf.select %in_k, %kq_slot, %st_quad : index
-      %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), mul(%kq_safe, 4)] : index
+      %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), multiple_of(%kq_safe, 4)] : index
       %na0 = vector.load %a_view[%a_row0, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
       %na1 = vector.load %a_view[%a_row1, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
       %na2 = vector.load %a_view[%a_row2, %kq_next] : view<[%m_bounded]x[%k_quads]xi32> -> vector<4xi32>
@@ -3181,11 +3181,11 @@ template.def<@h3.packed_swiglu_256b_gs> @h3_packed_swiglu_256b_gs(%m_size: index
 
 amdgpu.target<gfx11-generic> @h3_gemm_i4_swiglu_256b_gs_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_i4_swiglu_256b_gs.k_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_swiglu_256b_gs.k_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i4_swiglu_256b_gs.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_swiglu_256b_gs.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i4_swiglu_256b_gs.k_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_swiglu_256b_gs.k_stride : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
 config.decl @h3.gemm_i4_swiglu_256b_gs.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -3221,11 +3221,11 @@ kernel.def target(@h3_gemm_i4_swiglu_256b_gs_gfx11) export("h3_gemm_i4_swiglu_25
 
 amdgpu.target<gfx11-generic> @h3_gemm_i8_swiglu_256b_gs_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_i8_swiglu_256b_gs.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_swiglu_256b_gs.k_size : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
-config.decl @h3.gemm_i8_swiglu_256b_gs.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i8_swiglu_256b_gs.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i8_swiglu_256b_gs.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_swiglu_256b_gs.k_stride : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
 config.decl @h3.gemm_i8_swiglu_256b_gs.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -3261,11 +3261,11 @@ kernel.def target(@h3_gemm_i8_swiglu_256b_gs_gfx11) export("h3_gemm_i8_swiglu_25
 
 amdgpu.target<gfx11-generic> @h3_gemm_i4_swiglu_f32_256_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_i4_swiglu_f32_256.k_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_swiglu_f32_256.k_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i4_swiglu_f32_256.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_swiglu_f32_256.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i4_swiglu_f32_256.k_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_swiglu_f32_256.k_stride : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
 config.decl @h3.gemm_i4_swiglu_f32_256.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -3301,11 +3301,11 @@ kernel.def target(@h3_gemm_i4_swiglu_f32_256_gfx11) export("h3_gemm_i4_swiglu_f3
 
 amdgpu.target<gfx11-generic> @h3_gemm_i8_swiglu_f32_256_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_i8_swiglu_f32_256.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_swiglu_f32_256.k_size : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
-config.decl @h3.gemm_i8_swiglu_f32_256.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i8_swiglu_f32_256.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i8_swiglu_f32_256.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_swiglu_f32_256.k_stride : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
 config.decl @h3.gemm_i8_swiglu_f32_256.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -3348,11 +3348,11 @@ kernel.def target(@h3_gemm_i8_swiglu_f32_256_gfx11) export("h3_gemm_i8_swiglu_f3
 
 amdgpu.target<gfx11-generic> @h3_gemm_i4_swiglu_f32_256b_gs_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_i4_swiglu_f32_256b_gs.k_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_swiglu_f32_256b_gs.k_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i4_swiglu_f32_256b_gs.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_swiglu_f32_256b_gs.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i4_swiglu_f32_256b_gs.k_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i4_swiglu_f32_256b_gs.k_stride : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
 config.decl @h3.gemm_i4_swiglu_f32_256b_gs.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -3388,11 +3388,11 @@ kernel.def target(@h3_gemm_i4_swiglu_f32_256b_gs_gfx11) export("h3_gemm_i4_swigl
 
 amdgpu.target<gfx11-generic> @h3_gemm_i8_swiglu_f32_256b_gs_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_i8_swiglu_f32_256b_gs.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_swiglu_f32_256b_gs.k_size : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
-config.decl @h3.gemm_i8_swiglu_f32_256b_gs.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_i8_swiglu_f32_256b_gs.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_i8_swiglu_f32_256b_gs.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_swiglu_f32_256b_gs.k_stride : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
 config.decl @h3.gemm_i8_swiglu_f32_256b_gs.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -3429,11 +3429,11 @@ kernel.def target(@h3_gemm_i8_swiglu_f32_256b_gs_gfx11) export("h3_gemm_i8_swigl
 // Q/K rows are compact; V follows as [N/3][ceil(M/256)*256].
 amdgpu.target<gfx11-generic> @h3_gemm_i8_qkv_256_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_i8_qkv_256.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_qkv_256.k_size : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
-config.decl @h3.gemm_i8_qkv_256.n_size : %value: index where [range(%value, 384, 65536), mul(%value, 384)]
+config.decl @h3.gemm_i8_qkv_256.n_size : %value: index where [range(%value, 384, 65536), multiple_of(%value, 384)]
 
-config.decl @h3.gemm_i8_qkv_256.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_i8_qkv_256.k_stride : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
 config.decl @h3.gemm_i8_qkv_256.m_group : %value: index where [range(%value, 1, 4)]
 

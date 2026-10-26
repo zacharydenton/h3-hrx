@@ -197,7 +197,7 @@ struct Built {
     stage_out: Vec<half::f16>,
     /// `H3_GRAPH=1`: the stack's blocks recorded once and replayed per tile. A clip is a hundred
     /// tiles of identical work over identical allocations, which is the shape a recording wants.
-    graph: Option<hrx::GraphExec>,
+    graph: Option<Vec<hrx::GraphExec>>,
 }
 
 /// Encoder tiles reuse their widest channels-last planes and padded host input.

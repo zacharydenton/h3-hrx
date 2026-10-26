@@ -5,11 +5,11 @@
 
 amdgpu.target<gfx11-generic> @h3_gemm_f16_fast_256b_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_f16_fast_256b.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_f16_fast_256b.k_size : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
-config.decl @h3.gemm_f16_fast_256b.n_size : %value: index where [range(%value, 256, 65536), mul(%value, 256)]
+config.decl @h3.gemm_f16_fast_256b.n_size : %value: index where [range(%value, 256, 65536), multiple_of(%value, 256)]
 
-config.decl @h3.gemm_f16_fast_256b.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_f16_fast_256b.k_stride : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
 config.decl @h3.gemm_f16_fast_256b.m_group : %value: index where [range(%value, 1, 16)]
 
@@ -33,10 +33,10 @@ kernel.def target(@h3_gemm_f16_fast_256b_gfx11) export("h3_gemm_f16_fast_256b") 
 } launch(%m_size: index, %a: buffer, %w: buffer, %c: buffer, %bias: buffer) {
   %k_size0 = config.get @h3.gemm_f16_fast_256b.k_size : index
   %n_size0 = config.get @h3.gemm_f16_fast_256b.n_size : index
-  %k_size = index.assume %k_size0 [range(%k_size0, 64, 65536), mul(%k_size0, 64)] : index
+  %k_size = index.assume %k_size0 [range(%k_size0, 64, 65536), multiple_of(%k_size0, 64)] : index
   %k_stride0 = config.get @h3.gemm_f16_fast_256b.k_stride : index
-  %k_stride = index.assume %k_stride0 [range(%k_stride0, 64, 65536), mul(%k_stride0, 64)] : index
-  %n_size = index.assume %n_size0 [range(%n_size0, 256, 65536), mul(%n_size0, 256)] : index
+  %k_stride = index.assume %k_stride0 [range(%k_stride0, 64, 65536), multiple_of(%k_stride0, 64)] : index
+  %n_size = index.assume %n_size0 [range(%n_size0, 256, 65536), multiple_of(%n_size0, 256)] : index
 
   %c0 = index.constant 0 : index
   %c1 = index.constant 1 : index
@@ -127,7 +127,7 @@ kernel.def target(@h3_gemm_f16_fast_256b_gfx11) export("h3_gemm_f16_fast_256b") 
   %st_sub = index.rem %workitem, %c4 : index
   %st_quad = index.mul %st_sub, %c4 : index
   %st_col0 = index.mul %st_sub, %c16 : index
-  %st_col = index.assume %st_col0 [lt(%st_col0, %c64), mul(%st_col0, 16)] : index
+  %st_col = index.assume %st_col0 [lt(%st_col0, %c64), multiple_of(%st_col0, 16)] : index
   %st_row_base = index.div %workitem, %c4 : index
   %k_quad_limit = index.sub %k_quads, %c4 : index
   %st_arow0 = index.add %st_row_base, %c0 : index
@@ -162,9 +162,9 @@ kernel.def target(@h3_gemm_f16_fast_256b_gfx11) export("h3_gemm_f16_fast_256b") 
   %fb3 = index.add %fb0, %c48 : index
 
   %acc_init = vector.fragment<init> %zero_i32x8 shape [%m, %n] : vector<8xf32>
-  %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), mul(%st_quad, 4)] : index
+  %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), multiple_of(%st_quad, 4)] : index
   %ke_first0 = index.mul %kq_first, %c4 : index
-  %ke_first = index.assume %ke_first0 [le(%ke_first0, %k_last16), mul(%ke_first0, 16)] : index
+  %ke_first = index.assume %ke_first0 [le(%ke_first0, %k_last16), multiple_of(%ke_first0, 16)] : index
   %ga0 = vector.load %a_view[%a_row0, %ke_first] : view<[%m_bounded]x[%k_stride]xf16> -> vector<16xf16>
   %ga1 = vector.load %a_view[%a_row1, %ke_first] : view<[%m_bounded]x[%k_stride]xf16> -> vector<16xf16>
   %gw0 = vector.load %w_view[%w_row0, %ke_first] : view<[%n_size]x[%k_stride]xf16> -> vector<16xf16>
@@ -185,9 +185,9 @@ kernel.def target(@h3_gemm_f16_fast_256b_gfx11) export("h3_gemm_f16_fast_256b") 
     %kq_next0 = index.div %k_next, %c4 : index
     %kq_slot = index.add %kq_next0, %st_quad : index
     %kq_safe = scf.select %in_k, %kq_slot, %st_quad : index
-    %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), mul(%kq_safe, 4)] : index
+    %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), multiple_of(%kq_safe, 4)] : index
     %ke_next0 = index.mul %kq_next, %c4 : index
-    %ke_next = index.assume %ke_next0 [le(%ke_next0, %k_last16), mul(%ke_next0, 16)] : index
+    %ke_next = index.assume %ke_next0 [le(%ke_next0, %k_last16), multiple_of(%ke_next0, 16)] : index
     %na0 = vector.load %a_view[%a_row0, %ke_next] : view<[%m_bounded]x[%k_stride]xf16> -> vector<16xf16>
     %nw0 = vector.load %w_view[%w_row0, %ke_next] : view<[%n_size]x[%k_stride]xf16> -> vector<16xf16>
     scf.schedule.fence

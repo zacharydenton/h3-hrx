@@ -2,13 +2,13 @@
 // squares) over the group's channels x the frame's plane, f32. One wave per (frame, group).
 amdgpu.target<gfx11-generic> @h3_gn_stats_f16_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gn_stats_f16.channels : %value: index where [range(%value, 32, 4096), mul(%value, 32)]
+config.decl @h3.gn_stats_f16.channels : %value: index where [range(%value, 32, 4096), multiple_of(%value, 32)]
 
 config.decl @h3.gn_stats_f16.groups : %value: index where [range(%value, 1, 64)]
 
 config.decl @h3.gn_stats_f16.plane : %value: index where [range(%value, 1, 1048576)]
 
-config.decl @h3.gn_stats_f16.rows_bound : %value: index where [range(%value, 64, 2097152), mul(%value, 64)]
+config.decl @h3.gn_stats_f16.rows_bound : %value: index where [range(%value, 64, 2097152), multiple_of(%value, 64)]
 
 kernel.def target(@h3_gn_stats_f16_gfx11) export("h3_gn_stats_f16") @h3_gn_stats_f16(%frames: index) {
   %c1 = index.constant 1 : index

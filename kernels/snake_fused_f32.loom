@@ -7,7 +7,7 @@
 // x [C][len] -> out [C][len]; bindings must be disjoint.
 amdgpu.target<gfx11-generic> @h3_snake_fused_f32_gfx11 {subgroup_size = 32}
 config.decl @h3.snake_fused_f32.channels : %value: index where [range(%value, 1, 4096)]
-config.decl @h3.snake_fused_f32.len_bound : %value: index where [range(%value, 256, 4194304), mul(%value, 256)]
+config.decl @h3.snake_fused_f32.len_bound : %value: index where [range(%value, 256, 4194304), multiple_of(%value, 256)]
 kernel.def target(@h3_snake_fused_f32_gfx11) export("h3_snake_fused_f32") @h3_snake_fused_f32(%len: index) {
   %c1 = index.constant 1 : index
   %span = index.constant 64 : index

@@ -471,6 +471,7 @@ impl Compiler {
     /// A builder calls this once it has asked for its whole set, so that a kernel that will not
     /// compile is reported where it was configured rather than at the launch that first needs it.
     pub fn flush(&self, stream: &mut hrx::Stream) -> Result<()> {
+        crate::scheduling::yield_if_waiting(stream)?;
         // Safety: every requested source is this repository's own, checked in or embedded.
         Ok(unsafe { self.kernels(Some(stream.target()))?.kernels().build(stream) }?)
     }

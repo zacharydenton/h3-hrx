@@ -3,13 +3,13 @@
 // Pack four channels when groups align and the plane has enough work to fill the GPU.
 amdgpu.target<gfx11-generic> @h3_upscale_gn_silu_gfx11 {subgroup_size = 32}
 
-config.decl @h3.upscale_gn_silu.channels : %value: index where [range(%value, 32, 4096), mul(%value, 32)]
+config.decl @h3.upscale_gn_silu.channels : %value: index where [range(%value, 32, 4096), multiple_of(%value, 32)]
 
 config.decl @h3.upscale_gn_silu.groups : %value: index where [range(%value, 1, 64)]
 
 config.decl @h3.upscale_gn_silu.plane : %value: index where [range(%value, 1, 1048576)]
 
-config.decl @h3.upscale_gn_silu.rows_bound : %value: index where [range(%value, 64, 2097152), mul(%value, 64)]
+config.decl @h3.upscale_gn_silu.rows_bound : %value: index where [range(%value, 64, 2097152), multiple_of(%value, 64)]
 
 config.decl @h3.upscale_gn_silu.eps : f32
 

@@ -508,11 +508,11 @@ template.def<@h3.gemm_f16_finish> @h3.gemm_f16_finish_swiglu_swapped(%epilogue: 
 template.decl @h3.gemm_f16(%m_size: index, %a: buffer, %w: buffer, %c: buffer, %bias: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %has_bias: i1, %epilogue: index)
 
 template.def<@h3.gemm_f16> @h3.gemm_f16_body(%m_size: index, %a: buffer, %w: buffer, %c: buffer, %bias: buffer, %gate: buffer, %cls: buffer, %cfg_k_size: index, %cfg_n_size: index, %cfg_k_stride: index, %cfg_m_group: index, %cfg_classes: index, %has_bias: i1, %epilogue: index) {
-  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), mul(%cfg_k_size, 64)] : index
+  %k_size = index.assume %cfg_k_size [range(%cfg_k_size, 64, 65536), multiple_of(%cfg_k_size, 64)] : index
   // the operand rows' pitch (k elements); K itself when it is not a multiple of 1024, else K + 64,
   // so that the 384 rows a step touches do not alias in the cache (K = 7168: 36.7 -> 41.2 TOPS, K = 21504: 33.4 -> 41.4)
-  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), mul(%cfg_k_stride, 64)] : index
-  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 128, 65536), mul(%cfg_n_size, 128)] : index
+  %k_stride = index.assume %cfg_k_stride [range(%cfg_k_stride, 64, 65536), multiple_of(%cfg_k_stride, 64)] : index
+  %n_size = index.assume %cfg_n_size [range(%cfg_n_size, 128, 65536), multiple_of(%cfg_n_size, 128)] : index
 
   %c0 = index.constant 0 : index
   %c2 = index.constant 2 : index
@@ -577,7 +577,7 @@ template.def<@h3.gemm_f16> @h3.gemm_f16_body(%m_size: index, %a: buffer, %w: buf
   %st_sub = index.rem %workitem, %c4 : index
   %st_quad = index.mul %st_sub, %c4 : index
   %st_col0 = index.mul %st_sub, %c16 : index
-  %st_col = index.assume %st_col0 [lt(%st_col0, %c64), mul(%st_col0, 16)] : index
+  %st_col = index.assume %st_col0 [lt(%st_col0, %c64), multiple_of(%st_col0, 16)] : index
   %st_row_base = index.div %workitem, %c4 : index
   %k_quad_limit = index.sub %k_quads, %c4 : index
   %st_arow0 = index.add %st_row_base, %c0 : index
@@ -620,9 +620,9 @@ template.def<@h3.gemm_f16> @h3.gemm_f16_body(%m_size: index, %a: buffer, %w: buf
   %acc_init = vector.fragment<init> %zero_i32x8 shape [%m, %n] : vector<8xf32>
 
   // Gather of the first k step into registers.
-  %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), mul(%st_quad, 4)] : index
+  %kq_first = index.assume %st_quad [le(%st_quad, %k_quad_limit), multiple_of(%st_quad, 4)] : index
   %ke_first0 = index.mul %kq_first, %c4 : index
-  %ke_first = index.assume %ke_first0 [le(%ke_first0, %k_last16), mul(%ke_first0, 16)] : index
+  %ke_first = index.assume %ke_first0 [le(%ke_first0, %k_last16), multiple_of(%ke_first0, 16)] : index
   %ga0 = vector.load %a_view[%a_row0, %ke_first] : view<[%m_bounded]x[%k_stride]xf16> -> vector<16xf16>
   %ga1 = vector.load %a_view[%a_row1, %ke_first] : view<[%m_bounded]x[%k_stride]xf16> -> vector<16xf16>
   %ga2 = vector.load %a_view[%a_row2, %ke_first] : view<[%m_bounded]x[%k_stride]xf16> -> vector<16xf16>
@@ -646,9 +646,9 @@ template.def<@h3.gemm_f16> @h3.gemm_f16_body(%m_size: index, %a: buffer, %w: buf
     %kq_next0 = index.div %k_next, %c4 : index
     %kq_slot = index.add %kq_next0, %st_quad : index
     %kq_safe = scf.select %in_k, %kq_slot, %st_quad : index
-    %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), mul(%kq_safe, 4)] : index
+    %kq_next = index.assume %kq_safe [le(%kq_safe, %k_quad_limit), multiple_of(%kq_safe, 4)] : index
     %ke_next0 = index.mul %kq_next, %c4 : index
-    %ke_next = index.assume %ke_next0 [le(%ke_next0, %k_last16), mul(%ke_next0, 16)] : index
+    %ke_next = index.assume %ke_next0 [le(%ke_next0, %k_last16), multiple_of(%ke_next0, 16)] : index
     %na0 = vector.load %a_view[%a_row0, %ke_next] : view<[%m_bounded]x[%k_stride]xf16> -> vector<16xf16>
     %na1 = vector.load %a_view[%a_row1, %ke_next] : view<[%m_bounded]x[%k_stride]xf16> -> vector<16xf16>
     %na2 = vector.load %a_view[%a_row2, %ke_next] : view<[%m_bounded]x[%k_stride]xf16> -> vector<16xf16>
@@ -795,11 +795,11 @@ template.def<@h3.gemm_f16> @h3.gemm_f16_body(%m_size: index, %a: buffer, %w: buf
 
 amdgpu.target<gfx11-generic> @h3_gemm_f16_256_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_f16_256.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_f16_256.k_size : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
-config.decl @h3.gemm_f16_256.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_f16_256.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_f16_256.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_f16_256.k_stride : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
 config.decl @h3.gemm_f16_256.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -834,11 +834,11 @@ kernel.def target(@h3_gemm_f16_256_gfx11) export("h3_gemm_f16_256") @h3_gemm_f16
 
 amdgpu.target<gfx11-generic> @h3_gemm_f16_256b_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_f16_256b.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_f16_256b.k_size : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
-config.decl @h3.gemm_f16_256b.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_f16_256b.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_f16_256b.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_f16_256b.k_stride : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
 config.decl @h3.gemm_f16_256b.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -873,11 +873,11 @@ kernel.def target(@h3_gemm_f16_256b_gfx11) export("h3_gemm_f16_256b") @h3_gemm_f
 
 amdgpu.target<gfx11-generic> @h3_gemm_f16_resid_256_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_f16_resid_256.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_f16_resid_256.k_size : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
-config.decl @h3.gemm_f16_resid_256.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_f16_resid_256.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_f16_resid_256.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_f16_resid_256.k_stride : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
 config.decl @h3.gemm_f16_resid_256.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -914,11 +914,11 @@ kernel.def target(@h3_gemm_f16_resid_256_gfx11) export("h3_gemm_f16_resid_256") 
 
 amdgpu.target<gfx11-generic> @h3_gemm_f16_resid_256b_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_f16_resid_256b.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_f16_resid_256b.k_size : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
-config.decl @h3.gemm_f16_resid_256b.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_f16_resid_256b.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_f16_resid_256b.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_f16_resid_256b.k_stride : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
 config.decl @h3.gemm_f16_resid_256b.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -963,11 +963,11 @@ kernel.def target(@h3_gemm_f16_resid_256b_gfx11) export("h3_gemm_f16_resid_256b"
 
 amdgpu.target<gfx11-generic> @h3_gemm_f16_swiglu_256_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_f16_swiglu_256.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_f16_swiglu_256.k_size : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
-config.decl @h3.gemm_f16_swiglu_256.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_f16_swiglu_256.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_f16_swiglu_256.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_f16_swiglu_256.k_stride : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
 config.decl @h3.gemm_f16_swiglu_256.m_group : %value: index where [range(%value, 1, 4)]
 
@@ -1011,11 +1011,11 @@ kernel.def target(@h3_gemm_f16_swiglu_256_gfx11) export("h3_gemm_f16_swiglu_256"
 
 amdgpu.target<gfx11-generic> @h3_gemm_f16_swiglu_256b_gs_gfx11 {subgroup_size = 32}
 
-config.decl @h3.gemm_f16_swiglu_256b_gs.k_size : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_f16_swiglu_256b_gs.k_size : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
-config.decl @h3.gemm_f16_swiglu_256b_gs.n_size : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.gemm_f16_swiglu_256b_gs.n_size : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.gemm_f16_swiglu_256b_gs.k_stride : %value: index where [range(%value, 64, 65536), mul(%value, 64)]
+config.decl @h3.gemm_f16_swiglu_256b_gs.k_stride : %value: index where [range(%value, 64, 65536), multiple_of(%value, 64)]
 
 config.decl @h3.gemm_f16_swiglu_256b_gs.m_group : %value: index where [range(%value, 1, 4)]
 

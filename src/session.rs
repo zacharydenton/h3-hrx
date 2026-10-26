@@ -187,8 +187,9 @@ impl Session {
     /// that ceiling before allocating. StageScoped drains and releases finished
     /// units; Retain pins them for reuse and Budgeted caches each idle unit until
     /// allocation pressure evicts it. Each stage reserves the context's compute
-    /// lane while replaying its original private stream-bound graphs. Borrowed
-    /// inputs and progress callbacks stay on the calling thread.
+    /// lane while replaying private stream-bound graphs. Fenced checkpoints
+    /// between transformer blocks let queued components run before resuming.
+    /// Borrowed inputs and progress callbacks stay on the calling thread.
     ///
     /// # Safety
     /// The immutable checkpoint requirements of [`Session::new`] apply.
@@ -238,7 +239,8 @@ impl Session {
         // outputs never expose device pointers. NativeSession fences on success,
         // errors and panic, retaining all owners if completion is uncertain.
         unsafe {
-            self.native.run(|state| {
+            self.native.run_cooperative(|state, cooperator| {
+                let _scope = crate::scheduling::Scope::enter(&state.stream, cooperator);
                 let result = stage(state);
                 state.compiler.check_sanitizers(&mut state.stream)?;
                 result
@@ -1194,6 +1196,54 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires native GPU")]
+    fn cooperative_stage_serves_tracked_work_and_recovers_after_callback_panic() {
+        let context = hrx::inference::ModelContext::new(Default::default()).unwrap();
+        // SAFETY: this fixture never opens or changes checkpoint files.
+        let mut session =
+            unsafe { Session::new_in(Config::default(), SessionOptions::default(), &context) }
+                .unwrap();
+        let output = context
+            .runtime()
+            .allocate(64, hrx::execution::MemoryPlacement::HostVisible)
+            .unwrap();
+        let mut graph = context.runtime().graph();
+        graph.fill(output.view(), 0x5a).unwrap();
+        let graph = graph.prepare().unwrap();
+        for boundary in [false, true] {
+            session
+                .scheduled(|state| {
+                    let done = graph.submit()?;
+                    assert!(!done.is_complete(), "stage lost exclusive compute");
+                    if boundary {
+                        crate::scheduling::boundary(&mut state.stream)?;
+                    } else {
+                        crate::scheduling::yield_if_waiting(&mut state.stream)?;
+                    }
+                    assert!(done.is_complete());
+                    assert_eq!(&*output.map_read()?, &[0x5a; 64]);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.scheduled::<()>(|_| panic!("application callback"))
+        }))
+        .is_err());
+        // The H3 scope must be gone, rather than using an expired stage handle.
+        let mut other = context.runtime().stream(None).unwrap();
+        crate::scheduling::boundary(&mut other).unwrap();
+        session
+            .scheduled(|state| {
+                let done = graph.submit()?;
+                crate::scheduling::boundary(&mut state.stream)?;
+                assert!(done.is_complete());
+                Ok(())
+            })
+            .unwrap();
+    }
 
     #[test]
     fn existing_sessions_retain_models_by_default() {

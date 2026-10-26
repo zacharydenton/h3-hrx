@@ -5,9 +5,9 @@
 // Workgroups (width / tile_size, ceil(rows / tile_size)) of 256 lanes visit adjacent input columns first.
 amdgpu.target<gfx11-generic> @h3_transpose_qkv_v_f16_gfx11 {subgroup_size = 32}
 
-config.decl @h3.transpose_qkv_v_f16.width : %value: index where [range(%value, 32, 65536), mul(%value, 32)]
+config.decl @h3.transpose_qkv_v_f16.width : %value: index where [range(%value, 32, 65536), multiple_of(%value, 32)]
 
-config.decl @h3.transpose_qkv_v_f16.row_capacity : %value: index where [range(%value, 32, 1048576), mul(%value, 32)]
+config.decl @h3.transpose_qkv_v_f16.row_capacity : %value: index where [range(%value, 32, 1048576), multiple_of(%value, 32)]
 
 kernel.def target(@h3_transpose_qkv_v_f16_gfx11) export("h3_transpose_qkv_v_f16") @h3_transpose_qkv_v_f16(%rows: index) {
   %c1 = index.constant 1 : index
@@ -56,7 +56,7 @@ kernel.def target(@h3_transpose_qkv_v_f16_gfx11) export("h3_transpose_qkv_v_f16"
   %row0 = index.mul %rt, %tile_size : index
   %col0a = index.mul %ct, %tile_size : index
   %col_limit = index.sub %width, %tile_size : index
-  %col0 = index.assume %col0a [le(%col0a, %col_limit), mul(%col0a, 32)] : index
+  %col0 = index.assume %col0a [le(%col0a, %col_limit), multiple_of(%col0a, 32)] : index
   %x_global = buffer.assume.memory_space<global> %x : buffer
   %o_global = buffer.assume.memory_space<global> %out : buffer
   %stride = index.mul %width, %c3 : index
@@ -69,7 +69,7 @@ kernel.def target(@h3_transpose_qkv_v_f16_gfx11) export("h3_transpose_qkv_v_f16"
   %lr_base = index.div %lane, %lanes_per_row : index
   %lc0 = index.rem %lane, %lanes_per_row : index
   %lc = index.mul %lc0, %c4 : index
-  %lcb = index.assume %lc [le(%lc, %tile_limit), mul(%lc, 4)] : index
+  %lcb = index.assume %lc [le(%lc, %tile_limit), multiple_of(%lc, 4)] : index
   scf.for %pass = [%c0 to %passes step %c1] unroll {
     %lr_offset = index.mul %pass, %rows_per_pass : index
     %lr = index.add %lr_base, %lr_offset : index
@@ -79,10 +79,10 @@ kernel.def target(@h3_transpose_qkv_v_f16_gfx11) export("h3_transpose_qkv_v_f16"
       %grow_b = index.assume %grow [lt(%grow, %rows_b)] : index
       %gcol = index.add %col0, %lcb : index
       %gcol_limit = index.sub %width, %c4 : index
-      %gcolb = index.assume %gcol [le(%gcol, %gcol_limit), mul(%gcol, 4)] : index
+      %gcolb = index.assume %gcol [le(%gcol, %gcol_limit), multiple_of(%gcol, 4)] : index
       %vcol0 = index.add %voff, %gcolb : index
       %vlimit = index.sub %stride, %c4 : index
-      %vcol = index.assume %vcol0 [le(%vcol0, %vlimit), mul(%vcol0, 4)] : index
+      %vcol = index.assume %vcol0 [le(%vcol0, %vlimit), multiple_of(%vcol0, 4)] : index
       %v = vector.load %x_view[%grow_b, %vcol] : view<[%rows_b]x[%stride]xf16> -> vector<4xf16>
       vector.store %v, %tile[%lr, %lcb] : vector<4xf16>, view<[%tile_size]x[%tile_stride]xf16>
     } else {
@@ -95,7 +95,7 @@ kernel.def target(@h3_transpose_qkv_v_f16_gfx11) export("h3_transpose_qkv_v_f16"
     %tc_offset = index.mul %pass, %rows_per_pass : index
     %tc = index.add %lr_base, %tc_offset : index
     %tr = index.mul %lc0, %c4 : index
-    %trb = index.assume %tr [le(%tr, %tile_limit), mul(%tr, 4)] : index
+    %trb = index.assume %tr [le(%tr, %tile_limit), multiple_of(%tr, 4)] : index
     %e0 = view.load %tile[%trb, %tc] : view<[%tile_size]x[%tile_stride]xf16> -> f16
     %tr1 = index.add %trb, %c1 : index
     %tr2 = index.add %trb, %c2 : index
@@ -110,7 +110,7 @@ kernel.def target(@h3_transpose_qkv_v_f16_gfx11) export("h3_transpose_qkv_v_f16"
     %ocol_limit = index.sub %cap, %c4 : index
     %in_cols = index.cmp ule, %ocol, %ocol_limit : index
     scf.if %in_cols {
-      %ocol_b = index.assume %ocol [le(%ocol, %ocol_limit), mul(%ocol, 4)] : index
+      %ocol_b = index.assume %ocol [le(%ocol, %ocol_limit), multiple_of(%ocol, 4)] : index
       vector.store %ov, %o_view[%orow_b, %ocol_b] : vector<4xf16>, view<[%width]x[%cap]xf16>
     }
   }

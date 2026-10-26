@@ -3,8 +3,8 @@
 amdgpu.target<gfx11-generic> @h3_rope2d_qkv_f16_gfx11 {subgroup_size = 32}
 
 config.decl @h3.rope2d_qkv_f16.heads : %value: index where [range(%value, 1, 64)]
-config.decl @h3.rope2d_qkv_f16.hd : %value: index where [range(%value, 2, 256), mul(%value, 2)]
-config.decl @h3.rope2d_qkv_f16.hd_pad : %value: index where [range(%value, 32, 256), mul(%value, 32)]
+config.decl @h3.rope2d_qkv_f16.hd : %value: index where [range(%value, 2, 256), multiple_of(%value, 2)]
+config.decl @h3.rope2d_qkv_f16.hd_pad : %value: index where [range(%value, 32, 256), multiple_of(%value, 32)]
 
 kernel.def target(@h3_rope2d_qkv_f16_gfx11) export("h3_rope2d_qkv_f16") @h3_rope2d_qkv_f16(%tokens: index) {
   %one = index.constant 1 : index

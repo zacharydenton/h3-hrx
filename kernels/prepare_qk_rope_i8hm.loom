@@ -4,15 +4,15 @@
 // Unsmooth K only; callers using K mean smoothing retain the separate kernels.
 amdgpu.target<gfx11-generic> @h3_prepare_qk_rope_i8hm_gfx11 {subgroup_size = 32}
 
-config.decl @h3.prepare_qk_rope_i8hm.row_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.prepare_qk_rope_i8hm.row_stride : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.prepare_qk_rope_i8hm.head_offset : %value: index where [range(%value, 0, 65536), mul(%value, 128)]
+config.decl @h3.prepare_qk_rope_i8hm.head_offset : %value: index where [range(%value, 0, 65536), multiple_of(%value, 128)]
 
 config.decl @h3.prepare_qk_rope_i8hm.heads : %value: index where [range(%value, 1, 256)]
 
 config.decl @h3.prepare_qk_rope_i8hm.extra_scale : f32
 
-config.decl @h3.prepare_qk_rope_i8hm.token_capacity : %value: index where [range(%value, 32, 1048576), mul(%value, 32)]
+config.decl @h3.prepare_qk_rope_i8hm.token_capacity : %value: index where [range(%value, 32, 1048576), multiple_of(%value, 32)]
 
 config.decl @h3.prepare_qk_rope_i8hm.eps : f32
 
@@ -87,7 +87,7 @@ kernel.def target(@h3_prepare_qk_rope_i8hm_gfx11) export("h3_prepare_qk_rope_i8h
   %nr_pairlane0 = scf.select %nr_lo, %lane, %nr_down0 : index
   %nr_pairlane = scf.select %nr_pair, %nr_pairlane0, %c0 : index
   %nr_paircol0 = index.mul %nr_pairlane, %c4 : index
-  %nr_paircol = index.assume %nr_paircol0 [le(%nr_paircol0, %nr_44), mul(%nr_paircol0, 4)] : index
+  %nr_paircol = index.assume %nr_paircol0 [le(%nr_paircol0, %nr_44), multiple_of(%nr_paircol0, 4)] : index
   %c_view = buffer.view %c_global[%c0_offset] : buffer -> view<[%rows]x32xi32>
   %s_view = buffer.view %s_global[%c0_offset] : buffer -> view<[%heads]x[%capacity]xf32>
   // Every head uses the same channel weights and this token's rotary tables.
@@ -105,7 +105,7 @@ kernel.def target(@h3_prepare_qk_rope_i8hm_gfx11) export("h3_prepare_qk_rope_i8h
       %hcol1 = index.add %hcol0, %head_offset : index
       %col0 = index.add %hcol1, %lane4 : index
       %col_limit = index.sub %row_stride, %c4 : index
-      %col = index.assume %col0 [le(%col0, %col_limit), mul(%col0, 4)] : index
+      %col = index.assume %col0 [le(%col0, %col_limit), multiple_of(%col0, 4)] : index
       %x4h = vector.load %x_view[%token, %col] : view<[%tokens_b]x[%row_stride]xf16> -> vector<4xf16>
       %nr_v = vector.extf %x4h : vector<4xf16> to vector<4xf32>
       %nr_sq = vector.mulf %nr_v, %nr_v : vector<4xf32>

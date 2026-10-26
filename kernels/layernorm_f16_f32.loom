@@ -2,7 +2,7 @@
 // sum, centered variance and affine transform.
 amdgpu.target<gfx11-generic> @h3_layernorm_f16_f32_gfx11 {subgroup_size = 32}
 
-config.decl @h3.layernorm_f16_f32.width : %value: index where [range(%value, 32, 8192), mul(%value, 32)]
+config.decl @h3.layernorm_f16_f32.width : %value: index where [range(%value, 32, 8192), multiple_of(%value, 32)]
 
 config.decl @h3.layernorm_f16_f32.eps : f32
 

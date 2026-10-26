@@ -287,9 +287,9 @@ template.def<@h3.prepare_plain_tiled> @h3_prepare_plain_tiled(%tokens: index, %h
 }
 
 amdgpu.target<gfx11-generic> @h3_prepare_plain_tiled_i4_gfx11 {subgroup_size = 32}
-config.decl @h3.prepare_plain_tiled_i4.width : %v: index where [range(%v, 256, 32768), mul(%v, 256)]
-config.decl @h3.prepare_plain_tiled_i4.lanes : %v: index where [range(%v, 32, 1024), mul(%v, 32)]
-config.decl @h3.prepare_plain_tiled_i4.out_stride : %v: index where [range(%v, 256, 65536), mul(%v, 64)]
+config.decl @h3.prepare_plain_tiled_i4.width : %v: index where [range(%v, 256, 32768), multiple_of(%v, 256)]
+config.decl @h3.prepare_plain_tiled_i4.lanes : %v: index where [range(%v, 32, 1024), multiple_of(%v, 32)]
+config.decl @h3.prepare_plain_tiled_i4.out_stride : %v: index where [range(%v, 256, 65536), multiple_of(%v, 64)]
 kernel.def target(@h3_prepare_plain_tiled_i4_gfx11) export("h3_prepare_plain_tiled_i4") @h3_prepare_plain_tiled_i4(%tokens: index) {
   %c1 = index.constant 1 : index
   %lanes = config.get @h3.prepare_plain_tiled_i4.lanes : index
@@ -305,9 +305,9 @@ kernel.def target(@h3_prepare_plain_tiled_i4_gfx11) export("h3_prepare_plain_til
 }
 
 amdgpu.target<gfx11-generic> @h3_prepare_plain_tiled_f32_i4_gfx11 {subgroup_size = 32}
-config.decl @h3.prepare_plain_tiled_f32_i4.width : %v: index where [range(%v, 256, 32768), mul(%v, 256)]
-config.decl @h3.prepare_plain_tiled_f32_i4.lanes : %v: index where [range(%v, 32, 1024), mul(%v, 32)]
-config.decl @h3.prepare_plain_tiled_f32_i4.out_stride : %v: index where [range(%v, 256, 65536), mul(%v, 64)]
+config.decl @h3.prepare_plain_tiled_f32_i4.width : %v: index where [range(%v, 256, 32768), multiple_of(%v, 256)]
+config.decl @h3.prepare_plain_tiled_f32_i4.lanes : %v: index where [range(%v, 32, 1024), multiple_of(%v, 32)]
+config.decl @h3.prepare_plain_tiled_f32_i4.out_stride : %v: index where [range(%v, 256, 65536), multiple_of(%v, 64)]
 kernel.def target(@h3_prepare_plain_tiled_f32_i4_gfx11) export("h3_prepare_plain_tiled_f32_i4") @h3_prepare_plain_tiled_f32_i4(%tokens: index) {
   %c1 = index.constant 1 : index
   %lanes = config.get @h3.prepare_plain_tiled_f32_i4.lanes : index
@@ -323,9 +323,9 @@ kernel.def target(@h3_prepare_plain_tiled_f32_i4_gfx11) export("h3_prepare_plain
 }
 
 amdgpu.target<gfx11-generic> @h3_prepare_plain_tiled_i8_gfx11 {subgroup_size = 32}
-config.decl @h3.prepare_plain_tiled_i8.width : %v: index where [range(%v, 256, 32768), mul(%v, 256)]
-config.decl @h3.prepare_plain_tiled_i8.lanes : %v: index where [range(%v, 32, 1024), mul(%v, 32)]
-config.decl @h3.prepare_plain_tiled_i8.out_stride : %v: index where [range(%v, 256, 65536), mul(%v, 64)]
+config.decl @h3.prepare_plain_tiled_i8.width : %v: index where [range(%v, 256, 32768), multiple_of(%v, 256)]
+config.decl @h3.prepare_plain_tiled_i8.lanes : %v: index where [range(%v, 32, 1024), multiple_of(%v, 32)]
+config.decl @h3.prepare_plain_tiled_i8.out_stride : %v: index where [range(%v, 256, 65536), multiple_of(%v, 64)]
 kernel.def target(@h3_prepare_plain_tiled_i8_gfx11) export("h3_prepare_plain_tiled_i8") @h3_prepare_plain_tiled_i8(%tokens: index) {
   %c1 = index.constant 1 : index
   %lanes = config.get @h3.prepare_plain_tiled_i8.lanes : index
@@ -341,9 +341,9 @@ kernel.def target(@h3_prepare_plain_tiled_i8_gfx11) export("h3_prepare_plain_til
 }
 
 amdgpu.target<gfx11-generic> @h3_prepare_plain_tiled_f32_i8_gfx11 {subgroup_size = 32}
-config.decl @h3.prepare_plain_tiled_f32_i8.width : %v: index where [range(%v, 256, 32768), mul(%v, 256)]
-config.decl @h3.prepare_plain_tiled_f32_i8.lanes : %v: index where [range(%v, 32, 1024), mul(%v, 32)]
-config.decl @h3.prepare_plain_tiled_f32_i8.out_stride : %v: index where [range(%v, 256, 65536), mul(%v, 64)]
+config.decl @h3.prepare_plain_tiled_f32_i8.width : %v: index where [range(%v, 256, 32768), multiple_of(%v, 256)]
+config.decl @h3.prepare_plain_tiled_f32_i8.lanes : %v: index where [range(%v, 32, 1024), multiple_of(%v, 32)]
+config.decl @h3.prepare_plain_tiled_f32_i8.out_stride : %v: index where [range(%v, 256, 65536), multiple_of(%v, 64)]
 kernel.def target(@h3_prepare_plain_tiled_f32_i8_gfx11) export("h3_prepare_plain_tiled_f32_i8") @h3_prepare_plain_tiled_f32_i8(%tokens: index) {
   %c1 = index.constant 1 : index
   %lanes = config.get @h3.prepare_plain_tiled_f32_i8.lanes : index

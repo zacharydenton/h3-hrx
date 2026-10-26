@@ -2,7 +2,7 @@
 // Four-channel prefetch, hoisted padding checks, original channel/tap FP32 FMAs.
 amdgpu.target<gfx11-generic> @h3_conv1d_narrow_f32_gfx11 {subgroup_size = 32}
 
-config.decl @h3.conv1d_narrow_f32.cin : %value: index where [range(%value, 4, 16), mul(%value, 4)]
+config.decl @h3.conv1d_narrow_f32.cin : %value: index where [range(%value, 4, 16), multiple_of(%value, 4)]
 
 config.decl @h3.conv1d_narrow_f32.cout : %value: index where [range(%value, 1, 16)]
 
@@ -14,7 +14,7 @@ config.decl @h3.conv1d_narrow_f32.pad : %value: index where [range(%value, 0, 10
 
 config.decl @h3.conv1d_narrow_f32.accumulate : %value: index where [range(%value, 0, 1)]
 
-config.decl @h3.conv1d_narrow_f32.len_bound : %value: index where [range(%value, 256, 4194304), mul(%value, 256)]
+config.decl @h3.conv1d_narrow_f32.len_bound : %value: index where [range(%value, 256, 4194304), multiple_of(%value, 256)]
 
 kernel.def target(@h3_conv1d_narrow_f32_gfx11) export("h3_conv1d_narrow_f32") @h3_conv1d_narrow_f32(%len: index) {
   %c1 = index.constant 1 : index

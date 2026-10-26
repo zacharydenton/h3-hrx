@@ -95,6 +95,7 @@ pub(crate) unsafe fn launch(
 ) -> Result<()> {
     // Every H3 scalar is an unsigned Loom index. HRX handles the compiler's
     // checked 32/64-bit index lowering; arbitrary mixed scalars are never inferred.
+    crate::scheduling::yield_if_waiting(stream)?;
     let constants = hrx::Constants::indices(kernel, scalars)?;
     match profile {
         Some(p) if p.on && p.device => {

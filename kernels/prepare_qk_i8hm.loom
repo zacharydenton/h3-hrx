@@ -2,15 +2,15 @@
 // i32 and scales [heads][capacity] f32. The caller zeroes padded capacity once.
 amdgpu.target<gfx11-generic> @h3_prepare_qk_i8hm_gfx11 {subgroup_size = 32}
 
-config.decl @h3.prepare_qk_i8hm.row_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.prepare_qk_i8hm.row_stride : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.prepare_qk_i8hm.head_offset : %value: index where [range(%value, 0, 65536), mul(%value, 128)]
+config.decl @h3.prepare_qk_i8hm.head_offset : %value: index where [range(%value, 0, 65536), multiple_of(%value, 128)]
 
 config.decl @h3.prepare_qk_i8hm.heads : %value: index where [range(%value, 1, 256)]
 
 config.decl @h3.prepare_qk_i8hm.extra_scale : f32
 
-config.decl @h3.prepare_qk_i8hm.token_capacity : %value: index where [range(%value, 32, 1048576), mul(%value, 32)]
+config.decl @h3.prepare_qk_i8hm.token_capacity : %value: index where [range(%value, 32, 1048576), multiple_of(%value, 32)]
 
 kernel.def target(@h3_prepare_qk_i8hm_gfx11) export("h3_prepare_qk_i8hm") @h3_prepare_qk_i8hm(%tokens: index) {
   %c1 = index.constant 1 : index
@@ -75,7 +75,7 @@ kernel.def target(@h3_prepare_qk_i8hm_gfx11) export("h3_prepare_qk_i8hm") @h3_pr
       %lane4 = index.mul %lane, %c4 : index
       %col0 = index.add %hcol1, %lane4 : index
       %col_limit = index.sub %row_stride, %c4 : index
-      %col = index.assume %col0 [le(%col0, %col_limit), mul(%col0, 4)] : index
+      %col = index.assume %col0 [le(%col0, %col_limit), multiple_of(%col0, 4)] : index
       %x4h = vector.load %x_view[%token, %col] : view<[%tokens_b]x[%row_stride]xf16> -> vector<4xf16>
       %x4 = vector.extf %x4h : vector<4xf16> to vector<4xf32>
       %m4 = vector.load %m_view[%col] : view<[%row_stride]xf32> -> vector<4xf32>

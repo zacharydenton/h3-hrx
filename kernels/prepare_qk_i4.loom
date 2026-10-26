@@ -8,9 +8,9 @@
 //   -> codes [tokens][heads * 16] i32, scales [tokens][heads] f32 (= absmax/7 * extra_scale)
 amdgpu.target<gfx11-generic> @h3_prepare_qk_i4_gfx11 {subgroup_size = 32}
 
-config.decl @h3.prepare_qk_i4.row_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.prepare_qk_i4.row_stride : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
-config.decl @h3.prepare_qk_i4.head_offset : %value: index where [range(%value, 0, 65536), mul(%value, 128)]
+config.decl @h3.prepare_qk_i4.head_offset : %value: index where [range(%value, 0, 65536), multiple_of(%value, 128)]
 
 config.decl @h3.prepare_qk_i4.heads : %value: index where [range(%value, 1, 256)]
 
@@ -83,7 +83,7 @@ kernel.def target(@h3_prepare_qk_i4_gfx11) export("h3_prepare_qk_i4") @h3_prepar
       %lane4 = index.mul %lane, %c4 : index
       %col0 = index.add %hcol1, %lane4 : index
       %col_limit = index.sub %row_stride, %c4 : index
-      %col = index.assume %col0 [le(%col0, %col_limit), mul(%col0, 4)] : index
+      %col = index.assume %col0 [le(%col0, %col_limit), multiple_of(%col0, 4)] : index
       %x4h = vector.load %x_view[%token, %col] : view<[%tokens_b]x[%row_stride]xf16> -> vector<4xf16>
       %x4 = vector.extf %x4h : vector<4xf16> to vector<4xf32>
       %m4 = vector.load %m_view[%col] : view<[%row_stride]xf32> -> vector<4xf32>
@@ -105,7 +105,7 @@ kernel.def target(@h3_prepare_qk_i4_gfx11) export("h3_prepare_qk_i4") @h3_prepar
       %e3 = scalar.subf %ab_m, %cd_m : f32
       %s0 = vector.from_elements %e0, %e1, %e2, %e3 : vector<4xf32>
       %lane_col = index.mul %lane, %c4 : index
-      %lc = index.assume %lane_col [le(%lane_col, %c124), mul(%lane_col, 4)] : index
+      %lc = index.assume %lane_col [le(%lane_col, %c124), multiple_of(%lane_col, 4)] : index
       vector.store %s0, %row_view[%lc] : vector<4xf32>, view<128xf32>
       kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
       %lq1 = index.div %lane, %c1 : index
@@ -115,7 +115,7 @@ kernel.def target(@h3_prepare_qk_i4_gfx11) export("h3_prepare_qk_i4") @h3_prepar
       %pl1b = index.add %lane, %c1 : index
       %pl1 = scf.select %hi1, %pl1a, %pl1b : index
       %pc10 = index.mul %pl1, %c4 : index
-      %pc1 = index.assume %pc10 [range(%pc10, 0, 124), mul(%pc10, 4)] : index
+      %pc1 = index.assume %pc10 [range(%pc10, 0, 124), multiple_of(%pc10, 4)] : index
       %p1 = vector.load %row_view[%pc1] : view<128xf32> -> vector<4xf32>
       %sum1 = vector.addf %s0, %p1 : vector<4xf32>
       %dif1 = vector.subf %p1, %s0 : vector<4xf32>
@@ -130,7 +130,7 @@ kernel.def target(@h3_prepare_qk_i4_gfx11) export("h3_prepare_qk_i4") @h3_prepar
       %pl2b = index.add %lane, %c2 : index
       %pl2 = scf.select %hi2, %pl2a, %pl2b : index
       %pc20 = index.mul %pl2, %c4 : index
-      %pc2 = index.assume %pc20 [range(%pc20, 0, 124), mul(%pc20, 4)] : index
+      %pc2 = index.assume %pc20 [range(%pc20, 0, 124), multiple_of(%pc20, 4)] : index
       %p2 = vector.load %row_view[%pc2] : view<128xf32> -> vector<4xf32>
       %sum2 = vector.addf %s2, %p2 : vector<4xf32>
       %dif2 = vector.subf %p2, %s2 : vector<4xf32>
@@ -145,7 +145,7 @@ kernel.def target(@h3_prepare_qk_i4_gfx11) export("h3_prepare_qk_i4") @h3_prepar
       %pl4b = index.add %lane, %c4 : index
       %pl4 = scf.select %hi4, %pl4a, %pl4b : index
       %pc40 = index.mul %pl4, %c4 : index
-      %pc4 = index.assume %pc40 [range(%pc40, 0, 124), mul(%pc40, 4)] : index
+      %pc4 = index.assume %pc40 [range(%pc40, 0, 124), multiple_of(%pc40, 4)] : index
       %p4 = vector.load %row_view[%pc4] : view<128xf32> -> vector<4xf32>
       %sum4 = vector.addf %s4, %p4 : vector<4xf32>
       %dif4 = vector.subf %p4, %s4 : vector<4xf32>
@@ -160,7 +160,7 @@ kernel.def target(@h3_prepare_qk_i4_gfx11) export("h3_prepare_qk_i4") @h3_prepar
       %pl8b = index.add %lane, %c8 : index
       %pl8 = scf.select %hi8, %pl8a, %pl8b : index
       %pc80 = index.mul %pl8, %c4 : index
-      %pc8 = index.assume %pc80 [range(%pc80, 0, 124), mul(%pc80, 4)] : index
+      %pc8 = index.assume %pc80 [range(%pc80, 0, 124), multiple_of(%pc80, 4)] : index
       %p8 = vector.load %row_view[%pc8] : view<128xf32> -> vector<4xf32>
       %sum8 = vector.addf %s8, %p8 : vector<4xf32>
       %dif8 = vector.subf %p8, %s8 : vector<4xf32>
@@ -175,7 +175,7 @@ kernel.def target(@h3_prepare_qk_i4_gfx11) export("h3_prepare_qk_i4") @h3_prepar
       %pl16b = index.add %lane, %c16 : index
       %pl16 = scf.select %hi16, %pl16a, %pl16b : index
       %pc160 = index.mul %pl16, %c4 : index
-      %pc16 = index.assume %pc160 [range(%pc160, 0, 124), mul(%pc160, 4)] : index
+      %pc16 = index.assume %pc160 [range(%pc160, 0, 124), multiple_of(%pc160, 4)] : index
       %p16 = vector.load %row_view[%pc16] : view<128xf32> -> vector<4xf32>
       %sum16 = vector.addf %s16, %p16 : vector<4xf32>
       %dif16 = vector.subf %p16, %s16 : vector<4xf32>
@@ -185,7 +185,7 @@ kernel.def target(@h3_prepare_qk_i4_gfx11) export("h3_prepare_qk_i4") @h3_prepar
       kernel.barrier<workgroup> scope(subgroup) ordering(acq_rel)
       // per (token, head) absmax over the 128 rotated values: every lane scans the row
       %amax_v = scf.for %i = [%c0 to %c128 step %c4](%acc = %zero4 : vector<4xf32>) -> (vector<4xf32>) {
-        %ii = index.assume %i [le(%i, %c124), mul(%i, 4)] : index
+        %ii = index.assume %i [le(%i, %c124), multiple_of(%i, 4)] : index
         %v = vector.load %row_view[%ii] : view<128xf32> -> vector<4xf32>
         %av = vector.absf %v : vector<4xf32>
         %m = vector.maxnumf %acc, %av : vector<4xf32>

@@ -6,13 +6,13 @@
 //
 amdgpu.target<gfx11-generic> @h3_rope_qknorm_f16_gfx11 {subgroup_size = 32}
 
-config.decl @h3.rope_qknorm_f16.row_stride : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.rope_qknorm_f16.row_stride : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
 config.decl @h3.rope_qknorm_f16.heads : %value: index where [range(%value, 1, 256)]
 
 config.decl @h3.rope_qknorm_f16.kv_heads : %value: index where [range(%value, 1, 256)]
 
-config.decl @h3.rope_qknorm_f16.k_offset : %value: index where [range(%value, 128, 65536), mul(%value, 128)]
+config.decl @h3.rope_qknorm_f16.k_offset : %value: index where [range(%value, 128, 65536), multiple_of(%value, 128)]
 
 config.decl @h3.rope_qknorm_f16.eps : f32
 
@@ -91,7 +91,7 @@ kernel.def target(@h3_rope_qknorm_f16_gfx11) export("h3_rope_qknorm_f16") @h3_ro
   %pair_lane2 = scf.select %is_lo, %pair_lane0, %pair_lane1 : index
   %pair_lane3 = scf.select %is_pair, %pair_lane2, %c0 : index
   %pair_col0 = index.mul %pair_lane3, %cch : index
-  %pair_col = index.assume %pair_col0 [le(%pair_col0, %cpair_last), mul(%pair_col0, 4)] : index
+  %pair_col = index.assume %pair_col0 [le(%pair_col0, %cpair_last), multiple_of(%pair_col0, 4)] : index
   // Reuse channel weights and this token's rotary tables across all head rounds.
   %w_q = vector.load %qw_view[%lane_col] : view<128xf32> -> vector<4xf32>
   %w_k = vector.load %kw_view[%lane_col] : view<128xf32> -> vector<4xf32>
@@ -118,11 +118,11 @@ kernel.def target(@h3_rope_qknorm_f16_gfx11) export("h3_rope_qknorm_f16") @h3_ro
       %v_base = index.add %v_offset, %v_base0 : index
       %base = scf.select %is_v, %v_base, %base_qk : index
       %col0 = index.add %base, %lane_col : index
-      %col = index.assume %col0 [le(%col0, %col_limit), mul(%col0, 4)] : index
+      %col = index.assume %col0 [le(%col0, %col_limit), multiple_of(%col0, 4)] : index
       %v16 = vector.load %qkv_view[%row, %col] : view<[%tokens_b]x[%row_stride]xf16> -> vector<4xf16>
       scf.if %is_v {
         %vc0 = index.add %v_base0, %lane_col : index
-        %vc = index.assume %vc0 [le(%vc0, %kv_limit), mul(%vc0, 4)] : index
+        %vc = index.assume %vc0 [le(%vc0, %kv_limit), multiple_of(%vc0, 4)] : index
         vector.store %v16, %vo_view[%row, %vc] : vector<4xf16>, view<[%tokens_b]x[%kv_width]xf16>
       } else {
         %v = vector.extf %v16 : vector<4xf16> to vector<4xf32>
@@ -159,11 +159,11 @@ kernel.def target(@h3_rope_qknorm_f16_gfx11) export("h3_rope_qknorm_f16") @h3_ro
         %out16 = vector.fptrunc %out : vector<4xf32> to vector<4xf16>
         scf.if %is_q {
           %qc0 = index.add %q_base, %lane_col : index
-          %qc = index.assume %qc0 [le(%qc0, %w_limit), mul(%qc0, 4)] : index
+          %qc = index.assume %qc0 [le(%qc0, %w_limit), multiple_of(%qc0, 4)] : index
           vector.store %out16, %qo_view[%row, %qc] : vector<4xf16>, view<[%tokens_b]x[%width]xf16>
         } else {
           %kc0 = index.add %k_base0, %lane_col : index
-          %kc = index.assume %kc0 [le(%kc0, %kv_limit), mul(%kc0, 4)] : index
+          %kc = index.assume %kc0 [le(%kc0, %kv_limit), multiple_of(%kc0, 4)] : index
           vector.store %out16, %ko_view[%row, %kc] : vector<4xf16>, view<[%tokens_b]x[%kv_width]xf16>
         }
       }
