@@ -100,3 +100,40 @@ fn reflected_convolution_proves_nonnegative_gather_rows() -> hrx::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires the provisioned Loom compiler; no GPU required"
+)]
+fn head_major_operand_preparation_proves_scale_rows() -> hrx::Result<()> {
+    let compiler = hrx::loom::Compiler::resolve(None)?;
+    let (heads, inner) = (56usize, 7168usize);
+    let separate = include_str!("../kernels/prepare_qk_i8hm.loom");
+    let fused = include_str!("../kernels/prepare_qk_rope_i8hm.loom");
+    // 89,088 is the capacity of the 248-frame 768x1344 clip that failed to compile.
+    for capacity in [89_088usize, 1_048_544] {
+        // The fused kernel reads Q, then K one projection width further along.
+        for (stem, source, row_stride, head_offset) in [
+            ("prepare_qk_i8hm", separate, inner, 0),
+            ("prepare_qk_rope_i8hm", fused, 3 * inner, 0),
+            ("prepare_qk_rope_i8hm", fused, 3 * inner, inner),
+        ] {
+            let mut spec = hrx::loom::Specialization::new(format!("h3_{stem}"));
+            for (key, value) in [
+                ("row_stride", row_stride),
+                ("head_offset", head_offset),
+                ("heads", heads),
+                ("token_capacity", capacity),
+            ] {
+                spec.set_config(format!("h3.{stem}.{key}"), value.to_string());
+            }
+            spec.set_config(format!("h3.{stem}.extra_scale"), "1");
+            if stem == "prepare_qk_rope_i8hm" {
+                spec.set_config(format!("h3.{stem}.eps"), "0.000001");
+            }
+            compiler.module(source).compile(&spec)?;
+        }
+    }
+    Ok(())
+}

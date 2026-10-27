@@ -49,7 +49,8 @@ kernel.def target(@h3_prepare_qk_i8hm_gfx11) export("h3_prepare_qk_i8hm") @h3_pr
   %rows = index.mul %heads, %capacity : index
   // one workgroup per token; its eight waves take heads round * 8 + wave (as the rope kernel)
   %token0 = kernel.workgroup.id<x> : index
-  %token = index.assume %token0 [lt(%token0, %tokens_b)] : index
+  // The host's capacity is at least tokens + 16, so a token's scale row is in bounds.
+  %token = index.assume %token0 [lt(%token0, %tokens_b), lt(%token0, %capacity)] : index
   %wave0 = kernel.subgroup.id : index
   %wave = index.assume %wave0 [range(%wave0, 0, 7)] : index
   %lane0 = kernel.subgroup.lane.id : index
